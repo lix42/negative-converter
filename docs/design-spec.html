@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Negative Converter — High-Level Design Spec (Step 1)</title>
+<style>
+  :root {
+    --fg: #1c1e21;
+    --muted: #5c6670;
+    --bg: #ffffff;
+    --accent: #b5651d;        /* film-amber */
+    --accent-soft: #fdf4ea;
+    --border: #e3e6ea;
+    --code-bg: #f6f8fa;
+    --code-fg: #24292f;
+    --warn-bg: #fff8e6;
+    --warn-border: #f0d488;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 3rem 1.5rem 6rem; }
+  header.title {
+    border-bottom: 3px solid var(--accent);
+    padding-bottom: 1.25rem;
+    margin-bottom: 2rem;
+  }
+  header.title h1 { margin: 0 0 .35rem; font-size: 2rem; letter-spacing: -.01em; }
+  .badges { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
+  .badge {
+    font-size: .78rem; font-weight: 600; color: var(--accent);
+    background: var(--accent-soft); border: 1px solid #f0dcc4;
+    padding: .2rem .6rem; border-radius: 999px;
+  }
+  h2 {
+    margin: 2.75rem 0 1rem; font-size: 1.4rem; letter-spacing: -.01em;
+    padding-bottom: .35rem; border-bottom: 1px solid var(--border);
+  }
+  h3 { margin: 1.75rem 0 .6rem; font-size: 1.12rem; }
+  h4 { margin: 1.25rem 0 .4rem; font-size: 1rem; color: var(--muted); }
+  p, li { color: var(--fg); }
+  a { color: var(--accent); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: .88em; background: var(--code-bg); color: var(--code-fg);
+    padding: .12em .38em; border-radius: 5px;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.1rem; overflow-x: auto; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; font-size: .82rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { text-align: left; padding: .55rem .7rem; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--code-bg); font-weight: 600; }
+  tbody tr:nth-child(even) { background: #fafbfc; }
+  blockquote {
+    margin: 1.25rem 0; padding: .75rem 1.1rem;
+    background: var(--accent-soft); border-left: 4px solid var(--accent);
+    border-radius: 0 8px 8px 0; color: var(--muted);
+  }
+  blockquote p { margin: .3rem 0; }
+  .callout {
+    margin: 1.25rem 0; padding: .85rem 1.1rem;
+    background: var(--warn-bg); border: 1px solid var(--warn-border); border-radius: 8px;
+  }
+  .callout strong { color: #8a6d1a; }
+  .lead { font-size: 1.08rem; color: var(--muted); }
+  .toc {
+    background: #fafbfc; border: 1px solid var(--border); border-radius: 10px;
+    padding: 1rem 1.25rem; margin: 2rem 0;
+  }
+  .toc ol { margin: .25rem 0; padding-left: 1.4rem; columns: 2; column-gap: 2rem; }
+  .toc li { margin: .2rem 0; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  footer { margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .85rem; }
+  .pill { display:inline-block; font-size:.72rem; font-weight:600; padding:.1rem .5rem; border-radius:6px; }
+  .pill.in { background:#e7f6ec; color:#1a7f37; }
+  .pill.out { background:#fdeaea; color:#b42318; }
+  @media (max-width: 640px) { .toc ol { columns: 1; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Negative Converter — High-Level Design Spec</h1>
+  <p class="lead">A CLI tool that converts film-negative scans to positive images, with every parameter exposed for agent control.</p>
+  <div class="badges">
+    <span class="badge">Status: Draft for review</span>
+    <span class="badge">Target: Step 1 (MVP)</span>
+    <span class="badge">Language: Rust</span>
+  </div>
+</header>
+
+<blockquote>
+  <p>This is the human-readable (HTML) companion to <code>design-spec.md</code>. Both contain the same content; the Markdown version is the machine-readable source for agents.</p>
+</blockquote>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#purpose">Purpose</a></li>
+    <li><a href="#scope">Scope</a></li>
+    <li><a href="#principles">Design principles</a></li>
+    <li><a href="#input">Input formats</a></li>
+    <li><a href="#output">Output formats</a></li>
+    <li><a href="#pipeline">Pipeline architecture</a></li>
+    <li><a href="#algorithms">Conversion algorithms</a></li>
+    <li><a href="#cli">CLI design</a></li>
+    <li><a href="#params">Parameter reference</a></li>
+    <li><a href="#code">Code architecture</a></li>
+    <li><a href="#errors">Errors &amp; exit codes</a></li>
+    <li><a href="#roadmap">Roadmap (follow-ups)</a></li>
+    <li><a href="#open">Open questions</a></li>
+  </ol>
+</nav>
+
+<h2 id="purpose">1. Purpose</h2>
+<p>A command-line tool that reads a <strong>film negative scan</strong> (SilverFast HDR/HDRi format first) and produces a <strong>positive image</strong> as a TIFF file. Every step of the conversion is controlled by explicit CLI parameters so that an automated agent — or a human — can drive the full pipeline reproducibly.</p>
+
+<h3>What “AI-friendly” means here</h3>
+<p>This was the key clarification that reshaped the design. “AI-friendly” does <strong>not</strong> mean “use AI/ML models to process the image” (auto-crop, generative restoration, etc.). It means:</p>
+<ul>
+  <li><strong>Every parameter of the conversion is exposed as a CLI flag.</strong> A negative converter naturally has many knobs (film-base estimation, density, white balance, tone, gamma, color management, output bit depth). All of them are addressable from the command line.</li>
+  <li><strong>The tool is deterministic and scriptable.</strong> The same inputs and parameters always produce the same output. No hidden state, no interactive prompts in the conversion path.</li>
+  <li><strong>Machine-readable I/O.</strong> Parameters can be loaded from / dumped to a JSON “recipe” file, and the tool can emit JSON reports (estimated values, warnings, metadata) so an agent can read results and adjust on the next call.</li>
+</ul>
+<p>The deterministic core owns the image science. Any future ML assistance (see the Roadmap) is strictly opt-in and sits <em>around</em> this core, never replacing it.</p>
+
+<h2 id="scope">2. Scope</h2>
+
+<h3><span class="pill in">In scope</span> Step 1</h3>
+<ul>
+  <li>Read SilverFast <strong>HDR (48-bit RGB)</strong> and <strong>HDRi (64-bit RGB + infrared)</strong> scans.</li>
+  <li>Parse and <strong>preserve</strong> the IR channel (carry it through; optional export). Do <strong>not</strong> yet act on it.</li>
+  <li>Convert negative → positive entirely in a <strong>32-bit float linear working space</strong>.</li>
+  <li><strong>Pluggable algorithm</strong> architecture, shipping <strong>two</strong> algorithms:
+    <ol>
+      <li><code>simple</code> — channel inversion + white balance (baseline / debug / B&amp;W).</li>
+      <li><code>density</code> — density-domain inversion (Kodak Cineon / darktable <code>negadoctor</code> style), the default for color negatives.</li>
+    </ol>
+  </li>
+  <li>All conversion parameters controllable via CLI flags and/or a JSON recipe file.</li>
+  <li>Write <strong>TIFF</strong> output, selectable as <strong>16-bit integer</strong> or <strong>32-bit float</strong> (HDR) via a flag.</li>
+  <li>Auto-estimate film base (<code>Dmin</code>) from the unexposed border, with full CLI override.</li>
+  <li>JSON report output and JSON recipe load/dump.</li>
+</ul>
+
+<h3><span class="pill out">Out of scope</span> Step 1 — see Roadmap</h3>
+<ul>
+  <li>IR-based dust/scratch removal (follow-up task).</li>
+  <li>Additional algorithms beyond the two above, e.g. sigmoid / explicit H&amp;D curve (follow-up task).</li>
+  <li>Black &amp; white film support, incl. plain 16-bit RAW scans (follow-up task).</li>
+  <li>Camera RAW (Bayer/X-Trans) input, DNG processing.</li>
+  <li>ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).</li>
+  <li>Batch/roll preset UI, GUI, scanner ICC profiling workflow.</li>
+  <li>Output formats other than TIFF (JPEG/PNG/EXR later).</li>
+</ul>
+
+<h2 id="principles">3. Design principles</h2>
+<ol>
+  <li><strong>Separate capture from rendering.</strong> The scan is an archival record of transmitted light, not just an image to invert.</li>
+  <li><strong>Density conversion and print rendering are separate stages.</strong> The single most important architectural rule for color fidelity.</li>
+  <li><strong>Float-first, lossless internal pipeline.</strong> All math is <code>f32</code> in a linear working space; bit-depth reduction happens only at the final encode.</li>
+  <li><strong>Deterministic and reproducible.</strong> Same inputs + same params ⇒ identical output.</li>
+  <li><strong>Every knob is a flag.</strong> No conversion behavior is reachable only through code.</li>
+  <li><strong>Pure functions over classes.</strong> Each stage is a pure function <code>(input, params) -&gt; output</code>; the CLI is the only orchestrator.</li>
+  <li><strong>Fail loudly, never silently.</strong> Bad input, clipped data, or impossible parameters produce explicit errors/warnings with non-zero exit codes — never a quietly wrong image.</li>
+</ol>
+
+<h2 id="input">4. Input formats</h2>
+<h3>Step 1: SilverFast HDR / HDRi (TIFF-family)</h3>
+<p>SilverFast HDR/HDRi files are TIFF-family containers holding high-bit-depth, linear (raw-ish) scanner data:</p>
+<table>
+  <thead><tr><th>Variant</th><th>Channels</th><th>Bit depth</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>HDR</td><td>R, G, B</td><td>48-bit (16/ch)</td><td>No infrared.</td></tr>
+    <tr><td>HDRi</td><td>R, G, B, IR</td><td>64-bit (16/ch)</td><td>4th channel = infrared defect data.</td></tr>
+  </tbody>
+</table>
+<p>The tool reads both. On HDRi input the IR channel is parsed and kept; on HDR input there simply is no IR channel.</p>
+<div class="callout">
+  <strong>Caveat:</strong> there is no published low-level spec for the exact SilverFast HDRi tag/IFD layout. The implementation must be validated against real sample files, and the reader should degrade gracefully — treat unknown extra channels conservatively and log what it found via the JSON report.
+</div>
+<h3>Internal representation</h3>
+<p>After decode, the image is normalized to <strong>linear <code>f32</code> scanner RGB</strong> in <code>[0,1]</code> (plus an optional <code>f32</code> IR plane). This is the single input contract every algorithm consumes — nothing downstream needs to know the on-disk format.</p>
+
+<h2 id="output">5. Output formats</h2>
+<ul>
+  <li><strong>Container:</strong> TIFF (BigTIFF when size requires 64-bit offsets).</li>
+  <li><strong>Bit depth (flag-controlled):</strong>
+    <ul>
+      <li><code>--out-depth u16</code> → 16-bit integer TIFF (default; standard archival positive).</li>
+      <li><code>--out-depth f32</code> → 32-bit float TIFF (full HDR, no precision loss).</li>
+    </ul>
+  </li>
+  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for <code>u16</code> (display-ready), a <strong>wide-gamut</strong> space (e.g. ProPhoto / linear ACEScg) for <code>f32</code> to avoid clipping HDR range. Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
+  <li><strong>Metadata:</strong> the effective parameter set (recipe) and key estimated values are written to a sidecar JSON next to the output, and core provenance is embedded in the TIFF where practical.</li>
+</ul>
+
+<h2 id="pipeline">6. Pipeline architecture</h2>
+<p>The conversion is a linear sequence of pure-function stages. Each stage has its own parameter struct and can be unit-tested in isolation.</p>
+<pre><code>                 ┌──────────────────────────────────────────────┐
+  input file ──▶ │ 1. Decode  (SilverFast HDR/HDRi → f32 RGB[+IR])│
+                 └──────────────────────────────────────────────┘
+                                     │ linear scanner RGB (f32), IR (f32, opt)
+                                     ▼
+                 ┌──────────────────────────────────────────────┐
+                 │ 2. Film-base / Dmin estimate (auto or CLI)    │
+                 └──────────────────────────────────────────────┘
+                                     ▼
+                 ┌──────────────────────────────────────────────┐
+                 │ 3. Algorithm: negative → positive             │
+                 │    (simple | density)  — pluggable            │
+                 │    sub-stages: density convert, correct,      │
+                 │    invert, tone/print render                  │
+                 └──────────────────────────────────────────────┘
+                                     ▼
+                 ┌──────────────────────────────────────────────┐
+                 │ 4. Output color transform (working → output)  │
+                 └──────────────────────────────────────────────┘
+                                     ▼
+                 ┌──────────────────────────────────────────────┐
+                 │ 5. Encode  (f32 → u16/f32 TIFF + ICC + sidecar)│
+                 └──────────────────────────────────────────────┘
+                                     ▼  output.tiff (+ output.json)</code></pre>
+
+<h3>6.1 IR channel handling (Step 1)</h3>
+<p>The IR plane (when present) is decoded and carried alongside RGB but is <strong>not consumed</strong> by any conversion stage in Step 1. It can be exported with <code>--export-ir &lt;path&gt;</code> for inspection or downstream tooling. The dust-removal stage that <em>consumes</em> the IR mask is a deliberate follow-up.</p>
+<div class="callout">
+  <strong>Why IR is powerful, and why we defer it:</strong> the color dye image is transparent to infrared while physical defects (dust, scratches, hair) are opaque to it, so the IR channel is a near-clean defect map. Acting on it requires a separate mask + inpainting stage with its own parameters, and it does <strong>not</strong> work for traditional silver B&amp;W film (silver blocks IR like dust) or reliably for Kodachrome. Step 1 therefore preserves the data cheaply now and adds the consuming stage later.
+</div>
+
+<h2 id="algorithms">7. Conversion algorithms</h2>
+<p>Algorithms implement a common trait so new ones can be added without touching the rest of the pipeline. Selected with <code>--algorithm &lt;name&gt;</code>; algorithm-specific flags are namespaced.</p>
+
+<h3>7.1 <code>simple</code> — inversion baseline</h3>
+<p>Channel inversion plus white balance / border neutralization. Cheap, predictable, useful for B&amp;W negatives and as a debugging reference. Not a strong endpoint for color negatives (ignores density behavior and the orange mask).</p>
+
+<h3>7.2 <code>density</code> — density-domain inversion (default)</h3>
+<p>The credible baseline for color negatives, following Kodak Cineon / darktable <code>negadoctor</code> ideas:</p>
+<pre><code>1. transmission → density:   D = -log10(scan / Dmin_transmission)   (per channel)
+2. density correction:       per-channel scale/offset, orange-mask compensation
+3. map density → positive:   exponential / print-curve back-transform
+4. print render controls:    exposure, black point, gamma, highlight compression</code></pre>
+<p>Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as separate, independently parameterized sub-stages — the core fidelity rule.</p>
+
+<h4>Pluggable interface (sketch)</h4>
+<pre><code>/// A negative→positive conversion algorithm.
+/// Pure: no I/O, no hidden state.
+pub trait Converter {
+    type Params;
+    fn convert(&amp;self, img: &amp;LinearImage, base: &amp;FilmBase, p: &amp;Self::Params)
+        -&gt; Result&lt;LinearImage, ConvertError&gt;;
+}</code></pre>
+
+<h2 id="cli">8. CLI design</h2>
+<p>A single binary (working name <code>nc</code>) with subcommands. The agent-facing surface is optimized for scripting: flags for everything, JSON in/out, stable exit codes, no interactive prompts.</p>
+<table>
+  <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>nc convert</code></td><td>The main pipeline: negative file → positive TIFF.</td></tr>
+    <tr><td><code>nc inspect</code></td><td>Read a scan and emit a JSON report of format, channels, bit depth, detected film border, suggested <code>Dmin</code>. No output image.</td></tr>
+    <tr><td><code>nc estimate</code></td><td>Run only film-base/<code>Dmin</code> estimation; emit JSON.</td></tr>
+    <tr><td><code>nc params</code></td><td>Print the full default/effective parameter set as JSON (discovery + recipe scaffolding).</td></tr>
+  </tbody>
+</table>
+
+<h3>Recipes (JSON in/out)</h3>
+<ul>
+  <li><code>--params recipe.json</code> — load a full parameter set from JSON.</li>
+  <li><code>--dump-params out.json</code> — write the effective parameters (defaults + overrides) to JSON. Individual <code>--flag</code> overrides take precedence over the loaded recipe, so an agent can load a roll recipe and tweak one value per frame.</li>
+</ul>
+
+<h3>Reports &amp; determinism</h3>
+<ul>
+  <li><code>--report json</code> — emit a machine-readable result (estimated values, clip warnings, timings, output path) to stdout or <code>--report-file</code>.</li>
+  <li><code>--seed &lt;n&gt;</code> — fix any stochastic step (none in Step 1, reserved).</li>
+  <li>Stable, documented exit codes (see Errors section).</li>
+</ul>
+
+<h3>Example invocations</h3>
+<pre><code># Default density conversion, 16-bit TIFF out, auto Dmin, JSON report.
+nc convert in.tiff -o out.tiff --algorithm density --report json
+
+# Full HDR float output, manual film base, explicit print controls.
+nc convert in.tiff -o out.tiff \
+  --algorithm density --out-depth f32 \
+  --film-base 0.92,0.55,0.42 \
+  --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
+  --highlight-compress 0.3 --output-profile sRGB
+
+# Reuse a roll recipe but override one knob for this frame.
+nc convert frame12.tiff -o frame12_pos.tiff \
+  --params roll-A.json --print-exposure 0.15
+
+# Inspect only; let an agent read the JSON and decide parameters.
+nc inspect in.tiff --report json</code></pre>
+
+<h2 id="params">9. Parameter reference (grouped by stage)</h2>
+<p>All flags are also valid keys in the JSON recipe. Names are indicative.</p>
+
+<h4>Input / decode</h4>
+<ul>
+  <li><code>--export-ir &lt;path&gt;</code> — write the IR plane to a separate file (HDRi only).</li>
+  <li><code>--assume-linear</code> / <code>--input-profile &lt;icc&gt;</code> — input color handling.</li>
+</ul>
+<h4>Film base / Dmin (stage 2)</h4>
+<ul>
+  <li><code>--film-base R,G,B</code> — explicit base transmission per channel (overrides auto).</li>
+  <li><code>--base-region x,y,w,h</code> — region of unexposed border to sample.</li>
+  <li><code>--auto-base</code> (default) — estimate base from detected border.</li>
+</ul>
+<h4>Algorithm select</h4>
+<ul><li><code>--algorithm simple|density</code></li></ul>
+<h4>Density stage (algorithm = density)</h4>
+<ul>
+  <li><code>--density-scale R,G,B</code> — per-channel density gain.</li>
+  <li><code>--density-offset R,G,B</code> — per-channel density offset (orange-mask comp).</li>
+  <li><code>--density-gamma &lt;f&gt;</code> — film/print curve gamma.</li>
+</ul>
+<h4>Print / tone render</h4>
+<ul>
+  <li><code>--print-exposure &lt;f&gt;</code> — overall positive exposure.</li>
+  <li><code>--black-point &lt;f&gt;</code> — paper black / shadow floor.</li>
+  <li><code>--white-balance R,G,B</code> — highlight/neutral white balance gains.</li>
+  <li><code>--highlight-compress &lt;f&gt;</code> — highlight roll-off amount.</li>
+</ul>
+<h4>Simple algorithm</h4>
+<ul>
+  <li><code>--invert-white-balance R,G,B</code></li>
+  <li><code>--clip-low &lt;f&gt;</code> / <code>--clip-high &lt;f&gt;</code></li>
+</ul>
+<h4>Output / encode (stage 5)</h4>
+<ul>
+  <li><code>-o, --output &lt;path&gt;</code> (required)</li>
+  <li><code>--out-depth u16|f32</code> (default <code>u16</code>)</li>
+  <li><code>--output-profile &lt;icc|sRGB|prophoto|acescg|...&gt;</code> (depth-aware default: <code>sRGB</code> for <code>u16</code>, wide-gamut for <code>f32</code>)</li>
+  <li><code>--bigtiff auto|on|off</code> (default <code>auto</code>)</li>
+</ul>
+<h4>Global</h4>
+<ul>
+  <li><code>--params &lt;json&gt;</code>, <code>--dump-params &lt;json&gt;</code></li>
+  <li><code>--report json|none</code>, <code>--report-file &lt;path&gt;</code></li>
+  <li><code>-v/--verbose</code>, <code>--quiet</code></li>
+</ul>
+
+<h2 id="code">10. Code architecture (Rust)</h2>
+<p>Pure functions per stage; the CLI is the only orchestrator. Suggested layout:</p>
+<pre><code>nc/
+├── Cargo.toml
+└── src/
+    ├── main.rs           # CLI parsing (clap) → orchestration only
+    ├── cli.rs            # arg structs, recipe load/merge, report emit
+    ├── io/
+    │   ├── decode.rs     # SilverFast HDR/HDRi (TIFF) → LinearImage(+IR)
+    │   └── encode.rs     # LinearImage → u16/f32 TIFF + ICC + sidecar
+    ├── pipeline/
+    │   ├── film_base.rs  # Dmin estimation (pure)
+    │   ├── color.rs      # working/output color transforms (lcms2)
+    │   └── stages.rs     # stage wiring as pure functions
+    ├── algo/
+    │   ├── mod.rs        # Converter trait
+    │   ├── simple.rs     # baseline inversion
+    │   └── density.rs    # density-domain inversion
+    └── types.rs          # LinearImage, FilmBase, params, errors</code></pre>
+<h4>Candidate crates</h4>
+<table>
+  <thead><tr><th>Concern</th><th>Crate(s)</th></tr></thead>
+  <tbody>
+    <tr><td>CLI parsing</td><td><code>clap</code></td></tr>
+    <tr><td>TIFF decode/encode</td><td><code>tiff</code> (custom handling for scanner extras)</td></tr>
+    <tr><td>Image ops / buffers</td><td><code>image</code></td></tr>
+    <tr><td>Color spaces (linear vs encoded)</td><td><code>palette</code></td></tr>
+    <tr><td>ICC color management</td><td><code>lcms2</code> (rust-lcms2)</td></tr>
+    <tr><td>EXIF/metadata</td><td><code>kamadak-exif</code> (read), <code>rexiv2</code> if richer writing needed</td></tr>
+    <tr><td>Recipe / report JSON</td><td><code>serde</code>, <code>serde_json</code></td></tr>
+    <tr><td>Parallelism</td><td><code>rayon</code></td></tr>
+  </tbody>
+</table>
+
+<h2 id="errors">11. Error handling &amp; exit codes</h2>
+<table>
+  <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>Success.</td></tr>
+    <tr><td>1</td><td>Generic / unexpected error.</td></tr>
+    <tr><td>2</td><td>Invalid CLI usage or parameters.</td></tr>
+    <tr><td>3</td><td>Input read/decode error (unreadable or unsupported file).</td></tr>
+    <tr><td>4</td><td>Unsupported variant (e.g. channel layout we can't handle yet).</td></tr>
+    <tr><td>5</td><td>Output write error.</td></tr>
+  </tbody>
+</table>
+<p>Warnings (e.g. clipped highlights/shadows, IR present but ignored, BigTIFF auto-promoted) are surfaced in the JSON report and on stderr, without failing the run unless <code>--strict</code> is set.</p>
+
+<h2 id="roadmap">12. Roadmap (follow-up tasks, explicitly out of Step 1)</h2>
+<p>Deliberately deferred and recorded here so they aren't lost.</p>
+<ol>
+  <li><strong>IR-based dust &amp; scratch removal.</strong> Consume the IR channel (already preserved in Step 1) to build a defect mask and inpaint defects. Parameters: IR threshold, mask dilation/morphology, inpainting method/strength. Must handle the known limits — disable/guard for silver B&amp;W film and Kodachrome. New stages: <code>defect_mask</code>, <code>inpaint</code>; new flags under an <code>--ir-*</code> namespace.</li>
+  <li><strong>Additional algorithms.</strong> At minimum a <strong>sigmoid / explicit H&amp;D-curve</strong> model (NegPy-style) for more photographically meaningful controls; possibly a power-law/exponent model (RawTherapee-style) for camera-scanned negatives. Added via the existing <code>Converter</code> trait, selectable with <code>--algorithm</code>.</li>
+  <li><strong>Black &amp; white film support.</strong> B&amp;W negatives, including plain <strong>16-bit RAW</strong> scan files (not the SilverFast HDR/HDRi container). These typically have no usable orange mask and no IR defect channel (silver blocks IR), so they lean on the <code>simple</code> algorithm or a B&amp;W-tuned density path rather than color orange-mask compensation.</li>
+  <li><strong>Camera RAW input.</strong> Bayer/X-Trans and DNG ingestion (e.g. <code>rawler</code>/LibRaw) for camera-scanning workflows.</li>
+  <li><strong>More output formats.</strong> JPEG/PNG for proofs, EXR for HDR interchange.</li>
+  <li><strong>Roll-level presets &amp; batch mode.</strong> First-class roll recipes (film stock, <code>Dmin</code>, curve params, neutral spots) applied across many frames.</li>
+  <li><strong>Scanner ICC profiling workflow &amp; QA harness.</strong> IT8/target-based calibration and ΔE2000 / SSIM regression testing against standard test negatives.</li>
+</ol>
+
+<h2 id="open">13. Open questions</h2>
+<ul>
+  <li>Exact on-disk SilverFast HDRi tag/channel layout — must be confirmed against real sample files (user will provide); the decoder should log what it finds.</li>
+  <li>Which specific wide-gamut space to default to for <code>f32</code> HDR output (ProPhoto RGB vs linear ACEScg vs Rec.2020) — the <em>option</em> is decided; the default value is still open.</li>
+  <li>Whether the embedded TIFF metadata should carry the full recipe or just a pointer to the sidecar JSON.</li>
+</ul>
+
+<footer>
+  Negative Converter design spec · Step 1 draft · Companion to <code>design-spec.md</code>.
+</footer>
+
+</div>
+</body>
+</html>
