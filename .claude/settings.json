@@ -1,5 +1,69 @@
 {
+  "extraKnownMarketplaces": {
+    "lix42": {
+      "source": {
+        "source": "github",
+        "repo": "lix42/claude-plugins"
+      },
+      "autoUpdate": true
+    }
+  },
   "enabledPlugins": {
-    "ship@lix42": true
+    "tasks@lix42": true,
+    "ship@lix42": true,
+    "pr-review-toolkit@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cargo build*)",
+      "Bash(cargo check*)",
+      "Bash(cargo test*)",
+      "Bash(cargo run*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo add*)",
+      "Bash(cargo remove*)",
+      "Bash(cargo update*)",
+      "Bash(cargo doc*)",
+      "Bash(cargo bench*)",
+      "Bash(cargo tree*)",
+      "Bash(rustup *)",
+
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git checkout*)",
+      "Bash(git switch*)",
+      "Bash(git add*)",
+      "Bash(git restore*)",
+      "Bash(git rm *)",
+      "Bash(git commit*)",
+      "Bash(git fetch*)",
+      "Bash(git pull*)",
+      "Bash(git push*)",
+      "Bash(git rebase*)",
+      "Bash(git merge*)",
+      "Bash(git stash*)",
+      "Bash(git tag*)",
+      "Bash(git worktree*)",
+      "Bash(git remote *)",
+
+      "Bash(gh pr create*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr checks*)",
+      "Bash(gh pr diff*)",
+      "Bash(gh pr comment*)",
+      "Bash(gh pr edit*)",
+      "Bash(gh pr list*)",
+      "Bash(gh run view*)",
+      "Bash(gh run list*)",
+      "Bash(gh run watch*)",
+      "Bash(gh api *)",
+      "Bash(gh repo view*)"
+    ]
   }
 }
