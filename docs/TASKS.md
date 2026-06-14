@@ -79,7 +79,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 ### Phase 1: Foundation
 > Goal: a building Cargo project with the core types every stage shares.
 
-- [ ] [Project foundation and core types](tasks/project-foundation.md)
+- [x] [Project foundation and core types](tasks/project-foundation.md)
 
 ### Phase 2: Building blocks
 > Goal: each pipeline stage built and unit-tested in isolation. All parallelizable.

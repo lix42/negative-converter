@@ -37,7 +37,7 @@ when all its deps are `[x]`), read the task file and the relevant `progress.md`
 sections, then implement. Keep the Mermaid diagram, the canonical dependency list,
 and per-task Dependencies sections in sync — `TASKS.md` wins on conflicts.
 
-## Planned architecture (Step 1)
+## Architecture (Step 1)
 
 A pure-function pipeline orchestrated by a thin CLI layer. Stages:
 
@@ -55,17 +55,25 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
 - The **IR channel** (HDRi 64-bit input) is decoded and **preserved but not acted
   on** in Step 1; IR-based dust removal is a roadmap follow-up. Carry it through,
   don't consume it.
-- Planned module map (`src/`): `types.rs` (shared types), `io/{decode,encode}.rs`,
+- Module map (`src/`, scaffolded — `types.rs` filled, other modules are stubs):
+  `types.rs` (shared types), `io/{decode,encode}.rs`,
   `pipeline/{film_base,color,stages}.rs`, `algo/{mod,simple,density}.rs`,
   `cli.rs`, `main.rs`. `main`/`cli` are the only orchestrators; stages stay pure.
 
-### Planned stack / commands
+### Stack / commands
 
-Rust, single binary. Planned crates: `clap`, `tiff`, `image`, `palette`, `lcms2`,
-`serde`/`serde_json`, `rayon`, `kamadak-exif`. Once scaffolded the usual commands
-apply (`cargo build`, `cargo test`, `cargo test <name>` for a single test,
-`cargo clippy`). Update this section with the real commands when `project-foundation`
-lands.
+Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
+`tiff`, `image`, `palette`, `lcms2`, `serde`/`serde_json`, `rayon`,
+`kamadak-exif` (see `Cargo.toml` for versions; bump with `cargo add`).
+
+- `cargo build` — build · `cargo test` — all tests · `cargo test <name>` — one test
+- `cargo clippy --all-targets` — lint (keep clean)
+- **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
+  `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
+  `cargo build` → `cargo test`. The gate is strict — warnings fail the build.
+- `Cargo.lock` is committed (binary crate). `main.rs` carries a temporary
+  `#![allow(dead_code)]` while stages are stubs — remove it once
+  `pipeline-orchestration` wires them together.
 
 ## Conventions
 
