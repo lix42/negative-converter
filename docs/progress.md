@@ -40,7 +40,7 @@ a task; update your own section as you work. Append entries — don't rewrite th
     …). Defaults are neutral/identity placeholders — algo tasks refine the numbers.
   - Stub signatures already chosen (change if a task needs to):
     `io::decode::decode(&Path) -> Result<LinearImage>`,
-    `io::encode::encode(&LinearImage, &OutputParams, &Path) -> Result<()>`,
+    `io::encode::encode(&LinearImage, &OutputParams, Option<&[u8]> /*icc*/, &Path) -> Result<()>`,
     `pipeline::film_base::estimate(&LinearImage, &FilmBaseParams) -> Result<FilmBase>`,
     `pipeline::color::to_output(&LinearImage, &OutputParams) -> Result<(LinearImage, Vec<u8>)>`
     (returns the converted image **and** the ICC blob to embed),
@@ -65,8 +65,12 @@ a task; update your own section as you work. Append entries — don't rewrite th
   linear `f32` `LinearImage`, preserving the IR plane.
 - Note (from project-foundation review): build the result via
   `LinearImage::new(w, h, rgb, ir)` — it validates the buffer-length invariants
-  (`rgb.len()==w*h*3`, `ir.len()==w*h`) at the boundary. Don't construct the
-  struct literally and skip the check.
+  (`rgb.len()==w*h*3`, `ir.len()==w*h`, non-zero dims, no size overflow) at the
+  boundary. Don't construct the struct literally and skip the check.
+- Note (from PR #2 review): `nc inspect` / the JSON report need original format,
+  channel count, bits-per-sample, and decoder warnings — data lost once the image
+  is normalized. Return a `DecodeInfo` alongside the `LinearImage` (decide the
+  exact shape here) so inspection doesn't have to re-parse the file.
 
 ## tiff-encode
 **Status:** not started
@@ -112,6 +116,17 @@ a task; update your own section as you work. Append entries — don't rewrite th
   NaN, `clip_low > clip_high`, non-positive gamma/gains, etc., mapping failures to
   `NcError::Usage` (exit 2) so bad recipes fail loudly. The pure stages then trust
   their inputs.
+- Note (from PR #2 review): **reject unknown recipe keys.** With `#[serde(default)]`
+  alone a typo like `density_gama` silently deserializes to the default → a quietly
+  wrong image, which the "fail loudly" rule forbids. Add `#[serde(deny_unknown_fields)]`
+  (or equivalent) on the recipe-facing structs — placement depends on the recipe
+  layout you choose here (per-struct sub-objects vs one flat object); deny only
+  works cleanly with the former.
+- Note (from PR #2 review): `--export-ir <path>` (design §9) has no typed home yet —
+  `OutputParams` only carries depth/profile/bigtiff. Add the path here (or in a
+  dedicated output config) as you assemble the full param surface, so orchestration
+  can drive the IR exporter. Likewise the encoder needs the resolved recipe JSON to
+  write the `out.tiff.json` sidecar — pass it the Report/Recipe value once defined.
 
 ## algo-simple
 **Status:** not started

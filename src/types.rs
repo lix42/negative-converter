@@ -28,21 +28,35 @@ impl LinearImage {
     /// `ir.len() == w*h`) are checked once at the boundary instead of surfacing
     /// as a panic deep in the pipeline. Fields stay `pub` for stage ergonomics.
     pub fn new(width: u32, height: u32, rgb: Vec<f32>, ir: Option<Vec<f32>>) -> Result<Self> {
-        let pixels = (width as usize) * (height as usize);
-        if rgb.len() != pixels * 3 {
+        if width == 0 || height == 0 {
             return Err(NcError::Other(format!(
-                "rgb buffer length {} != width*height*3 ({})",
-                rgb.len(),
-                pixels * 3
+                "image dimensions must be non-zero (got {width}x{height})"
             )));
         }
-        if let Some(ir) = &ir
-            && ir.len() != pixels
-        {
+        // Checked arithmetic: a hostile/corrupt header advertising huge
+        // dimensions must surface as an error, not a debug panic / release wrap.
+        let overflow = || {
+            NcError::Other(format!(
+                "image dimensions {width}x{height} overflow address space"
+            ))
+        };
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .ok_or_else(overflow)?;
+        let rgb_len = pixels.checked_mul(3).ok_or_else(overflow)?;
+        if rgb.len() != rgb_len {
             return Err(NcError::Other(format!(
-                "ir buffer length {} != width*height ({pixels})",
-                ir.len()
+                "rgb buffer length {} != width*height*3 ({rgb_len})",
+                rgb.len()
             )));
+        }
+        if let Some(ir_plane) = &ir {
+            let ir_len = ir_plane.len();
+            if ir_len != pixels {
+                return Err(NcError::Other(format!(
+                    "ir buffer length {ir_len} != width*height ({pixels})"
+                )));
+            }
         }
         Ok(Self {
             width,
@@ -282,6 +296,11 @@ mod tests {
         // Wrong rgb length and wrong ir length both fail loudly.
         assert!(LinearImage::new(2, 1, vec![0.0; 5], None).is_err());
         assert!(LinearImage::new(2, 1, vec![0.0; 6], Some(vec![0.0; 3])).is_err());
+        // Zero dimensions are rejected, not silently accepted as an empty image.
+        assert!(LinearImage::new(0, 1, vec![], None).is_err());
+        assert!(LinearImage::new(2, 0, vec![], None).is_err());
+        // A pathological size that overflows is an error, not a panic.
+        assert!(LinearImage::new(u32::MAX, u32::MAX, vec![0.0; 1], None).is_err());
     }
 
     #[test]
