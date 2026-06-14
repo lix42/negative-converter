@@ -1,1 +1,7 @@
 .DS_Store
+
+# Rust
+/target
+
+# Local, environment-specific config (not shared)
+*.local.json
