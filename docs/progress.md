@@ -100,10 +100,58 @@ a task; update your own section as you work. Append entries — don't rewrite th
   Explicit(..) }` — deferred from foundation, decide here.
 
 ## algo-interface
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-16
 
 - Goal: `Converter` trait + algorithm selection so converters are pluggable.
+- **Done.** Everything lives in `src/algo/mod.rs`:
+  - `Converter` trait kept **object-safe** — params live in the implementor, no
+    associated `Params` type, `convert(&self, image, base) -> Result<LinearImage>`.
+    The design-spec §7.2 sketch shows an associated-type variant; that can't form
+    `Box<dyn Converter>`, which `build()` and the verification both need, so this
+    task supersedes the sketch (noted in a doc comment on the trait).
+  - `Algorithm { Simple, Density }` — `Copy`, `serde(rename_all="lowercase")` so it
+    round-trips as `"simple"`/`"density"`, `#[default] Density` (the documented
+    default algorithm).
+  - `FromStr for Algorithm` with `type Err = NcError`; unknown names →
+    `NcError::Usage` (exit 2), failing loudly instead of defaulting. CLI parses
+    `--algorithm` through this.
+  - `AlgoParams` enum: `Simple(SimpleParams)` and
+    `Density { density: DensityParams, print: PrintParams }`. **Decision:** the
+    `Density` variant (and the `Density` converter struct) carries **both**
+    sub-stages' params now — density correction + the separate print render —
+    rather than deferring `PrintParams` to `algo-density`. They stay distinct
+    fields, preserving the density/print separation (core fidelity rule).
+    `AlgoParams::algorithm()` reports which algorithm a param set selects.
+  - `build(params: AlgoParams) -> Box<dyn Converter>` — **infallible**, takes the
+    param set by value and moves it into the converter (no clone). The task sketch
+    had `build(algo, params)` taking the algorithm separately, but the
+    `AlgoParams` variant already *is* the algorithm selector (`AlgoParams::algorithm()`
+    derives it totally), so a separate `Algorithm` argument carried zero info and
+    only created a mismatch error that one argument makes unrepresentable
+    ("make illegal states unrepresentable"). Any `--algorithm` vs flag
+    contradiction is resolved/rejected in `cli-framework` where the flag context
+    lives, and the CLI hands `build` one already-valid `AlgoParams`. (Decision from
+    the ship code review — type-design agent.) The match is exhaustive over
+    `AlgoParams`, so a future algorithm variant fails at compile time.
+  - `AlgoParams::algorithm() -> Algorithm` kept (CLI uses it to derive the
+    algorithm for the JSON report from the param set alone).
+- **Touched `algo/density.rs`:** `Density` struct now has `density: DensityParams`
+  + `print: PrintParams` (was `params: DensityParams`). `algo-density` fills the
+    `convert` body and consumes both fields.
+- **Notes for dependent tasks:**
+  - `algo-simple` / `algo-density`: just implement `Converter::convert` on the
+    existing `Simple` / `Density` structs; the field shapes are fixed (`Simple.params`,
+    `Density.density` + `Density.print`). Don't widen the trait — push new tone
+    controls into the param structs.
+  - `cli-framework`: parse `--algorithm` via `Algorithm::from_str` (maps unknown →
+    `Usage` for you); assemble an `AlgoParams` for the chosen algorithm and pass it
+    to `algo::build`. `Algorithm` serializes lowercase for the JSON report/recipe.
+- **Verify:** `cargo build`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo fmt --check` all clean; `cargo test` 13/13 (6 new: `from_str` ok + unknown
+  → exit 2, default = density, lowercase serialize, object-safe boxed call, `build`
+  for both algorithms, `build` mismatch → exit 2). Object-safety proven by a test
+  `Identity` converter exercised through `Box<dyn Converter>`.
 
 ## cli-framework
 **Status:** not started
