@@ -88,7 +88,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [TIFF encode and output](tasks/tiff-encode.md)
 - [ ] [Color management](tasks/color-management.md)
 - [ ] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
-- [ ] [Algorithm interface](tasks/algo-interface.md)
+- [x] [Algorithm interface](tasks/algo-interface.md)
 - [ ] [CLI framework](tasks/cli-framework.md)
 
 ### Phase 3: Algorithms
