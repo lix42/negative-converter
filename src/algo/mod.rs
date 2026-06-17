@@ -45,11 +45,11 @@ impl FromStr for Algorithm {
     /// Parse the `--algorithm` value. Unknown names fail loudly as
     /// [`NcError::Usage`] (exit 2) rather than silently defaulting.
     fn from_str(s: &str) -> Result<Self> {
-        match s {
+        match s.to_ascii_lowercase().as_str() {
             "simple" => Ok(Algorithm::Simple),
             "density" => Ok(Algorithm::Density),
-            other => Err(NcError::Usage(format!(
-                "unknown algorithm '{other}' (expected: simple|density)"
+            _ => Err(NcError::Usage(format!(
+                "unknown algorithm '{s}' (expected: simple|density)"
             ))),
         }
     }
