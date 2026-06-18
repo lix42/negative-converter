@@ -288,12 +288,20 @@ Unknown keys are rejected (see §8).
 
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
-- `--assume-linear` / `--input-profile <icc>` — input color handling.
+  Recipe key `input.export_ir`.
+- Input color handling is a single mutually-exclusive choice, recipe key
+  `input.color` (default `"auto"` — the file's embedded / default profile):
+  - `--assume-linear` ⇒ `input.color = "linear"` — data is already linear.
+  - `--input-profile <icc>` ⇒ `input.color = { "profile": "<icc>" }`.
+  Passing both is a usage error; either flag replaces a recipe's `input.color`.
 
 ### Film base / Dmin (stage 2)
-- `--film-base R,G,B` — explicit base transmission per channel (overrides auto).
-- `--base-region x,y,w,h` — region of unexposed border to sample.
-- `--auto-base` (default) — estimate base from detected border.
+The base source is a single mutually-exclusive choice, recipe key
+`film_base.source` (default `"auto"`). The three flags conflict (passing more
+than one is a usage error); whichever is given replaces a recipe's source:
+- `--film-base R,G,B` ⇒ `{ "explicit": [r, g, b] }` — explicit base transmission.
+- `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this border.
+- `--auto-base` (default) ⇒ `"auto"` — estimate from the detected border.
 
 ### Algorithm select
 - `--algorithm simple|density`

@@ -16,8 +16,8 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    Algorithm, BigTiff, DensityParams, FilmBase, FilmBaseParams, InputParams, NcError, OutDepth,
-    OutputParams, PrintParams, Result, SimpleParams,
+    Algorithm, BigTiff, DensityParams, FilmBase, FilmBaseParams, FilmBaseSource, InputColor,
+    InputParams, NcError, OutDepth, OutputParams, PrintParams, Result, SimpleParams,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,10 +133,14 @@ pub struct ConvertArgs {
 // --- per-stage override groups (all-Option; presence flags for booleans) ----
 
 /// Input / decode overrides (design-spec §9, stage 1).
+///
+/// `--assume-linear` and `--input-profile` are the two non-default `input.color`
+/// choices and are mutually exclusive (clap rejects passing both); whichever is
+/// given replaces the recipe's color choice.
 #[derive(Args, Debug, Default)]
 pub struct InputOverrides {
     /// Treat scanner data as already linear (skip input-profile handling).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "input_profile")]
     pub assume_linear: bool,
     /// Input ICC profile selector / path.
     #[arg(long, value_name = "ICC")]
@@ -147,13 +151,18 @@ pub struct InputOverrides {
 }
 
 /// Film-base / Dmin overrides (design-spec §9, stage 2).
+///
+/// The three source flags are mutually exclusive (clap rejects passing more than
+/// one); whichever is given replaces the recipe's `film_base.source` entirely.
 #[derive(Args, Debug, Default)]
 pub struct FilmBaseOverrides {
-    /// Explicit per-channel base transmission (overrides auto).
-    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb)]
+    /// Explicit per-channel base transmission.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb,
+          conflicts_with_all = ["base_region", "auto_base"])]
     pub film_base: Option<[f32; 3]>,
     /// Region of the unexposed border to sample.
-    #[arg(long, value_name = "X,Y,W,H", value_parser = parse_region)]
+    #[arg(long, value_name = "X,Y,W,H", value_parser = parse_region,
+          conflicts_with = "auto_base")]
     pub base_region: Option<[u32; 4]>,
     /// Estimate the base from the detected border (the default behavior).
     #[arg(long)]
@@ -334,26 +343,27 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.algorithm = a;
     }
 
-    // input
+    // input color: `--assume-linear` / `--input-profile` are mutually exclusive
+    // (clap-enforced); whichever is given replaces the recipe's choice, and
+    // neither leaves it untouched. So `--input-profile` over a recipe `linear`
+    // wins cleanly — there's one field, not two booleans to disagree.
     if args.input_opts.assume_linear {
-        cfg.input.assume_linear = true;
-    }
-    if let Some(p) = &args.input_opts.input_profile {
-        cfg.input.input_profile = Some(p.clone());
+        cfg.input.color = InputColor::Linear;
+    } else if let Some(p) = &args.input_opts.input_profile {
+        cfg.input.color = InputColor::Profile(p.clone());
     }
     if let Some(p) = &args.input_opts.export_ir {
         cfg.input.export_ir = Some(p.clone());
     }
 
-    // film base
+    // film base: the three source flags are mutually exclusive (clap-enforced);
+    // whichever is given replaces the recipe's source entirely.
     if let Some(v) = args.film_base.film_base {
-        cfg.film_base.film_base = Some(v);
-    }
-    if let Some(v) = args.film_base.base_region {
-        cfg.film_base.base_region = Some(v);
-    }
-    if args.film_base.auto_base {
-        cfg.film_base.auto_base = true;
+        cfg.film_base.source = FilmBaseSource::Explicit(v);
+    } else if let Some(v) = args.film_base.base_region {
+        cfg.film_base.source = FilmBaseSource::Region(v);
+    } else if args.film_base.auto_base {
+        cfg.film_base.source = FilmBaseSource::Auto;
     }
 
     // density
@@ -429,14 +439,14 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
         Ok(())
     };
 
-    // Film base: each channel is a transmission, must be positive.
-    if let Some(b) = cfg.film_base.film_base {
-        positive("--film-base", &b)?;
-    }
-    if let Some([_, _, w, h]) = cfg.film_base.base_region
-        && (w == 0 || h == 0)
-    {
-        return Err(usage("--base-region width and height must be > 0".into()));
+    // Film base: an explicit base is a per-channel transmission (must be
+    // positive); a sampled region must have non-zero extent; auto needs nothing.
+    match cfg.film_base.source {
+        FilmBaseSource::Explicit(b) => positive("--film-base", &b)?,
+        FilmBaseSource::Region([_, _, w, h]) if w == 0 || h == 0 => {
+            return Err(usage("--base-region width and height must be > 0".into()));
+        }
+        FilmBaseSource::Region(_) | FilmBaseSource::Auto => {}
     }
 
     // Density: gamma and per-channel gain must be positive; offset just finite.
@@ -673,11 +683,11 @@ mod tests {
         // A recipe can carry values the CLI value-parsers would have rejected,
         // so validate is the only guard for these once they're in the config.
         let mut cfg = ResolvedConfig::default();
-        cfg.film_base.film_base = Some([0.9, 0.0, 0.4]); // zero transmission
+        cfg.film_base.source = FilmBaseSource::Explicit([0.9, 0.0, 0.4]); // zero transmission
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         let mut cfg = ResolvedConfig::default();
-        cfg.film_base.base_region = Some([0, 0, 0, 0]); // zero-area region
+        cfg.film_base.source = FilmBaseSource::Region([0, 0, 0, 0]); // zero-area region
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
     }
 
@@ -696,22 +706,75 @@ mod tests {
     }
 
     #[test]
-    fn merge_presence_flags_set_but_never_clobber() {
-        // A recipe `true` survives when no flag is passed (false must not clobber).
+    fn merge_keeps_recipe_source_until_a_flag_replaces_it() {
+        // No flag → the recipe's mutually-exclusive choice survives.
         let mut recipe = ResolvedConfig::default();
-        recipe.input.assume_linear = true;
-        recipe.film_base.auto_base = true;
-        let cfg = merge(recipe, &parse_convert(&[]));
-        assert!(cfg.input.assume_linear);
-        assert!(cfg.film_base.auto_base);
-
-        // Passing the flag sets a default `false` to `true`.
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--assume-linear", "--auto-base"]),
+        recipe.input.color = InputColor::Linear;
+        recipe.film_base.source = FilmBaseSource::Explicit([0.9, 0.5, 0.4]);
+        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        assert_eq!(cfg.input.color, InputColor::Linear);
+        assert_eq!(
+            cfg.film_base.source,
+            FilmBaseSource::Explicit([0.9, 0.5, 0.4])
         );
-        assert!(cfg.input.assume_linear);
-        assert!(cfg.film_base.auto_base);
+
+        // A flag replaces the whole source — no field is left behind to win on
+        // precedence (the #5/#6 fix). `--input-profile` beats a recipe `linear`,
+        // and `--base-region` beats a recipe explicit base.
+        let cfg = merge(
+            recipe,
+            &parse_convert(&["--input-profile", "prophoto", "--base-region", "0,0,100,40"]),
+        );
+        assert_eq!(cfg.input.color, InputColor::Profile("prophoto".into()));
+        assert_eq!(
+            cfg.film_base.source,
+            FilmBaseSource::Region([0, 0, 100, 40])
+        );
+    }
+
+    #[test]
+    fn mutually_exclusive_source_flags_are_rejected() {
+        // clap must reject conflicting source flags rather than silently picking one.
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "i",
+                "-o",
+                "o",
+                "--assume-linear",
+                "--input-profile",
+                "srgb"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "i",
+                "-o",
+                "o",
+                "--auto-base",
+                "--film-base",
+                "0.9,0.5,0.4"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "i",
+                "-o",
+                "o",
+                "--base-region",
+                "0,0,1,1",
+                "--film-base",
+                "0.9,0.5,0.4"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

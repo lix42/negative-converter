@@ -252,11 +252,32 @@ a task; update your own section as you work. Append entries — don't rewrite th
     clip_high` (was `<=`) — equal bounds are a zero-width interval the simple
     remap can't normalize without dividing by zero.
   - **Declined (with reasons):** let-chain "unstable" claim is false here (edition
-    2024, CI green proves it compiles); `assume_linear`/`input_profile` override +
-    film-base source precedence (explicit>region>auto) belong to
-    film-base-estimation/pipeline-orchestration; rejecting flags for the
-    unselected algorithm is deliberate — inert params are retained so recipes
-    round-trip across `--algorithm` switches.
+    2024, CI green proves it compiles); rejecting flags for the unselected
+    algorithm is deliberate — inert params are retained so recipes round-trip
+    across `--algorithm` switches.
+- **2026-06-18 (#5/#6 enum rework, user-directed):** the two deferred merge gaps
+  were fixed by modeling mutually-exclusive choices as enums (illegal states
+  unrepresentable), not patching the booleans. **Recipe shape changed** — spec
+  §9 (md+html) updated to match:
+  - **`FilmBaseSource { Auto, Region([u32;4]), Explicit([f32;3]) }`** replaces the
+    `film_base`/`base_region`/`auto_base` trio. `FilmBaseParams` is now
+    `{ source }`. Recipe: `"film_base": { "source": "auto" | {"region":[…]} |
+    {"explicit":[…]} }`. Higher specificity always wins with no fallback, so it
+    was always one choice, not three knobs.
+  - **`InputColor { Auto, Linear, Profile(String) }`** replaces
+    `assume_linear`/`input_profile`. `InputParams` is now `{ color, export_ir }`.
+    Recipe: `"input": { "color": "auto" | "linear" | {"profile":"<icc>"} }`.
+    `"auto"` (the no-flag default) = the file's embedded/default profile, which is
+    **not** linear — that's why `assume_linear` can't be inferred from "no
+    profile". **For color-management/decode: define what `Auto` resolves to.**
+  - **CLI:** the source flags within each group are now a clap mutual-exclusion
+    group (`conflicts_with`/`conflicts_with_all`) — passing two is a usage error.
+    `merge` maps whichever single flag is present to the enum, replacing the
+    recipe's choice; so `--input-profile` over a recipe `linear` now wins cleanly
+    (the #6 bug) and `--base-region` over a recipe explicit base wins (the #5 bug).
+  - **Verified:** fmt/clippy/build clean, **27 tests**; manual `nc params` shows
+    the new shapes; recipe load→`--dump-params` round-trips the nested variants;
+    `--assume-linear` over a `{"profile":…}` recipe resolves to `"linear"`.
 
 ## algo-simple
 **Status:** not started

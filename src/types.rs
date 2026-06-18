@@ -185,40 +185,60 @@ pub type Result<T> = std::result::Result<T, NcError>;
 // serde key names. Defaults are deliberately neutral (identity-ish) placeholders
 // — the algorithm tasks refine them.
 
+/// How the input's color is interpreted on decode (design-spec §9, Input/decode).
+///
+/// A single mutually-exclusive choice, not independent flags: the input is taken
+/// as already linear, interpreted through an explicit ICC profile, or (default)
+/// decoded with the file's embedded / default profile. Serializes as `"auto"` /
+/// `"linear"` / `{ "profile": "<icc>" }`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InputColor {
+    /// Decode with the file's embedded profile, or the documented fallback when
+    /// none is present. This is what passing no input-color flag does.
+    #[default]
+    Auto,
+    /// Treat the scanner data as already linear; apply no input transfer curve.
+    Linear,
+    /// Interpret the input through this ICC profile selector / path.
+    Profile(String),
+}
+
 /// Input / decode knobs (design-spec §9, stage 1).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct InputParams {
-    /// Treat the scanner data as already linear, skipping input-profile handling.
-    pub assume_linear: bool,
-    /// Input ICC profile selector / path. `None` uses the decode default.
-    pub input_profile: Option<String>,
+    /// How to interpret the input's color (default `auto`).
+    pub color: InputColor,
     /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
     /// An input/decode-domain artifact (design-spec §9, Input/decode) — carried
     /// here so `pipeline-orchestration` can drive the IR exporter.
     pub export_ir: Option<String>,
 }
 
-/// Film-base / `Dmin` estimation knobs (design-spec §9, stage 2).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FilmBaseParams {
-    /// Explicit per-channel base transmission `[r, g, b]`; overrides auto.
-    pub film_base: Option<[f32; 3]>,
-    /// Region of the unexposed border to sample, `[x, y, w, h]`.
-    pub base_region: Option<[u32; 4]>,
-    /// Estimate the base from the detected border (default).
-    pub auto_base: bool,
+/// Where the film base comes from (design-spec §9, stage 2).
+///
+/// A single mutually-exclusive choice, not independent flags: more-specific
+/// sources always win with no fallback, so this is one selection. Serializes as
+/// `"auto"` / `{ "region": [x, y, w, h] }` / `{ "explicit": [r, g, b] }`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FilmBaseSource {
+    /// Estimate the base from the detected unexposed border.
+    #[default]
+    Auto,
+    /// Sample the base from this border region `[x, y, w, h]`.
+    Region([u32; 4]),
+    /// Explicit per-channel base transmission `[r, g, b]`.
+    Explicit([f32; 3]),
 }
 
-impl Default for FilmBaseParams {
-    fn default() -> Self {
-        Self {
-            film_base: None,
-            base_region: None,
-            auto_base: true,
-        }
-    }
+/// Film-base / `Dmin` estimation knobs (design-spec §9, stage 2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilmBaseParams {
+    /// Where the film base comes from (default `auto`).
+    pub source: FilmBaseSource,
 }
 
 /// Density-domain algorithm knobs (design-spec §9, `algorithm = density`).

@@ -317,14 +317,15 @@ nc inspect in.tiff --report json</code></pre>
 
 <h4>Input / decode</h4>
 <ul>
-  <li><code>--export-ir &lt;path&gt;</code> — write the IR plane to a separate file (HDRi only).</li>
-  <li><code>--assume-linear</code> / <code>--input-profile &lt;icc&gt;</code> — input color handling.</li>
+  <li><code>--export-ir &lt;path&gt;</code> — write the IR plane to a separate file (HDRi only). Recipe key <code>input.export_ir</code>.</li>
+  <li>Input color handling is a single mutually-exclusive choice, recipe key <code>input.color</code> (default <code>"auto"</code> — the file's embedded / default profile). <code>--assume-linear</code> ⇒ <code>input.color = "linear"</code> (data already linear); <code>--input-profile &lt;icc&gt;</code> ⇒ <code>input.color = { "profile": "&lt;icc&gt;" }</code>. Passing both is a usage error; either flag replaces a recipe's <code>input.color</code>.</li>
 </ul>
 <h4>Film base / Dmin (stage 2)</h4>
+<p>The base source is a single mutually-exclusive choice, recipe key <code>film_base.source</code> (default <code>"auto"</code>). The three flags conflict (passing more than one is a usage error); whichever is given replaces a recipe's source.</p>
 <ul>
-  <li><code>--film-base R,G,B</code> — explicit base transmission per channel (overrides auto).</li>
-  <li><code>--base-region x,y,w,h</code> — region of unexposed border to sample.</li>
-  <li><code>--auto-base</code> (default) — estimate base from detected border.</li>
+  <li><code>--film-base R,G,B</code> ⇒ <code>{ "explicit": [r, g, b] }</code> — explicit base transmission per channel.</li>
+  <li><code>--base-region x,y,w,h</code> ⇒ <code>{ "region": [x, y, w, h] }</code> — region of unexposed border to sample.</li>
+  <li><code>--auto-base</code> (default) ⇒ <code>"auto"</code> — estimate base from detected border.</li>
 </ul>
 <h4>Algorithm select</h4>
 <ul><li><code>--algorithm simple|density</code></li></ul>
