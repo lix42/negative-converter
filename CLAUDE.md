@@ -87,6 +87,13 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
   a field in the CLI `*Overrides` struct (`cli.rs`), the recipe `*Params` struct
   (`types.rs`), a `merge` arm, and usually a `validate` check — a forgotten
   `merge` arm silently makes the flag a no-op, so add a merge test for new knobs.
+- **Recipe shape mirrors design-spec §9.** A flag's recipe key lives under the
+  stage section §9 assigns it (`--export-ir` ⇒ `input.export_ir`); because every
+  recipe struct uses `deny_unknown_fields`, a misplaced key silently rejects
+  docs-shaped recipes — keep structs and §9 in sync. Model a set of
+  mutually-exclusive knobs as **one enum field** (e.g. `FilmBaseSource`,
+  `InputColor`), not parallel `Option`/bool fields: independent fields can encode
+  illegal combinations and silently break the flags-win merge.
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.
