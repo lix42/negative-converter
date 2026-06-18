@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "detectedAt": "2026-06-18T02:35:26Z",
+  "environment": {
+    "hasGitHubRemote": true,
+    "defaultBranch": "main"
+  },
+  "qualityGates": {
+    "typecheck": null,
+    "test": "cargo test",
+    "build": "cargo build",
+    "lint": "cargo fmt --all --check && cargo clippy --all-targets -- -D warnings"
+  },
+  "tasks": {
+    "tasksFile": "docs/TASKS.md"
+  },
+  "skills": {
+    "review": "pr-review-toolkit:review-pr",
+    "reviseClaudeMd": "claude-md-management:revise-claude-md",
+    "tasksDone": "tasks:tasks-done",
+    "commitPushPr": "commit-commands:commit-push-pr"
+  }
+}

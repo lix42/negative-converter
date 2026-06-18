@@ -154,8 +154,8 @@ a task; update your own section as you work. Append entries — don't rewrite th
   `Identity` converter exercised through `Box<dyn Converter>`.
 
 ## cli-framework
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-18
 
 - Goal: clap subcommands, recipe load/merge (flags override), JSON report,
   `params` subcommand, exit-code mapping.
@@ -175,6 +175,70 @@ a task; update your own section as you work. Append entries — don't rewrite th
   dedicated output config) as you assemble the full param surface, so orchestration
   can drive the IR exporter. Likewise the encoder needs the resolved recipe JSON to
   write the `out.tiff.json` sidecar — pass it the Report/Recipe value once defined.
+
+- **Done.** `cli.rs` holds the full agent-facing surface; `cli::run()` parses and
+  dispatches. `main`'s exit-code mapping is unchanged.
+- **Decisions for dependent tasks (esp. `pipeline-orchestration`):**
+  - **Recipe = nested per-stage objects** (user decision), not a flat bag:
+    `{ "algorithm": "...", "input": {…}, "film_base": {…}, "density": {…},
+    "print": {…}, "simple": {…}, "output": {…} }`. This is the *only* layout that
+    lets `#[serde(deny_unknown_fields)]` reject typos at every level
+    (`serde(flatten)` would silently defeat it). The single struct that *is* this
+    shape is `cli::ResolvedConfig` — it doubles as the recipe (partial, serde
+    defaults fill gaps), the `--dump-params` output, and `nc params` output, so the
+    three can't drift. **Updated design-spec §8/§9 + HTML** to document the nesting.
+  - **Merge model:** clap arg structs use `Option<T>` per knob (+ presence-flag
+    `bool`s for `--auto-base`/`--assume-linear`). `merge(cfg, &ConvertArgs)` is a
+    pure fn applying `defaults ← recipe ← CLI` (flags win); a `false` presence flag
+    never clobbers a recipe `true`. Orchestration consumes the returned
+    `ResolvedConfig` — it should not re-read CLI args.
+  - **Validation at the boundary:** `validate(&ResolvedConfig)` rejects NaN/inf,
+    `clip_low > clip_high`, non-positive gamma/gains/film-base, zero `base-region`
+    w/h → all `NcError::Usage` (exit 2). **Pure stages can trust their inputs** —
+    don't re-validate ranges downstream.
+  - **New types added to `types.rs`:** `Algorithm {Simple,Density}` (default
+    `Density`, serde-lowercase + `clap::ValueEnum`); `InputParams`
+    (`assume_linear`, `input_profile`) for the §9 input flags; `export_ir:
+    Option<String>` added to `OutputParams`. `OutDepth`/`BigTiff` gained
+    `clap::ValueEnum` (their lowercase ValueEnum names already match serde).
+    `deny_unknown_fields` added to all recipe-facing param structs.
+  - **stdout is report-only;** logs/warnings/errors go to stderr (agents pipe
+    stdout). `--report json|none`, `--report-file`, `-v`, `--quiet`, `--strict`
+    are parsed and carried; the `Report` struct + `emit_report()` exist but are
+    populated by orchestration (kept minimal here).
+  - **clap error handling:** `Cli::parse()` lets clap exit directly — `--help`/
+    `--version` exit 0, usage/value-parser errors exit 2 — so those don't route
+    through `NcError`. Everything else flows through the `NcError` exit-code map.
+  - **Stubs:** `convert`/`inspect`/`estimate` resolve+validate config (and write
+    `--dump-params`) then return `NcError::Other("… not yet wired
+    (pipeline-orchestration)")` (exit 1). The pipeline replaces those returns.
+    `main.rs`'s `#![allow(dead_code)]` still needed (Report/emit_report unused
+    until wired) — remove it in `pipeline-orchestration`.
+- **Verify:** `cargo fmt --check`, `clippy --all-targets -D warnings`, build all
+  clean; `cargo test` 14/14 (6 new cli tests: parser `debug_assert`, comma-list
+  parsers, merge precedence, dump→reload round-trip, unknown-key rejection,
+  validation). Manual: `nc --help`/`convert --help` list every §9 flag; `nc params`
+  emits the full default JSON; dump→`--params` reload round-trips byte-identical;
+  forced usage/validation/bad-recipe/bad-value paths all exit 2.
+- **2026-06-18 (ship review):** multi-agent review before merge. Fixes:
+  - **Bug:** `PrintParams::print_exposure` default was `1.0`; spec §9 neutral is
+    `0.0` (exposure is in **stops/EV**, not a linear multiplier — every other print
+    default is identity). Corrected to `0.0` and documented the unit in `types.rs`.
+  - **`--strict` made an explicit deferral:** it's parsed but only acted on by
+    `pipeline-orchestration` (promote warnings→errors); marked so in `run_convert`
+    rather than looking silently dropped. **For pipeline-orchestration: wire
+    `args.strict` into the warnings path.**
+  - **Tests +3 → 25 total:** boolean presence-flag merge (`assume_linear`/
+    `auto_base` — a `false` flag never clobbers a recipe `true`), `load_recipe`
+    error mapping (missing/malformed/unknown-key file → `NcError::Usage`), and
+    recipe-smuggled bad values caught by `validate` (zero film-base transmission,
+    zero-area `base_region`) — recipes bypass clap value-parsers, so `validate` is
+    their only guard.
+  - **Deferred (noted, not done):** profile/`export_ir` as `PathBuf`/enum vs
+    `String`; range bounds on print knobs and `film_base ≤ 1.0`; a `ValidatedConfig`
+    newtype to make "unvalidated config reaches a stage" unrepresentable; a
+    `--no-assume-linear` counterpart. These belong to the algorithm / film-base /
+    pipeline-orchestration tasks that own those semantics.
 
 ## algo-simple
 **Status:** not started

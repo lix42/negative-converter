@@ -233,6 +233,24 @@ no interactive prompts.
   to JSON. Individual `--flag` overrides take precedence over the loaded recipe,
   so an agent can load a roll recipe and tweak one value per frame.
 
+The recipe JSON is **grouped into per-stage objects** (`input`, `film_base`,
+`density`, `print`, `simple`, `output`, plus the top-level `algorithm`) rather
+than one flat bag of keys. The grouping lets the tool **reject unknown/typo'd
+keys at every level** (a misspelled knob is a hard error, not a silently-ignored
+default → a quietly wrong image). A recipe may be **partial** — any omitted key or
+section falls back to its default. `nc params` prints this exact shape fully
+populated with defaults, so it doubles as a recipe template; `--dump-params`
+writes the same shape with the resolved values. Example:
+
+```json
+{
+  "algorithm": "density",
+  "density": { "density_gamma": 1.8 },
+  "print":   { "print_exposure": 0.0, "black_point": 0.002 },
+  "output":  { "out_depth": "f32" }
+}
+```
+
 ### Reports & determinism
 
 - `--report json` — emit a machine-readable result (estimated values, clip
@@ -263,7 +281,10 @@ nc inspect in.tiff --report json
 
 ## 9. Parameter reference (grouped by stage)
 
-All flags are also valid keys in the JSON recipe. Names are indicative.
+Every flag is also a recipe key, nested under the stage object shown in each
+heading below (e.g. `--density-gamma` ⇒ `density.density_gamma`, `--out-depth` ⇒
+`output.out_depth`, `--algorithm` ⇒ top-level `algorithm`). Names are indicative.
+Unknown keys are rejected (see §8).
 
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).

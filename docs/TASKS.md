@@ -89,7 +89,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Color management](tasks/color-management.md)
 - [ ] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
 - [x] [Algorithm interface](tasks/algo-interface.md)
-- [ ] [CLI framework](tasks/cli-framework.md)
+- [x] [CLI framework](tasks/cli-framework.md)
 
 ### Phase 3: Algorithms
 > Goal: the two negative→positive converters, both selectable.

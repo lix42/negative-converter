@@ -279,6 +279,13 @@ pub trait Converter {
   <li><code>--params recipe.json</code> — load a full parameter set from JSON.</li>
   <li><code>--dump-params out.json</code> — write the effective parameters (defaults + overrides) to JSON. Individual <code>--flag</code> overrides take precedence over the loaded recipe, so an agent can load a roll recipe and tweak one value per frame.</li>
 </ul>
+<p>The recipe JSON is <strong>grouped into per-stage objects</strong> (<code>input</code>, <code>film_base</code>, <code>density</code>, <code>print</code>, <code>simple</code>, <code>output</code>, plus the top-level <code>algorithm</code>) rather than one flat bag of keys. The grouping lets the tool <strong>reject unknown/typo'd keys at every level</strong> (a misspelled knob is a hard error, not a silently-ignored default → a quietly wrong image). A recipe may be <strong>partial</strong> — any omitted key or section falls back to its default. <code>nc params</code> prints this exact shape fully populated with defaults, so it doubles as a recipe template; <code>--dump-params</code> writes the same shape with the resolved values. Example:</p>
+<pre><code>{
+  "algorithm": "density",
+  "density": { "density_gamma": 1.8 },
+  "print":   { "print_exposure": 0.0, "black_point": 0.002 },
+  "output":  { "out_depth": "f32" }
+}</code></pre>
 
 <h3>Reports &amp; determinism</h3>
 <ul>
@@ -306,7 +313,7 @@ nc convert frame12.tiff -o frame12_pos.tiff \
 nc inspect in.tiff --report json</code></pre>
 
 <h2 id="params">9. Parameter reference (grouped by stage)</h2>
-<p>All flags are also valid keys in the JSON recipe. Names are indicative.</p>
+<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are indicative. Unknown keys are rejected (see the Recipes section).</p>
 
 <h4>Input / decode</h4>
 <ul>

@@ -90,8 +90,23 @@ impl From<FilmBase> for [f32; 3] {
     }
 }
 
+/// Negative→positive algorithm selector (design-spec §9, `--algorithm`).
+///
+/// A neutral selector that mirrors the CLI/recipe key, like the param structs —
+/// it does not depend on the `algo` implementations. Serializes lowercase
+/// (`"simple"` / `"density"`) and parses the same on the CLI via `ValueEnum`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Algorithm {
+    /// Channel-inversion baseline (debug / B&W).
+    Simple,
+    /// Density-domain inversion (Cineon / negadoctor) — the default.
+    #[default]
+    Density,
+}
+
 /// Output bit depth selector. Serializes as `"u16"` / `"f32"` to match the CLI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum OutDepth {
     #[default]
@@ -100,7 +115,7 @@ pub enum OutDepth {
 }
 
 /// BigTIFF promotion policy for the encoder. Serializes lowercase.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum BigTiff {
     /// Promote to BigTIFF only when the output would exceed the classic limit.
@@ -170,9 +185,19 @@ pub type Result<T> = std::result::Result<T, NcError>;
 // serde key names. Defaults are deliberately neutral (identity-ish) placeholders
 // — the algorithm tasks refine them.
 
+/// Input / decode knobs (design-spec §9, stage 1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct InputParams {
+    /// Treat the scanner data as already linear, skipping input-profile handling.
+    pub assume_linear: bool,
+    /// Input ICC profile selector / path. `None` uses the decode default.
+    pub input_profile: Option<String>,
+}
+
 /// Film-base / `Dmin` estimation knobs (design-spec §9, stage 2).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FilmBaseParams {
     /// Explicit per-channel base transmission `[r, g, b]`; overrides auto.
     pub film_base: Option<[f32; 3]>,
@@ -194,7 +219,7 @@ impl Default for FilmBaseParams {
 
 /// Density-domain algorithm knobs (design-spec §9, `algorithm = density`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DensityParams {
     /// Per-channel density gain `[r, g, b]`.
     pub density_scale: [f32; 3],
@@ -217,9 +242,9 @@ impl Default for DensityParams {
 /// Print / tone-render knobs (design-spec §9). A **separate** sub-stage from
 /// density conversion — the core fidelity rule; don't collapse the two.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PrintParams {
-    /// Overall positive exposure.
+    /// Overall positive exposure, in stops (EV); `0.0` is neutral (design-spec §9).
     pub print_exposure: f32,
     /// Paper black / shadow floor.
     pub black_point: f32,
@@ -232,7 +257,7 @@ pub struct PrintParams {
 impl Default for PrintParams {
     fn default() -> Self {
         Self {
-            print_exposure: 1.0,
+            print_exposure: 0.0,
             black_point: 0.0,
             white_balance: [1.0, 1.0, 1.0],
             highlight_compress: 0.0,
@@ -242,7 +267,7 @@ impl Default for PrintParams {
 
 /// Simple inversion-baseline knobs (design-spec §9, `algorithm = simple`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SimpleParams {
     /// White-balance gains applied to the inverted result `[r, g, b]`.
     pub invert_white_balance: [f32; 3],
@@ -264,7 +289,7 @@ impl Default for SimpleParams {
 
 /// Output / encode knobs (design-spec §9, stage 5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct OutputParams {
     /// Output bit depth (default `u16`).
     pub out_depth: OutDepth,
@@ -273,6 +298,9 @@ pub struct OutputParams {
     pub output_profile: Option<String>,
     /// BigTIFF promotion policy (default `auto`).
     pub bigtiff: BigTiff,
+    /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
+    /// Carried here so `pipeline-orchestration` can drive the IR exporter.
+    pub export_ir: Option<String>,
 }
 
 #[cfg(test)]

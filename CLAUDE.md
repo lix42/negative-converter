@@ -83,7 +83,10 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 - **Every conversion knob is a CLI flag and a recipe-JSON key** — nothing
   reachable only from code. Determinism is required: same inputs + params ⇒
   identical output. The JSON report goes to stdout cleanly (logs/warnings to
-  stderr) so agents can pipe it.
+  stderr) so agents can pipe it. Mechanically, a knob spans four coupled spots:
+  a field in the CLI `*Overrides` struct (`cli.rs`), the recipe `*Params` struct
+  (`types.rs`), a `merge` arm, and usually a `validate` check — a forgotten
+  `merge` arm silently makes the flag a no-op, so add a merge test for new knobs.
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.
