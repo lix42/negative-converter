@@ -122,6 +122,9 @@ pub struct ConvertArgs {
     /// Treat warnings (clipping, IR-ignored, …) as hard errors.
     #[arg(long)]
     pub strict: bool,
+    /// Fix any stochastic step for reproducibility (none in Step 1; reserved).
+    #[arg(long, value_name = "N")]
+    pub seed: Option<u64>,
 
     #[command(flatten)]
     pub report: ReportArgs,
@@ -138,6 +141,9 @@ pub struct InputOverrides {
     /// Input ICC profile selector / path.
     #[arg(long, value_name = "ICC")]
     pub input_profile: Option<String>,
+    /// Write the decoded IR plane to this path (HDRi only).
+    #[arg(long, value_name = "PATH")]
+    pub export_ir: Option<String>,
 }
 
 /// Film-base / Dmin overrides (design-spec §9, stage 2).
@@ -211,9 +217,6 @@ pub struct OutputOverrides {
     /// BigTIFF promotion policy (default `auto`).
     #[arg(long, value_enum)]
     pub bigtiff: Option<BigTiff>,
-    /// Write the decoded IR plane to this path (HDRi only).
-    #[arg(long, value_name = "PATH")]
-    pub export_ir: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +341,9 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     if let Some(p) = &args.input_opts.input_profile {
         cfg.input.input_profile = Some(p.clone());
     }
+    if let Some(p) = &args.input_opts.export_ir {
+        cfg.input.export_ir = Some(p.clone());
+    }
 
     // film base
     if let Some(v) = args.film_base.film_base {
@@ -396,9 +402,6 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     if let Some(v) = args.output_opts.bigtiff {
         cfg.output.bigtiff = v;
     }
-    if let Some(v) = &args.output_opts.export_ir {
-        cfg.output.export_ir = Some(v.clone());
-    }
 
     cfg
 }
@@ -453,9 +456,11 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
         "--clip-low/--clip-high",
         &[cfg.simple.clip_low, cfg.simple.clip_high],
     )?;
-    if cfg.simple.clip_low > cfg.simple.clip_high {
+    // Equal endpoints leave a zero-width interval the simple remap can't
+    // normalize without dividing by zero, so require strictly low < high.
+    if cfg.simple.clip_low >= cfg.simple.clip_high {
         return Err(usage(format!(
-            "--clip-low ({}) must be <= --clip-high ({})",
+            "--clip-low ({}) must be < --clip-high ({})",
             cfg.simple.clip_low, cfg.simple.clip_high
         )));
     }
@@ -525,8 +530,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     }
     // The decode→…→encode pipeline is wired by `pipeline-orchestration`, which
     // also consumes the run-mode flags resolved here but not yet acted on:
-    // `args.strict` (promote warnings to errors) and `args.report`.
-    let _ = args.strict;
+    // `args.strict` (promote warnings to errors), `args.seed` (reserved; no
+    // stochastic step in Step 1), and `args.report`.
+    let _ = (args.strict, args.seed);
     Err(NcError::Other(
         "conversion pipeline not yet wired (pipeline-orchestration)".into(),
     ))
@@ -648,6 +654,12 @@ mod tests {
         cfg.density.density_gamma = 0.0;
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
+        // Equal clip endpoints are a zero-width interval → rejected.
+        let mut cfg = ResolvedConfig::default();
+        cfg.simple.clip_low = 0.5;
+        cfg.simple.clip_high = 0.5;
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
         let mut cfg = ResolvedConfig::default();
         cfg.print.white_balance = [1.0, f32::NAN, 1.0];
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
@@ -667,6 +679,20 @@ mod tests {
         let mut cfg = ResolvedConfig::default();
         cfg.film_base.base_region = Some([0, 0, 0, 0]); // zero-area region
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+    }
+
+    #[test]
+    fn export_ir_and_seed_parse_into_the_right_homes() {
+        // `--export-ir` is an input/decode key (design-spec §9), not output.
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--export-ir", "ir.tiff"]),
+        );
+        assert_eq!(cfg.input.export_ir.as_deref(), Some("ir.tiff"));
+
+        // The reserved `--seed` flag parses rather than being rejected by clap.
+        let args = parse_convert(&["--seed", "42"]);
+        assert_eq!(args.seed, Some(42));
     }
 
     #[test]

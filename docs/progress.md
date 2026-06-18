@@ -239,6 +239,24 @@ a task; update your own section as you work. Append entries — don't rewrite th
     newtype to make "unvalidated config reaches a stage" unrepresentable; a
     `--no-assume-linear` counterpart. These belong to the algorithm / film-base /
     pipeline-orchestration tasks that own those semantics.
+- **2026-06-18 (PR #5 bot review):** addressed automated review (claude-review /
+  Codex / Gemini). Fixes (26 tests):
+  - **`export_ir` moved `OutputParams` → `InputParams`** (recipe key
+    `output.export_ir` → `input.export_ir`). Spec §9 lists `--export-ir` under
+    Input/decode; with `deny_unknown_fields` the old home rejected the
+    documented recipe shape. Code now matches the spec.
+  - **`--seed <n>` now parsed** (reserved `Option<u64>` on `ConvertArgs`, carried
+    like `--strict`). Spec §documents it; clap previously rejected it as unknown,
+    so the documented interface wasn't actually accepted.
+  - **Equal clip endpoints rejected:** `validate` now requires `clip_low <
+    clip_high` (was `<=`) — equal bounds are a zero-width interval the simple
+    remap can't normalize without dividing by zero.
+  - **Declined (with reasons):** let-chain "unstable" claim is false here (edition
+    2024, CI green proves it compiles); `assume_linear`/`input_profile` override +
+    film-base source precedence (explicit>region>auto) belong to
+    film-base-estimation/pipeline-orchestration; rejecting flags for the
+    unselected algorithm is deliberate — inert params are retained so recipes
+    round-trip across `--algorithm` switches.
 
 ## algo-simple
 **Status:** not started

@@ -193,6 +193,10 @@ pub struct InputParams {
     pub assume_linear: bool,
     /// Input ICC profile selector / path. `None` uses the decode default.
     pub input_profile: Option<String>,
+    /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
+    /// An input/decode-domain artifact (design-spec §9, Input/decode) — carried
+    /// here so `pipeline-orchestration` can drive the IR exporter.
+    pub export_ir: Option<String>,
 }
 
 /// Film-base / `Dmin` estimation knobs (design-spec §9, stage 2).
@@ -298,9 +302,6 @@ pub struct OutputParams {
     pub output_profile: Option<String>,
     /// BigTIFF promotion policy (default `auto`).
     pub bigtiff: BigTiff,
-    /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
-    /// Carried here so `pipeline-orchestration` can drive the IR exporter.
-    pub export_ir: Option<String>,
 }
 
 #[cfg(test)]
