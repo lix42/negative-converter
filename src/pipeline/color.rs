@@ -78,7 +78,14 @@ pub fn resolve_output_space(explicit: Option<OutputSpace>, depth: OutDepth) -> O
 
 /// The ICC bytes to embed for a given space.
 pub fn icc_profile(space: &OutputSpace) -> Result<Vec<u8>> {
-    build_profile(space)?
+    profile_icc(&build_profile(space)?)
+}
+
+/// Serialize an already-built profile to ICC bytes. Shared by `icc_profile` and
+/// `to_output` so the latter doesn't rebuild (and re-read from disk) a profile
+/// it already holds.
+fn profile_icc(profile: &Profile) -> Result<Vec<u8>> {
+    profile
         .icc()
         .map_err(|e| NcError::Other(format!("failed to serialize ICC profile: {e}")))
 }
@@ -120,7 +127,7 @@ pub fn to_output(image: &LinearImage, params: &OutputParams) -> Result<(LinearIm
     }
     transform.transform_in_place(pixels);
 
-    let icc = icc_profile(&space)?;
+    let icc = profile_icc(&output)?;
     Ok((out, icc))
 }
 

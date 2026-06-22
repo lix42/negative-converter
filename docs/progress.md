@@ -136,7 +136,9 @@ a task; update your own section as you work. Append entries — don't rewrite th
   `debug_assert!`, which compiled out in release → risked a quietly-wrong tail);
   (3) `Custom` profiles are validated as RGB color space (else `Usage`), so a
   CMYK/Lab/gray profile fails clearly rather than with an opaque transform error;
-  (4) `to_output` reuses `icc_profile` (no duplicated `.icc()`).
+  (4) `icc_profile` and `to_output` share a `profile_icc(&Profile)` helper — no
+  duplicated `.icc()` string and, per PR #7 review, no rebuilding/re-reading the
+  output profile it already holds.
 - **Deferred follow-up for `pipeline-orchestration`/`main`:** lcms2
   `transform_in_place` can't return an error — Little CMS reports runtime
   transform failures (OOM-class) only through the process-global
