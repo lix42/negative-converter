@@ -80,11 +80,72 @@ a task; update your own section as you work. Append entries — don't rewrite th
   sidecar JSON.
 
 ## color-management
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-21
 
 - Goal: working→output ICC transforms with depth-aware default profile (sRGB for
   u16, wide-gamut for f32); provide the ICC blob to embed.
+- **Done.** `pipeline/color.rs` implemented over `lcms2` 6.1.1 (API verified via
+  Context7 + crate source, not memory). Public surface: `OutputSpace` enum
+  (`SRgb`/`ProPhoto`/`AcesCg`/`Custom(PathBuf)`) with `OutputSpace::parse`,
+  `resolve_output_space(explicit, depth)`, `icc_profile(space) -> Vec<u8>`, and
+  the foundation-established `to_output(&LinearImage, &OutputParams) ->
+  (LinearImage, Vec<u8>)` (kept verbatim — orchestration depends on it).
+- **Decisions (these are the task's open questions, now resolved):**
+  - **Working space = linear Rec.709/sRGB primaries, D65, linear TRC.** Decode
+    gives "linear scanner RGB" with no input ICC in Step 1, so the source
+    colorimetry had to be pinned to build any transform. Synthesized as the
+    transform's source profile. The `--input-profile`/`--assume-linear` knobs
+    (`InputColor`, added by cli-framework) are parsed into config but not yet
+    applied; any input→working conversion will live upstream in decode/
+    orchestration, so this fixed working space still holds.
+  - **f32 wide-gamut default = `AcesCg`** (AP1 primaries, ~D60 white, **linear**
+    TRC — scene-referred, avoids clipping HDR range). u16 default = `SRgb`.
+    (User confirmed ACEScg over ProPhoto/Rec.2020.)
+  - **TRC is a property of the space, not the output depth** — every embedded
+    profile self-describes its data. `SRgb`→sRGB curve (display), `ProPhoto`→
+    ROMM/D50 gamma 1.8 (display), `AcesCg`→linear (scene). So an explicit
+    `--output-profile prophoto` is always a valid encoded profile regardless of
+    `--out-depth`.
+  - **This stage does not clamp.** A gamut remap can push values outside
+    `[0, 1]`; range clamping + clipping warnings are the encoder's job
+    (`tiff-encode`), per "fail loudly". Note left for that task.
+  - Intent: `RelativeColorimetric`. Transform runs on the interleaved `f32` RGB
+    buffer in `[f32;3]` chunks via `transform_in_place` (no extra copy beyond the
+    one `image.clone()`); IR plane carried through untouched.
+  - `Custom` profile load/parse failures map to `NcError::Usage` (exit 2);
+    transform/serialize failures to `NcError::Other`.
+- **Notes for dependent tasks:**
+  - `tiff-encode`: `to_output` returns the ICC blob to embed and may hand you
+    out-of-`[0,1]` values — clamp at encode for u16 and surface clipping as a
+    report warning. f32 output (AcesCg) is **linear/scene-referred**; sRGB output
+    is **display-referred** (already tone-curved).
+  - `cli-framework`: `--output-profile` string → `OutputSpace::parse` (keywords
+    `srgb`/`prophoto`/`acescg` case-insensitive, else treated as an ICC path).
+- **Verify:** `cargo test` 13 color tests pass (whole suite 40/40): resolve
+  defaults + explicit override, keyword/path parse + misspelled-keyword rejected,
+  linear 0.5 → sRGB ~0.7353, sRGB round-trip within 0.005, ICC bytes
+  valid+re-openable for all built-ins, custom-from-disk load+transform,
+  missing-path and garbage-ICC → exit 2, IR pass-through preserved, f32/AcesCg
+  transform runs, wide-gamut saturated-red primaries remap. `cargo fmt --check`,
+  `clippy --all-targets -D warnings` clean.
+- **Review fixes (ship, 2026-06-21):** multi-agent review applied —
+  (1) `OutputSpace::parse` is now fallible: a misspelled bare-word keyword
+  (`prophooto`) is a loud `Usage` error instead of a deferred "cannot read ICC"
+  path error; (2) the chunk-remainder guard is a real runtime check (was
+  `debug_assert!`, which compiled out in release → risked a quietly-wrong tail);
+  (3) `Custom` profiles are validated as RGB color space (else `Usage`), so a
+  CMYK/Lab/gray profile fails clearly rather than with an opaque transform error;
+  (4) `icc_profile` and `to_output` share a `profile_icc(&Profile)` helper — no
+  duplicated `.icc()` string and, per PR #7 review, no rebuilding/re-reading the
+  output profile it already holds.
+- **Deferred follow-up for `pipeline-orchestration`/`main`:** lcms2
+  `transform_in_place` can't return an error — Little CMS reports runtime
+  transform failures (OOM-class) only through the process-global
+  `cmsSetLogErrorHandler`. A pure stage can't own a process-global handler, so
+  **`main`/`cli` must install one at startup** (lcms2 `ThreadContext::
+  set_error_logging_function`) to turn those into loud errors. Tracked here so
+  orchestration wires it.
 
 ## film-base-estimation
 **Status:** not started

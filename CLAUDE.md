@@ -97,6 +97,10 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.
+  - *lcms2 gotcha:* `Transform::transform_in_place` (`cmsDoTransform`) is
+    infallible — Little CMS reports runtime transform failures only via the
+    process-global `cmsSetLogErrorHandler`, so `main`/`cli` must install one
+    (lcms2 `ThreadContext::set_error_logging_function`) at startup.
 - **Verify against real sample files.** There is no public spec for the SilverFast
   HDRi on-disk layout; the decoder must be validated against the user's actual
   scans and degrade gracefully on unrecognized layouts.
