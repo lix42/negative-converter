@@ -18,7 +18,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use tiff::ColorType;
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 
 use crate::types::{LinearImage, NcError, Result};
@@ -60,15 +60,16 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     let file = File::open(path)
         .map_err(|e| NcError::Decode(format!("cannot open {}: {e}", path.display())))?;
     let mut dec = Decoder::new(BufReader::new(file))
-        .map_err(|e| decode_err(path, "not a readable TIFF", e))?;
+        .map_err(|e| tiff_err(path, "not a readable TIFF", e))?
+        .with_limits(decode_limits());
 
     // --- IFD0: the RGB image -------------------------------------------------
     let (width, height) = dec
         .dimensions()
-        .map_err(|e| decode_err(path, "reading image dimensions", e))?;
+        .map_err(|e| tiff_err(path, "reading image dimensions", e))?;
     let color = dec
         .colortype()
-        .map_err(|e| decode_err(path, "reading color type", e))?;
+        .map_err(|e| tiff_err(path, "reading color type", e))?;
     if color != ColorType::RGB(16) {
         return Err(NcError::Unsupported(format!(
             "{}: expected 3-channel 16-bit RGB in the primary image, found {color:?}; \
@@ -102,10 +103,10 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     // --- IFD1 (if present): the IR plane ------------------------------------
     let ir = if dec.more_images() {
         dec.next_image()
-            .map_err(|e| decode_err(path, "advancing to the IR image", e))?;
+            .map_err(|e| tiff_err(path, "advancing to the IR image", e))?;
         let (iw, ih) = dec
             .dimensions()
-            .map_err(|e| decode_err(path, "reading IR dimensions", e))?;
+            .map_err(|e| tiff_err(path, "reading IR dimensions", e))?;
         if (iw, ih) != (width, height) {
             return Err(NcError::Unsupported(format!(
                 "{}: IR plane is {iw}x{ih} but RGB image is {width}x{height}; \
@@ -115,10 +116,25 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         }
         let ir_color = dec
             .colortype()
-            .map_err(|e| decode_err(path, "reading IR color type", e))?;
+            .map_err(|e| tiff_err(path, "reading IR color type", e))?;
         if ir_color != ColorType::Gray(16) {
             return Err(NcError::Unsupported(format!(
                 "{}: expected a 1-channel 16-bit grayscale IR plane, found {ir_color:?}",
+                path.display()
+            )));
+        }
+        // `colortype()` reports both BlackIsZero and WhiteIsZero as Gray(16), and
+        // the crate *inverts* WhiteIsZero samples while decoding — so a WhiteIsZero
+        // second page would be silently kept as IR with transformed values. The
+        // verified IR layout is BlackIsZero (PhotometricInterpretation=1); reject
+        // anything else rather than preserve a possibly-inverted plane.
+        let ir_photometric = dec
+            .find_tag_unsigned::<u16>(Tag::PhotometricInterpretation)
+            .ok()
+            .flatten();
+        if ir_photometric != Some(1) {
+            return Err(NcError::Unsupported(format!(
+                "{}: IR plane PhotometricInterpretation={ir_photometric:?} (expected 1 = BlackIsZero)",
                 path.display()
             )));
         }
@@ -175,7 +191,7 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
 fn read_plane_u16(dec: &mut Decoder<BufReader<File>>, path: &Path, what: &str) -> Result<Vec<f32>> {
     match dec
         .read_image()
-        .map_err(|e| decode_err(path, &format!("reading {what} pixels"), e))?
+        .map_err(|e| tiff_err(path, &format!("reading {what} pixels"), e))?
     {
         DecodingResult::U16(samples) => Ok(normalize_u16(&samples)),
         other => Err(NcError::Unsupported(format!(
@@ -193,9 +209,30 @@ fn normalize_u16(samples: &[u16]) -> Vec<f32> {
     samples.iter().map(|&s| s as f32 / MAX).collect()
 }
 
-/// Wrap a `tiff` error as a [`NcError::Decode`] with file + operation context.
-fn decode_err(path: &Path, while_doing: &str, err: tiff::TiffError) -> NcError {
-    NcError::Decode(format!("{}: {while_doing}: {err}", path.display()))
+/// Decode limits raised above the `tiff` crate's 256 MiB default so full-size
+/// archival scans (a single uncompressed RGB16 IFD can exceed 256 MiB) decode in
+/// one read. Capped at the classic-TIFF ceiling rather than unlimited so a corrupt
+/// oversized header still trips the limit and fails loudly instead of OOMing.
+fn decode_limits() -> Limits {
+    // SilverFast HDR/HDRi are classic TIFFs (< 4 GiB); size both the whole-image
+    // and per-segment buffers to that ceiling.
+    const MAX_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = MAX_BYTES;
+    limits.intermediate_buffer_size = MAX_BYTES;
+    limits
+}
+
+/// Wrap a `tiff` error with file + operation context, mapping a
+/// readable-but-unsupported layout (`TiffError::UnsupportedError`) to
+/// [`NcError::Unsupported`] (exit 4) and IO/parse/corruption to
+/// [`NcError::Decode`] (exit 3), per the documented exit-code contract (§11).
+fn tiff_err(path: &Path, while_doing: &str, err: tiff::TiffError) -> NcError {
+    let msg = format!("{}: {while_doing}: {err}", path.display());
+    match err {
+        tiff::TiffError::UnsupportedError(_) => NcError::Unsupported(msg),
+        _ => NcError::Decode(msg),
+    }
 }
 
 /// Human-readable name of a `DecodingResult` variant, for error messages.
@@ -351,6 +388,30 @@ mod tests {
         let mut enc = TiffEncoder::new(std::fs::File::create(&tmp.0).unwrap()).unwrap();
         enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
         enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+
+        match decode(&tmp.0) {
+            Err(NcError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_white_is_zero_ir_plane() {
+        // IFD1 is Gray16 but WhiteIsZero (Photometric=0): the tiff crate reports it
+        // as Gray(16) and would invert it on read, so it must be rejected rather
+        // than preserved as an inverted IR plane.
+        let tmp = temp_path("wiz");
+        let rgb: [u16; 6] = [0; 6];
+        let ir: [u16; 2] = [0, 65535];
+        let mut enc = TiffEncoder::new(std::fs::File::create(&tmp.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        let mut ir_img = enc.new_image::<Gray16>(2, 1).unwrap();
+        // Override the BlackIsZero default the Gray16 colortype would write.
+        ir_img
+            .encoder()
+            .write_tag(Tag::PhotometricInterpretation, 0u16)
+            .unwrap();
+        ir_img.write_data(&ir).unwrap();
 
         match decode(&tmp.0) {
             Err(NcError::Unsupported(_)) => {}

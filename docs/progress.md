@@ -114,6 +114,21 @@ a task; update your own section as you work. Append entries — don't rewrite th
   ordering. 11 decode tests, all green. The planar-config and `read_plane_u16`
   non-`U16` branches stay fixture-only (the `tiff` encoder can't synthesize those
   inputs); they fail loudly and are noted as known-untested-by-design.
+- **PR-review pass (bot feedback on #8):** three further fixes.
+  - **Decode limit:** the `tiff` crate's default `Limits` caps a single
+    `read_image()` at 256 MiB; a full-size RGB16 IFD can exceed that. Raised
+    `decoding_buffer_size`/`intermediate_buffer_size` to the 4 GiB classic-TIFF
+    ceiling via `with_limits` — full archival scans decode in one read, while a
+    corrupt oversized header still trips the cap and fails loudly (not OOM).
+  - **Error contract:** `tiff_err` (was `decode_err`) now maps
+    `TiffError::UnsupportedError` → `NcError::Unsupported` (exit 4) and everything
+    else → `Decode` (exit 3), so readable-but-unsupported layouts (photometric/
+    compression/etc.) are distinguishable from corrupt files per design-spec §11.
+  - **WhiteIsZero IR:** `colortype()` returns `Gray(16)` for *both* BlackIsZero and
+    WhiteIsZero, and the crate inverts WhiteIsZero on read — so a WhiteIsZero second
+    page would be silently kept as an inverted IR plane. Now require
+    `PhotometricInterpretation=1` (BlackIsZero, the verified layout) on IFD1, with a
+    test. 12 decode tests, all green.
 
 ## tiff-encode
 **Status:** not started
