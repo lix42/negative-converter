@@ -180,15 +180,18 @@
 <h3>Step 1: SilverFast HDR / HDRi (TIFF-family)</h3>
 <p>SilverFast HDR/HDRi files are TIFF-family containers holding high-bit-depth, linear (raw-ish) scanner data:</p>
 <table>
-  <thead><tr><th>Variant</th><th>Channels</th><th>Bit depth</th><th>Notes</th></tr></thead>
+  <thead><tr><th>Variant</th><th>Channels</th><th>Bit depth</th><th>On-disk layout</th></tr></thead>
   <tbody>
-    <tr><td>HDR</td><td>R, G, B</td><td>48-bit (16/ch)</td><td>No infrared.</td></tr>
-    <tr><td>HDRi</td><td>R, G, B, IR</td><td>64-bit (16/ch)</td><td>4th channel = infrared defect data.</td></tr>
+    <tr><td>HDR</td><td>R, G, B</td><td>48-bit (16/ch)</td><td>Single IFD: 3-sample chunky RGB, no IR.</td></tr>
+    <tr><td>HDRi</td><td>R, G, B + IR</td><td>64-bit (16/ch)</td><td><strong>Two IFDs</strong>: IFD0 = 3-sample RGB (as HDR); IFD1 = 1-sample grayscale IR plane.</td></tr>
   </tbody>
 </table>
-<p>The tool reads both. On HDRi input the IR channel is parsed and kept; on HDR input there simply is no IR channel.</p>
+<p>The tool reads both. On HDRi input the IR plane is parsed and kept; on HDR input there simply is no IR channel.</p>
 <div class="callout">
-  <strong>Caveat:</strong> there is no published low-level spec for the exact SilverFast HDRi tag/IFD layout. The implementation must be validated against real sample files, and the reader should degrade gracefully — treat unknown extra channels conservatively and log what it found via the JSON report.
+  <strong>On-disk layout (verified against real sample files, 2026-06):</strong> these are uncompressed little-endian ClassicTIFFs, <code>PlanarConfiguration=1</code> (chunky), 16-bit <strong>unsigned</strong> samples (no <code>SampleFormat</code> tag). The IR channel is <strong>not</strong> a 4th sample interleaved into the RGB pixels — HDRi files carry it as a <strong>second IFD</strong> (<code>NewSubfileType=4</code>, <code>Photometric=BlackIsZero</code>, <code>SamplesPerPixel=1</code>, <code>BitsPerSample=16</code>) at the same dimensions as IFD0. The decoder therefore distinguishes HDR from HDRi <strong>structurally</strong> — by the presence of that second image — not from metadata: the <code>Silverfast:HDRScan="Yes"</code> XMP flag is present on <em>both</em> variants and cannot be used to detect IR.
+</div>
+<div class="callout">
+  <strong>Caveat:</strong> there is still no published low-level spec for the SilverFast layout; the above is reverse-engineered from sample scans. The reader degrades gracefully — recognized-but-unhandled layouts return an <code>Unsupported</code> error, and what was found is logged via the JSON report.
 </div>
 <h3>Internal representation</h3>
 <p>After decode, the image is normalized to <strong>linear <code>f32</code> scanner RGB</strong> in <code>[0,1]</code> (plus an optional <code>f32</code> IR plane). This is the single input contract every algorithm consumes — nothing downstream needs to know the on-disk format.</p>
