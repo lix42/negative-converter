@@ -86,18 +86,28 @@ The deterministic core owns the image science. Any future ML assistance (see
 SilverFast HDR/HDRi files are TIFF-family containers holding high-bit-depth,
 linear (raw-ish) scanner data:
 
-| Variant | Channels | Bit depth | Notes |
+| Variant | Channels | Bit depth | On-disk layout |
 |---|---|---|---|
-| HDR   | R, G, B            | 48-bit (16/ch) | No infrared. |
-| HDRi  | R, G, B, IR        | 64-bit (16/ch) | 4th channel = infrared defect data. |
+| HDR   | R, G, B            | 48-bit (16/ch) | Single IFD: 3-sample chunky RGB, no IR. |
+| HDRi  | R, G, B + IR       | 64-bit (16/ch) | **Two IFDs**: IFD0 = 3-sample RGB (as HDR); IFD1 = 1-sample grayscale IR plane. |
 
-The tool reads both. On HDRi input the IR channel is parsed and kept; on HDR
-input there simply is no IR channel.
+The tool reads both. On HDRi input the IR plane is parsed and kept; on HDR input
+there simply is no IR channel.
 
-**Caveat (carried from research):** there is no published low-level spec for the
-exact SilverFast HDRi tag/IFD layout. Implementation must be validated against
-real sample files, and the reader should degrade gracefully (treat unknown extra
-channels conservatively, log what it found via the JSON report).
+**On-disk layout (verified against real sample files, 2026-06):** these are
+uncompressed little-endian ClassicTIFFs, `PlanarConfiguration=1` (chunky), 16-bit
+**unsigned** samples (no `SampleFormat` tag). The IR channel is **not** a 4th
+sample interleaved into the RGB pixels — HDRi files carry it as a **second IFD**
+(`NewSubfileType=4`, `Photometric=BlackIsZero`, `SamplesPerPixel=1`,
+`BitsPerSample=16`) at the same dimensions as IFD0. So the decoder distinguishes
+HDR from HDRi **structurally** — by the presence of that second image — not from
+metadata: the `Silverfast:HDRScan="Yes"` XMP flag is present on *both* variants
+and cannot be used to detect IR.
+
+**Caveat (carried from research):** there is still no published low-level spec for
+the SilverFast layout; the above is reverse-engineered from sample scans. The
+reader degrades gracefully — recognized-but-unhandled layouts return an
+`Unsupported` error, and what was found is logged via the JSON report.
 
 ### Internal representation
 

@@ -58,19 +58,77 @@ a task; update your own section as you work. Append entries — don't rewrite th
   **The gate is strict** — keep `fmt` clean and zero clippy warnings, or CI fails.
 
 ## silverfast-decode
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-21
 
 - Goal: read SilverFast HDR (48-bit RGB) and HDRi (64-bit RGB+IR) TIFFs into a
   linear `f32` `LinearImage`, preserving the IR plane.
-- Note (from project-foundation review): build the result via
-  `LinearImage::new(w, h, rgb, ir)` — it validates the buffer-length invariants
-  (`rgb.len()==w*h*3`, `ir.len()==w*h`, non-zero dims, no size overflow) at the
-  boundary. Don't construct the struct literally and skip the check.
-- Note (from PR #2 review): `nc inspect` / the JSON report need original format,
-  channel count, bits-per-sample, and decoder warnings — data lost once the image
-  is normalized. Return a `DecodeInfo` alongside the `LinearImage` (decide the
-  exact shape here) so inspection doesn't have to re-parse the file.
+- **Done.** `io/decode.rs` implemented; `decode(&Path) -> Result<(LinearImage,
+  DecodeInfo)>`. Full CI gate clean (fmt/clippy `-D warnings`/build/test, 14 tests).
+
+- **Key finding — the task spec's channel model was wrong, now corrected.** I
+  inspected the user's real scans (`/Users/lix/src/nc-assets/{48,64}bit-{small,full}`,
+  via `tiffdump`/`tiffinfo`). The IR channel is **not** a 4th interleaved sample.
+  Layout, consistent across all 16 sample files:
+  - **HDR (48-bit):** a single IFD — `SamplesPerPixel=3`, `BitsPerSample=16/16/16`,
+    `Photometric=RGB`, `NewSubfileType=0`. No IR.
+  - **HDRi (64-bit):** **two IFDs.** IFD0 is identical to the HDR image; **IFD1 is
+    the IR plane** — `SamplesPerPixel=1`, `BitsPerSample=16`,
+    `Photometric=BlackIsZero`, `NewSubfileType=4`, same W×H as IFD0.
+  - Both: uncompressed, little-endian **ClassicTIFF** (full 66 MB files are still
+    under the 4 GB classic limit — no BigTIFF seen), `PlanarConfiguration=1`
+    (chunky), **no `SampleFormat` tag** ⇒ 16-bit **unsigned**, normalize `/65535`,
+    treated as linear (no gamma).
+  - **HDR vs HDRi is detected structurally** (`decoder.more_images()`), *not* from
+    metadata: `Silverfast:HDRScan="Yes"` appears on **both** variants. Updated
+    `design-spec.md` + `.html` §4 and this task's `tasks/silverfast-decode.md`
+    accordingly.
+- **Decisions / notes for dependent tasks (pipeline-orchestration, cli):**
+  - **Signature changed** from the foundation stub: `decode` now returns
+    `(LinearImage, DecodeInfo)`. `DecodeInfo` (in `io/decode.rs`, `Serialize`)
+    carries `format` (`SilverFastFormat::{Hdr,Hdri}`), `width`/`height`,
+    `channels`, `bits_per_sample`, `ir_present`, `make`/`model`/`software`
+    (from TIFF tags 271/272/305), and `warnings`. Feed this straight into the
+    `inspect`/report JSON — it's the "what was found" record PR #2 asked for.
+  - Builds the image via `LinearImage::new(...)` (validated constructor), per the
+    foundation note.
+  - Failure mapping: unreadable/parse/IO → `NcError::Decode`; recognized-but-
+    unhandled layout (non-16-bit, wrong channel count, planar-multi-sample,
+    IR-dim mismatch, non-grayscale IR) → `NcError::Unsupported`. No panics.
+  - **Planar guard:** the `tiff` crate's `read_image()` only returns the first
+    sample plane under `PlanarConfiguration=2`; since RGB has 3 samples we reject
+    planar with `Unsupported` rather than silently dropping G/B. All real scans
+    are chunky, so this is a safety net.
+- **Tests:** real-scan fixtures committed at `tests/fixtures/hdr-48bit.tif`
+  (from `48bit-small/1.tif`) and `hdri-64bit.tif` (from `64bit-small/1.tif`) so
+  the real-file tests also run in CI. Plus synthetic single-/two-IFD TIFFs built
+  with the `tiff` encoder cover normalization, IR split, structural detection, and
+  the `Unsupported`/`Decode` error paths.
+- **Review pass (pre-ship):** added a `NewSubfileType` guard on IFD1 — the real IR
+  plane is marked `NewSubfileType=4` (verified on the fixture); a matching-dimension
+  16-bit grayscale second IFD without it is still accepted (layout is
+  reverse-engineered; IR is only carried in Step 1) but now records a warning, so an
+  incidental second page isn't reported as IR provenance with no trace. Added three
+  tests: non-grayscale IR plane → `Unsupported`, the extra-IFD warning path, and a
+  `Software`-tag round-trip pinning the "read metadata before `next_image()`"
+  ordering. 11 decode tests, all green. The planar-config and `read_plane_u16`
+  non-`U16` branches stay fixture-only (the `tiff` encoder can't synthesize those
+  inputs); they fail loudly and are noted as known-untested-by-design.
+- **PR-review pass (bot feedback on #8):** three further fixes.
+  - **Decode limit:** the `tiff` crate's default `Limits` caps a single
+    `read_image()` at 256 MiB; a full-size RGB16 IFD can exceed that. Raised
+    `decoding_buffer_size`/`intermediate_buffer_size` to the 4 GiB classic-TIFF
+    ceiling via `with_limits` — full archival scans decode in one read, while a
+    corrupt oversized header still trips the cap and fails loudly (not OOM).
+  - **Error contract:** `tiff_err` (was `decode_err`) now maps
+    `TiffError::UnsupportedError` → `NcError::Unsupported` (exit 4) and everything
+    else → `Decode` (exit 3), so readable-but-unsupported layouts (photometric/
+    compression/etc.) are distinguishable from corrupt files per design-spec §11.
+  - **WhiteIsZero IR:** `colortype()` returns `Gray(16)` for *both* BlackIsZero and
+    WhiteIsZero, and the crate inverts WhiteIsZero on read — so a WhiteIsZero second
+    page would be silently kept as an inverted IR plane. Now require
+    `PhotometricInterpretation=1` (BlackIsZero, the verified layout) on IFD1, with a
+    test. 12 decode tests, all green.
 
 ## tiff-encode
 **Status:** not started

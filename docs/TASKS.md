@@ -84,7 +84,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 ### Phase 2: Building blocks
 > Goal: each pipeline stage built and unit-tested in isolation. All parallelizable.
 
-- [ ] [SilverFast HDR/HDRi decode](tasks/silverfast-decode.md)
+- [x] [SilverFast HDR/HDRi decode](tasks/silverfast-decode.md)
 - [ ] [TIFF encode and output](tasks/tiff-encode.md)
 - [x] [Color management](tasks/color-management.md)
 - [ ] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
