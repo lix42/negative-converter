@@ -311,6 +311,55 @@ impl Default for SimpleParams {
     }
 }
 
+/// What the encode stage observed while writing — fed into the JSON report by
+/// the orchestrator. Records information lost during u16 quantization: when u16
+/// output is requested, `pipeline::color::to_output` may legitimately hand back
+/// values outside `[0, 1]` (it does not clamp), and the density-domain algorithm
+/// can produce non-finite (`NaN`) samples from log/division math — the encoder
+/// clamps the former and forces the latter to 0, counting both here so a quietly
+/// wrong image surfaces as a warning instead. This rides back on the value path
+/// rather than down `Result` because it is a quality warning, not a write failure
+/// (`--strict` can promote it to an error). f32 output is written verbatim and
+/// never quantized, so an f32 encode reports all-zero counts (`total_samples` 0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[must_use]
+pub struct EncodeReport {
+    /// Samples examined during u16 quantization (0 for f32 output). The
+    /// denominator that makes the clip counts interpretable as a fraction.
+    pub total_samples: u64,
+    /// Samples below 0.0 that were clamped up to 0.
+    pub clipped_low: u64,
+    /// Samples above 1.0 that were clamped down to 65535.
+    pub clipped_high: u64,
+    /// Non-finite (`NaN`) samples, forced to 0. Counted separately because they
+    /// signal a pipeline numerical fault, not mere out-of-gamut clipping.
+    pub non_finite: u64,
+}
+
+impl EncodeReport {
+    /// Total samples clamped at a range end (excludes non-finite).
+    pub fn clipped_total(&self) -> u64 {
+        self.clipped_low + self.clipped_high
+    }
+
+    /// Whether any sample lost information — clamped at a range end or forced to
+    /// 0 because it was non-finite. The condition a normal run surfaces as a
+    /// warning and `--strict` promotes to an error.
+    pub fn any_loss(&self) -> bool {
+        self.clipped_total() > 0 || self.non_finite > 0
+    }
+
+    /// Fraction of examined samples that lost information, in `[0, 1]`. Returns
+    /// 0.0 when nothing was quantized (f32 output).
+    pub fn loss_fraction(&self) -> f64 {
+        if self.total_samples == 0 {
+            0.0
+        } else {
+            (self.clipped_total() + self.non_finite) as f64 / self.total_samples as f64
+        }
+    }
+}
+
 /// Output / encode knobs (design-spec §9, stage 5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]

@@ -16,7 +16,7 @@ use tiff::encoder::colortype::{ColorType, Gray16, Gray32Float, RGB16, RGB32Float
 use tiff::encoder::{TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, TiffValue};
 use tiff::tags::Tag;
 
-use crate::types::{BigTiff, LinearImage, NcError, OutDepth, OutputParams, Result};
+use crate::types::{BigTiff, EncodeReport, LinearImage, NcError, OutDepth, OutputParams, Result};
 
 /// Slack added to the raw sample-data size when deciding BigTIFF auto-promotion:
 /// IFD entries, strip offset/bytecount tables, and the embedded ICC all live
@@ -32,12 +32,15 @@ const CLASSIC_TIFF_LIMIT: u64 = u32::MAX as u64;
 /// is the output-profile blob to embed — produced by `pipeline::color::to_output`,
 /// so the encoder embeds exactly the profile the pixels were converted into rather
 /// than re-resolving it. `None` embeds no profile.
+///
+/// Returns an [`EncodeReport`] recording any quantization clipping so the caller
+/// can fold it into the JSON report (and `--strict` can promote it to an error).
 pub fn encode(
     image: &LinearImage,
     params: &OutputParams,
     icc: Option<&[u8]>,
     path: &Path,
-) -> Result<()> {
+) -> Result<EncodeReport> {
     let writer = BufWriter::new(create(path)?);
     encode_to_writer(writer, image, params, icc)
 }
@@ -70,34 +73,56 @@ fn encode_to_writer<W: Write + Seek>(
     image: &LinearImage,
     params: &OutputParams,
     icc: Option<&[u8]>,
-) -> Result<()> {
+) -> Result<EncodeReport> {
     let (w, h) = (image.width, image.height);
     let bytes_per_sample = depth_bytes(params.out_depth);
     let big = resolve_bigtiff(params.bigtiff, w, h, 3, bytes_per_sample);
 
+    // f32 is written verbatim (HDR-preserving, no clamp) so it never clips;
+    // only the u16 path quantizes and can clamp out-of-range samples.
     match (params.out_depth, big) {
         (OutDepth::U16, false) => {
-            let data = quantize_u16(&image.rgb);
-            encode_planar::<_, TiffKindStandard, RGB16>(TiffEncoder::new(writer)?, w, h, &data, icc)
+            let (data, report) = quantize_u16(&image.rgb);
+            encode_planar::<_, TiffKindStandard, RGB16>(
+                TiffEncoder::new(writer)?,
+                w,
+                h,
+                &data,
+                icc,
+            )?;
+            Ok(report)
         }
         (OutDepth::U16, true) => {
-            let data = quantize_u16(&image.rgb);
-            encode_planar::<_, TiffKindBig, RGB16>(TiffEncoder::new_big(writer)?, w, h, &data, icc)
+            let (data, report) = quantize_u16(&image.rgb);
+            encode_planar::<_, TiffKindBig, RGB16>(
+                TiffEncoder::new_big(writer)?,
+                w,
+                h,
+                &data,
+                icc,
+            )?;
+            Ok(report)
         }
-        (OutDepth::F32, false) => encode_planar::<_, TiffKindStandard, RGB32Float>(
-            TiffEncoder::new(writer)?,
-            w,
-            h,
-            &image.rgb,
-            icc,
-        ),
-        (OutDepth::F32, true) => encode_planar::<_, TiffKindBig, RGB32Float>(
-            TiffEncoder::new_big(writer)?,
-            w,
-            h,
-            &image.rgb,
-            icc,
-        ),
+        (OutDepth::F32, false) => {
+            encode_planar::<_, TiffKindStandard, RGB32Float>(
+                TiffEncoder::new(writer)?,
+                w,
+                h,
+                &image.rgb,
+                icc,
+            )?;
+            Ok(EncodeReport::default())
+        }
+        (OutDepth::F32, true) => {
+            encode_planar::<_, TiffKindBig, RGB32Float>(
+                TiffEncoder::new_big(writer)?,
+                w,
+                h,
+                &image.rgb,
+                icc,
+            )?;
+            Ok(EncodeReport::default())
+        }
     }
 }
 
@@ -114,7 +139,11 @@ fn export_ir_to_writer<W: Write + Seek>(
 
     match (depth, big) {
         (OutDepth::U16, false) => {
-            let data = quantize_u16(ir);
+            // IR is normalized to [0,1] at decode and carried through untouched,
+            // so quantization cannot clip it — the report is provably all-zero
+            // and safe to drop. Revisit if IR-processing stages ever land.
+            let (data, report) = quantize_u16(ir);
+            debug_assert!(!report.any_loss(), "IR plane unexpectedly clipped");
             encode_planar::<_, TiffKindStandard, Gray16>(
                 TiffEncoder::new(writer)?,
                 w,
@@ -124,7 +153,8 @@ fn export_ir_to_writer<W: Write + Seek>(
             )
         }
         (OutDepth::U16, true) => {
-            let data = quantize_u16(ir);
+            let (data, report) = quantize_u16(ir);
+            debug_assert!(!report.any_loss(), "IR plane unexpectedly clipped");
             encode_planar::<_, TiffKindBig, Gray16>(
                 TiffEncoder::new_big(writer)?,
                 w,
@@ -214,16 +244,38 @@ fn resolve_bigtiff(policy: BigTiff, width: u32, height: u32, channels: u64, byte
     }
 }
 
-/// Quantize linear `f32` samples in `[0, 1]` to `u16` `[0, 65535]`. Out-of-range
-/// values are clamped (a quietly wrapped pixel would violate "fail loudly"), and
-/// rounding is round-half-away-from-zero via `f32::round` — chosen for determinism
-/// and simplicity. (`NaN` saturates to 0 through the `as` cast; the CLI rejects
-/// NaN params upstream, so it should never reach here.)
-fn quantize_u16(samples: &[f32]) -> Vec<u16> {
-    samples
+/// Quantize linear `f32` samples in `[0, 1]` to `u16` `[0, 65535]`, returning the
+/// quantized data alongside an [`EncodeReport`] counting the information lost.
+/// Out-of-range values are clamped rather than wrapped (a quietly wrapped pixel
+/// would violate "fail loudly") *and* counted, so the caller can surface the loss
+/// as a report warning. Rounding is round-half-away-from-zero via `f32::round` —
+/// chosen for determinism and simplicity.
+///
+/// `NaN` needs its own branch: it is neither `< 0.0` nor `> 1.0`, so the range
+/// comparisons miss it, yet `NaN as u16` saturates to 0 — a pixel silently turned
+/// black. Pixel `NaN` is a live possibility (the density algorithm's log/division
+/// math), distinct from param `NaN` the CLI rejects upstream, so it is counted as
+/// `non_finite` to keep the fault visible. (`±inf` is handled by the range
+/// branches: `-inf < 0.0` and `+inf > 1.0`, and both clamp sanely.)
+fn quantize_u16(samples: &[f32]) -> (Vec<u16>, EncodeReport) {
+    let mut report = EncodeReport {
+        total_samples: samples.len() as u64,
+        ..EncodeReport::default()
+    };
+    let data = samples
         .iter()
-        .map(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16)
-        .collect()
+        .map(|&v| {
+            if v.is_nan() {
+                report.non_finite += 1;
+            } else if v < 0.0 {
+                report.clipped_low += 1;
+            } else if v > 1.0 {
+                report.clipped_high += 1;
+            }
+            (v.clamp(0.0, 1.0) * 65535.0).round() as u16
+        })
+        .collect();
+    (data, report)
 }
 
 // `tiff`'s encoder errors surface as `NcError::Write` — a TIFF that won't start is
@@ -266,8 +318,13 @@ mod tests {
 
     fn encode_bytes(image: &LinearImage, params: &OutputParams, icc: Option<&[u8]>) -> Vec<u8> {
         let mut buf = Cursor::new(Vec::new());
-        encode_to_writer(&mut buf, image, params, icc).unwrap();
+        let _ = encode_to_writer(&mut buf, image, params, icc).unwrap();
         buf.into_inner()
+    }
+
+    fn encode_report(image: &LinearImage, params: &OutputParams) -> EncodeReport {
+        let mut buf = Cursor::new(Vec::new());
+        encode_to_writer(&mut buf, image, params, None).unwrap()
     }
 
     #[test]
@@ -285,6 +342,52 @@ mod tests {
         // 0→0, 1→65535, 0.5→32768 (round half up), 0.25→16384, 2.0 clamps→65535,
         // -1.0 clamps→0.
         assert_eq!(pixels, vec![0, 65535, 32768, 16384, 65535, 0]);
+    }
+
+    #[test]
+    fn u16_reports_clipping_counts() {
+        // Two samples below 0 and one above 1; the rest in range. The encoder
+        // must count each clamp so the caller can warn (color-management does
+        // not clamp — that job is delegated here).
+        let image = img(2, 1, vec![-0.5, -2.0, 0.5, 0.25, 1.0, 3.0], None);
+        let report = encode_report(&image, &out(OutDepth::U16, BigTiff::Off));
+        assert_eq!(report.total_samples, 6);
+        assert_eq!(report.clipped_low, 2);
+        assert_eq!(report.clipped_high, 1);
+        assert_eq!(report.non_finite, 0);
+        assert_eq!(report.clipped_total(), 3);
+        assert!(report.any_loss());
+        assert_eq!(report.loss_fraction(), 0.5);
+    }
+
+    #[test]
+    fn u16_reports_non_finite_samples() {
+        // A NaN pixel (e.g. from density-domain log/division math) must be
+        // counted, not silently turned black — that is the "fail loudly" rule.
+        // ±inf clamp sanely and count as range clips, not non-finite.
+        let image = img(
+            2,
+            1,
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5, 0.5, 0.5],
+            None,
+        );
+        let report = encode_report(&image, &out(OutDepth::U16, BigTiff::Off));
+        assert_eq!(report.non_finite, 1);
+        assert_eq!(report.clipped_high, 1); // +inf
+        assert_eq!(report.clipped_low, 1); // -inf
+        assert!(report.any_loss());
+    }
+
+    #[test]
+    fn f32_never_clips() {
+        // HDR values > 1.0 are written verbatim, so an f32 encode reports no
+        // loss even with out-of-[0,1] samples and never quantizes.
+        let image = img(2, 1, vec![-0.5, 0.5, 1.0, 1.5, 7.25, 42.0], None);
+        let report = encode_report(&image, &out(OutDepth::F32, BigTiff::Off));
+        assert_eq!(report, EncodeReport::default());
+        assert_eq!(report.total_samples, 0);
+        assert!(!report.any_loss());
+        assert_eq!(report.loss_fraction(), 0.0);
     }
 
     #[test]

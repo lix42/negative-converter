@@ -132,7 +132,7 @@ a task; update your own section as you work. Append entries — don't rewrite th
 
 ## tiff-encode
 **Status:** done
-**Updated:** 2026-06-16
+**Updated:** 2026-06-28
 
 - Goal: write u16/f32 TIFF with embedded ICC, BigTIFF auto-promote, IR export, and
   sidecar JSON.
@@ -167,9 +167,20 @@ a task; update your own section as you work. Append entries — don't rewrite th
     can reuse the path-based fns directly.
   - **u16 quantization:** `v.clamp(0.0, 1.0) * 65535.0` then `f32::round`
     (round-half-away-from-zero). Out-of-range clamps (no silent wrap); `NaN`
-    saturates to 0 via the `as` cast (CLI rejects NaN upstream).
+    forced to 0 via the `as` cast.
   - **f32 path:** samples written directly, **no clamp** — values > 1.0 preserved
     for HDR (round-trips exactly in test).
+  - **Clipping/loss report (added 2026-06-28, post-review):** `encode` now returns
+    `EncodeReport { total_samples, clipped_low, clipped_high, non_finite }`
+    (`types.rs`, `#[must_use]`, `Serialize`). `color-management` deliberately does
+    not clamp and may hand out-of-`[0,1]` or `NaN` samples (density log/division
+    math), so the encoder counts the information lost and surfaces it instead of
+    silently blackening pixels — `any_loss()` / `loss_fraction()` for consumers.
+    f32 encodes never quantize and report all-zero (`total_samples == 0`).
+    `export_ir` discards the report behind a `debug_assert!(!any_loss())` because
+    IR is decode-normalized to `[0,1]` and carried untouched (revisit when IR
+    processing lands). **`pipeline-orchestration` must fold this into the JSON
+    report and honor `--strict`** — the encoder only surfaces, doesn't decide.
   - **BigTIFF `Auto`:** promote when `w*h*channels*bytes + 1 MiB margin` exceeds
     `u32::MAX` (~4 GiB classic 32-bit-offset limit). `resolve_bigtiff` uses
     saturating arithmetic so huge synthetic dims don't overflow the estimate.
@@ -178,10 +189,11 @@ a task; update your own section as you work. Append entries — don't rewrite th
   - **Not yet wired:** `--export-ir` path and the resolved recipe-JSON for the
     sidecar still need a typed home in the CLI param surface (see `cli-framework`
     notes); orchestration calls `export_ir`/`write_sidecar` once those exist.
-- **Verify:** `cargo test` 14/14 (8 new: u16/f32 round-trip incl. >1.0, BigTIFF
+- **Verify:** `cargo test` (10 encode tests: u16/f32 round-trip incl. >1.0, BigTIFF
   policy header magic 42/43, Auto estimate threshold, ICC embed+read, IR
-  single-channel + no-IR error, sidecar path). `fmt --check` clean,
-  `clippy --all-targets -D warnings` clean.
+  single-channel + no-IR error, sidecar path, plus clipping-count and non-finite
+  report assertions). Full suite 63/63 after the post-review additions; `fmt
+  --check` clean, `clippy --all-targets -D warnings` clean.
 
 ## color-management
 **Status:** done
