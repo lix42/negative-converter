@@ -41,16 +41,21 @@ pub fn encode(
     icc: Option<&[u8]>,
     path: &Path,
 ) -> Result<EncodeReport> {
-    let writer = BufWriter::new(create(path)?);
-    encode_to_writer(writer, image, params, icc)
+    // Borrow the BufWriter into the encoder rather than moving it, so we still
+    // own it afterward and can flush explicitly — see `flush_buf`.
+    let mut writer = BufWriter::new(create(path)?);
+    let report = encode_to_writer(&mut writer, image, params, icc)?;
+    flush_buf(&mut writer, path)?;
+    Ok(report)
 }
 
 /// Write the IR plane as a single-channel TIFF at `depth`. Errors loudly when the
 /// image carries no IR plane rather than writing an empty/placeholder file — the
 /// caller asked for IR export, so a missing plane is a real failure.
 pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<()> {
-    let writer = BufWriter::new(create(path)?);
-    export_ir_to_writer(writer, image, depth)
+    let mut writer = BufWriter::new(create(path)?);
+    export_ir_to_writer(&mut writer, image, depth)?;
+    flush_buf(&mut writer, path)
 }
 
 /// Write the effective recipe JSON to the sidecar next to the output. The sidecar
@@ -218,6 +223,18 @@ where
 
 fn create(path: &Path) -> Result<File> {
     File::create(path).map_err(|e| NcError::Write(format!("creating {}: {e}", path.display())))
+}
+
+/// Flush buffered output explicitly, surfacing the error. `BufWriter`'s implicit
+/// flush on drop discards any error (e.g. a full disk on the final block), so a
+/// dropped-without-flush writer would silently truncate the TIFF — exactly the
+/// "fail loudly" violation this stage must avoid. The `tiff` encoder never flushes
+/// and gives no way to reclaim the moved writer, so callers own the BufWriter and
+/// flush it here once encoding returns.
+fn flush_buf<W: Write>(writer: &mut W, path: &Path) -> Result<()> {
+    writer
+        .flush()
+        .map_err(|e| NcError::Write(format!("flushing {}: {e}", path.display())))
 }
 
 fn depth_bytes(depth: OutDepth) -> u64 {
@@ -470,6 +487,24 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         let err = export_ir_to_writer(&mut buf, &image, OutDepth::U16).unwrap_err();
         assert!(matches!(err, NcError::Unsupported(_)));
+    }
+
+    #[test]
+    fn flush_error_is_surfaced_not_swallowed() {
+        // A writer whose flush fails must produce an NcError::Write, not be
+        // silently dropped (the BufWriter-drop-swallows-errors trap).
+        struct FailFlush;
+        impl Write for FailFlush {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("disk full"))
+            }
+        }
+        let mut w = FailFlush;
+        let err = flush_buf(&mut w, Path::new("out.tiff")).unwrap_err();
+        assert!(matches!(err, NcError::Write(msg) if msg.contains("disk full")));
     }
 
     #[test]

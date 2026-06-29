@@ -186,6 +186,13 @@ a task; update your own section as you work. Append entries — don't rewrite th
     saturating arithmetic so huge synthetic dims don't overflow the estimate.
   - `impl From<tiff::TiffError> for NcError` maps encoder errors to
     `NcError::Write` (exit 5).
+  - **Explicit flush (added 2026-06-28, post-review):** the `tiff` encoder never
+    flushes and `TiffEncoder` exposes no way to reclaim the moved writer, so the
+    `&Path` entry points now *borrow* the `BufWriter` into the encoder (`&mut W`
+    is `Write + Seek`) and call `flush_buf` after encoding. `BufWriter`'s implicit
+    drop-flush discards errors (e.g. disk full on the last block) — flushing
+    explicitly surfaces them as `NcError::Write` instead of silently truncating
+    the file.
   - **Not yet wired:** `--export-ir` path and the resolved recipe-JSON for the
     sidecar still need a typed home in the CLI param surface (see `cli-framework`
     notes); orchestration calls `export_ir`/`write_sidecar` once those exist.
