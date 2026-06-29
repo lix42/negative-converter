@@ -19,9 +19,11 @@ use tiff::tags::Tag;
 use crate::types::{BigTiff, EncodeReport, LinearImage, NcError, OutDepth, OutputParams, Result};
 
 /// Slack added to the raw sample-data size when deciding BigTIFF auto-promotion:
-/// IFD entries, strip offset/bytecount tables, and the embedded ICC all live
-/// outside `width*height*channels*bytes`. A conservative margin keeps a file that
-/// sits just under the classic limit from overflowing its 32-bit offsets.
+/// IFD entries and strip offset/bytecount tables live outside
+/// `width*height*channels*bytes`. A conservative margin keeps a file that sits
+/// just under the classic limit from overflowing its 32-bit offsets. (The
+/// embedded ICC is counted explicitly via `extra_bytes`, not folded in here, so a
+/// large custom profile can't slip past the margin.)
 const BIGTIFF_MARGIN_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// Classic (non-Big) TIFF addresses file contents with 32-bit offsets, so the
@@ -53,6 +55,11 @@ pub fn encode(
 /// image carries no IR plane rather than writing an empty/placeholder file — the
 /// caller asked for IR export, so a missing plane is a real failure.
 pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<()> {
+    // Check for the IR plane *before* creating the file: a no-IR error must not
+    // truncate/clobber an existing target the user pointed `--export-ir` at.
+    if image.ir.is_none() {
+        return Err(no_ir_error());
+    }
     let mut writer = BufWriter::new(create(path)?);
     export_ir_to_writer(&mut writer, image, depth)?;
     flush_buf(&mut writer, path)
@@ -81,7 +88,8 @@ fn encode_to_writer<W: Write + Seek>(
 ) -> Result<EncodeReport> {
     let (w, h) = (image.width, image.height);
     let bytes_per_sample = depth_bytes(params.out_depth);
-    let big = resolve_bigtiff(params.bigtiff, w, h, 3, bytes_per_sample);
+    let icc_bytes = icc.map_or(0, |b| b.len() as u64);
+    let big = resolve_bigtiff(params.bigtiff, w, h, 3, bytes_per_sample, icc_bytes);
 
     // f32 is written verbatim (HDR-preserving, no clamp) so it never clips;
     // only the u16 path quantizes and can clamp out-of-range samples.
@@ -136,11 +144,9 @@ fn export_ir_to_writer<W: Write + Seek>(
     image: &LinearImage,
     depth: OutDepth,
 ) -> Result<()> {
-    let ir = image.ir.as_deref().ok_or_else(|| {
-        NcError::Unsupported("cannot export IR: image has no IR plane (HDRi input only)".into())
-    })?;
+    let ir = image.ir.as_deref().ok_or_else(no_ir_error)?;
     let (w, h) = (image.width, image.height);
-    let big = resolve_bigtiff(BigTiff::Auto, w, h, 1, depth_bytes(depth));
+    let big = resolve_bigtiff(BigTiff::Auto, w, h, 1, depth_bytes(depth), 0);
 
     match (depth, big) {
         (OutDepth::U16, false) => {
@@ -225,6 +231,10 @@ fn create(path: &Path) -> Result<File> {
     File::create(path).map_err(|e| NcError::Write(format!("creating {}: {e}", path.display())))
 }
 
+fn no_ir_error() -> NcError {
+    NcError::Unsupported("cannot export IR: image has no IR plane (HDRi input only)".into())
+}
+
 /// Flush buffered output explicitly, surfacing the error. `BufWriter`'s implicit
 /// flush on drop discards any error (e.g. a full disk on the final block), so a
 /// dropped-without-flush writer would silently truncate the TIFF — exactly the
@@ -245,9 +255,17 @@ fn depth_bytes(depth: OutDepth) -> u64 {
 }
 
 /// Decide whether to emit BigTIFF. `On`/`Off` force the choice; `Auto` estimates
-/// the file size (`width*height*channels*bytes` plus a margin for tags/strips/ICC)
-/// and promotes once it would exceed the classic 32-bit-offset limit.
-fn resolve_bigtiff(policy: BigTiff, width: u32, height: u32, channels: u64, bytes: u64) -> bool {
+/// the file size (`width*height*channels*bytes`, plus `extra_bytes` for the
+/// embedded ICC, plus a margin for tags/strips) and promotes once it would exceed
+/// the classic 32-bit-offset limit.
+fn resolve_bigtiff(
+    policy: BigTiff,
+    width: u32,
+    height: u32,
+    channels: u64,
+    bytes: u64,
+    extra_bytes: u64,
+) -> bool {
     match policy {
         BigTiff::On => true,
         BigTiff::Off => false,
@@ -256,7 +274,10 @@ fn resolve_bigtiff(policy: BigTiff, width: u32, height: u32, channels: u64, byte
                 .saturating_mul(height as u64)
                 .saturating_mul(channels)
                 .saturating_mul(bytes);
-            sample_bytes.saturating_add(BIGTIFF_MARGIN_BYTES) > CLASSIC_TIFF_LIMIT
+            sample_bytes
+                .saturating_add(extra_bytes)
+                .saturating_add(BIGTIFF_MARGIN_BYTES)
+                > CLASSIC_TIFF_LIMIT
         }
     }
 }
@@ -448,12 +469,24 @@ mod tests {
         // Estimate-only (no allocation): a synthetic large image must trip Auto.
         // ~1.5 GiB at f32×3ch exceeds 4 GiB? No — pick dims whose sample bytes
         // exceed u32::MAX: 40000 * 40000 * 3 * 4 ≈ 19.2 GB.
-        assert!(resolve_bigtiff(BigTiff::Auto, 40_000, 40_000, 3, 4));
+        assert!(resolve_bigtiff(BigTiff::Auto, 40_000, 40_000, 3, 4, 0));
         // Just under the limit stays classic.
-        assert!(!resolve_bigtiff(BigTiff::Auto, 1000, 1000, 3, 2));
+        assert!(!resolve_bigtiff(BigTiff::Auto, 1000, 1000, 3, 2, 0));
         // On/Off ignore size.
-        assert!(resolve_bigtiff(BigTiff::On, 1, 1, 1, 1));
-        assert!(!resolve_bigtiff(BigTiff::Off, 40_000, 40_000, 3, 4));
+        assert!(resolve_bigtiff(BigTiff::On, 1, 1, 1, 1, 0));
+        assert!(!resolve_bigtiff(BigTiff::Off, 40_000, 40_000, 3, 4, 0));
+    }
+
+    #[test]
+    fn auto_counts_icc_bytes_in_sizing() {
+        // Sample data sits just under the classic limit; a large ICC pushes the
+        // total over, so Auto must promote (ignoring the ICC would wrongly stay
+        // classic and fail at encode time).
+        let bytes = CLASSIC_TIFF_LIMIT - (8 << 20); // 8 MiB of headroom
+        let (w, h) = (bytes / 3 / 2, 1); // u16 RGB sample bytes ≈ `bytes`
+        assert!(!resolve_bigtiff(BigTiff::Auto, w as u32, h, 3, 2, 0));
+        // A 16 MiB ICC blob exceeds the headroom + margin → promote.
+        assert!(resolve_bigtiff(BigTiff::Auto, w as u32, h, 3, 2, 16 << 20));
     }
 
     #[test]
@@ -487,6 +520,19 @@ mod tests {
         let mut buf = Cursor::new(Vec::new());
         let err = export_ir_to_writer(&mut buf, &image, OutDepth::U16).unwrap_err();
         assert!(matches!(err, NcError::Unsupported(_)));
+    }
+
+    #[test]
+    fn export_ir_without_plane_does_not_create_file() {
+        // The no-IR error must fire before the file is created, so an existing
+        // target the user pointed --export-ir at is never clobbered.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nc_no_ir_test_{}.tiff", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let image = img(2, 1, vec![0.0; 6], None);
+        let err = export_ir(&image, OutDepth::U16, &path).unwrap_err();
+        assert!(matches!(err, NcError::Unsupported(_)));
+        assert!(!path.exists(), "no-IR export must not create the file");
     }
 
     #[test]

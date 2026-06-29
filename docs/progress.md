@@ -144,7 +144,9 @@ a task; update your own section as you work. Append entries — don't rewrite th
   - `export_ir(image, depth: OutDepth, &Path)` — added a `depth` param (the task's
     bare `export_ir(path, img)` gave no way to pick the IR file's bit depth; user
     confirmed taking the param). Errors `NcError::Unsupported` when `image.ir` is
-    `None` — fail loudly rather than write a placeholder.
+    `None` — fail loudly rather than write a placeholder. The check runs *before*
+    `File::create` (post-review) so a no-IR failure never truncates an existing
+    target the user pointed `--export-ir` at.
   - `write_sidecar(output_path, recipe_json)` — writes `<output>.json` (e.g.
     `out.tiff` → `out.tiff.json`), matching design-spec wording. IO errors →
     `NcError::Write`.
@@ -181,9 +183,11 @@ a task; update your own section as you work. Append entries — don't rewrite th
     IR is decode-normalized to `[0,1]` and carried untouched (revisit when IR
     processing lands). **`pipeline-orchestration` must fold this into the JSON
     report and honor `--strict`** — the encoder only surfaces, doesn't decide.
-  - **BigTIFF `Auto`:** promote when `w*h*channels*bytes + 1 MiB margin` exceeds
-    `u32::MAX` (~4 GiB classic 32-bit-offset limit). `resolve_bigtiff` uses
-    saturating arithmetic so huge synthetic dims don't overflow the estimate.
+  - **BigTIFF `Auto`:** promote when `w*h*channels*bytes + ICC bytes + 1 MiB
+    margin` exceeds `u32::MAX` (~4 GiB classic 32-bit-offset limit). The embedded
+    ICC is counted explicitly (post-review) so a large custom profile near the
+    limit can't slip past the fixed margin. `resolve_bigtiff` uses saturating
+    arithmetic so huge synthetic dims don't overflow the estimate.
   - `impl From<tiff::TiffError> for NcError` maps encoder errors to
     `NcError::Write` (exit 5).
   - **Explicit flush (added 2026-06-28, post-review):** the `tiff` encoder never
