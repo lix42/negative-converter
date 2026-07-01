@@ -101,6 +101,12 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
     infallible — Little CMS reports runtime transform failures only via the
     process-global `cmsSetLogErrorHandler`, so `main`/`cli` must install one
     (lcms2 `ThreadContext::set_error_logging_function`) at startup.
+  - *Clamping boundary:* range-clamp to the output gamut **only** at the u16
+    encode step; color/algo stages pass values through unclamped (f32 output is
+    HDR/scene-referred). `io::encode` counts every clamped and non-finite (`NaN`)
+    sample into `EncodeReport` (`types.rs`) so the loss rides back to the
+    orchestrator as a report warning (`--strict` promotes it) — never clamp
+    silently anywhere.
 - **Verify against real sample files.** There is no public spec for the SilverFast
   HDRi on-disk layout; the decoder must be validated against the user's actual
   scans and degrade gracefully on unrecognized layouts.

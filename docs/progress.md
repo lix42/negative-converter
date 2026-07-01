@@ -131,11 +131,83 @@ a task; update your own section as you work. Append entries — don't rewrite th
     test. 12 decode tests, all green.
 
 ## tiff-encode
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-28
 
 - Goal: write u16/f32 TIFF with embedded ICC, BigTIFF auto-promote, IR export, and
   sidecar JSON.
+- **Done.** `io/encode.rs` implements three public fns:
+  - `encode(image, &OutputParams, Option<&[u8]> icc, &Path)` — kept the
+    foundation stub signature instead of the task's `EncodeOptions`/`encode_tiff`
+    sketch: `OutputParams` already carries `out_depth` + `bigtiff`, and `color`
+    passes the ICC blob separately, so a second options struct would be redundant.
+  - `export_ir(image, depth: OutDepth, &Path)` — added a `depth` param (the task's
+    bare `export_ir(path, img)` gave no way to pick the IR file's bit depth; user
+    confirmed taking the param). Errors `NcError::Unsupported` when `image.ir` is
+    `None` — fail loudly rather than write a placeholder. The check runs *before*
+    `File::create` (post-review) so a no-IR failure never truncates an existing
+    target the user pointed `--export-ir` at.
+  - `write_sidecar(output_path, recipe_json)` — writes `<output>.json` (e.g.
+    `out.tiff` → `out.tiff.json`), matching design-spec wording. IO errors →
+    `NcError::Write`.
+- **`tiff` 0.11.3 capability check (verified via current docs, no gaps):**
+  - f32 is native — `colortype::{RGB32Float, Gray32Float}` (SampleFormat::Float,
+    32 bpp); u16 via `{RGB16, Gray16}`. No manual sample-format writing needed.
+  - BigTIFF is a *constructor* choice: `TiffEncoder::new` (classic) vs `new_big`,
+    which return **different `TiffKind` types** — so the policy can't be a runtime
+    `bool` variable. Solved with a single generic `encode_planar<W, K: TiffKind,
+    C: ColorType>` helper, dispatched by a `match (depth, big)` that picks the
+    concrete `new`/`new_big` + colortype monomorphization. One body covers all
+    u16/f32 × classic/big × RGB/Gray combos.
+  - ICC: the crate has a first-class `Tag::IccProfile` (= 34675); written as a
+    BYTE array via `image.encoder().write_tag(...)` before `write_data`. Read back
+    in tests with `Decoder::get_tag_u8_vec(Tag::IccProfile)`.
+- **Decisions / notes for dependent tasks:**
+  - **Testable seam:** the `&Path` entry points wrap thin `*_to_writer<W: Write +
+    Seek>` cores; tests encode into a `Cursor<Vec<u8>>` and decode the bytes back
+    with `tiff::decoder` — no temp files, deterministic. `pipeline-orchestration`
+    can reuse the path-based fns directly.
+  - **u16 quantization:** `v.clamp(0.0, 1.0) * 65535.0` then `f32::round`
+    (round-half-away-from-zero). Out-of-range clamps (no silent wrap); `NaN`
+    forced to 0 via the `as` cast.
+  - **f32 path:** samples written directly, **no clamp** — values > 1.0 preserved
+    for HDR (round-trips exactly in test).
+  - **Clipping/loss report (added 2026-06-28, post-review):** `encode` now returns
+    `EncodeReport { total_samples, clipped_low, clipped_high, non_finite }`
+    (`types.rs`, `#[must_use]`, `Serialize`). `color-management` deliberately does
+    not clamp and may hand out-of-`[0,1]` or non-finite (`NaN`/`inf`) samples
+    (density log/division math), so the encoder counts the trouble and surfaces it
+    instead of silently blackening pixels — `any_loss()` / `loss_fraction()` for
+    consumers. Model: `clipped_*` = finite out-of-`[0,1]` values clamped by the
+    u16 path; `non_finite` = any `NaN`/`inf`, counted at **both** depths (u16
+    forces to 0; f32 writes verbatim but is scanned via `scan_non_finite`), so a
+    numerical fault surfaces regardless of output depth. `export_ir` discards the
+    report behind a `debug_assert!(!any_loss())` because IR is decode-normalized to
+    `[0,1]` and carried untouched (revisit when IR processing lands).
+    **`pipeline-orchestration` must fold this into the JSON report and honor
+    `--strict`** — the encoder only surfaces, doesn't decide.
+  - **BigTIFF `Auto`:** promote when `w*h*channels*bytes + ICC bytes + 1 MiB
+    margin` exceeds `u32::MAX` (~4 GiB classic 32-bit-offset limit). The embedded
+    ICC is counted explicitly (post-review) so a large custom profile near the
+    limit can't slip past the fixed margin. `resolve_bigtiff` uses saturating
+    arithmetic so huge synthetic dims don't overflow the estimate.
+  - `impl From<tiff::TiffError> for NcError` maps encoder errors to
+    `NcError::Write` (exit 5).
+  - **Explicit flush (added 2026-06-28, post-review):** the `tiff` encoder never
+    flushes and `TiffEncoder` exposes no way to reclaim the moved writer, so the
+    `&Path` entry points now *borrow* the `BufWriter` into the encoder (`&mut W`
+    is `Write + Seek`) and call `flush_buf` after encoding. `BufWriter`'s implicit
+    drop-flush discards errors (e.g. disk full on the last block) — flushing
+    explicitly surfaces them as `NcError::Write` instead of silently truncating
+    the file.
+  - **Not yet wired:** `--export-ir` path and the resolved recipe-JSON for the
+    sidecar still need a typed home in the CLI param surface (see `cli-framework`
+    notes); orchestration calls `export_ir`/`write_sidecar` once those exist.
+- **Verify:** `cargo test` (10 encode tests: u16/f32 round-trip incl. >1.0, BigTIFF
+  policy header magic 42/43, Auto estimate threshold, ICC embed+read, IR
+  single-channel + no-IR error, sidecar path, plus clipping-count and non-finite
+  report assertions). Full suite 63/63 after the post-review additions; `fmt
+  --check` clean, `clippy --all-targets -D warnings` clean.
 
 ## color-management
 **Status:** done
