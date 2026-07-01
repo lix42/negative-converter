@@ -87,7 +87,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [SilverFast HDR/HDRi decode](tasks/silverfast-decode.md)
 - [x] [TIFF encode and output](tasks/tiff-encode.md)
 - [x] [Color management](tasks/color-management.md)
-- [ ] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
+- [x] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
 - [x] [Algorithm interface](tasks/algo-interface.md)
 - [x] [CLI framework](tasks/cli-framework.md)
 

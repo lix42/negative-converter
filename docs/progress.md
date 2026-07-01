@@ -278,17 +278,56 @@ a task; update your own section as you work. Append entries — don't rewrite th
   orchestration wires it.
 
 ## film-base-estimation
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-30
 
 - Goal: estimate `Dmin` `FilmBase` from border/region with full CLI override.
-- Note (from project-foundation review): `FilmBaseParams` keeps three flat fields
-  (`film_base`, `base_region`, `auto_base`) which can express contradictory combos.
-  **Enforce and unit-test the precedence** here: explicit `film_base` overrides
-  `base_region` overrides `auto_base`. Use `FilmBase::from([f32;3])` for the
-  `film_base` override (conversion lives in `types.rs`). If the flat shape proves
-  awkward, consider collapsing to an enum `FilmBaseSource { Auto, Region(..),
-  Explicit(..) }` — deferred from foundation, decide here.
+- **Done.** `pipeline/film_base.rs` implements `estimate(&LinearImage,
+  &FilmBaseParams) -> Result<FilmBase>` as a thin `match` over the selected
+  `FilmBaseSource`, delegating to pure helpers (`sample_region`, `auto_estimate`,
+  `percentile`).
+- **Rebased onto the merged `cli-framework` model (was originally built on the
+  flat `FilmBaseParams`).** The foundation-review question "flat fields vs enum"
+  was answered by `cli-framework`, not here: `FilmBaseParams` is now `{ source:
+  FilmBaseSource }` where `FilmBaseSource = Auto | Region([u32;4]) |
+  Explicit([f32;3])`. Precedence (`explicit > region > auto`) is therefore
+  **structural** and resolved in `cli.rs`'s flag→recipe merge — `estimate` just
+  honors whichever variant it's handed. I dropped my earlier `FilmBaseEstimate`
+  return type and its separate report-enum (name-collided with the input
+  `FilmBaseSource` and the merged stub is `-> Result<FilmBase>`); reporting *how*
+  the base was chosen is derivable by the orchestrator from `params.source`.
+- **Decisions (unchanged by the rebase):**
+  - **Estimation statistic:** per-channel **97th percentile** (nearest-rank,
+    `SAMPLE_PERCENTILE`) over the sampled pixels — resists hot pixels/dust while
+    landing on the bright base (task suggested 95th–99th). `percentile` sorts NaNs
+    to the end so they can't poison the rank.
+  - **Region sampling** validates the rect against image bounds with u64 math
+    (no u32 wrap near the edge); out-of-bounds or empty region → `NcError::Usage`
+    (exit 2). `cli.rs` already rejects a zero-area `Region` at the boundary, but
+    the bounds/empty check stays here as defense-in-depth (the CLI can't see the
+    image dimensions, so OOB can only be caught in the stage).
+  - **Auto border detection (Step-1 heuristic):** sample the outer margin band
+    (`AUTO_MARGIN_FRAC = 4%` of the shorter side on all four edges), take the p97
+    per channel as the candidate base, and accept only if (a) the band is
+    near-uniform — per-channel relative spread `(p97−p10)/p97 ≤ 0.15` — and (b) the
+    base is brighter than the interior **median** (median, not p97, so a sampled
+    interior that clips a wide rebate doesn't defeat the check). On low confidence
+    it returns a clear, actionable `NcError::Other` telling the user to pass
+    `--film-base`/`--base-region` (per user decision: **hard error, no silent
+    fallback** to whole-image sampling).
+- **Notes for dependent tasks:**
+  - `pipeline-orchestration` / `nc estimate`: `estimate` returns just the resolved
+    `FilmBase`. For the JSON report, take the *source* label from `cfg.film_base
+    .source` (you already hold it) rather than expecting it back from `estimate`.
+    If a report ever needs the auto path's *detected* region, `estimate` will have
+    to be extended to return it — today it doesn't (the auto sample is a spread
+    edge band, not a single reusable `--base-region` rect).
+- **Verify:** 7 unit tests in `film_base.rs` (explicit verbatim, region samples the
+  rect, auto detects a bright uniform border, p97 rejects hot pixels, OOB/empty
+  region → Usage error, auto fails loudly on no-border and on a non-uniform
+  gradient). Full suite **73/73**, `clippy --all-targets -D warnings` clean, `fmt`
+  clean — verified after the rebase onto the merged decode/encode/color/algo/cli
+  work.
 
 ## algo-interface
 **Status:** done
