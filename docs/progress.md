@@ -129,6 +129,22 @@ a task; update your own section as you work. Append entries — don't rewrite th
     page would be silently kept as an inverted IR plane. Now require
     `PhotometricInterpretation=1` (BlackIsZero, the verified layout) on IFD1, with a
     test. 12 decode tests, all green.
+- **High-res preview IFD (2026-06-30, during film-base real-scan verification):**
+  the full-resolution Nikon HDRi scans (5184×3600, 159 MB) have **three** IFDs —
+  IFD0 RGB, **IFD1 a reduced-resolution RGB preview** (`NewSubfileType` bit 0,
+  1470×1021), IFD2 the full-res IR plane (`NewSubfileType=4`). The old code assumed
+  the *second* IFD was the IR plane and rejected these files as a mismatched-
+  dimension IR (`Unsupported`). Fix: scan **all** remaining IFDs, **skip** any
+  reduced-resolution preview (bit 0) without reading its strips, and validate the
+  first non-preview page as the IR plane with the same strict checks as before
+  (dims match, `Gray(16)`, `PhotometricInterpretation=1`, `NewSubfileType=4` else
+  warn). All prior strict-rejection tests keep their semantics (a full-res non-gray
+  / mismatched / WhiteIsZero page still errors); added
+  `skips_reduced_resolution_preview_before_ir` mirroring the real 3-IFD layout.
+  Verified: both `20260630-nikon-84{2,4}.tif` now decode as `Hdri 5184x3600
+  ir=true` with **no warnings**. **13 decode tests, all green.** (Landed on the
+  `film-base-estimation` branch since it blocked real-scan verification; logically
+  a `silverfast-decode` follow-up.)
 
 ## tiff-encode
 **Status:** done
@@ -328,6 +344,44 @@ a task; update your own section as you work. Append entries — don't rewrite th
   gradient). Full suite **73/73**, `clippy --all-targets -D warnings` clean, `fmt`
   clean — verified after the rebase onto the merged decode/encode/color/algo/cli
   work.
+- **Real-scan verification (throwaway `#[ignore]` probes, decoded via `io::decode`;
+  probes not committed):**
+  - Decoding works on every real scan tried: `../nc-assets/{48,64}bit-full/*`
+    (3456×2396) and the full-res `~/Pictures/scan/20260630-nikon-84{2,4}.tif`
+    (5184×3600 HDRi, after the decode preview-IFD fix above). Region/explicit
+    `estimate` paths return sensible per-channel values on all of them.
+  - **Real scans have a `holder → thin rebate → picture` structure, NOT a bright
+    outer margin.** Marching a 1px strip inward from each edge: the outermost band
+    is the near-black film **holder** (~0.01), then a **thin, bright, uniform
+    orange film-base rebate** sits *behind* it, then the picture. The rebate only
+    appears on some edges and can be a few px wide. Measured rebate is consistent
+    per film stock (e.g. `48bit-full/1` bottom and `/2` left both ≈`[0.53, 0.26,
+    0.16]`), confirming Dmin is a stock/develop/scanner property, not per-frame.
+  - **The current outer-4%-margin auto heuristic can't isolate that rebate** — it
+    averages holder+rebate+picture into one high-spread blob and **fails loudly**
+    (correct fail-safe, exercised on real data), but the auto *happy path* does not
+    work on real scans. A proper fix (scan strips inward, pick the brightest
+    low-spread band past the holder) is **deferred** — see decision below.
+  - **Decision (with user): focus on the explicit-reference workflow, not auto.**
+    Because Dmin is constant across a roll scanned with fixed settings, the
+    accurate path is: scan one **unexposed reference** frame once, measure its base
+    with `--base-region`, and reuse it as `--film-base` across the batch (design's
+    reusable-recipe idea). Verified end-to-end: the unexposed reference
+    `20260630-nikon-844.tif` (same film/develop/scanner as the `842` scan) yields a
+    large uniform base of **`[0.553, 0.271, 0.159]`** from a center region; `842`'s
+    own left-edge rebate reads `[0.475, 0.236, 0.136]` and its picture center
+    `[0.387, 0.189, 0.090]` (darker, as expected). Note the reference-vs-edge-rebate
+    gap (~14%): the large clean unexposed area is the more reliable anchor than a
+    narrow edge strip (edge falloff/fog) — another reason to prefer a dedicated
+    reference frame.
+- **Follow-up tasks noted (not in this branch):**
+  - **Auto redesign:** inward-strip "brightest uniform band past the holder"
+    detector so `--auto-base` works on real `holder→rebate→picture` scans. Deferred
+    per the Step-1 "don't over-engineer auto" guidance now that the explicit path
+    covers real work.
+  - **White holder support:** some film holders are white, not black — auto/border
+    logic assumes a dark surround. Add a CLI flag (e.g. `--holder white|black`) to
+    tell the detector which. Follow-up.
 
 ## algo-interface
 **Status:** done
