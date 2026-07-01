@@ -312,45 +312,48 @@ impl Default for SimpleParams {
 }
 
 /// What the encode stage observed while writing — fed into the JSON report by
-/// the orchestrator. Records information lost during u16 quantization: when u16
-/// output is requested, `pipeline::color::to_output` may legitimately hand back
-/// values outside `[0, 1]` (it does not clamp), and the density-domain algorithm
-/// can produce non-finite (`NaN`) samples from log/division math — the encoder
-/// clamps the former and forces the latter to 0, counting both here so a quietly
-/// wrong image surfaces as a warning instead. This rides back on the value path
-/// rather than down `Result` because it is a quality warning, not a write failure
-/// (`--strict` can promote it to an error). f32 output is written verbatim and
-/// never quantized, so an f32 encode reports all-zero counts (`total_samples` 0).
+/// the orchestrator. Records two kinds of trouble the output samples can carry,
+/// since `pipeline::color::to_output` does not clamp and the density-domain
+/// algorithm can produce non-finite values from log/division math:
+///
+/// - **clipping** (`clipped_low`/`clipped_high`): finite samples outside `[0, 1]`
+///   clamped into range. Only the u16 path clamps, so these are u16-only.
+/// - **non-finite** (`non_finite`): `NaN`/`±inf` samples — a pipeline numerical
+///   fault. Counted for *both* depths (u16 forces them to 0; f32 writes them
+///   verbatim), so the fault surfaces regardless of output depth.
+///
+/// This rides back on the value path rather than down `Result` because it is a
+/// quality warning, not a write failure (`--strict` can promote it to an error).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[must_use]
 pub struct EncodeReport {
-    /// Samples examined during u16 quantization (0 for f32 output). The
-    /// denominator that makes the clip counts interpretable as a fraction.
+    /// Samples examined (`width * height * channels`). The denominator that makes
+    /// the clip / non-finite counts interpretable as a fraction.
     pub total_samples: u64,
-    /// Samples below 0.0 that were clamped up to 0.
+    /// Finite samples below 0.0 clamped up to 0 (u16 output only).
     pub clipped_low: u64,
-    /// Samples above 1.0 that were clamped down to 65535.
+    /// Finite samples above 1.0 clamped down to 65535 (u16 output only).
     pub clipped_high: u64,
-    /// Non-finite (`NaN`) samples, forced to 0. Counted separately because they
-    /// signal a pipeline numerical fault, not mere out-of-gamut clipping.
+    /// Non-finite (`NaN`/`±inf`) samples. Counted separately because they signal
+    /// a numerical fault rather than mere out-of-gamut clipping.
     pub non_finite: u64,
 }
 
 impl EncodeReport {
-    /// Total samples clamped at a range end (excludes non-finite).
+    /// Total finite samples clamped at a range end (excludes non-finite).
     pub fn clipped_total(&self) -> u64 {
         self.clipped_low + self.clipped_high
     }
 
-    /// Whether any sample lost information — clamped at a range end or forced to
-    /// 0 because it was non-finite. The condition a normal run surfaces as a
-    /// warning and `--strict` promotes to an error.
+    /// Whether any sample is problematic — clamped at a range end or non-finite.
+    /// The condition a normal run surfaces as a warning and `--strict` promotes
+    /// to an error.
     pub fn any_loss(&self) -> bool {
         self.clipped_total() > 0 || self.non_finite > 0
     }
 
-    /// Fraction of examined samples that lost information, in `[0, 1]`. Returns
-    /// 0.0 when nothing was quantized (f32 output).
+    /// Fraction of examined samples that were clipped or non-finite, in `[0, 1]`.
+    /// Returns 0.0 when no samples were examined.
     pub fn loss_fraction(&self) -> f64 {
         if self.total_samples == 0 {
             0.0

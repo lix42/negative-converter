@@ -175,14 +175,17 @@ a task; update your own section as you work. Append entries — don't rewrite th
   - **Clipping/loss report (added 2026-06-28, post-review):** `encode` now returns
     `EncodeReport { total_samples, clipped_low, clipped_high, non_finite }`
     (`types.rs`, `#[must_use]`, `Serialize`). `color-management` deliberately does
-    not clamp and may hand out-of-`[0,1]` or `NaN` samples (density log/division
-    math), so the encoder counts the information lost and surfaces it instead of
-    silently blackening pixels — `any_loss()` / `loss_fraction()` for consumers.
-    f32 encodes never quantize and report all-zero (`total_samples == 0`).
-    `export_ir` discards the report behind a `debug_assert!(!any_loss())` because
-    IR is decode-normalized to `[0,1]` and carried untouched (revisit when IR
-    processing lands). **`pipeline-orchestration` must fold this into the JSON
-    report and honor `--strict`** — the encoder only surfaces, doesn't decide.
+    not clamp and may hand out-of-`[0,1]` or non-finite (`NaN`/`inf`) samples
+    (density log/division math), so the encoder counts the trouble and surfaces it
+    instead of silently blackening pixels — `any_loss()` / `loss_fraction()` for
+    consumers. Model: `clipped_*` = finite out-of-`[0,1]` values clamped by the
+    u16 path; `non_finite` = any `NaN`/`inf`, counted at **both** depths (u16
+    forces to 0; f32 writes verbatim but is scanned via `scan_non_finite`), so a
+    numerical fault surfaces regardless of output depth. `export_ir` discards the
+    report behind a `debug_assert!(!any_loss())` because IR is decode-normalized to
+    `[0,1]` and carried untouched (revisit when IR processing lands).
+    **`pipeline-orchestration` must fold this into the JSON report and honor
+    `--strict`** — the encoder only surfaces, doesn't decide.
   - **BigTIFF `Auto`:** promote when `w*h*channels*bytes + ICC bytes + 1 MiB
     margin` exceeds `u32::MAX` (~4 GiB classic 32-bit-offset limit). The embedded
     ICC is counted explicitly (post-review) so a large custom profile near the

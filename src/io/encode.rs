@@ -91,8 +91,9 @@ fn encode_to_writer<W: Write + Seek>(
     let icc_bytes = icc.map_or(0, |b| b.len() as u64);
     let big = resolve_bigtiff(params.bigtiff, w, h, 3, bytes_per_sample, icc_bytes);
 
-    // f32 is written verbatim (HDR-preserving, no clamp) so it never clips;
-    // only the u16 path quantizes and can clamp out-of-range samples.
+    // Only the u16 path quantizes and can clamp out-of-range samples. f32 is
+    // written verbatim (HDR-preserving, no clamp), but we still scan it for
+    // non-finite samples so a NaN/inf numerical fault surfaces at either depth.
     match (params.out_depth, big) {
         (OutDepth::U16, false) => {
             let (data, report) = quantize_u16(&image.rgb);
@@ -117,6 +118,7 @@ fn encode_to_writer<W: Write + Seek>(
             Ok(report)
         }
         (OutDepth::F32, false) => {
+            let report = scan_non_finite(&image.rgb);
             encode_planar::<_, TiffKindStandard, RGB32Float>(
                 TiffEncoder::new(writer)?,
                 w,
@@ -124,9 +126,10 @@ fn encode_to_writer<W: Write + Seek>(
                 &image.rgb,
                 icc,
             )?;
-            Ok(EncodeReport::default())
+            Ok(report)
         }
         (OutDepth::F32, true) => {
+            let report = scan_non_finite(&image.rgb);
             encode_planar::<_, TiffKindBig, RGB32Float>(
                 TiffEncoder::new_big(writer)?,
                 w,
@@ -134,7 +137,7 @@ fn encode_to_writer<W: Write + Seek>(
                 &image.rgb,
                 icc,
             )?;
-            Ok(EncodeReport::default())
+            Ok(report)
         }
     }
 }
@@ -283,18 +286,18 @@ fn resolve_bigtiff(
 }
 
 /// Quantize linear `f32` samples in `[0, 1]` to `u16` `[0, 65535]`, returning the
-/// quantized data alongside an [`EncodeReport`] counting the information lost.
-/// Out-of-range values are clamped rather than wrapped (a quietly wrapped pixel
-/// would violate "fail loudly") *and* counted, so the caller can surface the loss
-/// as a report warning. Rounding is round-half-away-from-zero via `f32::round` —
-/// chosen for determinism and simplicity.
+/// quantized data alongside an [`EncodeReport`] counting the samples that lost
+/// information. Out-of-range values are clamped rather than wrapped (a quietly
+/// wrapped pixel would violate "fail loudly") *and* counted, so the caller can
+/// surface the loss as a report warning. Rounding is round-half-away-from-zero via
+/// `f32::round` — chosen for determinism and simplicity.
 ///
-/// `NaN` needs its own branch: it is neither `< 0.0` nor `> 1.0`, so the range
-/// comparisons miss it, yet `NaN as u16` saturates to 0 — a pixel silently turned
-/// black. Pixel `NaN` is a live possibility (the density algorithm's log/division
-/// math), distinct from param `NaN` the CLI rejects upstream, so it is counted as
-/// `non_finite` to keep the fault visible. (`±inf` is handled by the range
-/// branches: `-inf < 0.0` and `+inf > 1.0`, and both clamp sanely.)
+/// Non-finite samples get their own branch: `NaN` is neither `< 0.0` nor `> 1.0`
+/// so the range comparisons miss it, yet `NaN as u16` saturates to 0 — a pixel
+/// silently turned black. `±inf` would clamp sanely but is a numerical fault, not
+/// an in-gamut value. Both are a live possibility (the density algorithm's
+/// log/division math), so any non-finite sample is counted as `non_finite` (kept
+/// out of the `clipped_*` finite-clamp tallies) to keep the fault visible.
 fn quantize_u16(samples: &[f32]) -> (Vec<u16>, EncodeReport) {
     let mut report = EncodeReport {
         total_samples: samples.len() as u64,
@@ -303,7 +306,7 @@ fn quantize_u16(samples: &[f32]) -> (Vec<u16>, EncodeReport) {
     let data = samples
         .iter()
         .map(|&v| {
-            if v.is_nan() {
+            if !v.is_finite() {
                 report.non_finite += 1;
             } else if v < 0.0 {
                 report.clipped_low += 1;
@@ -314,6 +317,18 @@ fn quantize_u16(samples: &[f32]) -> (Vec<u16>, EncodeReport) {
         })
         .collect();
     (data, report)
+}
+
+/// Scan verbatim-written f32 samples for non-finite values. f32 output is not
+/// clamped (HDR is preserved), so there is no `clipped_*` accounting — but a
+/// `NaN`/`inf` still signals a pipeline numerical fault that must surface, so it
+/// is counted here just as the u16 path counts it.
+fn scan_non_finite(samples: &[f32]) -> EncodeReport {
+    EncodeReport {
+        total_samples: samples.len() as u64,
+        non_finite: samples.iter().filter(|v| !v.is_finite()).count() as u64,
+        ..EncodeReport::default()
+    }
 }
 
 // `tiff`'s encoder errors surface as `NcError::Write` — a TIFF that won't start is
@@ -400,9 +415,9 @@ mod tests {
 
     #[test]
     fn u16_reports_non_finite_samples() {
-        // A NaN pixel (e.g. from density-domain log/division math) must be
+        // Non-finite pixels (e.g. from density-domain log/division math) must be
         // counted, not silently turned black — that is the "fail loudly" rule.
-        // ±inf clamp sanely and count as range clips, not non-finite.
+        // NaN and ±inf all count as non_finite, kept out of the finite clip tally.
         let image = img(
             2,
             1,
@@ -410,22 +425,34 @@ mod tests {
             None,
         );
         let report = encode_report(&image, &out(OutDepth::U16, BigTiff::Off));
-        assert_eq!(report.non_finite, 1);
-        assert_eq!(report.clipped_high, 1); // +inf
-        assert_eq!(report.clipped_low, 1); // -inf
+        assert_eq!(report.non_finite, 3); // NaN, +inf, -inf
+        assert_eq!(report.clipped_high, 0);
+        assert_eq!(report.clipped_low, 0);
         assert!(report.any_loss());
     }
 
     #[test]
-    fn f32_never_clips() {
-        // HDR values > 1.0 are written verbatim, so an f32 encode reports no
-        // loss even with out-of-[0,1] samples and never quantizes.
-        let image = img(2, 1, vec![-0.5, 0.5, 1.0, 1.5, 7.25, 42.0], None);
-        let report = encode_report(&image, &out(OutDepth::F32, BigTiff::Off));
-        assert_eq!(report, EncodeReport::default());
-        assert_eq!(report.total_samples, 0);
+    fn f32_writes_verbatim_but_counts_non_finite() {
+        // HDR values > 1.0 are written verbatim with no clip, so finite
+        // out-of-[0,1] samples produce no loss...
+        let clean = img(2, 1, vec![-0.5, 0.5, 1.0, 1.5, 7.25, 42.0], None);
+        let report = encode_report(&clean, &out(OutDepth::F32, BigTiff::Off));
+        assert_eq!(report.total_samples, 6);
+        assert_eq!(report.clipped_total(), 0);
+        assert_eq!(report.non_finite, 0);
         assert!(!report.any_loss());
-        assert_eq!(report.loss_fraction(), 0.0);
+
+        // ...but a NaN/inf is still a numerical fault and must surface even
+        // though f32 writes it verbatim.
+        let faulty = img(
+            2,
+            1,
+            vec![f32::NAN, 0.5, f32::INFINITY, 0.5, 0.5, 0.5],
+            None,
+        );
+        let report = encode_report(&faulty, &out(OutDepth::F32, BigTiff::Off));
+        assert_eq!(report.non_finite, 2);
+        assert!(report.any_loss());
     }
 
     #[test]
