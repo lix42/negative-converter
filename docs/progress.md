@@ -142,9 +142,15 @@ a task; update your own section as you work. Append entries — don't rewrite th
   / mismatched / WhiteIsZero page still errors); added
   `skips_reduced_resolution_preview_before_ir` mirroring the real 3-IFD layout.
   Verified: both `20260630-nikon-84{2,4}.tif` now decode as `Hdri 5184x3600
-  ir=true` with **no warnings**. **13 decode tests, all green.** (Landed on the
+  ir=true` with **no warnings**. **14 decode tests, all green.** (Landed on the
   `film-base-estimation` branch since it blocked real-scan verification; logically
   a `silverfast-decode` follow-up.)
+- **Ship review hardening:** the preview-skip now also requires *reduced
+  dimensions*, not the `NewSubfileType` bit alone, so a full-res IR plane carrying a
+  stray bit 0 (e.g. `5` = reduced|transparency-mask) still reaches IR validation
+  instead of being silently dropped. `PlanarConfiguration` read errors now surface
+  as `Decode` (a corrupt tag no longer silently defaults to chunky). Added tests:
+  `preview_without_ir_decodes_as_hdr`, plus an accepted-by-shape warning assertion.
 
 ## tiff-encode
 **Status:** done
@@ -338,12 +344,20 @@ a task; update your own section as you work. Append entries — don't rewrite th
     If a report ever needs the auto path's *detected* region, `estimate` will have
     to be extended to return it — today it doesn't (the auto sample is a spread
     edge band, not a single reusable `--base-region` rect).
-- **Verify:** 7 unit tests in `film_base.rs` (explicit verbatim, region samples the
+- **Verify:** 8 unit tests in `film_base.rs` (explicit verbatim, region samples the
   rect, auto detects a bright uniform border, p97 rejects hot pixels, OOB/empty
   region → Usage error, auto fails loudly on no-border and on a non-uniform
-  gradient). Full suite **73/73**, `clippy --all-targets -D warnings` clean, `fmt`
-  clean — verified after the rebase onto the merged decode/encode/color/algo/cli
-  work.
+  gradient, non-finite samples never become the base). Full suite **76/76**,
+  `clippy --all-targets -D warnings` clean, `fmt` clean.
+- **Ship review pass (4 agents):** applied the accepted findings — `percentile` now
+  ranks over finite values only via `f32::total_cmp` (a NaN/±inf can never be
+  returned as the base; comment was previously unsound); fixed a contradictory
+  "densest" comment and softened the auto doc's over-claim (it can mis-anchor on a
+  uniform bright surround — deferred to `auto-base-redesign`); cast the auto index
+  math to `usize` first. Declined (with reasons): changing the auto heuristic now
+  (that's the `auto-base-redesign` task, which gained a "must not mis-anchor on a
+  bright surround" requirement) and the auto-failure `NcError` variant (Other/exit-1
+  catch-all is defensible per §11).
 - **Real-scan verification (throwaway `#[ignore]` probes, decoded via `io::decode`;
   probes not committed):**
   - Decoding works on every real scan tried: `../nc-assets/{48,64}bit-full/*`

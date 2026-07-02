@@ -93,9 +93,17 @@ fn sample_region_at(image: &LinearImage, [x, y, w, h]: [u32; 4], p: f32) -> Resu
 
 /// Step-1 heuristic border detection: sample the outer margin band on all four
 /// edges, summarize per channel, and accept it only if the band is near-uniform
-/// and brighter than the frame interior. On low confidence, fail loudly so the
-/// user can pass `--film-base` / `--base-region` instead of getting a silently
-/// wrong anchor.
+/// and brighter than the frame interior; on low confidence, fail loudly so the
+/// user can pass `--film-base` / `--base-region`.
+///
+/// This is **best-effort**. The uniformity + brighter-than-interior gates catch
+/// the common "no usable border" cases, but they are not proof of an unexposed
+/// rebate: a frame with a uniformly bright surround (e.g. a white background or
+/// sky bleeding to the edge) can pass both and yield a base anchored on that
+/// surround. Real scans are `holder → thin inset rebate → picture`, which this
+/// outer-margin sampler does not model. The robust replacement (inward strip scan
+/// with cross-edge agreement) is a follow-up — see `docs/tasks/auto-base-redesign.md`.
+/// For accurate results, prefer the explicit-reference workflow (design-spec §8).
 fn auto_estimate(image: &LinearImage) -> Result<FilmBase> {
     let (w, h) = (image.width, image.height);
     let margin = (w.min(h) as f32 * AUTO_MARGIN_FRAC).round() as u32;
@@ -120,7 +128,9 @@ fn auto_estimate(image: &LinearImage) -> Result<FilmBase> {
         for col in 0..w {
             let in_band = edge_row || col < margin || col >= w - margin;
             if in_band {
-                push_px((row * w + col) as usize, &mut chans);
+                // Cast to usize before multiplying (as `sample_region_at` does) so
+                // the pixel index can't overflow u32 on very large images.
+                push_px(row as usize * w as usize + col as usize, &mut chans);
             }
         }
     }
@@ -142,11 +152,13 @@ fn auto_estimate(image: &LinearImage) -> Result<FilmBase> {
         base[c] = hi;
     }
 
-    // The base must be brighter than the interior (it's the densest/brightest
-    // transmission area); if it isn't, we haven't found an unexposed border.
-    // Compare against the interior *median* (not a high percentile): the sampled
-    // interior can still clip part of a wide rebate, and the median resists that
-    // contamination so a genuine border stays distinguishable.
+    // The base must be brighter than the interior — the unexposed film base is the
+    // minimum-density, i.e. maximum-transmission, area — else we haven't found a
+    // border. Compare against the interior *median* (not a high percentile): the
+    // sampled interior can still clip part of a wide rebate, and the median resists
+    // that contamination so a genuine border stays distinguishable. Accept when
+    // *any* channel exceeds the interior median by >2%, so an orange base that is
+    // bright in R but not in B still qualifies (a per-channel `all` would reject it).
     let interior = sample_region_at(image, [margin, margin, w - 2 * margin, h - 2 * margin], 0.5)?;
     let interior = [interior.r, interior.g, interior.b];
     if !base.iter().zip(interior).any(|(&b, i)| b > i * 1.02) {
@@ -161,16 +173,27 @@ fn auto_estimate(image: &LinearImage) -> Result<FilmBase> {
 }
 
 /// The `p`-quantile (0.0–1.0) of `values` by nearest-rank, sorting in place.
-/// Empty input yields `0.0`. NaNs sort to the end so they don't poison the rank.
+///
+/// Sorted with a *total* order (`f32::total_cmp`), then ranked over only the
+/// **finite** values: non-finite samples (`NaN`, `±inf`) are excluded rather than
+/// ranked, so a stray non-finite pixel can never be returned as the base (which
+/// would poison the density divide downstream). Empty / all-non-finite input
+/// yields `0.0`. In practice decoded samples are always finite `[0, 1]`; this just
+/// makes the helper sound if reused.
 fn percentile(values: &mut [f32], p: f32) -> f32 {
-    if values.is_empty() {
+    // total_cmp is a valid total order (unlike partial_cmp), so the sort is
+    // well-defined even with NaN present; non-finite values collect at the ends.
+    values.sort_by(f32::total_cmp);
+    let (Some(first), Some(last)) = (
+        values.iter().position(|v| v.is_finite()),
+        values.iter().rposition(|v| v.is_finite()),
+    ) else {
         return 0.0;
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Greater));
+    };
+    let n = last - first + 1;
     let p = p.clamp(0.0, 1.0);
-    // Nearest-rank: index of the p-quantile within [0, len-1].
-    let idx = ((values.len() - 1) as f32 * p).round() as usize;
-    values[idx]
+    // Nearest-rank within the finite sub-slice `[first, last]`.
+    values[first + ((n - 1) as f32 * p).round() as usize]
 }
 
 #[cfg(test)]
@@ -285,5 +308,18 @@ mod tests {
         let img = LinearImage::new(w, h, buf, None).unwrap();
         let err = estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err();
         assert!(matches!(err, NcError::Other(_)));
+    }
+
+    #[test]
+    fn non_finite_samples_never_become_the_base() {
+        // A NaN in the sampled region must be excluded from the rank, not returned
+        // as the base (a NaN/inf Dmin would poison the density divide downstream).
+        let mut img = solid(10, 10, [0.5, 0.5, 0.5]);
+        set_px(&mut img, 0, 0, [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+        let base = estimate(&img, &params(FilmBaseSource::Region([0, 0, 10, 10]))).unwrap();
+        assert!(base.r.is_finite() && base.g.is_finite() && base.b.is_finite());
+        assert!((base.r - 0.5).abs() < 1e-6);
+        assert!((base.g - 0.5).abs() < 1e-6);
+        assert!((base.b - 0.5).abs() < 1e-6);
     }
 }

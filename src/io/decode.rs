@@ -83,10 +83,12 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     // `read_image` only returns the first sample plane under PlanarConfiguration=2
     // (a known `tiff`-crate limitation); RGB has 3 samples, so reject planar to
     // avoid silently dropping G and B. SilverFast scans are always chunky (=1).
+    // Absent PlanarConfiguration ⇒ chunky (=1) per the TIFF spec; but a *read
+    // error* on the tag is corruption, not absence — surface it as Decode rather
+    // than defaulting to chunky and risking a silently channel-dropped image.
     let planar = dec
         .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)
-        .ok()
-        .flatten()
+        .map_err(|e| tiff_err(path, "reading PlanarConfiguration", e))?
         .unwrap_or(1);
     if planar != 1 {
         return Err(NcError::Unsupported(format!(
@@ -114,14 +116,22 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         dec.next_image()
             .map_err(|e| tiff_err(path, "advancing to the next IFD", e))?;
 
-        // `NewSubfileType` is a bitfield; bit 0 marks a reduced-resolution
-        // preview. These are normal in high-res scans — skip them silently
-        // (without reading their strips) rather than mistaking one for the IR.
         let subfile = dec
             .find_tag_unsigned::<u32>(Tag::NewSubfileType)
             .ok()
             .flatten();
-        if subfile.is_some_and(|s| s & 0x1 != 0) {
+        let (iw, ih) = dec
+            .dimensions()
+            .map_err(|e| tiff_err(path, "reading IFD dimensions", e))?;
+
+        // `NewSubfileType` bit 0 marks a reduced-resolution preview. These are
+        // normal in high-res scans — skip them (without reading their strips)
+        // rather than mistaking one for the IR. Gate on the reduced *dimensions*
+        // too, not the bit alone: the IR plane could carry a stray bit 0 (e.g.
+        // `5` = reduced|transparency-mask), and a full-resolution page must still
+        // reach IR validation instead of being silently dropped.
+        let is_preview = subfile.is_some_and(|s| s & 0x1 != 0) && (iw, ih) != (width, height);
+        if is_preview {
             continue;
         }
 
@@ -132,9 +142,6 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
             continue;
         }
 
-        let (iw, ih) = dec
-            .dimensions()
-            .map_err(|e| tiff_err(path, "reading IR dimensions", e))?;
         if (iw, ih) != (width, height) {
             return Err(NcError::Unsupported(format!(
                 "{}: IR plane is {iw}x{ih} but RGB image is {width}x{height}; \
@@ -356,6 +363,40 @@ mod tests {
         assert_eq!(ir_plane[0], 0.0);
         assert_eq!(ir_plane[1], 1.0);
         assert_unit_range(&img.rgb);
+        // The `tiff` encoder writes no NewSubfileType, so the page is accepted as
+        // IR by shape alone — that must be surfaced as a warning, not silent.
+        assert!(
+            info.warnings.iter().any(|w| w.contains("NewSubfileType")),
+            "expected an accepted-by-shape warning, got {:?}",
+            info.warnings
+        );
+    }
+
+    #[test]
+    fn preview_without_ir_decodes_as_hdr() {
+        // IFD0 RGB + a reduced-resolution RGB preview (NewSubfileType=1), but no IR
+        // plane: the preview is skipped and the file classifies as HDR, ir absent.
+        let tmp = temp_path("preview-noir");
+        let rgb: [u16; 6] = [1000, 2000, 3000, 4000, 5000, 6000];
+        let thumb: [u16; 3] = [1000, 2000, 3000];
+        let mut enc = TiffEncoder::new(std::fs::File::create(&tmp.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        let mut preview = enc.new_image::<RGB16>(1, 1).unwrap();
+        preview
+            .encoder()
+            .write_tag(Tag::NewSubfileType, 1u32)
+            .unwrap();
+        preview.write_data(&thumb).unwrap();
+
+        let (img, info) = decode(&tmp.0).unwrap();
+        assert_eq!(info.format, SilverFastFormat::Hdr);
+        assert!(!info.ir_present);
+        assert!(img.ir.is_none());
+        assert!(
+            info.warnings.is_empty(),
+            "a skipped preview should not warn, got {:?}",
+            info.warnings
+        );
     }
 
     #[test]

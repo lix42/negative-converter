@@ -33,6 +33,17 @@ the film's minimum density ⇒ maximum transmission, so it is the brightest unif
 region). If no edge yields a confident band, return a clear `NcError` pointing at
 `--base-region` / `--film-base`, exactly as today.
 
+**Must not mis-anchor on a uniform bright surround.** The Step-1 heuristic's two
+gates (per-channel uniformity spread ≤ 0.15, and brighter-than-interior-median by
+>2% on *any* channel) are jointly insufficient: a frame with a uniformly bright
+surround bleeding to the edge (white background, sky) passes both and yields a base
+anchored on that surround instead of the film rebate — a silently-wrong `Dmin`
+(flagged in code review of `film-base-estimation`). The redesign must add a
+corroborating signal — e.g. require **cross-edge agreement** (a real rebate is the
+same orange base value on the edges where it appears; a bright background usually
+is not), and/or a more meaningful base-vs-interior margin than 2% — and revisit the
+lenient `any`-channel brightness gate vs. the strict all-channel uniformity gate.
+
 Keep it deterministic and modest — this is not a segmentation problem. Coordinate
 with `white-holder-support` (a light holder inverts the "holder is dark"
 assumption) and consider exposing only minimal tuning (if any) as flags.

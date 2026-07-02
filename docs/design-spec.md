@@ -89,7 +89,7 @@ linear (raw-ish) scanner data:
 | Variant | Channels | Bit depth | On-disk layout |
 |---|---|---|---|
 | HDR   | R, G, B            | 48-bit (16/ch) | Single IFD: 3-sample chunky RGB, no IR. |
-| HDRi  | R, G, B + IR       | 64-bit (16/ch) | **Two IFDs**: IFD0 = 3-sample RGB (as HDR); IFD1 = 1-sample grayscale IR plane. |
+| HDRi  | R, G, B + IR       | 64-bit (16/ch) | IFD0 = 3-sample RGB (as HDR); a 1-sample grayscale IR plane in a later IFD. High-res scans also embed a reduced-resolution RGB preview IFD between them. |
 
 The tool reads both. On HDRi input the IR plane is parsed and kept; on HDR input
 there simply is no IR channel.
@@ -97,12 +97,16 @@ there simply is no IR channel.
 **On-disk layout (verified against real sample files, 2026-06):** these are
 uncompressed little-endian ClassicTIFFs, `PlanarConfiguration=1` (chunky), 16-bit
 **unsigned** samples (no `SampleFormat` tag). The IR channel is **not** a 4th
-sample interleaved into the RGB pixels — HDRi files carry it as a **second IFD**
+sample interleaved into the RGB pixels — HDRi files carry it as a **separate IFD**
 (`NewSubfileType=4`, `Photometric=BlackIsZero`, `SamplesPerPixel=1`,
-`BitsPerSample=16`) at the same dimensions as IFD0. So the decoder distinguishes
-HDR from HDRi **structurally** — by the presence of that second image — not from
-metadata: the `Silverfast:HDRScan="Yes"` XMP flag is present on *both* variants
-and cannot be used to detect IR.
+`BitsPerSample=16`) at the same dimensions as IFD0. High-resolution scans also
+embed a **reduced-resolution RGB preview** IFD (`NewSubfileType` bit 0) between the
+RGB image and the IR plane, so the IR plane is not always the second IFD; the
+decoder skips previews (by their reduced dimensions) and locates the IR plane by
+its full-resolution grayscale shape. So it distinguishes HDR from HDRi
+**structurally** — by the presence of that IR image — not from metadata: the
+`Silverfast:HDRScan="Yes"` XMP flag is present on *both* variants and cannot be
+used to detect IR.
 
 **Caveat (carried from research):** there is still no published low-level spec for
 the SilverFast layout; the above is reverse-engineered from sample scans. The
