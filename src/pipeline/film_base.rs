@@ -117,22 +117,35 @@ fn auto_estimate(image: &LinearImage) -> Result<FilmBase> {
     }
 
     // Gather the four edge strips into a per-channel sample of the margin band.
+    // Iterate only the margins (top/bottom full rows, left/right on the middle
+    // rows) — not every pixel — so a full-frame scan doesn't walk millions of
+    // interior pixels just to skip them. Cast to usize before multiplying (as
+    // `sample_region_at` does) so the index can't overflow u32 on large images.
     let mut chans: [Vec<f32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let band = (w as usize * h as usize) - ((w - 2 * margin) as usize * (h - 2 * margin) as usize);
+    for c in &mut chans {
+        c.reserve(band);
+    }
     let push_px = |i: usize, chans: &mut [Vec<f32>; 3]| {
         chans[0].push(image.rgb[i * 3]);
         chans[1].push(image.rgb[i * 3 + 1]);
         chans[2].push(image.rgb[i * 3 + 2]);
     };
-    for row in 0..h {
-        let edge_row = row < margin || row >= h - margin;
-        for col in 0..w {
-            let in_band = edge_row || col < margin || col >= w - margin;
-            if in_band {
-                // Cast to usize before multiplying (as `sample_region_at` does) so
-                // the pixel index can't overflow u32 on very large images.
-                push_px(row as usize * w as usize + col as usize, &mut chans);
-            }
+    let push_row = |row: u32, cols: std::ops::Range<u32>, chans: &mut [Vec<f32>; 3]| {
+        let row_off = row as usize * w as usize;
+        for col in cols {
+            push_px(row_off + col as usize, chans);
         }
+    };
+    for row in 0..margin {
+        push_row(row, 0..w, &mut chans); // top band, full width
+    }
+    for row in margin..h - margin {
+        push_row(row, 0..margin, &mut chans); // left band
+        push_row(row, w - margin..w, &mut chans); // right band
+    }
+    for row in h - margin..h {
+        push_row(row, 0..w, &mut chans); // bottom band, full width
     }
 
     // Per-channel high percentile is the candidate base; the low percentile gives

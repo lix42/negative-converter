@@ -112,6 +112,7 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     // second IFD. Scan every remaining page: skip previews, validate the first
     // non-preview page as the IR plane (strictly, as before), and note extras.
     let mut ir = None;
+    let mut warned_extra = false;
     while dec.more_images() {
         dec.next_image()
             .map_err(|e| tiff_err(path, "advancing to the next IFD", e))?;
@@ -137,8 +138,12 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
 
         // A non-preview page after the IR plane is already accounted for is
         // unexpected; carry it through as a note (matches the prior contract).
+        // Warn once, however many extra IFDs there are, to avoid report spam.
         if ir.is_some() {
-            warnings.push("file has additional IFDs beyond the IR plane; ignored".into());
+            if !warned_extra {
+                warnings.push("file has additional IFDs beyond the IR plane; ignored".into());
+                warned_extra = true;
+            }
             continue;
         }
 
