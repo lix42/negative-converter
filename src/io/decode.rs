@@ -4,10 +4,13 @@
 //! see `docs/tasks/silverfast-decode.md`):
 //!
 //! - **HDR**: a single TIFF IFD — 3-sample chunky RGB, 16-bit unsigned, no IR.
-//! - **HDRi**: **two** IFDs — IFD0 is the RGB image (as HDR); IFD1 is the IR plane
-//!   (1-sample grayscale, 16-bit, same dimensions, `NewSubfileType=4`).
+//! - **HDRi**: the RGB image in IFD0 (as HDR) plus a full-resolution IR plane
+//!   (1-sample grayscale, 16-bit, same dimensions, `NewSubfileType=4`) in a later
+//!   IFD. High-resolution scans also embed a reduced-resolution RGB **preview**
+//!   (`NewSubfileType` bit 0) between the two, so the IR plane is not always the
+//!   second IFD; the decoder skips previews and scans for the IR plane by shape.
 //!
-//! HDR vs HDRi is detected **structurally** (the presence of the second image),
+//! HDR vs HDRi is detected **structurally** (the presence of an IR plane),
 //! never from metadata — the `Silverfast:HDRScan` XMP flag is `"Yes"` on both.
 //! The IR plane is preserved into [`LinearImage::ir`], never consumed in Step 1
 //! (design-spec §6.1).
@@ -80,10 +83,12 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     // `read_image` only returns the first sample plane under PlanarConfiguration=2
     // (a known `tiff`-crate limitation); RGB has 3 samples, so reject planar to
     // avoid silently dropping G and B. SilverFast scans are always chunky (=1).
+    // Absent PlanarConfiguration ⇒ chunky (=1) per the TIFF spec; but a *read
+    // error* on the tag is corruption, not absence — surface it as Decode rather
+    // than defaulting to chunky and risking a silently channel-dropped image.
     let planar = dec
         .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)
-        .ok()
-        .flatten()
+        .map_err(|e| tiff_err(path, "reading PlanarConfiguration", e))?
         .unwrap_or(1);
     if planar != 1 {
         return Err(NcError::Unsupported(format!(
@@ -100,13 +105,48 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
 
     let mut warnings = Vec::new();
 
-    // --- IFD1 (if present): the IR plane ------------------------------------
-    let ir = if dec.more_images() {
+    // --- Remaining IFDs: locate the IR plane, skipping preview thumbnails ----
+    // High-resolution HDRi scans place a reduced-resolution RGB preview
+    // (`NewSubfileType` bit 0) between the RGB image and the full-res IR plane
+    // (`NewSubfileType=4`, 16-bit grayscale), so the IR plane is not always the
+    // second IFD. Scan every remaining page: skip previews, validate the first
+    // non-preview page as the IR plane (strictly, as before), and note extras.
+    let mut ir = None;
+    let mut warned_extra = false;
+    while dec.more_images() {
         dec.next_image()
-            .map_err(|e| tiff_err(path, "advancing to the IR image", e))?;
+            .map_err(|e| tiff_err(path, "advancing to the next IFD", e))?;
+
+        let subfile = dec
+            .find_tag_unsigned::<u32>(Tag::NewSubfileType)
+            .ok()
+            .flatten();
         let (iw, ih) = dec
             .dimensions()
-            .map_err(|e| tiff_err(path, "reading IR dimensions", e))?;
+            .map_err(|e| tiff_err(path, "reading IFD dimensions", e))?;
+
+        // `NewSubfileType` bit 0 marks a reduced-resolution preview. These are
+        // normal in high-res scans — skip them (without reading their strips)
+        // rather than mistaking one for the IR. Gate on the reduced *dimensions*
+        // too, not the bit alone: the IR plane could carry a stray bit 0 (e.g.
+        // `5` = reduced|transparency-mask), and a full-resolution page must still
+        // reach IR validation instead of being silently dropped.
+        let is_preview = subfile.is_some_and(|s| s & 0x1 != 0) && (iw, ih) != (width, height);
+        if is_preview {
+            continue;
+        }
+
+        // A non-preview page after the IR plane is already accounted for is
+        // unexpected; carry it through as a note (matches the prior contract).
+        // Warn once, however many extra IFDs there are, to avoid report spam.
+        if ir.is_some() {
+            if !warned_extra {
+                warnings.push("file has additional IFDs beyond the IR plane; ignored".into());
+                warned_extra = true;
+            }
+            continue;
+        }
+
         if (iw, ih) != (width, height) {
             return Err(NcError::Unsupported(format!(
                 "{}: IR plane is {iw}x{ih} but RGB image is {width}x{height}; \
@@ -125,9 +165,9 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         }
         // `colortype()` reports both BlackIsZero and WhiteIsZero as Gray(16), and
         // the crate *inverts* WhiteIsZero samples while decoding — so a WhiteIsZero
-        // second page would be silently kept as IR with transformed values. The
-        // verified IR layout is BlackIsZero (PhotometricInterpretation=1); reject
-        // anything else rather than preserve a possibly-inverted plane.
+        // page would be silently kept as IR with transformed values. The verified
+        // IR layout is BlackIsZero (PhotometricInterpretation=1); reject anything
+        // else rather than preserve a possibly-inverted plane.
         let ir_photometric = dec
             .find_tag_unsigned::<u16>(Tag::PhotometricInterpretation)
             .ok()
@@ -141,27 +181,16 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         // The real IR plane is marked `NewSubfileType=4`. We still accept a
         // matching-dimension 16-bit grayscale IFD without it (the layout is
         // reverse-engineered, and the IR plane is only carried, not consumed in
-        // Step 1), but record a warning so an incidental second page isn't
-        // reported as IR provenance with no trace.
-        let subfile = dec
-            .find_tag_unsigned::<u32>(Tag::NewSubfileType)
-            .ok()
-            .flatten();
+        // Step 1), but record a warning so an incidental page isn't reported as IR
+        // provenance with no trace.
         if subfile != Some(4) {
             warnings.push(format!(
-                "second IFD has NewSubfileType={subfile:?} (expected 4 for an IR plane); \
-                 identified as IR by its 16-bit grayscale shape alone"
+                "IR plane has NewSubfileType={subfile:?} (expected 4); \
+                 identified as IR by its full-res 16-bit grayscale shape alone"
             ));
         }
-        let ir = read_plane_u16(&mut dec, path, "IR plane")?;
-        // Anything past the IR plane is unexpected; carry it through as a note.
-        if dec.more_images() {
-            warnings.push("file has additional IFDs beyond the IR plane; ignored".into());
-        }
-        Some(ir)
-    } else {
-        None
-    };
+        ir = Some(read_plane_u16(&mut dec, path, "IR plane")?);
+    }
 
     let format = if ir.is_some() {
         SilverFastFormat::Hdri
@@ -339,6 +368,40 @@ mod tests {
         assert_eq!(ir_plane[0], 0.0);
         assert_eq!(ir_plane[1], 1.0);
         assert_unit_range(&img.rgb);
+        // The `tiff` encoder writes no NewSubfileType, so the page is accepted as
+        // IR by shape alone — that must be surfaced as a warning, not silent.
+        assert!(
+            info.warnings.iter().any(|w| w.contains("NewSubfileType")),
+            "expected an accepted-by-shape warning, got {:?}",
+            info.warnings
+        );
+    }
+
+    #[test]
+    fn preview_without_ir_decodes_as_hdr() {
+        // IFD0 RGB + a reduced-resolution RGB preview (NewSubfileType=1), but no IR
+        // plane: the preview is skipped and the file classifies as HDR, ir absent.
+        let tmp = temp_path("preview-noir");
+        let rgb: [u16; 6] = [1000, 2000, 3000, 4000, 5000, 6000];
+        let thumb: [u16; 3] = [1000, 2000, 3000];
+        let mut enc = TiffEncoder::new(std::fs::File::create(&tmp.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        let mut preview = enc.new_image::<RGB16>(1, 1).unwrap();
+        preview
+            .encoder()
+            .write_tag(Tag::NewSubfileType, 1u32)
+            .unwrap();
+        preview.write_data(&thumb).unwrap();
+
+        let (img, info) = decode(&tmp.0).unwrap();
+        assert_eq!(info.format, SilverFastFormat::Hdr);
+        assert!(!info.ir_present);
+        assert!(img.ir.is_none());
+        assert!(
+            info.warnings.is_empty(),
+            "a skipped preview should not warn, got {:?}",
+            info.warnings
+        );
     }
 
     #[test]
@@ -417,6 +480,47 @@ mod tests {
             Err(NcError::Unsupported(_)) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn skips_reduced_resolution_preview_before_ir() {
+        // Real high-res HDRi layout: IFD0 RGB, IFD1 a reduced-resolution RGB
+        // preview (NewSubfileType=1), IFD2 the full-res Gray16 IR (NewSubfileType
+        // =4). The preview must be skipped and the IR read from the third IFD.
+        let tmp = temp_path("preview");
+        let rgb: [u16; 6] = [1000, 2000, 3000, 4000, 5000, 6000];
+        let thumb: [u16; 3] = [1000, 2000, 3000];
+        let ir: [u16; 2] = [0, 65535];
+        let mut enc = TiffEncoder::new(std::fs::File::create(&tmp.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        // Reduced-resolution preview (1x1 RGB) tagged NewSubfileType=1.
+        let mut preview = enc.new_image::<RGB16>(1, 1).unwrap();
+        preview
+            .encoder()
+            .write_tag(Tag::NewSubfileType, 1u32)
+            .unwrap();
+        preview.write_data(&thumb).unwrap();
+        // Full-res IR (2x1 Gray16) tagged NewSubfileType=4 (transparency mask).
+        let mut ir_img = enc.new_image::<Gray16>(2, 1).unwrap();
+        ir_img
+            .encoder()
+            .write_tag(Tag::NewSubfileType, 4u32)
+            .unwrap();
+        ir_img.write_data(&ir).unwrap();
+
+        let (img, info) = decode(&tmp.0).unwrap();
+        assert_eq!(info.format, SilverFastFormat::Hdri);
+        assert!(info.ir_present);
+        let ir_plane = img.ir.expect("IR plane present");
+        assert_eq!(ir_plane.len(), 2);
+        assert_eq!(ir_plane[0], 0.0);
+        assert_eq!(ir_plane[1], 1.0);
+        // The preview is expected, not an anomaly — no warnings for this layout.
+        assert!(
+            info.warnings.is_empty(),
+            "expected no warnings, got {:?}",
+            info.warnings
+        );
     }
 
     #[test]

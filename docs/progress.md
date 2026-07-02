@@ -129,6 +129,28 @@ a task; update your own section as you work. Append entries — don't rewrite th
     page would be silently kept as an inverted IR plane. Now require
     `PhotometricInterpretation=1` (BlackIsZero, the verified layout) on IFD1, with a
     test. 12 decode tests, all green.
+- **High-res preview IFD (2026-06-30, during film-base real-scan verification):**
+  the full-resolution Nikon HDRi scans (5184×3600, 159 MB) have **three** IFDs —
+  IFD0 RGB, **IFD1 a reduced-resolution RGB preview** (`NewSubfileType` bit 0,
+  1470×1021), IFD2 the full-res IR plane (`NewSubfileType=4`). The old code assumed
+  the *second* IFD was the IR plane and rejected these files as a mismatched-
+  dimension IR (`Unsupported`). Fix: scan **all** remaining IFDs, **skip** any
+  reduced-resolution preview (bit 0) without reading its strips, and validate the
+  first non-preview page as the IR plane with the same strict checks as before
+  (dims match, `Gray(16)`, `PhotometricInterpretation=1`, `NewSubfileType=4` else
+  warn). All prior strict-rejection tests keep their semantics (a full-res non-gray
+  / mismatched / WhiteIsZero page still errors); added
+  `skips_reduced_resolution_preview_before_ir` mirroring the real 3-IFD layout.
+  Verified: both `20260630-nikon-84{2,4}.tif` now decode as `Hdri 5184x3600
+  ir=true` with **no warnings**. **14 decode tests, all green.** (Landed on the
+  `film-base-estimation` branch since it blocked real-scan verification; logically
+  a `silverfast-decode` follow-up.)
+- **Ship review hardening:** the preview-skip now also requires *reduced
+  dimensions*, not the `NewSubfileType` bit alone, so a full-res IR plane carrying a
+  stray bit 0 (e.g. `5` = reduced|transparency-mask) still reaches IR validation
+  instead of being silently dropped. `PlanarConfiguration` read errors now surface
+  as `Decode` (a corrupt tag no longer silently defaults to chunky). Added tests:
+  `preview_without_ir_decodes_as_hdr`, plus an accepted-by-shape warning assertion.
 
 ## tiff-encode
 **Status:** done
@@ -278,17 +300,102 @@ a task; update your own section as you work. Append entries — don't rewrite th
   orchestration wires it.
 
 ## film-base-estimation
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-06-30
 
 - Goal: estimate `Dmin` `FilmBase` from border/region with full CLI override.
-- Note (from project-foundation review): `FilmBaseParams` keeps three flat fields
-  (`film_base`, `base_region`, `auto_base`) which can express contradictory combos.
-  **Enforce and unit-test the precedence** here: explicit `film_base` overrides
-  `base_region` overrides `auto_base`. Use `FilmBase::from([f32;3])` for the
-  `film_base` override (conversion lives in `types.rs`). If the flat shape proves
-  awkward, consider collapsing to an enum `FilmBaseSource { Auto, Region(..),
-  Explicit(..) }` — deferred from foundation, decide here.
+- **Done.** `pipeline/film_base.rs` implements `estimate(&LinearImage,
+  &FilmBaseParams) -> Result<FilmBase>` as a thin `match` over the selected
+  `FilmBaseSource`, delegating to pure helpers (`sample_region`, `auto_estimate`,
+  `percentile`).
+- **Rebased onto the merged `cli-framework` model (was originally built on the
+  flat `FilmBaseParams`).** The foundation-review question "flat fields vs enum"
+  was answered by `cli-framework`, not here: `FilmBaseParams` is now `{ source:
+  FilmBaseSource }` where `FilmBaseSource = Auto | Region([u32;4]) |
+  Explicit([f32;3])`. Precedence (`explicit > region > auto`) is therefore
+  **structural** and resolved in `cli.rs`'s flag→recipe merge — `estimate` just
+  honors whichever variant it's handed. I dropped my earlier `FilmBaseEstimate`
+  return type and its separate report-enum (name-collided with the input
+  `FilmBaseSource` and the merged stub is `-> Result<FilmBase>`); reporting *how*
+  the base was chosen is derivable by the orchestrator from `params.source`.
+- **Decisions (unchanged by the rebase):**
+  - **Estimation statistic:** per-channel **97th percentile** (nearest-rank,
+    `SAMPLE_PERCENTILE`) over the sampled pixels — resists hot pixels/dust while
+    landing on the bright base (task suggested 95th–99th). `percentile` sorts NaNs
+    to the end so they can't poison the rank.
+  - **Region sampling** validates the rect against image bounds with u64 math
+    (no u32 wrap near the edge); out-of-bounds or empty region → `NcError::Usage`
+    (exit 2). `cli.rs` already rejects a zero-area `Region` at the boundary, but
+    the bounds/empty check stays here as defense-in-depth (the CLI can't see the
+    image dimensions, so OOB can only be caught in the stage).
+  - **Auto border detection (Step-1 heuristic):** sample the outer margin band
+    (`AUTO_MARGIN_FRAC = 4%` of the shorter side on all four edges), take the p97
+    per channel as the candidate base, and accept only if (a) the band is
+    near-uniform — per-channel relative spread `(p97−p10)/p97 ≤ 0.15` — and (b) the
+    base is brighter than the interior **median** (median, not p97, so a sampled
+    interior that clips a wide rebate doesn't defeat the check). On low confidence
+    it returns a clear, actionable `NcError::Other` telling the user to pass
+    `--film-base`/`--base-region` (per user decision: **hard error, no silent
+    fallback** to whole-image sampling).
+- **Notes for dependent tasks:**
+  - `pipeline-orchestration` / `nc estimate`: `estimate` returns just the resolved
+    `FilmBase`. For the JSON report, take the *source* label from `cfg.film_base
+    .source` (you already hold it) rather than expecting it back from `estimate`.
+    If a report ever needs the auto path's *detected* region, `estimate` will have
+    to be extended to return it — today it doesn't (the auto sample is a spread
+    edge band, not a single reusable `--base-region` rect).
+- **Verify:** 8 unit tests in `film_base.rs` (explicit verbatim, region samples the
+  rect, auto detects a bright uniform border, p97 rejects hot pixels, OOB/empty
+  region → Usage error, auto fails loudly on no-border and on a non-uniform
+  gradient, non-finite samples never become the base). Full suite **76/76**,
+  `clippy --all-targets -D warnings` clean, `fmt` clean.
+- **Ship review pass (4 agents):** applied the accepted findings — `percentile` now
+  ranks over finite values only via `f32::total_cmp` (a NaN/±inf can never be
+  returned as the base; comment was previously unsound); fixed a contradictory
+  "densest" comment and softened the auto doc's over-claim (it can mis-anchor on a
+  uniform bright surround — deferred to `auto-base-redesign`); cast the auto index
+  math to `usize` first. Declined (with reasons): changing the auto heuristic now
+  (that's the `auto-base-redesign` task, which gained a "must not mis-anchor on a
+  bright surround" requirement) and the auto-failure `NcError` variant (Other/exit-1
+  catch-all is defensible per §11).
+- **Real-scan verification (throwaway `#[ignore]` probes, decoded via `io::decode`;
+  probes not committed):**
+  - Decoding works on every real scan tried: `../nc-assets/{48,64}bit-full/*`
+    (3456×2396) and the full-res `~/Pictures/scan/20260630-nikon-84{2,4}.tif`
+    (5184×3600 HDRi, after the decode preview-IFD fix above). Region/explicit
+    `estimate` paths return sensible per-channel values on all of them.
+  - **Real scans have a `holder → thin rebate → picture` structure, NOT a bright
+    outer margin.** Marching a 1px strip inward from each edge: the outermost band
+    is the near-black film **holder** (~0.01), then a **thin, bright, uniform
+    orange film-base rebate** sits *behind* it, then the picture. The rebate only
+    appears on some edges and can be a few px wide. Measured rebate is consistent
+    per film stock (e.g. `48bit-full/1` bottom and `/2` left both ≈`[0.53, 0.26,
+    0.16]`), confirming Dmin is a stock/develop/scanner property, not per-frame.
+  - **The current outer-4%-margin auto heuristic can't isolate that rebate** — it
+    averages holder+rebate+picture into one high-spread blob and **fails loudly**
+    (correct fail-safe, exercised on real data), but the auto *happy path* does not
+    work on real scans. A proper fix (scan strips inward, pick the brightest
+    low-spread band past the holder) is **deferred** — see decision below.
+  - **Decision (with user): focus on the explicit-reference workflow, not auto.**
+    Because Dmin is constant across a roll scanned with fixed settings, the
+    accurate path is: scan one **unexposed reference** frame once, measure its base
+    with `--base-region`, and reuse it as `--film-base` across the batch (design's
+    reusable-recipe idea). Verified end-to-end: the unexposed reference
+    `20260630-nikon-844.tif` (same film/develop/scanner as the `842` scan) yields a
+    large uniform base of **`[0.553, 0.271, 0.159]`** from a center region; `842`'s
+    own left-edge rebate reads `[0.475, 0.236, 0.136]` and its picture center
+    `[0.387, 0.189, 0.090]` (darker, as expected). Note the reference-vs-edge-rebate
+    gap (~14%): the large clean unexposed area is the more reliable anchor than a
+    narrow edge strip (edge falloff/fog) — another reason to prefer a dedicated
+    reference frame.
+- **Follow-up tasks noted (not in this branch):**
+  - **Auto redesign:** inward-strip "brightest uniform band past the holder"
+    detector so `--auto-base` works on real `holder→rebate→picture` scans. Deferred
+    per the Step-1 "don't over-engineer auto" guidance now that the explicit path
+    covers real work.
+  - **White holder support:** some film holders are white, not black — auto/border
+    logic assumes a dark surround. Add a CLI flag (e.g. `--holder white|black`) to
+    tell the detector which. Follow-up.
 
 ## algo-interface
 **Status:** done

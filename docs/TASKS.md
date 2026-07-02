@@ -57,6 +57,9 @@ graph TD
   algo-simple --> pipeline-orchestration
   algo-density --> pipeline-orchestration
   cli-framework --> pipeline-orchestration
+  film-base-estimation --> auto-base-redesign
+  auto-base-redesign --> white-holder-support
+  pipeline-orchestration --> estimate-reuse-output
 ```
 
 Dependency list (a task is executable when all its deps are `[x]` done):
@@ -71,6 +74,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo-simple`: `algo-interface`
 - `algo-density`: `algo-interface`
 - `pipeline-orchestration`: `silverfast-decode`, `tiff-encode`, `color-management`, `film-base-estimation`, `algo-simple`, `algo-density`, `cli-framework`
+- `auto-base-redesign` (post-MVP): `film-base-estimation`
+- `white-holder-support` (post-MVP): `auto-base-redesign`
+- `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
+
+> **Post-MVP follow-ups** (Phase 5) are recorded for continuity and are **not**
+> blockers of `pipeline-orchestration` / the Step-1 MVP. They came out of
+> real-scan verification of `film-base-estimation` (see `progress.md`).
 
 ## Tasks
 
@@ -87,7 +97,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [SilverFast HDR/HDRi decode](tasks/silverfast-decode.md)
 - [x] [TIFF encode and output](tasks/tiff-encode.md)
 - [x] [Color management](tasks/color-management.md)
-- [ ] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
+- [x] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
 - [x] [Algorithm interface](tasks/algo-interface.md)
 - [x] [CLI framework](tasks/cli-framework.md)
 
@@ -101,3 +111,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > Goal: the full CLI works end to end on a real scan.
 
 - [ ] [Pipeline orchestration](tasks/pipeline-orchestration.md)
+
+### Phase 5: Follow-ups (post-Step-1)
+> Deferred improvements from real-scan verification; not blockers of the MVP.
+> See design-spec §12 (roadmap) and the `film-base-estimation` progress notes.
+
+- [ ] [Robust auto film-base detection](tasks/auto-base-redesign.md)
+- [ ] [Light film holder support](tasks/white-holder-support.md)
+- [ ] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)

@@ -1,0 +1,63 @@
+# Robust auto film-base detection
+
+## Goal
+
+Replace the Step-1 margin heuristic in `pipeline/film_base.rs::auto_estimate`
+with a detector that works on real scans, whose layout is
+`dark film holder → thin unexposed rebate → exposed picture`. Auto (`--auto-base`,
+the default) must locate the thin rebate band and return its per-channel
+transmission as the `FilmBase`, or fail loudly when there is no confident band.
+
+## Background (why the Step-1 heuristic fails)
+
+Real-scan verification of `film-base-estimation` (see `progress.md`) showed the
+current heuristic samples the outer 4% margin as one blob — holder + rebate +
+picture — which is high-spread, so it always bails. The rebate (the actual film
+base) is a **narrow, uniform, bright orange band inset behind the holder**, and it
+may appear on **only some edges**. Measured transmission is consistent per film
+stock (e.g. `48bit-full/1` bottom and `/2` left both ≈ `[0.53, 0.26, 0.16]`).
+
+## Design
+
+Per edge, march a thin (1px) strip parallel to the edge inward from depth 0 to a
+cap (e.g. ~10% of the short dimension). For each strip compute a per-channel high
+percentile (p97, reuse `percentile`) and an along-strip spread `(p97−p10)/p97`.
+Classify:
+
+- **Holder** — very dark; skip.
+- **Rebate candidate** — bright *and* low-spread (uniform along the edge).
+- **Picture** — high-spread; skip.
+
+The film base is the **brightest low-spread band across all edges** (the rebate is
+the film's minimum density ⇒ maximum transmission, so it is the brightest uniform
+region). If no edge yields a confident band, return a clear `NcError` pointing at
+`--base-region` / `--film-base`, exactly as today.
+
+**Must not mis-anchor on a uniform bright surround.** The Step-1 heuristic's two
+gates (per-channel uniformity spread ≤ 0.15, and brighter-than-interior-median by
+>2% on *any* channel) are jointly insufficient: a frame with a uniformly bright
+surround bleeding to the edge (white background, sky) passes both and yields a base
+anchored on that surround instead of the film rebate — a silently-wrong `Dmin`
+(flagged in code review of `film-base-estimation`). The redesign must add a
+corroborating signal — e.g. require **cross-edge agreement** (a real rebate is the
+same orange base value on the edges where it appears; a bright background usually
+is not), and/or a more meaningful base-vs-interior margin than 2% — and revisit the
+lenient `any`-channel brightness gate vs. the strict all-channel uniformity gate.
+
+Keep it deterministic and modest — this is not a segmentation problem. Coordinate
+with `white-holder-support` (a light holder inverts the "holder is dark"
+assumption) and consider exposing only minimal tuning (if any) as flags.
+
+## How to Verify
+
+- Synthetic `holder → thin rebate → picture` image (rebate on one/two edges only)
+  yields a base close to the rebate value.
+- A uniform dark picture region does **not** out-rank a genuine (brighter) rebate.
+- No-rebate image still fails loudly with an actionable error.
+- Regression: the existing explicit/region paths and their tests are unchanged.
+- Validate against the real scans in `../nc-assets` and `~/Pictures/scan`
+  (uncommitted probe, as in the `film-base-estimation` verification).
+
+## Dependencies
+
+- [Film-base / Dmin estimation](film-base-estimation.md)

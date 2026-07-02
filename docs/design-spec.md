@@ -89,7 +89,7 @@ linear (raw-ish) scanner data:
 | Variant | Channels | Bit depth | On-disk layout |
 |---|---|---|---|
 | HDR   | R, G, B            | 48-bit (16/ch) | Single IFD: 3-sample chunky RGB, no IR. |
-| HDRi  | R, G, B + IR       | 64-bit (16/ch) | **Two IFDs**: IFD0 = 3-sample RGB (as HDR); IFD1 = 1-sample grayscale IR plane. |
+| HDRi  | R, G, B + IR       | 64-bit (16/ch) | IFD0 = 3-sample RGB (as HDR); a 1-sample grayscale IR plane in a later IFD. High-res scans also embed a reduced-resolution RGB preview IFD between them. |
 
 The tool reads both. On HDRi input the IR plane is parsed and kept; on HDR input
 there simply is no IR channel.
@@ -97,12 +97,16 @@ there simply is no IR channel.
 **On-disk layout (verified against real sample files, 2026-06):** these are
 uncompressed little-endian ClassicTIFFs, `PlanarConfiguration=1` (chunky), 16-bit
 **unsigned** samples (no `SampleFormat` tag). The IR channel is **not** a 4th
-sample interleaved into the RGB pixels — HDRi files carry it as a **second IFD**
+sample interleaved into the RGB pixels — HDRi files carry it as a **separate IFD**
 (`NewSubfileType=4`, `Photometric=BlackIsZero`, `SamplesPerPixel=1`,
-`BitsPerSample=16`) at the same dimensions as IFD0. So the decoder distinguishes
-HDR from HDRi **structurally** — by the presence of that second image — not from
-metadata: the `Silverfast:HDRScan="Yes"` XMP flag is present on *both* variants
-and cannot be used to detect IR.
+`BitsPerSample=16`) at the same dimensions as IFD0. High-resolution scans also
+embed a **reduced-resolution RGB preview** IFD (`NewSubfileType` bit 0) between the
+RGB image and the IR plane, so the IR plane is not always the second IFD; the
+decoder skips previews (by their reduced dimensions) and locates the IR plane by
+its full-resolution grayscale shape. So it distinguishes HDR from HDRi
+**structurally** — by the presence of that IR image — not from metadata: the
+`Silverfast:HDRScan="Yes"` XMP flag is present on *both* variants and cannot be
+used to detect IR.
 
 **Caveat (carried from research):** there is still no published low-level spec for
 the SilverFast layout; the above is reverse-engineered from sample scans. The
@@ -287,6 +291,14 @@ nc convert frame12.tiff -o frame12_pos.tiff \
 
 # Inspect only; let an agent read the JSON and decide parameters.
 nc inspect in.tiff --report json
+
+# Calibrate once from an unexposed reference frame, then reuse for the roll.
+# `estimate` measures Dmin from the sampled rectangle and reports it in a form
+# ready to drop into --film-base or a recipe's film_base.source.
+nc estimate reference.tiff --base-region 200,0,300,3600 --report json
+# → { "film_base": [0.553, 0.271, 0.159], ... }
+nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
+# …or bake the value into roll-A.json (film_base.source = explicit) and batch it.
 ```
 
 ## 9. Parameter reference (grouped by stage)
@@ -310,8 +322,24 @@ The base source is a single mutually-exclusive choice, recipe key
 `film_base.source` (default `"auto"`). The three flags conflict (passing more
 than one is a usage error); whichever is given replaces a recipe's source:
 - `--film-base R,G,B` ⇒ `{ "explicit": [r, g, b] }` — explicit base transmission.
-- `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this border.
-- `--auto-base` (default) ⇒ `"auto"` — estimate from the detected border.
+- `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this rectangle.
+- `--auto-base` (default) ⇒ `"auto"` — best-effort estimate from the film border.
+
+**Recommended workflow — calibrate once, reuse across the batch.** `Dmin` is a
+property of the *film stock + development + scanner settings*, not of an
+individual frame, so the accurate path for color negatives is to measure the base
+**once** from an unexposed reference and reuse it for the whole roll (see the
+calibration example in §8), rather than re-detecting per frame. Measured this way
+the base is identical across frames, keeping a roll color-consistent.
+
+**On `--auto-base` (best-effort).** Real scans are laid out as
+`dark film holder → thin unexposed rebate → exposed picture`; the rebate (the
+actual film base) is a narrow, uniform, bright band *inset behind the holder*, and
+may appear on only some edges. Step-1 auto uses a simple margin heuristic and will
+**fail loudly** (never emit a silently-wrong base) when it can't confidently
+isolate that band — at which point use `--base-region` (point it at the rebate or
+an unexposed reference) or `--film-base`. A robust inward-scan detector and a
+`--holder white|black` control for light holders are roadmap items (§12).
 
 ### Algorithm select
 - `--algorithm simple|density`
@@ -420,6 +448,17 @@ These are deliberately deferred and recorded here so they aren't lost.
    `Dmin`, curve params, neutral spots) applied across many frames.
 7. **Scanner ICC profiling workflow & QA harness.** IT8/target-based calibration
    and ΔE2000 / SSIM regression testing against standard test negatives.
+8. **Robust auto film-base detection.** Replace the Step-1 margin heuristic with an
+   inward-scan detector for the real `holder → thin rebate → picture` layout:
+   march strips in from each edge and pick the brightest uniform band past the
+   holder (the rebate can be thin and on only some edges). Keep deterministic;
+   still fail loudly when no confident band exists.
+9. **Light film holders.** Auto/border logic assumes a dark holder surround; some
+   holders are white. Add a `--holder white|black` control (recipe key
+   `film_base.holder`) so detection knows the surround polarity.
+10. **Reuse-ready `nc estimate` output.** Emit the measured base in a directly
+    reusable form — a `--film-base R,G,B` string and/or a `film_base` recipe
+    fragment — so the calibrate-once → reuse workflow (§8) is copy-paste smooth.
 
 ## 13. Open questions
 
