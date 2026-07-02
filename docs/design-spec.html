@@ -313,7 +313,15 @@ nc convert frame12.tiff -o frame12_pos.tiff \
   --params roll-A.json --print-exposure 0.15
 
 # Inspect only; let an agent read the JSON and decide parameters.
-nc inspect in.tiff --report json</code></pre>
+nc inspect in.tiff --report json
+
+# Calibrate once from an unexposed reference frame, then reuse for the roll.
+# `estimate` measures Dmin from the sampled rectangle and reports it in a form
+# ready to drop into --film-base or a recipe's film_base.source.
+nc estimate reference.tiff --base-region 200,0,300,3600 --report json
+# → { "film_base": [0.553, 0.271, 0.159], ... }
+nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
+# …or bake the value into roll-A.json (film_base.source = explicit) and batch it.</code></pre>
 
 <h2 id="params">9. Parameter reference (grouped by stage)</h2>
 <p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are indicative. Unknown keys are rejected (see the Recipes section).</p>
@@ -327,9 +335,11 @@ nc inspect in.tiff --report json</code></pre>
 <p>The base source is a single mutually-exclusive choice, recipe key <code>film_base.source</code> (default <code>"auto"</code>). The three flags conflict (passing more than one is a usage error); whichever is given replaces a recipe's source.</p>
 <ul>
   <li><code>--film-base R,G,B</code> ⇒ <code>{ "explicit": [r, g, b] }</code> — explicit base transmission per channel.</li>
-  <li><code>--base-region x,y,w,h</code> ⇒ <code>{ "region": [x, y, w, h] }</code> — region of unexposed border to sample.</li>
-  <li><code>--auto-base</code> (default) ⇒ <code>"auto"</code> — estimate base from detected border.</li>
+  <li><code>--base-region x,y,w,h</code> ⇒ <code>{ "region": [x, y, w, h] }</code> — sample this rectangle.</li>
+  <li><code>--auto-base</code> (default) ⇒ <code>"auto"</code> — best-effort estimate from the film border.</li>
 </ul>
+<p><strong>Recommended workflow — calibrate once, reuse across the batch.</strong> <code>Dmin</code> is a property of the <em>film stock + development + scanner settings</em>, not of an individual frame, so the accurate path for color negatives is to measure the base <strong>once</strong> from an unexposed reference and reuse it for the whole roll (see the calibration example above), rather than re-detecting per frame. Measured this way the base is identical across frames, keeping a roll color-consistent.</p>
+<p><strong>On <code>--auto-base</code> (best-effort).</strong> Real scans are laid out as <code>dark film holder → thin unexposed rebate → exposed picture</code>; the rebate (the actual film base) is a narrow, uniform, bright band <em>inset behind the holder</em>, and may appear on only some edges. Step-1 auto uses a simple margin heuristic and will <strong>fail loudly</strong> (never emit a silently-wrong base) when it can't confidently isolate that band — at which point use <code>--base-region</code> (point it at the rebate or an unexposed reference) or <code>--film-base</code>. A robust inward-scan detector and a <code>--holder white|black</code> control for light holders are roadmap items.</p>
 <h4>Algorithm select</h4>
 <ul><li><code>--algorithm simple|density</code></li></ul>
 <h4>Density stage (algorithm = density)</h4>
@@ -422,6 +432,9 @@ nc inspect in.tiff --report json</code></pre>
   <li><strong>More output formats.</strong> JPEG/PNG for proofs, EXR for HDR interchange.</li>
   <li><strong>Roll-level presets &amp; batch mode.</strong> First-class roll recipes (film stock, <code>Dmin</code>, curve params, neutral spots) applied across many frames.</li>
   <li><strong>Scanner ICC profiling workflow &amp; QA harness.</strong> IT8/target-based calibration and ΔE2000 / SSIM regression testing against standard test negatives.</li>
+  <li><strong>Robust auto film-base detection.</strong> Replace the Step-1 margin heuristic with an inward-scan detector for the real <code>holder → thin rebate → picture</code> layout: march strips in from each edge and pick the brightest uniform band past the holder (the rebate can be thin and on only some edges). Keep deterministic; still fail loudly when no confident band exists.</li>
+  <li><strong>Light film holders.</strong> Auto/border logic assumes a dark holder surround; some holders are white. Add a <code>--holder white|black</code> control (recipe key <code>film_base.holder</code>) so detection knows the surround polarity.</li>
+  <li><strong>Reuse-ready <code>nc estimate</code> output.</strong> Emit the measured base in a directly reusable form — a <code>--film-base R,G,B</code> string and/or a <code>film_base</code> recipe fragment — so the calibrate-once → reuse workflow is copy-paste smooth.</li>
 </ol>
 
 <h2 id="open">13. Open questions</h2>
