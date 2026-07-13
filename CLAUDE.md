@@ -101,6 +101,12 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
     infallible — Little CMS reports runtime transform failures only via the
     process-global `cmsSetLogErrorHandler`, so `main`/`cli` must install one
     (lcms2 `ThreadContext::set_error_logging_function`) at startup.
+  - *Film-base gotcha:* only an explicit `--film-base` is CLI-validated; a
+    `Region`/`Auto` base is estimated from pixels at runtime with no positivity
+    guarantee (a region on the dark holder → zero channel). Any stage that
+    divides by or takes the log of the base must guard finite-and-positive and
+    error loudly (see `algo/simple.rs`) — until `film_base::estimate` rejects
+    degenerate bases at birth (planned follow-up).
   - *Clamping boundary:* range-clamp to the output gamut **only** at the u16
     encode step; color/algo stages pass values through unclamped (f32 output is
     HDR/scene-referred). `io::encode` counts every clamped and non-finite (`NaN`)
