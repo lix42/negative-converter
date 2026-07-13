@@ -454,10 +454,18 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     positive("--density-scale", &cfg.density.density_scale)?;
     finite("--density-offset", &cfg.density.density_offset)?;
 
-    // Print: exposure / black point / highlight roll-off finite; gains positive.
+    // Print: exposure / black point finite; gains positive. Highlight roll-off is a
+    // non-negative amount — 0 disables it, and a negative value would be silently
+    // ignored by the density render's soft-clip, so reject it loudly here.
     finite("--print-exposure", &[cfg.print.print_exposure])?;
     finite("--black-point", &[cfg.print.black_point])?;
     finite("--highlight-compress", &[cfg.print.highlight_compress])?;
+    if cfg.print.highlight_compress < 0.0 {
+        return Err(usage(format!(
+            "--highlight-compress must be >= 0 (got {})",
+            cfg.print.highlight_compress
+        )));
+    }
     positive("--white-balance", &cfg.print.white_balance)?;
 
     // Simple: gains positive; clip range finite and ordered.
@@ -673,6 +681,16 @@ mod tests {
         let mut cfg = ResolvedConfig::default();
         cfg.print.white_balance = [1.0, f32::NAN, 1.0];
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
+        // Negative highlight compression is rejected (the density render silently
+        // treats it as "off", so a wrong-sign value must fail loudly, not no-op).
+        let mut cfg = ResolvedConfig::default();
+        cfg.print.highlight_compress = -0.3;
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+        // Zero is valid (disables the roll-off).
+        let mut cfg = ResolvedConfig::default();
+        cfg.print.highlight_compress = 0.0;
+        validate(&cfg).unwrap();
 
         // A clean default passes.
         validate(&ResolvedConfig::default()).unwrap();
