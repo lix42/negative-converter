@@ -138,8 +138,12 @@ pub(crate) fn to_density(
 ///
 /// No clamping: values may land outside `[0, 1]` (scene-referred / HDR); the encode
 /// stage counts and reports any clipping. The result preserves the carried IR plane.
+///
+/// Consumes the `DensityImage` (it is a use-once intermediate): the density buffer
+/// is transformed into the output in place and the IR plane is moved, so no
+/// image-sized buffer is allocated or cloned here.
 pub(crate) fn render(
-    density: &DensityImage,
+    density: DensityImage,
     density_gamma: f32,
     print: &PrintParams,
 ) -> LinearImage {
@@ -148,23 +152,21 @@ pub(crate) fn render(
     let black = print.black_point;
     let hc = print.highlight_compress;
 
-    let mut rgb = vec![0.0f32; density.density.len()];
-    rgb.par_chunks_exact_mut(3)
-        .zip(density.density.par_chunks_exact(3))
-        .for_each(|(out, d)| {
-            for c in 0..3 {
-                let paper = 10f32.powf(density_gamma * d[c]); // stage 3
-                let exposed = paper * wb[c] * exposure_gain; // stage 4
-                out[c] = soft_clip(exposed - black, hc);
-            }
-        });
+    let mut rgb = density.density;
+    rgb.par_chunks_exact_mut(3).for_each(|d| {
+        for c in 0..3 {
+            let paper = 10f32.powf(density_gamma * d[c]); // stage 3
+            let exposed = paper * wb[c] * exposure_gain; // stage 4
+            d[c] = soft_clip(exposed - black, hc);
+        }
+    });
 
     // Lengths are inherited unchanged from a `DensityImage` built from a validated
     // `LinearImage`, so the invariants hold by construction. Route through the
     // validated constructor anyway — its checks are O(1) (buffer lengths, not a
     // per-sample scan), so a future regression that breaks the invariant panics
     // loudly here instead of minting a silently-malformed image.
-    LinearImage::new(density.width, density.height, rgb, density.ir.clone())
+    LinearImage::new(density.width, density.height, rgb, density.ir)
         .expect("render preserves the validated buffer-length invariants")
 }
 
@@ -198,17 +200,20 @@ impl Converter for Density {
         // guarded here — the base's consumption point. Fail loudly instead.
         check_base(base)?;
         let density = to_density(image, base, &self.density);
-        Ok(render(&density, self.density.density_gamma, &self.print))
+        Ok(render(density, self.density.density_gamma, &self.print))
     }
 }
 
-/// Reject a film base that would make the density conversion ill-defined (a
-/// division by a non-positive / non-finite per-channel transmission).
+/// Reject a film base that would make the density conversion ill-defined: each
+/// per-channel value is a transmission in `(0, 1]`. Non-positive / non-finite
+/// values would divide into inf/NaN; values above `1.0` are impossible for a
+/// `[0, 1]`-normalized scan (a typo like `--film-base 90` for `0.90`) and would
+/// silently render every real sample above white.
 fn check_base(base: &FilmBase) -> Result<()> {
     for (name, v) in [("r", base.r), ("g", base.g), ("b", base.b)] {
-        if !v.is_finite() || v <= 0.0 {
+        if !v.is_finite() || v <= 0.0 || v > 1.0 {
             return Err(NcError::Other(format!(
-                "film base {name} channel must be finite and > 0 (got {v}); \
+                "film base {name} channel must be a transmission in (0, 1] (got {v}); \
                  measure a valid Dmin or pass an explicit --film-base"
             )));
         }
@@ -307,7 +312,7 @@ mod tests {
             density: vec![1.0, 0.0, 2.0],
             ir: None,
         };
-        let out = render(&d, 1.0, &PrintParams::default());
+        let out = render(d, 1.0, &PrintParams::default());
         assert!(approx(out.rgb[0], 10.0, 1e-3));
         assert!(approx(out.rgb[1], 1.0, 1e-5));
         assert!(approx(out.rgb[2], 100.0, 1e-2));
@@ -322,7 +327,7 @@ mod tests {
             density: vec![1.0, 1.0, 1.0],
             ir: None,
         };
-        let out = render(&d, 0.5, &PrintParams::default());
+        let out = render(d, 0.5, &PrintParams::default());
         for c in 0..3 {
             assert!(approx(out.rgb[c], 10f32.powf(0.5), 1e-3), "channel {c}");
         }
@@ -343,7 +348,7 @@ mod tests {
             white_balance: [2.0, 1.0, 0.5],
             highlight_compress: 0.0,
         };
-        let out = render(&d, 1.0, &print);
+        let out = render(d, 1.0, &print);
         assert!(approx(out.rgb[0], 3.5, 1e-4)); // 1·2·2 − 0.5
         assert!(approx(out.rgb[1], 1.5, 1e-4)); // 1·1·2 − 0.5
         assert!(approx(out.rgb[2], 0.5, 1e-4)); // 1·0.5·2 − 0.5
@@ -357,7 +362,7 @@ mod tests {
             density: vec![0.3, 0.3, 0.3],
             ir: Some(vec![0.7]),
         };
-        let out = render(&d, 1.0, &PrintParams::default());
+        let out = render(d, 1.0, &PrintParams::default());
         assert_eq!(out.ir.as_deref(), Some(&[0.7_f32][..]));
     }
 
@@ -412,7 +417,7 @@ mod tests {
         };
         let via_convert = conv.convert(&img, &base).unwrap();
         let via_parts = render(
-            &to_density(&img, &base, &conv.density),
+            to_density(&img, &base, &conv.density),
             conv.density.density_gamma,
             &conv.print,
         );
@@ -488,7 +493,7 @@ mod tests {
             highlight_compress: 0.5,
             ..PrintParams::default()
         };
-        let out = render(&d, 1.0, &print);
+        let out = render(d, 1.0, &print);
         let expected_r = 1.0 + 0.5 * (1.0 - (-2.0f32).exp());
         assert!(approx(out.rgb[0], expected_r, 1e-4), "got {}", out.rgb[0]);
         assert!(approx(out.rgb[1], 1.0, 1e-5));
@@ -524,6 +529,7 @@ mod tests {
             [1.0, -0.5, 1.0],     // negative transmission
             [f32::NAN, 1.0, 1.0], // non-finite
             [1.0, f32::INFINITY, 1.0],
+            [1.0, 90.0, 1.0], // transmission > 1 (e.g. "90" typo for "0.90")
         ] {
             let err = conv.convert(&img, &FilmBase::from(bad)).unwrap_err();
             assert_eq!(err.exit_code(), 1, "base {bad:?} should fail loudly");

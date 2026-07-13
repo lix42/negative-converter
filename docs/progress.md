@@ -749,6 +749,16 @@ a task; update your own section as you work. Append entries — don't rewrite th
   re-run green, PR opened from branch `algo-density`). **Follow-up for the spec:**
   design-spec §7.2's stage-3 sketch (`10^(−D'·gamma)`) has the polarity bug
   described above — correct it (and design-spec.html together) to `10^(+gamma·D')`.
+- **2026-07-13 — PR-review follow-ups.** From bot review on the PR: `render` now
+  consumes its `DensityImage` (in-place transform, IR moved not cloned); film-base
+  transmissions are bounded to `(0, 1]` at both the CLI (`--film-base`, exit 2) and
+  `check_base` (estimated/recipe base, exit 1) — a `90`-for-`0.90` typo previously
+  blew out silently. **Deferred design finding (for `pipeline-orchestration` /
+  spec):** with default params the render maps scene black (base) to `1.0` and all
+  detail *above* it, so the default u16 encode clips the whole image (loudly, via
+  the clip report, but still unusable). Needs a display-range anchor — e.g. a
+  Dmax-style white anchor or different default `print_exposure`/`black_point` —
+  decided at the spec level (§7.2/§9 defaults) alongside the polarity correction.
 
 ## pipeline-orchestration
 **Status:** not started

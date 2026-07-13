@@ -439,10 +439,19 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
         Ok(())
     };
 
-    // Film base: an explicit base is a per-channel transmission (must be
-    // positive); a sampled region must have non-zero extent; auto needs nothing.
+    // Film base: an explicit base is a per-channel transmission in (0, 1] — the
+    // decoded scan is [0, 1]-normalized, so a value above 1 (e.g. a "90" typo for
+    // "0.90") would silently render every real sample denser than the base; a
+    // sampled region must have non-zero extent; auto needs nothing.
     match cfg.film_base.source {
-        FilmBaseSource::Explicit(b) => positive("--film-base", &b)?,
+        FilmBaseSource::Explicit(b) => {
+            positive("--film-base", &b)?;
+            if let Some(v) = b.iter().find(|v| **v > 1.0) {
+                return Err(usage(format!(
+                    "--film-base channels are transmissions in (0, 1] (got {v})"
+                )));
+            }
+        }
         FilmBaseSource::Region([_, _, w, h]) if w == 0 || h == 0 => {
             return Err(usage("--base-region width and height must be > 0".into()));
         }
@@ -703,6 +712,13 @@ mod tests {
         let mut cfg = ResolvedConfig::default();
         cfg.film_base.source = FilmBaseSource::Explicit([0.9, 0.0, 0.4]); // zero transmission
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
+        let mut cfg = ResolvedConfig::default();
+        cfg.film_base.source = FilmBaseSource::Explicit([0.9, 90.0, 0.4]); // "90" typo for "0.90"
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+        let mut cfg = ResolvedConfig::default();
+        cfg.film_base.source = FilmBaseSource::Explicit([1.0, 1.0, 1.0]); // 1.0 exactly is valid
+        validate(&cfg).unwrap();
 
         let mut cfg = ResolvedConfig::default();
         cfg.film_base.source = FilmBaseSource::Region([0, 0, 0, 0]); // zero-area region
