@@ -61,20 +61,18 @@ impl Converter for Simple {
             (positive - low) / span
         };
 
-        // Per-pixel independent; rayon's ordered collect keeps the result
-        // deterministic. `rgb.len()` is a multiple of 3 (a `LinearImage`
-        // invariant), so every chunk is exactly one RGB triple.
-        let rgb: Vec<f32> = image
-            .rgb
-            .par_chunks_exact(3)
-            .flat_map_iter(|px| {
-                [
-                    per_channel(px[0], 0),
-                    per_channel(px[1], 1),
-                    per_channel(px[2], 2),
-                ]
-            })
-            .collect();
+        // Per-pixel independent; writing through zipped position-matched chunks
+        // keeps the result deterministic without per-thread collect buffers.
+        // `rgb.len()` is a multiple of 3 (a `LinearImage` invariant), so every
+        // chunk is exactly one RGB triple.
+        let mut rgb = vec![0.0f32; image.rgb.len()];
+        rgb.par_chunks_exact_mut(3)
+            .zip(image.rgb.par_chunks_exact(3))
+            .for_each(|(out, px)| {
+                for c in 0..3 {
+                    out[c] = per_channel(px[c], c);
+                }
+            });
 
         LinearImage::new(image.width, image.height, rgb, image.ir.clone())
     }
