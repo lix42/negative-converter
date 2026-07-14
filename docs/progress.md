@@ -766,3 +766,56 @@ a task; update your own section as you work. Append entries — don't rewrite th
 
 - Goal: wire `convert`/`inspect`/`estimate` end to end, producing a positive TIFF
   and JSON reports from a real scan.
+
+## auto-base-redesign
+**Status:** not started
+**Updated:** —
+
+- Goal: robust `--auto-base` film-base detection on real scan layouts (dark
+  holder → rebate → picture), replacing the best-effort Step-1 heuristic.
+
+## white-holder-support
+**Status:** not started
+**Updated:** —
+
+- Goal: support scans made in light/white film holders, where the current
+  darker-than-interior assumptions of base estimation don't hold.
+
+## estimate-reuse-output
+**Status:** not started
+**Updated:** —
+
+- Goal: `nc estimate` output shaped for direct reuse (drop-in recipe fragment /
+  flag values), closing the measure-once-reuse-for-the-roll loop.
+
+## dmax-white-anchor
+**Status:** not started
+**Updated:** —
+
+- Goal: anchor scene white (Dmax) in the density render so default u16 output
+  fills the display range instead of clipping (PR #12 review finding; NLP
+  comparison priority 1). Includes the design-spec §7.2 polarity correction.
+
+## algo-sigmoid
+**Status:** not started
+**Updated:** —
+
+- Goal: third converter — S-curve (H&D / paper response) tone mapping in density
+  space with toe/shoulder control (design-spec §12 roadmap; NLP comparison
+  priority 2).
+
+## auto-neutral-wb
+**Status:** not started
+**Updated:** —
+
+- Goal: deterministic auto white-balance estimation (gray-world / neutral-
+  percentile) feeding `print.white_balance`, reported for roll reuse (NLP
+  comparison priority 3a).
+
+## regional-color-balance
+**Status:** not started
+**Updated:** —
+
+- Goal: shadow/highlight per-channel balance (density-weighted offsets in stage
+  2) to correct color crossover a global gain can't fix (NLP comparison
+  priority 3b).
