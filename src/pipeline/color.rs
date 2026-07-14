@@ -85,13 +85,26 @@ pub fn icc_profile(space: &OutputSpace) -> Result<Vec<u8>> {
     profile_icc(&build_profile(space)?)
 }
 
+/// ICC header offset of the creation `dateTimeNumber` (ICC.1 §7.2, bytes 24–35).
+const ICC_HEADER_DATETIME: std::ops::Range<usize> = 24..36;
+
 /// Serialize an already-built profile to ICC bytes. Shared by `icc_profile` and
 /// `to_output` so the latter doesn't rebuild (and re-read from disk) a profile
 /// it already holds.
+///
+/// Little CMS stamps profiles with the wall-clock creation time on synthesis, so
+/// two otherwise-identical runs seconds apart would embed different ICC bytes and
+/// break the byte-identical determinism contract (§8) — the failure is a single
+/// seconds byte deep inside the TIFF. Zero the header `dateTimeNumber` (an
+/// ICC-legal "unknown" value) so the embedded blob is reproducible.
 fn profile_icc(profile: &Profile) -> Result<Vec<u8>> {
-    profile
+    let mut bytes = profile
         .icc()
-        .map_err(|e| NcError::Other(format!("failed to serialize ICC profile: {e}")))
+        .map_err(|e| NcError::Other(format!("failed to serialize ICC profile: {e}")))?;
+    if let Some(dt) = bytes.get_mut(ICC_HEADER_DATETIME) {
+        dt.fill(0);
+    }
+    Ok(bytes)
 }
 
 /// Transform `image` from the linear working space into the output profile
@@ -291,6 +304,20 @@ mod tests {
         for &c in &buf {
             assert!((c - 0.5).abs() < 0.005, "round-trip got {c}, expected ~0.5");
         }
+    }
+
+    #[test]
+    fn icc_profile_bytes_are_deterministic_with_zeroed_datetime() {
+        // The header creation dateTimeNumber (bytes 24..36) is wall-clock time at
+        // synthesis — it must be zeroed or byte-identical reruns fail across a
+        // second boundary (caught by CI on the E2E recipe round-trip).
+        let a = icc_profile(&OutputSpace::AcesCg).unwrap();
+        assert!(
+            a[24..36].iter().all(|&b| b == 0),
+            "ICC creation dateTime must be zeroed for determinism"
+        );
+        let b = icc_profile(&OutputSpace::AcesCg).unwrap();
+        assert_eq!(a, b, "same space must serialize to identical bytes");
     }
 
     #[test]
