@@ -55,10 +55,11 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
 - The **IR channel** (HDRi 64-bit input) is decoded and **preserved but not acted
   on** in Step 1; IR-based dust removal is a roadmap follow-up. Carry it through,
   don't consume it.
-- Module map (`src/`, scaffolded — `types.rs` filled, other modules are stubs):
-  `types.rs` (shared types), `io/{decode,encode}.rs`,
-  `pipeline/{film_base,color,stages}.rs`, `algo/{mod,simple,density}.rs`,
-  `cli.rs`, `main.rs`. `main`/`cli` are the only orchestrators; stages stay pure.
+- Module map (`src/`, all implemented): `types.rs` (shared types),
+  `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages}.rs`
+  (`stages::render` is the pure decode-to-encode core),
+  `algo/{mod,simple,density}.rs`, `cli.rs`, `main.rs`. `main`/`cli` are the only
+  orchestrators; stages stay pure.
 
 ### Stack / commands
 
@@ -71,9 +72,10 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 - **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
   `cargo build` → `cargo test`. The gate is strict — warnings fail the build.
-- `Cargo.lock` is committed (binary crate). `main.rs` carries a temporary
-  `#![allow(dead_code)]` while stages are stubs — remove it once
-  `pipeline-orchestration` wires them together.
+- `Cargo.lock` is committed (binary crate). The crate-level `#![allow(dead_code)]`
+  is gone; the only remaining allows are three narrow, documented item-level ones
+  (`algo/mod.rs`, `pipeline/color.rs`) for API surface the single Step-1 path
+  doesn't exercise — don't add new ones without a comment saying who will use it.
 
 ## Conventions
 
@@ -99,8 +101,12 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
   never a quietly wrong image.
   - *lcms2 gotcha:* `Transform::transform_in_place` (`cmsDoTransform`) is
     infallible — Little CMS reports runtime transform failures only via the
-    process-global `cmsSetLogErrorHandler`, so `main`/`cli` must install one
-    (lcms2 `ThreadContext::set_error_logging_function`) at startup.
+    process-global `cmsSetLogErrorHandler`. `color.rs` uses the **global**
+    context, and the safe `lcms2` wrapper only exposes per-`ThreadContext`
+    handlers, so `cli` installs the global handler via `lcms2-sys` FFI at
+    startup (sets an `AtomicBool` + logs to stderr); `run_convert` clears the
+    flag before the render and checks it after, turning a CMS fault into a loud
+    error instead of a silently unconverted image.
   - *Film-base gotcha:* only an explicit `--film-base` is CLI-validated; a
     `Region`/`Auto` base is estimated from pixels at runtime with no positivity
     guarantee (a region on the dark holder → zero channel). Any stage that

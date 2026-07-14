@@ -124,7 +124,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 ### Phase 4: Integration
 > Goal: the full CLI works end to end on a real scan.
 
-- [ ] [Pipeline orchestration](tasks/pipeline-orchestration.md)
+- [x] [Pipeline orchestration](tasks/pipeline-orchestration.md)
 
 ### Phase 5: Follow-ups (post-Step-1)
 > Deferred improvements from real-scan verification; not blockers of the MVP.

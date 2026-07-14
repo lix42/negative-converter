@@ -4,11 +4,6 @@
 //! [`NcError`] to its stable process exit code (design-spec §11). All real work
 //! happens in the pure pipeline stages; `main`/`cli` are the only orchestrators.
 
-// Scaffolding: the stage stubs aren't wired together until `pipeline-orchestration`,
-// so most public items are unused for now. Remove this once that task lands and the
-// pipeline references every stage.
-#![allow(dead_code)]
-
 mod algo;
 mod cli;
 mod io;

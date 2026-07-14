@@ -51,6 +51,22 @@ pub fn encode(
     Ok(report)
 }
 
+/// Whether encoding `image` under `params` (with an `icc_len`-byte embedded
+/// profile) will produce a BigTIFF. Reuses the same sizing logic `encode` runs
+/// internally, so the orchestrator can report an `auto` promotion in the JSON
+/// report without duplicating the threshold — and without re-deciding it
+/// differently than the encoder does.
+pub fn plans_bigtiff(params: &OutputParams, image: &LinearImage, icc_len: usize) -> bool {
+    resolve_bigtiff(
+        params.bigtiff,
+        image.width,
+        image.height,
+        3,
+        depth_bytes(params.out_depth),
+        icc_len as u64,
+    )
+}
+
 /// Write the IR plane as a single-channel TIFF at `depth`. Errors loudly when the
 /// image carries no IR plane rather than writing an empty/placeholder file — the
 /// caller asked for IR export, so a missing plane is a real failure.
