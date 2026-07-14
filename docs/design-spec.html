@@ -94,7 +94,6 @@
   <h1>Negative Converter — High-Level Design Spec</h1>
   <p class="lead">A CLI tool that converts film-negative scans to positive images, with every parameter exposed for agent control.</p>
   <div class="badges">
-    <span class="badge">Status: Draft for review</span>
     <span class="badge">Target: Step 1 (MVP)</span>
     <span class="badge">Language: Rust</span>
   </div>
@@ -205,8 +204,8 @@
       <li><code>--out-depth f32</code> → 32-bit float TIFF (full HDR, no precision loss).</li>
     </ul>
   </li>
-  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for <code>u16</code> (display-ready), a <strong>wide-gamut</strong> space (e.g. ProPhoto / linear ACEScg) for <code>f32</code> to avoid clipping HDR range. Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
-  <li><strong>Metadata:</strong> the effective parameter set (recipe) and key estimated values are written to a sidecar JSON next to the output, and core provenance is embedded in the TIFF where practical.</li>
+  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for <code>u16</code> (display-ready), <strong>linear ACEScg</strong> (wide-gamut) for <code>f32</code> to avoid clipping HDR range (<code>prophoto</code> and user ICC files are also accepted). Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
+  <li><strong>Metadata:</strong> the effective parameter set (recipe) and key estimated values are written to a <strong>sidecar JSON</strong> next to the output (paired by name; the same shape as <code>--dump-params</code>). The TIFF itself embeds the ICC profile of the chosen output space; the recipe is deliberately <em>not</em> embedded in the TIFF (resolved, §13).</li>
 </ul>
 
 <h2 id="pipeline">6. Pipeline architecture</h2>
@@ -258,11 +257,11 @@
 
 <h4>Pluggable interface (sketch)</h4>
 <pre><code>/// A negative→positive conversion algorithm.
-/// Pure: no I/O, no hidden state.
+/// Pure: no I/O, no hidden state. Parameters live in the implementing struct
+/// (e.g. `Density { density, print }`), keeping the trait object-safe; a
+/// factory maps `--algorithm` + the resolved params to a boxed converter.
 pub trait Converter {
-    type Params;
-    fn convert(&amp;self, img: &amp;LinearImage, base: &amp;FilmBase, p: &amp;Self::Params)
-        -&gt; Result&lt;LinearImage, ConvertError&gt;;
+    fn convert(&amp;self, image: &amp;LinearImage, base: &amp;FilmBase) -&gt; Result&lt;LinearImage&gt;;
 }</code></pre>
 
 <h2 id="cli">8. CLI design</h2>
@@ -316,6 +315,9 @@ nc convert frame12.tiff -o frame12_pos.tiff \
 nc inspect in.tiff --report json
 
 # Calibrate once from an unexposed reference frame, then reuse for the roll.
+# (Product tip: wind past the light-struck leader, shoot a lens-cap frame, and
+# scan it — a full frame of clean base beats sampling the thin rebate. Don't use
+# the auto-burned wind-on frames; they are fogged leader. See §9 film-base.)
 # `estimate` measures Dmin from the sampled rectangle and reports it in a form
 # ready to drop into --film-base or a recipe's film_base.source.
 nc estimate reference.tiff --base-region 200,0,300,3600 --report json
@@ -324,7 +326,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # …or bake the value into roll-A.json (film_base.source = explicit) and batch it.</code></pre>
 
 <h2 id="params">9. Parameter reference (grouped by stage)</h2>
-<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are indicative. Unknown keys are rejected (see the Recipes section).</p>
+<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are binding — the recipe structs and this section are kept in sync (<code>deny_unknown_fields</code>). Unknown keys are rejected (see the Recipes section).</p>
 
 <h4>Input / decode</h4>
 <ul>
@@ -338,8 +340,13 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
   <li><code>--base-region x,y,w,h</code> ⇒ <code>{ "region": [x, y, w, h] }</code> — sample this rectangle.</li>
   <li><code>--auto-base</code> (default) ⇒ <code>"auto"</code> — best-effort estimate from the film border.</li>
 </ul>
-<p><strong>Recommended workflow — calibrate once, reuse across the batch.</strong> <code>Dmin</code> is a property of the <em>film stock + development + scanner settings</em>, not of an individual frame, so the accurate path for color negatives is to measure the base <strong>once</strong> from an unexposed reference and reuse it for the whole roll (see the calibration example above), rather than re-detecting per frame. Measured this way the base is identical across frames, keeping a roll color-consistent.</p>
-<p><strong>On <code>--auto-base</code> (best-effort).</strong> Real scans are laid out as <code>dark film holder → thin unexposed rebate → exposed picture</code>; the rebate (the actual film base) is a narrow, uniform, bright band <em>inset behind the holder</em>, and may appear on only some edges. Step-1 auto uses a simple margin heuristic and will <strong>fail loudly</strong> (never emit a silently-wrong base) when it can't confidently isolate that band — at which point use <code>--base-region</code> (point it at the rebate or an unexposed reference) or <code>--film-base</code>. A robust inward-scan detector and a <code>--holder white|black</code> control for light holders are roadmap items.</p>
+<p><strong>How to obtain <code>Dmin</code> — the acquisition ladder.</strong> <code>Dmin</code> is a property of the <em>film stock + development + scanner settings</em>, not of an individual frame, so measure it <strong>once per roll</strong> and reuse it (recipe / <code>--film-base</code>) rather than re-detecting per frame — measured this way the base is identical across frames, keeping the roll color-consistent. The sources, in decreasing reliability:</p>
+<ol>
+  <li><strong>A dedicated unexposed frame (best).</strong> Recommended shooting workflow: after loading a roll and winding past the light-struck leader (the frame counter reaching 1), take a deliberate exposure with the lens cap on, then scan that blank frame alongside the roll. Do <strong>not</strong> rely on the 1–2 auto-burned wind-on frames — that leader area was exposed while loading with the back open, so it is fogged film, denser than clean base, and would bake a wrong <code>Dmin</code> into the whole roll. A true cap-on frame provides a full frame of clean base — far more area than the rebate — measured with <code>nc estimate</code> and frozen into the roll recipe (§8 example). The large area also enables multi-region sampling with an agreement check (roadmap §12), which doubles as a light-leak / illumination-falloff diagnostic.</li>
+  <li><strong>The rebate (the unexposed strip around each frame).</strong> Reliable form: point <code>--base-region</code> at a visible rebate patch manually (read the coordinates from any image viewer; UI-assisted picking is a roadmap item, §12). Convenience form: <code>--auto-base</code> (the default) — real scans are laid out as <code>dark film holder → thin unexposed rebate → exposed picture</code>, the rebate being a narrow, uniform, bright band <em>inset behind the holder</em>, possibly on only some edges. Auto detection keeps <strong>deliberately strict</strong> confidence gates (uniformity, brighter-than-interior) and <strong>fails loudly</strong> rather than emit a silently-wrong base — note the Step-1 heuristic often refuses on real <code>holder → rebate → picture</code> layouts. The robust inward-scan detector, thresholds tuned against real scans (<code>real-scan-verification</code>), and a <code>--holder white|black</code> control for light holders are roadmap items (§12).</li>
+  <li><strong>Content-based estimation (last resort, opt-in).</strong> When the scan is cropped to the image with no unexposed film visible, a per-channel high percentile of the <em>exposed content</em> approximates the base (the thinnest area of a negative is the scene's deepest black, close to true base). This is an <strong>explicit opt-in source</strong> (roadmap §12): it changes the assumption from "physical base measured" to "scene contains a near-black", so the tool never falls back to it silently, and the report records that the base came from content statistics. When the assumption fails (foggy/high-key scenes), blacks wash out and pick up a cast.</li>
+</ol>
+<p><strong>When every source is missing</strong> (no explicit base, auto refuses, content mode not requested), <code>convert</code> <strong>fails loudly</strong> with an actionable message naming the recovery flags — an agent can catch the exit code and re-run with an explicit choice. Estimator selection is never silent. A neutral base <code>[1,1,1]</code> is representable but not recommended: it forfeits the per-channel orange-mask neutralization (content estimation strictly dominates it). Note the failure geometry is forgiving: because <code>D = -log10(scan/base)</code>, a base error is a <em>constant per-channel density offset</em> — a global cast/exposure error correctable downstream (<code>density_offset</code>, white balance) — never a shadow/highlight crossover.</p>
 <h4>Algorithm select</h4>
 <ul><li><code>--algorithm simple|density</code></li></ul>
 <h4>Density stage (algorithm = density)</h4>
@@ -364,13 +371,14 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <ul>
   <li><code>-o, --output &lt;path&gt;</code> (required)</li>
   <li><code>--out-depth u16|f32</code> (default <code>u16</code>)</li>
-  <li><code>--output-profile &lt;icc|sRGB|prophoto|acescg|...&gt;</code> (depth-aware default: <code>sRGB</code> for <code>u16</code>, wide-gamut for <code>f32</code>)</li>
+  <li><code>--output-profile &lt;srgb|prophoto|acescg|path-to-icc&gt;</code> (depth-aware default: <code>srgb</code> for <code>u16</code>, <code>acescg</code> for <code>f32</code>)</li>
   <li><code>--bigtiff auto|on|off</code> (default <code>auto</code>)</li>
 </ul>
 <h4>Global</h4>
 <ul>
   <li><code>--params &lt;json&gt;</code>, <code>--dump-params &lt;json&gt;</code></li>
   <li><code>--report json|none</code>, <code>--report-file &lt;path&gt;</code></li>
+  <li><code>--strict</code> — promote report warnings (clipping, non-finite samples, …) to a failing exit (see the Errors section)</li>
   <li><code>-v/--verbose</code>, <code>--quiet</code></li>
 </ul>
 
@@ -423,7 +431,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <p>Warnings (e.g. clipped highlights/shadows, IR present but ignored, BigTIFF auto-promoted) are surfaced in the JSON report and on stderr, without failing the run unless <code>--strict</code> is set.</p>
 
 <h2 id="roadmap">12. Roadmap (follow-up tasks, explicitly out of Step 1)</h2>
-<p>Deliberately deferred and recorded here so they aren't lost.</p>
+<p>Deliberately deferred and recorded here so they aren't lost. Items graduate into tracked tasks in <code>docs/TASKS.md</code> — several already have (item 2's sigmoid → <code>algo-sigmoid</code>; plus <code>dmax-white-anchor</code>, <code>auto-neutral-wb</code>, and <code>regional-color-balance</code> from the NLP feature comparison, Phase 6).</p>
 <ol>
   <li><strong>IR-based dust &amp; scratch removal.</strong> Consume the IR channel (already preserved in Step 1) to build a defect mask and inpaint defects. Parameters: IR threshold, mask dilation/morphology, inpainting method/strength. Must handle the known limits — disable/guard for silver B&amp;W film and Kodachrome. New stages: <code>defect_mask</code>, <code>inpaint</code>; new flags under an <code>--ir-*</code> namespace.</li>
   <li><strong>Additional algorithms.</strong> At minimum a <strong>sigmoid / explicit H&amp;D-curve</strong> model (NegPy-style) for more photographically meaningful controls; possibly a power-law/exponent model (RawTherapee-style) for camera-scanned negatives. Added via the existing <code>Converter</code> trait, selectable with <code>--algorithm</code>.</li>
@@ -432,16 +440,18 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
   <li><strong>More output formats.</strong> JPEG/PNG for proofs, EXR for HDR interchange.</li>
   <li><strong>Roll-level presets &amp; batch mode.</strong> First-class roll recipes (film stock, <code>Dmin</code>, curve params, neutral spots) applied across many frames.</li>
   <li><strong>Scanner ICC profiling workflow &amp; QA harness.</strong> IT8/target-based calibration and ΔE2000 / SSIM regression testing against standard test negatives.</li>
-  <li><strong>Robust auto film-base detection.</strong> Replace the Step-1 margin heuristic with an inward-scan detector for the real <code>holder → thin rebate → picture</code> layout: march strips in from each edge and pick the brightest uniform band past the holder (the rebate can be thin and on only some edges). Keep deterministic; still fail loudly when no confident band exists.</li>
+  <li><strong>Robust auto film-base detection.</strong> Replace the Step-1 margin heuristic with an inward-scan detector for the real <code>holder → thin rebate → picture</code> layout: march strips in from each edge and pick the brightest uniform band past the holder (the rebate can be thin and on only some edges). Keep deterministic; still fail loudly when no confident band exists, with thresholds tuned against the real-scan verification results. This task family also includes: an explicit opt-in <strong>content-based source</strong> (<code>film_base.source = "content"</code>, §9 ladder tier 3) recorded in the report; a <strong>uniformity warning on <code>--base-region</code></strong> (a mixed rebate/image rectangle currently yields a plausible-looking bad base silently); and <code>nc inspect</code> reporting <strong>candidate rebate regions</strong> (coordinates + confidence) so CLI users confirm instead of measuring — the same data a future UI would highlight.</li>
   <li><strong>Light film holders.</strong> Auto/border logic assumes a dark holder surround; some holders are white. Add a <code>--holder white|black</code> control (recipe key <code>film_base.holder</code>) so detection knows the surround polarity.</li>
-  <li><strong>Reuse-ready <code>nc estimate</code> output.</strong> Emit the measured base in a directly reusable form — a <code>--film-base R,G,B</code> string and/or a <code>film_base</code> recipe fragment — so the calibrate-once → reuse workflow is copy-paste smooth.</li>
+  <li><strong>Reuse-ready <code>nc estimate</code> output.</strong> Emit the measured base in a directly reusable form — a <code>--film-base R,G,B</code> string and/or a <code>film_base</code> recipe fragment — so the calibrate-once → reuse workflow is copy-paste smooth. This includes <strong>grid / multi-region sampling with an agreement check</strong> for unexposed-frame calibration (§9 ladder tier 1): sample center + corners, require per-channel agreement within a tolerance, and report the spread — disagreement diagnoses light leaks and scanner illumination falloff.</li>
+  <li><strong>UI-assisted film-base picking.</strong> Once a UI layer exists: visual region picking for the rebate/reference frame, highlighting auto-detected candidates, and feedback when a chosen region fails the uniformity check (the CLI-side uniformity warning and inspect candidates above are the building blocks).</li>
 </ol>
 
 <h2 id="open">13. Open questions</h2>
+<p>All of the Step-1 open questions have since been resolved (kept here as a record):</p>
 <ul>
-  <li>Exact on-disk SilverFast HDRi tag/channel layout — must be confirmed against real sample files (user will provide); the decoder should log what it finds.</li>
-  <li>Which specific wide-gamut space to default to for <code>f32</code> HDR output (ProPhoto RGB vs linear ACEScg vs Rec.2020) — the <em>option</em> is decided; the default value is still open.</li>
-  <li>Whether the embedded TIFF metadata should carry the full recipe or just a pointer to the sidecar JSON.</li>
+  <li><s>Exact on-disk SilverFast HDRi tag/channel layout</s> — <strong>resolved 2026-06</strong>: reverse-engineered and verified against real sample files; documented in §4 (separate full-resolution grayscale IR IFD, optional preview IFD, structural HDR/HDRi detection).</li>
+  <li><s>Which wide-gamut space to default to for <code>f32</code> HDR output</s> — <strong>resolved</strong>: <strong>linear ACEScg</strong> is the <code>f32</code> default (<code>prophoto</code> and user ICC remain selectable); see §5.</li>
+  <li><s>Whether the embedded TIFF metadata should carry the full recipe</s> — <strong>resolved</strong>: the recipe lives in the sidecar JSON only (paired by name with the output); the TIFF embeds just the ICC profile. See §5.</li>
 </ul>
 
 <footer>
