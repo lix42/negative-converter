@@ -513,8 +513,9 @@ run unless `--strict` is set.
 
 These are deliberately deferred and recorded here so they aren't lost. Items
 graduate into tracked tasks in [TASKS.md](TASKS.md) — several already have
-(item 2's sigmoid → `algo-sigmoid`; plus `dmax-white-anchor`, `auto-neutral-wb`,
-and `regional-color-balance` from the NLP feature comparison, Phase 6).
+(item 2's sigmoid → `algo-sigmoid`; item 3's B&W rendering → `bw-support`;
+plus `dmax-white-anchor`, `auto-neutral-wb`, and `regional-color-balance` from
+the NLP feature comparison, Phase 6).
 
 1. **IR-based dust & scratch removal.** Consume the IR channel (already preserved
    in Step 1) to build a defect mask and inpaint defects. Parameters: IR
@@ -525,11 +526,14 @@ and `regional-color-balance` from the NLP feature comparison, Phase 6).
    (NegPy-style) for more photographically meaningful controls; possibly a
    power-law/exponent model (RawTherapee-style) for camera-scanned negatives.
    Added via the existing `Converter` trait, selectable with `--algorithm`.
-3. **Black & white film support.** B&W negatives, including plain **16-bit RAW**
-   scan files (not the SilverFast HDR/HDRi container). Note these typically have
-   no usable orange mask and no IR defect channel (silver blocks IR), so they
-   lean on the `simple` algorithm or a B&W-tuned density path rather than the
-   color orange-mask compensation.
+3. **Black & white film support.** The *rendering* half has graduated into the
+   tracked `bw-support` task (Phase 6): B&W film is still a density medium, so
+   the `density` algorithm is the B&W renderer, plus a mono color model that
+   pools R,G,B into one gray so scanner channel mismatch can't tint the output.
+   What remains here is the *input* half: plain **16-bit RAW** scan files (not
+   the SilverFast HDR/HDRi container). Note B&W negatives have no usable orange
+   mask and no IR defect channel (silver blocks IR) — item 1's IR dust removal
+   must be disabled/guarded for B&W.
 4. **Camera RAW input.** Bayer/X-Trans and DNG ingestion (e.g. `rawler`/LibRaw)
    to support camera-scanning workflows.
 5. **More output formats.** JPEG/PNG for proofs, EXR for HDR interchange.
