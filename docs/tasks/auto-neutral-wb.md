@@ -26,11 +26,17 @@ convert:  decode → film base → algorithm → [auto-wb analysis → re-render
     low-saturation pixels or at matched luminance percentiles; more robust.
   Both are pure statistics — deterministic, no ML (per the project's
   "AI-friendly ≠ ML" rule).
-- **Explicit gains always win:** `--white-balance` overrides auto (flags-win
-  merge; auto fills the gap only when gains are at default — model so illegal
-  combinations can't be expressed).
-- The resolved gains go in the JSON report (and `nc estimate` output) so an agent
-  can freeze them into a roll recipe.
+- **Explicit gains always win — by *source*, not by value.** Do not detect "user
+  set gains" via `gains == default`: an explicit `--white-balance 1,1,1` must
+  still beat auto, and after the merge a default-valued field is
+  indistinguishable from an omitted one. Model the choice as one source enum
+  (e.g. `WbSource { Auto(mode) | Explicit(gains) }`) or carry presence through
+  the merge — the house one-enum rule for mutually-exclusive knobs.
+- The resolved gains go in the **convert JSON report** so an agent can freeze
+  them into a roll recipe. They are **not** added to `nc estimate`: its contract
+  is film-base/Dmin-only and it carries no algorithm/print params, so it cannot
+  render the positive these statistics are computed from. Extending `estimate`
+  is a separate redesign (`estimate-reuse-output` territory), out of scope here.
 - Spec: §8/§9 gain the mode + document the workflow; design-spec.md and .html
   together.
 

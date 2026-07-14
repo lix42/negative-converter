@@ -37,6 +37,12 @@ with a parameterized sigmoid anchored on the density range `[0, Dmax]`:
 - Depends on the Dmax anchor semantics: `S` maps `[0, Dmax] → [~0, 1]`, so build
   after `dmax-white-anchor` lands and reuse its resolved anchor rather than
   inventing a second one.
+- **Factor `density::render` first.** Today it fuses stage 3 (`10^(γ·D')`) with
+  stage 4 (the `PrintParams` gains/black-point/soft-clip) in one function —
+  sharing it as-is would stack the exponential curve on top of the sigmoid.
+  Extract the stage-4 print render into a shared helper as a pure refactor of
+  `density.rs`, protected by bit-exact regression tests, then compose
+  `S-curve → shared stage 4`.
 - Keep `simple` and `density` untouched — this is additive; the highlight
   soft-clip may be redundant under a shoulder (document the interaction, don't
   silently disable either).
