@@ -85,7 +85,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `auto-base-redesign` (post-MVP): `film-base-estimation`
 - `white-holder-support` (post-MVP): `auto-base-redesign`
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
-- `real-scan-verification`: `pipeline-orchestration`, `dmax-white-anchor`
+- `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
 - `dmax-white-anchor` (post-MVP): `algo-density`
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
@@ -125,7 +125,6 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > Goal: the full CLI works end to end on a real scan.
 
 - [ ] [Pipeline orchestration](tasks/pipeline-orchestration.md)
-- [ ] [Real-scan verification](tasks/real-scan-verification.md)
 
 ### Phase 5: Follow-ups (post-Step-1)
 > Deferred improvements from real-scan verification; not blockers of the MVP.
@@ -144,3 +143,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [ ] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [ ] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
+
+### Phase 7: Acceptance
+> The shipped defaults verified on the user's full-size real scans (assets
+> prepared by the user). Post-MVP because it deliberately waits for the Dmax
+> anchor — it validates the *default* output quality, not just plumbing.
+
+- [ ] [Real-scan verification](tasks/real-scan-verification.md)
