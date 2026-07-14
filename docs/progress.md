@@ -819,3 +819,11 @@ a task; update your own section as you work. Append entries — don't rewrite th
 - Goal: shadow/highlight per-channel balance (density-weighted offsets in stage
   2) to correct color crossover a global gain can't fix (NLP comparison
   priority 3b).
+
+## real-scan-verification
+**Status:** not started
+**Updated:** —
+
+- Goal: run the verification matrix (inspect/estimate/convert/IR/determinism/
+  resources) against the full-size real scans once the user prepares the assets;
+  record results here, file follow-up tasks for defects.

@@ -60,6 +60,8 @@ graph TD
   film-base-estimation --> auto-base-redesign
   auto-base-redesign --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
+  pipeline-orchestration --> real-scan-verification
+  dmax-white-anchor --> real-scan-verification
   algo-density --> dmax-white-anchor
   algo-interface --> algo-sigmoid
   dmax-white-anchor --> algo-sigmoid
@@ -83,6 +85,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `auto-base-redesign` (post-MVP): `film-base-estimation`
 - `white-holder-support` (post-MVP): `auto-base-redesign`
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
+- `real-scan-verification`: `pipeline-orchestration`, `dmax-white-anchor`
 - `dmax-white-anchor` (post-MVP): `algo-density`
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
@@ -122,6 +125,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > Goal: the full CLI works end to end on a real scan.
 
 - [ ] [Pipeline orchestration](tasks/pipeline-orchestration.md)
+- [ ] [Real-scan verification](tasks/real-scan-verification.md)
 
 ### Phase 5: Follow-ups (post-Step-1)
 > Deferred improvements from real-scan verification; not blockers of the MVP.
