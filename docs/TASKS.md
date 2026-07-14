@@ -69,6 +69,8 @@ graph TD
   algo-density --> auto-neutral-wb
   pipeline-orchestration --> auto-neutral-wb
   algo-density --> regional-color-balance
+  algo-density --> bw-support
+  pipeline-orchestration --> bw-support
 ```
 
 Dependency list (a task is executable when all its deps are `[x]` done):
@@ -92,6 +94,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
 - `regional-color-balance` (post-MVP): `algo-density`
+- `bw-support` (post-MVP): `algo-density`, `pipeline-orchestration`
 
 > **Post-MVP follow-ups** (Phases 5–6) are recorded for continuity and are **not**
 > blockers of `pipeline-orchestration` / the Step-1 MVP. Phase 5 came out of
@@ -145,6 +148,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [ ] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [ ] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
+- [ ] [Black & white negative support (mono color model)](tasks/bw-support.md)
 
 ### Phase 7: Acceptance
 > The shipped defaults verified on the user's full-size real scans (assets
