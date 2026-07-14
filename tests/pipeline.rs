@@ -468,3 +468,94 @@ fn report_file_writes_json_off_stdout() {
         serde_json::from_str(&std::fs::read_to_string(&report).unwrap()).unwrap();
     assert_eq!(written["command"], "convert");
 }
+
+// --- write-target collision guards (PR review: never clobber data, exit 0) ----
+
+#[test]
+fn convert_rejects_in_place_output() {
+    let fix = fixture("hdr-48bit.tif");
+    let before = std::fs::read(&fix).unwrap();
+    let (code, _, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        fix.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "in-place output must be a usage error: {err}");
+    assert!(err.contains("overwrite the input"), "stderr: {err}");
+    assert_eq!(
+        std::fs::read(&fix).unwrap(),
+        before,
+        "input scan must be untouched"
+    );
+}
+
+#[test]
+fn convert_rejects_report_file_colliding_with_artifacts() {
+    let dir = TempDir::new("collide");
+    let out = dir.path("out.tiff");
+    let fix = fixture("hdr-48bit.tif");
+    // --report-file == the output TIFF.
+    let (code, _, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--report-file",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "report over output must be a usage error: {err}");
+    // --report-file == the automatic sidecar.
+    let sidecar = dir.path("out.tiff.json");
+    let (code, _, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--report-file",
+        sidecar.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "report over sidecar must be a usage error: {err}");
+    assert!(
+        !out.exists(),
+        "no artifact may be written on a rejected run"
+    );
+}
+
+#[test]
+fn inspect_rejects_report_file_over_input() {
+    let fix = fixture("hdri-64bit.tif");
+    let before = std::fs::read(&fix).unwrap();
+    let (code, _, err) = run(&[
+        "inspect",
+        fix.to_str().unwrap(),
+        "--report-file",
+        fix.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "report over input must be a usage error: {err}");
+    assert_eq!(
+        std::fs::read(&fix).unwrap(),
+        before,
+        "input scan must be untouched"
+    );
+}
+
+#[test]
+fn convert_rejects_unapplied_input_profile() {
+    // `input.color = profile` is parsed but input-side CM isn't implemented in
+    // Step 1 — it must fail loudly (exit 4), not silently ignore the profile.
+    let dir = TempDir::new("inprofile");
+    let out = dir.path("out.tiff");
+    let fix = fixture("hdr-48bit.tif");
+    let (code, _, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--input-profile",
+        "scanner.icc",
+    ]);
+    assert_eq!(code, 4, "unapplied input profile must exit 4: {err}");
+    assert!(err.contains("not implemented"), "stderr: {err}");
+    assert!(!out.exists());
+}

@@ -705,6 +705,42 @@ fn run_params() -> Result<()> {
     Ok(())
 }
 
+/// Best-effort stable key for path-collision checks: canonicalized when the
+/// file exists (resolves symlinks / `..`), otherwise the absolute lexical form
+/// (write targets may not exist yet). A guard against accidental
+/// self-clobbering, not adversarial links.
+fn collision_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Reject write targets that would clobber the input scan or one another —
+/// e.g. `-o` equal to the input (destroys the negative), or `--report-file`
+/// equal to the output/sidecar (truncates a just-written artifact) — all of
+/// which would otherwise "succeed" with exit 0. Fail loudly up front instead.
+fn ensure_write_targets_distinct(input: &Path, targets: &[(&str, &Path)]) -> Result<()> {
+    let input_key = collision_key(input);
+    let mut seen: Vec<(&str, PathBuf)> = Vec::with_capacity(targets.len());
+    for (label, path) in targets {
+        let key = collision_key(path);
+        if key == input_key {
+            return Err(NcError::Usage(format!(
+                "{label} ({}) would overwrite the input scan",
+                path.display()
+            )));
+        }
+        if let Some((other, _)) = seen.iter().find(|(_, k)| *k == key) {
+            return Err(NcError::Usage(format!(
+                "{label} ({}) collides with {other}",
+                path.display()
+            )));
+        }
+        seen.push((label, key));
+    }
+    Ok(())
+}
+
 /// `nc convert` — the full pipeline: decode → film-base → algorithm → output
 /// color transform → encode (+ sidecar, + optional IR export). Warnings are
 /// collected into the report and echoed to stderr; `--strict` promotes any of
@@ -715,6 +751,32 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
     let cfg = merge(load_recipe(args.recipe_in.as_deref())?, &args);
     validate(&cfg)?;
+
+    // `input.color` profiles are parsed into the recipe shape, but input-side
+    // color management is not implemented yet — reject loudly rather than
+    // silently ignoring a documented knob (scans are decoded as linear).
+    if let InputColor::Profile(p) = &cfg.input.color {
+        return Err(NcError::Unsupported(format!(
+            "--input-profile {p}: input-side color management is not implemented              yet; SilverFast scans are decoded as linear (omit the flag or use              --assume-linear)"
+        )));
+    }
+
+    // Guard every write target against the input and against each other before
+    // anything is decoded or written.
+    let sidecar = encode::sidecar_path(&args.output);
+    let mut targets: Vec<(&str, &Path)> =
+        vec![("--output", &args.output), ("the sidecar", &sidecar)];
+    if let Some(p) = &args.dump_params {
+        targets.push(("--dump-params", p));
+    }
+    if let Some(p) = args.report.report_file.as_deref() {
+        targets.push(("--report-file", p));
+    }
+    if let Some(p) = cfg.input.export_ir.as_deref() {
+        targets.push(("--export-ir", Path::new(p)));
+    }
+    ensure_write_targets_distinct(&args.input, &targets)?;
+
     if let Some(path) = &args.dump_params {
         write_json(path, &cfg)?;
     }
@@ -863,6 +925,9 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     let started = Instant::now();
     let log = Log::new(&args.report);
 
+    if let Some(rf) = args.report.report_file.as_deref() {
+        ensure_write_targets_distinct(&args.input, &[("--report-file", rf)])?;
+    }
     let (image, info) = decode(&args.input)?;
     log.info(format_args!(
         "decoded {:?} {}x{} (ir={})",
@@ -921,6 +986,9 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     let started = Instant::now();
     let log = Log::new(&args.report);
 
+    if let Some(rf) = args.report.report_file.as_deref() {
+        ensure_write_targets_distinct(&args.input, &[("--report-file", rf)])?;
+    }
     let source = film_base_source_override(&args.film_base).unwrap_or_default();
     // Guard an explicit base with the same check `convert` applies (a recipe
     // never reaches estimate, but a bad `--film-base` must fail loudly rather

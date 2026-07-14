@@ -906,6 +906,16 @@ a task; update your own section as you work. Append entries — don't rewrite th
     lcms severity discrimination. Confirmation re-review came back clean of
     important issues.
 
+- 2026-07-14 — **PR #16 review fixes (data-loss guards).** (1) Every write
+  target (`--output`, the sidecar, `--dump-params`, `--report-file`,
+  `--export-ir`) is now checked against the input scan and against each other
+  before anything is decoded or written — previously `-o <input>` destroyed the
+  negative and `--report-file <output>` truncated the just-written TIFF, both
+  with exit 0. `encode::sidecar_path` extracted so the CLI can include the
+  sidecar in the check. (2) `--input-profile` / recipe `input.color.profile`
+  was a silent no-op (parsed, never applied); `convert` now rejects it with
+  exit 4 until input-side color management lands (§9 note added). Four new E2E
+  tests pin all of it.
 - 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
   (gates re-run green: 110 unit + 13 integration tests; CLAUDE.md refreshed —
   module map, dead-code note, and the lcms2 global-handler mechanism now match

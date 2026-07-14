@@ -331,7 +331,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <h4>Input / decode</h4>
 <ul>
   <li><code>--export-ir &lt;path&gt;</code> — write the IR plane to a separate file (HDRi only). Recipe key <code>input.export_ir</code>.</li>
-  <li>Input color handling is a single mutually-exclusive choice, recipe key <code>input.color</code> (default <code>"auto"</code> — the file's embedded / default profile). <code>--assume-linear</code> ⇒ <code>input.color = "linear"</code> (data already linear); <code>--input-profile &lt;icc&gt;</code> ⇒ <code>input.color = { "profile": "&lt;icc&gt;" }</code>. Passing both is a usage error; either flag replaces a recipe's <code>input.color</code>.</li>
+  <li>Input color handling is a single mutually-exclusive choice, recipe key <code>input.color</code> (default <code>"auto"</code> — the file's embedded / default profile). <code>--assume-linear</code> ⇒ <code>input.color = "linear"</code> (data already linear); <code>--input-profile &lt;icc&gt;</code> ⇒ <code>input.color = { "profile": "&lt;icc&gt;" }</code> — accepted in the recipe shape but <strong>not yet applied</strong>: <code>convert</code> rejects it loudly (exit 4) until input-side color management lands; scans are decoded as linear. Passing both is a usage error; either flag replaces a recipe's <code>input.color</code>.</li>
 </ul>
 <h4>Film base / Dmin (stage 2)</h4>
 <p>The base source is a single mutually-exclusive choice, recipe key <code>film_base.source</code> (default <code>"auto"</code>). The three flags conflict (passing more than one is a usage error); whichever is given replaces a recipe's source.</p>
