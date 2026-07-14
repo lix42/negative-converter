@@ -94,7 +94,7 @@
   <h1>Negative Converter — High-Level Design Spec</h1>
   <p class="lead">A CLI tool that converts film-negative scans to positive images, with every parameter exposed for agent control.</p>
   <div class="badges">
-    <span class="badge">Status: Draft for review</span>
+    <span class="badge">Status: Living document (updated as tasks land)</span>
     <span class="badge">Target: Step 1 (MVP)</span>
     <span class="badge">Language: Rust</span>
   </div>
@@ -205,8 +205,8 @@
       <li><code>--out-depth f32</code> → 32-bit float TIFF (full HDR, no precision loss).</li>
     </ul>
   </li>
-  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for <code>u16</code> (display-ready), a <strong>wide-gamut</strong> space (e.g. ProPhoto / linear ACEScg) for <code>f32</code> to avoid clipping HDR range. Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
-  <li><strong>Metadata:</strong> the effective parameter set (recipe) and key estimated values are written to a sidecar JSON next to the output, and core provenance is embedded in the TIFF where practical.</li>
+  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for <code>u16</code> (display-ready), <strong>linear ACEScg</strong> (wide-gamut) for <code>f32</code> to avoid clipping HDR range (<code>prophoto</code> and user ICC files are also accepted). Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
+  <li><strong>Metadata:</strong> the effective parameter set (recipe) and key estimated values are written to a <strong>sidecar JSON</strong> next to the output (paired by name; the same shape as <code>--dump-params</code>). The TIFF itself embeds the ICC profile of the chosen output space; the recipe is deliberately <em>not</em> embedded in the TIFF (resolved, §13).</li>
 </ul>
 
 <h2 id="pipeline">6. Pipeline architecture</h2>
@@ -258,11 +258,11 @@
 
 <h4>Pluggable interface (sketch)</h4>
 <pre><code>/// A negative→positive conversion algorithm.
-/// Pure: no I/O, no hidden state.
+/// Pure: no I/O, no hidden state. Parameters live in the implementing struct
+/// (e.g. `Density { density, print }`), keeping the trait object-safe; a
+/// factory maps `--algorithm` + the resolved params to a boxed converter.
 pub trait Converter {
-    type Params;
-    fn convert(&amp;self, img: &amp;LinearImage, base: &amp;FilmBase, p: &amp;Self::Params)
-        -&gt; Result&lt;LinearImage, ConvertError&gt;;
+    fn convert(&amp;self, image: &amp;LinearImage, base: &amp;FilmBase) -&gt; Result&lt;LinearImage&gt;;
 }</code></pre>
 
 <h2 id="cli">8. CLI design</h2>
@@ -326,7 +326,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # …or bake the value into roll-A.json (film_base.source = explicit) and batch it.</code></pre>
 
 <h2 id="params">9. Parameter reference (grouped by stage)</h2>
-<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are indicative. Unknown keys are rejected (see the Recipes section).</p>
+<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are binding — the recipe structs and this section are kept in sync (<code>deny_unknown_fields</code>). Unknown keys are rejected (see the Recipes section).</p>
 
 <h4>Input / decode</h4>
 <ul>
@@ -371,13 +371,14 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <ul>
   <li><code>-o, --output &lt;path&gt;</code> (required)</li>
   <li><code>--out-depth u16|f32</code> (default <code>u16</code>)</li>
-  <li><code>--output-profile &lt;icc|sRGB|prophoto|acescg|...&gt;</code> (depth-aware default: <code>sRGB</code> for <code>u16</code>, wide-gamut for <code>f32</code>)</li>
+  <li><code>--output-profile &lt;srgb|prophoto|acescg|path-to-icc&gt;</code> (depth-aware default: <code>srgb</code> for <code>u16</code>, <code>acescg</code> for <code>f32</code>)</li>
   <li><code>--bigtiff auto|on|off</code> (default <code>auto</code>)</li>
 </ul>
 <h4>Global</h4>
 <ul>
   <li><code>--params &lt;json&gt;</code>, <code>--dump-params &lt;json&gt;</code></li>
   <li><code>--report json|none</code>, <code>--report-file &lt;path&gt;</code></li>
+  <li><code>--strict</code> — promote report warnings (clipping, non-finite samples, …) to a failing exit (see the Errors section)</li>
   <li><code>-v/--verbose</code>, <code>--quiet</code></li>
 </ul>
 
@@ -430,7 +431,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <p>Warnings (e.g. clipped highlights/shadows, IR present but ignored, BigTIFF auto-promoted) are surfaced in the JSON report and on stderr, without failing the run unless <code>--strict</code> is set.</p>
 
 <h2 id="roadmap">12. Roadmap (follow-up tasks, explicitly out of Step 1)</h2>
-<p>Deliberately deferred and recorded here so they aren't lost.</p>
+<p>Deliberately deferred and recorded here so they aren't lost. Items graduate into tracked tasks in <code>docs/TASKS.md</code> — several already have (item 2's sigmoid → <code>algo-sigmoid</code>; plus <code>dmax-white-anchor</code>, <code>auto-neutral-wb</code>, and <code>regional-color-balance</code> from the NLP feature comparison, Phase 6).</p>
 <ol>
   <li><strong>IR-based dust &amp; scratch removal.</strong> Consume the IR channel (already preserved in Step 1) to build a defect mask and inpaint defects. Parameters: IR threshold, mask dilation/morphology, inpainting method/strength. Must handle the known limits — disable/guard for silver B&amp;W film and Kodachrome. New stages: <code>defect_mask</code>, <code>inpaint</code>; new flags under an <code>--ir-*</code> namespace.</li>
   <li><strong>Additional algorithms.</strong> At minimum a <strong>sigmoid / explicit H&amp;D-curve</strong> model (NegPy-style) for more photographically meaningful controls; possibly a power-law/exponent model (RawTherapee-style) for camera-scanned negatives. Added via the existing <code>Converter</code> trait, selectable with <code>--algorithm</code>.</li>
@@ -446,10 +447,11 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 </ol>
 
 <h2 id="open">13. Open questions</h2>
+<p>All of the Step-1 open questions have since been resolved (kept here as a record):</p>
 <ul>
-  <li>Exact on-disk SilverFast HDRi tag/channel layout — must be confirmed against real sample files (user will provide); the decoder should log what it finds.</li>
-  <li>Which specific wide-gamut space to default to for <code>f32</code> HDR output (ProPhoto RGB vs linear ACEScg vs Rec.2020) — the <em>option</em> is decided; the default value is still open.</li>
-  <li>Whether the embedded TIFF metadata should carry the full recipe or just a pointer to the sidecar JSON.</li>
+  <li><s>Exact on-disk SilverFast HDRi tag/channel layout</s> — <strong>resolved 2026-06</strong>: reverse-engineered and verified against real sample files; documented in §4 (separate full-resolution grayscale IR IFD, optional preview IFD, structural HDR/HDRi detection).</li>
+  <li><s>Which wide-gamut space to default to for <code>f32</code> HDR output</s> — <strong>resolved</strong>: <strong>linear ACEScg</strong> is the <code>f32</code> default (<code>prophoto</code> and user ICC remain selectable); see §5.</li>
+  <li><s>Whether the embedded TIFF metadata should carry the full recipe</s> — <strong>resolved</strong>: the recipe lives in the sidecar JSON only (paired by name with the output); the TIFF embeds just the ICC profile. See §5.</li>
 </ul>
 
 <footer>

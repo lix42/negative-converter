@@ -1,6 +1,6 @@
 # Negative Converter — High-Level Design Spec (Step 1)
 
-> Status: Draft for review · Target: Step 1 (MVP) · Language: Rust
+> Status: Living document (updated as tasks land) · Target: Step 1 (MVP) · Language: Rust
 >
 > This document is the machine-readable (Markdown) companion to `design-spec.html`.
 > Both contain the same content; the HTML version is for humans, this one is for agents.
@@ -128,13 +128,15 @@ algorithm consumes — nothing downstream needs to know the on-disk format.
 - **Color (selectable, depth-aware default):** the output color space is a CLI
   option (`--output-profile`). The default depends on output depth:
   - `u16` output → **sRGB** (standard, display-ready positive).
-  - `f32` output → a **wide-gamut** space (e.g. ProPhoto / linear ACEScg) to
-    avoid clipping the extended range of HDR data.
+  - `f32` output → **linear ACEScg** (wide-gamut), avoiding clipping of the
+    extended range of HDR data. (`prophoto` and user ICC files are also
+    accepted.)
   Either default can be overridden explicitly. Output is tagged with the embedded
   ICC profile for the chosen space.
 - **Metadata:** the effective parameter set (recipe) and key estimated values are
-  written to a sidecar JSON next to the output, and core provenance is embedded in
-  the TIFF where practical.
+  written to a **sidecar JSON** next to the output (paired by name; the same shape
+  as `--dump-params`). The TIFF itself embeds the ICC profile of the chosen output
+  space; the recipe is deliberately *not* embedded in the TIFF (resolved, §13).
 
 ## 6. Pipeline architecture
 
@@ -217,11 +219,11 @@ separate, independently parameterized sub-stages — the core fidelity rule from
 
 ```rust
 /// A negative→positive conversion algorithm.
-/// Pure: no I/O, no hidden state.
+/// Pure: no I/O, no hidden state. Parameters live in the implementing struct
+/// (e.g. `Density { density, print }`), keeping the trait object-safe; a
+/// factory maps `--algorithm` + the resolved params to a boxed converter.
 pub trait Converter {
-    type Params;
-    fn convert(&self, img: &LinearImage, base: &FilmBase, p: &Self::Params)
-        -> Result<LinearImage, ConvertError>;
+    fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
 }
 ```
 
@@ -307,7 +309,8 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 
 Every flag is also a recipe key, nested under the stage object shown in each
 heading below (e.g. `--density-gamma` ⇒ `density.density_gamma`, `--out-depth` ⇒
-`output.out_depth`, `--algorithm` ⇒ top-level `algorithm`). Names are indicative.
+`output.out_depth`, `--algorithm` ⇒ top-level `algorithm`). Names are binding —
+the recipe structs and this section are kept in sync (`deny_unknown_fields`).
 Unknown keys are rejected (see §8).
 
 ### Input / decode
@@ -394,13 +397,15 @@ crossover.
 ### Output / encode (stage 5)
 - `-o, --output <path>` (required)
 - `--out-depth u16|f32` (default `u16`)
-- `--output-profile <icc|sRGB|prophoto|acescg|...>` (default is depth-aware:
-  `sRGB` for `u16`, wide-gamut for `f32`)
+- `--output-profile <srgb|prophoto|acescg|path-to-icc>` (default is depth-aware:
+  `srgb` for `u16`, `acescg` for `f32`)
 - `--bigtiff auto|on|off` (default `auto`)
 
 ### Global
 - `--params <json>`, `--dump-params <json>`
 - `--report json|none`, `--report-file <path>`
+- `--strict` — promote report warnings (clipping, non-finite samples, …) to a
+  failing exit (see §11)
 - `-v/--verbose`, `--quiet`
 
 ## 10. Code architecture (Rust)
@@ -457,7 +462,10 @@ run unless `--strict` is set.
 
 ## 12. Roadmap (follow-up tasks, explicitly out of Step 1)
 
-These are deliberately deferred and recorded here so they aren't lost.
+These are deliberately deferred and recorded here so they aren't lost. Items
+graduate into tracked tasks in [TASKS.md](TASKS.md) — several already have
+(item 2's sigmoid → `algo-sigmoid`; plus `dmax-white-anchor`, `auto-neutral-wb`,
+and `regional-color-balance` from the NLP feature comparison, Phase 6).
 
 1. **IR-based dust & scratch removal.** Consume the IR channel (already preserved
    in Step 1) to build a defect mask and inpaint defects. Parameters: IR
@@ -510,10 +518,15 @@ These are deliberately deferred and recorded here so they aren't lost.
 
 ## 13. Open questions
 
-- Exact on-disk SilverFast HDRi tag/channel layout — must be confirmed against
-  real sample files (user will provide); the decoder should log what it finds.
-- Which specific wide-gamut space to default to for `f32` HDR output (ProPhoto
-  RGB vs linear ACEScg vs Rec.2020) — the *option* is decided; the default value
-  is still open.
-- Whether the embedded TIFF metadata should carry the full recipe or just a
-  pointer to the sidecar JSON.
+All of the Step-1 open questions have since been resolved (kept here as a record):
+
+- ~~Exact on-disk SilverFast HDRi tag/channel layout~~ — **resolved 2026-06**:
+  reverse-engineered and verified against real sample files; documented in §4
+  (separate full-resolution grayscale IR IFD, optional preview IFD, structural
+  HDR/HDRi detection).
+- ~~Which wide-gamut space to default to for `f32` HDR output~~ — **resolved**:
+  **linear ACEScg** is the `f32` default (`prophoto` and user ICC remain
+  selectable); see §5.
+- ~~Whether the embedded TIFF metadata should carry the full recipe~~ —
+  **resolved**: the recipe lives in the sidecar JSON only (paired by name with
+  the output); the TIFF embeds just the ICC profile. See §5.
