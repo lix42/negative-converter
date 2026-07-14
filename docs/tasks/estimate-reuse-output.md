@@ -27,6 +27,15 @@ JSON on stdout clean (logs/warnings to stderr) per the determinism rules. Report
 the sampled region and source (from the resolved `film_base.source`) too, so the
 output documents how the base was obtained.
 
+**Grid / multi-region sampling for unexposed-frame calibration (§9 ladder Tier
+1).** A dedicated blank frame offers far more area than a rebate strip — exploit
+it: a mode (e.g. `--grid`) that samples several regions (center + corners),
+requires per-channel agreement within a documented tolerance, and reports the
+spread alongside the combined value. Agreement failure is *diagnostic* — it
+indicates light leaks, scanner illumination falloff, or dust — so report it
+loudly (warning, `--strict`-promotable) with the per-region values rather than
+just averaging them away. Deterministic: fixed grid layout, fixed percentile.
+
 ## How to Verify
 
 - `nc estimate --base-region … ref.tiff --report json` emits both the array and

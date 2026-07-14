@@ -293,6 +293,8 @@ nc convert frame12.tiff -o frame12_pos.tiff \
 nc inspect in.tiff --report json
 
 # Calibrate once from an unexposed reference frame, then reuse for the roll.
+# (Product tip: shoot 1-2 lens-cap frames when loading the roll and scan one —
+# a full frame of clean base beats sampling the thin rebate. See §9 film-base.)
 # `estimate` measures Dmin from the sampled rectangle and reports it in a form
 # ready to drop into --film-base or a recipe's film_base.source.
 nc estimate reference.tiff --base-region 200,0,300,3600 --report json
@@ -325,21 +327,51 @@ than one is a usage error); whichever is given replaces a recipe's source:
 - `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this rectangle.
 - `--auto-base` (default) ⇒ `"auto"` — best-effort estimate from the film border.
 
-**Recommended workflow — calibrate once, reuse across the batch.** `Dmin` is a
-property of the *film stock + development + scanner settings*, not of an
-individual frame, so the accurate path for color negatives is to measure the base
-**once** from an unexposed reference and reuse it for the whole roll (see the
-calibration example in §8), rather than re-detecting per frame. Measured this way
-the base is identical across frames, keeping a roll color-consistent.
+**How to obtain `Dmin` — the acquisition ladder.** `Dmin` is a property of the
+*film stock + development + scanner settings*, not of an individual frame, so
+measure it **once per roll** and reuse it (recipe / `--film-base`) rather than
+re-detecting per frame — measured this way the base is identical across frames,
+keeping the roll color-consistent. The sources, in decreasing reliability:
 
-**On `--auto-base` (best-effort).** Real scans are laid out as
-`dark film holder → thin unexposed rebate → exposed picture`; the rebate (the
-actual film base) is a narrow, uniform, bright band *inset behind the holder*, and
-may appear on only some edges. Step-1 auto uses a simple margin heuristic and will
-**fail loudly** (never emit a silently-wrong base) when it can't confidently
-isolate that band — at which point use `--base-region` (point it at the rebate or
-an unexposed reference) or `--film-base`. A robust inward-scan detector and a
-`--holder white|black` control for light holders are roadmap items (§12).
+1. **A dedicated unexposed frame (best).** Recommended shooting workflow: after
+   loading a roll, fire 1–2 frames with the lens cap on (most cameras burn 1–2
+   wind-on frames anyway), then scan one of those blank frames alongside the
+   roll. It provides a full frame of clean base — far more area than the rebate
+   — measured with `nc estimate` and frozen into the roll recipe (§8 example).
+   The large area also enables multi-region sampling with an agreement check
+   (roadmap §12), which doubles as a light-leak / illumination-falloff
+   diagnostic.
+2. **The rebate (the unexposed strip around each frame).** Reliable form: point
+   `--base-region` at a visible rebate patch manually (read the coordinates from
+   any image viewer; UI-assisted picking is a roadmap item, §12). Convenience
+   form: `--auto-base` (the default) — real scans are laid out as
+   `dark film holder → thin unexposed rebate → exposed picture`, the rebate being
+   a narrow, uniform, bright band *inset behind the holder*, possibly on only
+   some edges. Auto detection keeps **deliberately strict** confidence gates
+   (uniformity, brighter-than-interior) and **fails loudly** rather than emit a
+   silently-wrong base; its thresholds are tuned against real scans
+   (`real-scan-verification`). A robust inward-scan detector and a
+   `--holder white|black` control for light holders are roadmap items (§12).
+3. **Content-based estimation (last resort, opt-in).** When the scan is cropped
+   to the image with no unexposed film visible, a per-channel high percentile of
+   the *exposed content* approximates the base (the thinnest area of a negative
+   is the scene's deepest black, close to true base). This is an **explicit
+   opt-in source** (roadmap §12): it changes the assumption from "physical base
+   measured" to "scene contains a near-black", so the tool never falls back to
+   it silently, and the report records that the base came from content
+   statistics. When the assumption fails (foggy/high-key scenes) blacks wash out
+   and pick up a cast.
+
+**When every source is missing** (no explicit base, auto refuses, content mode
+not requested), `convert` **fails loudly** with an actionable message naming the
+recovery flags — an agent can catch the exit code and re-run with an explicit
+choice. Estimator selection is never silent. A neutral base `[1,1,1]` is
+representable but not recommended: it forfeits the per-channel orange-mask
+neutralization (content estimation strictly dominates it). Note the failure
+geometry is forgiving: because `D = -log10(scan/base)`, a base error is a
+*constant per-channel density offset* — a global cast/exposure error correctable
+downstream (`density_offset`, white balance) — never a shadow/highlight
+crossover.
 
 ### Algorithm select
 - `--algorithm simple|density`
@@ -452,13 +484,29 @@ These are deliberately deferred and recorded here so they aren't lost.
    inward-scan detector for the real `holder → thin rebate → picture` layout:
    march strips in from each edge and pick the brightest uniform band past the
    holder (the rebate can be thin and on only some edges). Keep deterministic;
-   still fail loudly when no confident band exists.
+   still fail loudly when no confident band exists, with thresholds tuned
+   against the real-scan verification results. Same task family: an explicit
+   opt-in **content-based source** (`film_base.source = "content"`, §9 ladder
+   tier 3) recorded in the report; a **uniformity warning on `--base-region`**
+   (a mixed rebate/image rectangle currently yields a plausible-looking bad
+   base silently); and `nc inspect` reporting **candidate rebate regions**
+   (coordinates + confidence) so CLI users confirm instead of measuring — the
+   same data a future UI would highlight.
 9. **Light film holders.** Auto/border logic assumes a dark holder surround; some
    holders are white. Add a `--holder white|black` control (recipe key
    `film_base.holder`) so detection knows the surround polarity.
 10. **Reuse-ready `nc estimate` output.** Emit the measured base in a directly
     reusable form — a `--film-base R,G,B` string and/or a `film_base` recipe
     fragment — so the calibrate-once → reuse workflow (§8) is copy-paste smooth.
+    Plus **grid / multi-region sampling with an agreement check** for
+    unexposed-frame calibration (§9 ladder tier 1): sample center + corners,
+    require per-channel agreement within a tolerance, and report the spread —
+    disagreement diagnoses light leaks and scanner illumination falloff.
+11. **UI-assisted film-base picking.** Once a UI layer exists: visual region
+    picking for the rebate/reference frame, highlighting auto-detected
+    candidates, and feedback when a chosen region fails the uniformity check
+    (the CLI-side uniformity warning and inspect candidates above are the
+    building blocks).
 
 ## 13. Open questions
 
