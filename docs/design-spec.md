@@ -242,6 +242,12 @@ separate, independently parameterized sub-stages — the core fidelity rule from
 /// factory maps `--algorithm` + the resolved params to a boxed converter.
 pub trait Converter {
     fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
+
+    /// Optional per-conversion diagnostics for the JSON report (e.g. the
+    /// resolved `Dmax`). Defaulted to `convert` + an empty `ConvertReport`,
+    /// so algorithms with nothing to report only implement `convert`.
+    fn convert_reported(&self, image: &LinearImage, base: &FilmBase)
+        -> Result<(LinearImage, ConvertReport)> { /* default provided */ }
 }
 ```
 
@@ -295,15 +301,17 @@ writes the same shape with the resolved values. Example:
 ### Example invocations
 
 ```bash
-# Default density conversion, 16-bit TIFF out, auto Dmin, JSON report.
+# Default density conversion, 16-bit TIFF out, auto Dmin & Dmax, JSON report.
 nc convert in.tiff -o out.tiff --algorithm density --report json
 
-# Full HDR float output, manual film base, explicit print controls.
+# Full scene-referred HDR float output: --no-d-max disables the display-white
+# anchor (base → 1.0, detail above), and the depth-aware default profile
+# (acescg for f32) applies. Manual film base, explicit print controls.
 nc convert in.tiff -o out.tiff \
-  --algorithm density --out-depth f32 \
+  --algorithm density --out-depth f32 --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
-  --highlight-compress 0.3 --output-profile sRGB
+  --highlight-compress 0.3
 
 # Reuse a roll recipe but override one knob for this frame.
 nc convert frame12.tiff -o frame12_pos.tiff \
