@@ -705,14 +705,48 @@ fn run_params() -> Result<()> {
     Ok(())
 }
 
-/// Best-effort stable key for path-collision checks: canonicalized when the
-/// file exists (resolves symlinks / `..`), otherwise the absolute lexical form
-/// (write targets may not exist yet). A guard against accidental
-/// self-clobbering, not adversarial links.
+/// Best-effort stable key for path-collision checks. Canonicalize the path when
+/// it exists (resolves symlinks and `..`); for a not-yet-created write target,
+/// canonicalize its parent directory instead (`tmp/sub/../out.tiff` and
+/// `tmp/out.tiff` must compare equal — `std::path::absolute` alone keeps the
+/// `..` and would let them slip past the check), re-attaching the file name.
+/// When even the parent doesn't exist, fall back to a lexical normalization of
+/// the absolute form. A guard against accidental self-clobbering, not
+/// adversarial links.
 fn collision_key(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path)
-        .or_else(|_| std::path::absolute(path))
-        .unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(p) = std::fs::canonicalize(parent) {
+            return p.join(name);
+        }
+    }
+    lexical_absolute(path)
+}
+
+/// Absolute form with `.`/`..` components removed lexically (no filesystem
+/// access). Last-resort key for paths whose parent doesn't exist yet; lexical
+/// `..` removal can disagree with the filesystem across symlinked directories,
+/// which is acceptable for an accident guard.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Reject write targets that would clobber the input scan or one another —

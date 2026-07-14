@@ -516,6 +516,19 @@ fn convert_rejects_report_file_colliding_with_artifacts() {
         sidecar.to_str().unwrap(),
     ]);
     assert_eq!(code, 2, "report over sidecar must be a usage error: {err}");
+    // --report-file reaching the output through a `..` traversal (the target
+    // doesn't exist yet, so canonicalizing the full path alone can't catch it).
+    std::fs::create_dir_all(dir.path("sub")).unwrap();
+    let dotted = dir.path("sub/../out.tiff");
+    let (code, _, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--report-file",
+        dotted.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "dotted report over output must be rejected: {err}");
     assert!(
         !out.exists(),
         "no artifact may be written on a rejected run"
