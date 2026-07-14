@@ -587,9 +587,9 @@ dependencies = [
 
 [[package]]
 name = "lcms2-sys"
-version = "4.0.6"
+version = "4.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c2604b23848ca80b2add60f0fb2270fd980e622c25029b6597fa01cfd5f8d5f"
+checksum = "264db0b78119c5a37d78bb41fb355daab29b3b29430b53cd92e3da51f0ab06cc"
 dependencies = [
  "cc",
  "dunce",
@@ -684,6 +684,7 @@ dependencies = [
  "image",
  "kamadak-exif",
  "lcms2",
+ "lcms2-sys",
  "palette",
  "rayon",
  "serde",

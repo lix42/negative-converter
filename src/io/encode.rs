@@ -51,6 +51,22 @@ pub fn encode(
     Ok(report)
 }
 
+/// Whether encoding `image` under `params` (with an `icc_len`-byte embedded
+/// profile) will produce a BigTIFF. Reuses the same sizing logic `encode` runs
+/// internally, so the orchestrator can report an `auto` promotion in the JSON
+/// report without duplicating the threshold — and without re-deciding it
+/// differently than the encoder does.
+pub fn plans_bigtiff(params: &OutputParams, image: &LinearImage, icc_len: usize) -> bool {
+    resolve_bigtiff(
+        params.bigtiff,
+        image.width,
+        image.height,
+        3,
+        depth_bytes(params.out_depth),
+        icc_len as u64,
+    )
+}
+
 /// Write the IR plane as a single-channel TIFF at `depth`. Errors loudly when the
 /// image carries no IR plane rather than writing an empty/placeholder file — the
 /// caller asked for IR export, so a missing plane is a real failure.
@@ -69,11 +85,18 @@ pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<()
 /// path is `<output>.json` (e.g. `out.tiff` → `out.tiff.json`), so an output and
 /// its recipe stay paired by name.
 pub fn write_sidecar(output_path: &Path, recipe_json: &str) -> Result<()> {
-    let mut name = OsString::from(output_path.as_os_str());
-    name.push(".json");
-    let sidecar = PathBuf::from(name);
+    let sidecar = sidecar_path(output_path);
     std::fs::write(&sidecar, recipe_json)
         .map_err(|e| NcError::Write(format!("writing sidecar {}: {e}", sidecar.display())))
+}
+
+/// The sidecar path for an output: `<output>.json` (extension appended, not
+/// replaced, so `a.tiff` → `a.tiff.json` and output/sidecar stay paired by name).
+/// Exposed so the CLI can include the sidecar in write-target collision checks.
+pub fn sidecar_path(output_path: &Path) -> PathBuf {
+    let mut name = OsString::from(output_path.as_os_str());
+    name.push(".json");
+    PathBuf::from(name)
 }
 
 // ---------------------------------------------------------------------------

@@ -320,7 +320,10 @@ Unknown keys are rejected (see §8).
 - Input color handling is a single mutually-exclusive choice, recipe key
   `input.color` (default `"auto"` — the file's embedded / default profile):
   - `--assume-linear` ⇒ `input.color = "linear"` — data is already linear.
-  - `--input-profile <icc>` ⇒ `input.color = { "profile": "<icc>" }`.
+  - `--input-profile <icc>` ⇒ `input.color = { "profile": "<icc>" }` —
+    accepted in the recipe shape but **not yet applied**: `convert` rejects it
+    loudly (exit 4) until input-side color management lands; scans are decoded
+    as linear.
   Passing both is a usage error; either flag replaces a recipe's `input.color`.
 
 ### Film base / Dmin (stage 2)

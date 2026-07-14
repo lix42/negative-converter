@@ -761,11 +761,169 @@ a task; update your own section as you work. Append entries — don't rewrite th
   decided at the spec level (§7.2/§9 defaults) alongside the polarity correction.
 
 ## pipeline-orchestration
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-14
 
-- Goal: wire `convert`/`inspect`/`estimate` end to end, producing a positive TIFF
-  and JSON reports from a real scan.
+- Goal: wire `convert`/`inspect`/`estimate` (+ `params`) end to end, producing a
+  positive TIFF and JSON reports from a real scan. Final Step-1 MVP task.
+- **Done.** The four subcommands run end to end. Full CI gate clean
+  (`fmt --check`, `clippy --all-targets -D warnings`, `build`, `test`); suite is
+  **124 tests** (110 unit + 14 new end-to-end in `tests/pipeline.rs`).
+
+### What was built
+- **`pipeline/stages.rs` (the pure in-memory core).** `render(image,
+  &FilmBaseParams, AlgoParams, &OutputParams) -> Result<Rendered>` threads stages
+  2–4 (film-base estimate → algorithm → output color transform) and returns
+  `Rendered { image, icc, film_base }`. `algo_params(algorithm, &simple,
+  &density, &print) -> AlgoParams` assembles the selected algorithm's param set.
+  Both are **pure** (no I/O); decode (stage 1) and encode (stage 5) are I/O and
+  stay in the `cli` orchestrator, honoring "stages stay pure; main/cli
+  orchestrate."
+- **`cli.rs` (orchestration).** `run_convert` does decode → IR-export fast-fail
+  guard → render → lcms error check → BigTIFF-auto notice → optional IR export →
+  encode → effective-recipe sidecar → report emit → `--strict` gate. `run_inspect`
+  decodes and reports `DecodeInfo` + a best-effort auto `Dmin` (a failed auto is a
+  report *warning*, not fatal — real scans need `--base-region`/`--film-base`).
+  `run_estimate` runs only film-base estimation from the selected source and emits
+  the `FilmBase`. `run_params` unchanged.
+- **Report shape.** One `Report` struct serves all commands; per-command
+  irrelevant fields are `None`/empty and omitted via `skip_serializing_if`, so
+  stdout is a clean per-command JSON object. Serialize-only (embeds the
+  serialize-only `DecodeInfo`/`EncodeReport`). `film_base_source` is the
+  **structured** `FilmBaseSource` (`"auto"` / `{"region":[…]}` / `{"explicit":[…]}`),
+  not a display string, so an agent gets the sampled rect without string-parsing.
+- **`io/encode.rs`.** Added `plans_bigtiff(&OutputParams, &LinearImage, icc_len)`
+  reusing the internal `resolve_bigtiff`, so orchestration can report an `auto`
+  BigTIFF promotion without duplicating the threshold logic.
+- **Removed `#![allow(dead_code)]` from `main.rs`.** Revealed three deliberately
+  unused-by-Step-1 items now behind narrow, documented `#[allow(dead_code)]`:
+  `algo::Algorithm` + `AlgoParams::algorithm()` (the CLI/recipe standardized on
+  the identical `types::Algorithm`) and `color::icc_profile` (orchestration gets
+  the ICC from `to_output`). See follow-up below.
+
+### Key decisions / notes for dependents
+- **lcms2 gotcha handled (CLAUDE.md).** `color.rs` builds profiles/transforms on
+  lcms2's **global** context, and `transform_in_place` is infallible; Little CMS's
+  default handler is a **no-op that silently swallows errors** (verified in the
+  vendored source). The safe `lcms2` wrapper only exposes the handler per
+  `ThreadContext`, which would *not* cover the global-context transforms — so
+  `cli` installs the process-global handler directly via the **`lcms2-sys` FFI**
+  (`cmsSetLogErrorHandler`), added as a direct dep (`cargo add lcms2-sys`, 4.0.7,
+  already transitively present). The handler sets an `AtomicBool` + logs to
+  stderr; `run_convert` clears the flag right before `render` and checks it right
+  after, turning a runtime CMS fault into a loud `NcError::Other`.
+- **Exit codes (§11):** Usage=2 (bad params/recipe, bad `--film-base`), Decode=3
+  (unreadable/non-TIFF input), Unsupported=4 (`--export-ir` on an HDR scan with no
+  IR plane — fails *before* any output is written), Write=5 (unwritable output
+  path), Other=1 (degenerate estimated base; `--strict` warning promotion; lcms
+  fault). All exercised end-to-end.
+- **`--strict`** promotes any accumulated warning to exit 1 *after* emitting the
+  report (the machine-readable record still lands). Output/sidecar are written
+  before the strict gate because clip counts are only known post-encode — a
+  `--strict` failure therefore leaves the (honestly-reported-as-clipped) files on
+  disk; the loud exit code is the signal. Documented in the flag's behavior.
+- **IR handling:** the "IR present but not consumed in Step 1" notice is a report
+  warning **only when `--export-ir` is absent** — exporting *is* the user handling
+  it, so `--strict --export-ir` is a usable workflow on the primary HDRi format
+  (otherwise every HDRi `--strict` run would fail on that notice).
+- **`estimate` gained the film-base flags** (`EstimateArgs` flattens
+  `FilmBaseOverrides`) so the design-spec §8 calibrate-once-from-a-reference
+  workflow (`nc estimate ref.tif --base-region …`) works; `inspect` keeps the
+  bare `IoArgs`. Explicit-base range validation is shared with `convert` via
+  `validate_explicit_film_base`.
+- **Verbosity:** `Log { verbose, quiet }` — `-v` enables stderr progress lines,
+  `--quiet` silences them; warnings always land in the report regardless, and a
+  **non-finite (NaN/inf) fault is echoed to stderr even under `--quiet`** (it's a
+  numerical fault, not routine clipping, so `--quiet --report none` can't fully
+  hide it). stdout stays report-only.
+
+### Real-scan verification (committed fixtures — the large `../nc-assets/*`
+  and `~/Pictures/scan/*` dirs are absent in this environment, so verification
+  used the committed real SilverFast scans `tests/fixtures/{hdr-48bit,hdri-64bit}.tif`,
+  502×462, from the small asset set):
+- `inspect hdri-64bit.tif` → `format=hdri 502x462 ir=true`,
+  make/model/software `Plustek / OpticFilm 8300i / SilverFast 9.2.8`; auto Dmin
+  reported unavailable (non-uniform border, relative spread 0.83) as a warning —
+  the documented real-scan behavior.
+- `estimate hdr-48bit.tif --base-region 10,10,50,50` → structured
+  `film_base_source = {"region":[10,10,50,50]}`, a finite per-channel base.
+- `convert … --algorithm density` (default **u16**) → exit 0, report warns
+  **100% clipped_high (695772/695772)** — the known no-white-anchor issue below.
+- `convert … --algorithm density --out-depth f32 --film-base 0.9,0.55,0.42` →
+  exit 0, `loss = {clipped_low:0, clipped_high:0, non_finite:0}` (clean HDR).
+- `convert … --export-ir ir.tiff` on HDRi → writes a 1-channel IR TIFF; on HDR →
+  exit 4, no output written. `--strict --export-ir` on HDRi → exit 0.
+- Determinism confirmed: two identical `convert` runs produce **byte-identical**
+  TIFF + sidecar; a sidecar reloaded via `--params` reproduces the output.
+
+### Known issue explicitly NOT fixed here (parallel task `dmax-white-anchor`)
+- With the **current** default density params the render maps scene black (the
+  base) to `1.0` with all detail above it, so the default **u16** encode clips
+  heavily (≈100% on these fixtures) — surfaced loudly via the clip report and
+  `--strict`-promotable. This is **temporary**: the parallel `dmax-white-anchor`
+  branch adds a Dmax white anchor that drops the default clip fraction to ~0.5%
+  (per that agent), so nothing here treats the heavy clipping as permanent. Test
+  wording/assertions were kept anchor-independent — `u16_clipping_is_reported_and_
+  strict_promotes_it` forces clipping with a large `--print-exposure` rather than
+  relying on the default, so it stays valid after the anchor lands. Verify HDR
+  output end-to-end with `--out-depth f32` (clean) meanwhile.
+- **Report is extensible for the incoming `dmax`.** `dmax-white-anchor` adds a
+  defaulted `Converter::convert_reported -> ConvertReport { dmax }`; at merge the
+  resolved anchor rides into the JSON report by adding one optional field to
+  `Report` and carrying a `ConvertReport` on `stages::Rendered` (which already
+  bundles the algorithm's outputs) — the flat `skip_serializing_if` report shape
+  takes a new optional field without reshaping the JSON. Not integrated here per
+  the coordination note (its API does not exist in this branch); cli.rs edits were
+  kept tight so its `DmaxOverrides` merge/validate/flatten conflict stays small.
+
+### Follow-ups / deferred (with reasons)
+- **Unify the two `Algorithm` enums.** `types::Algorithm` (CLI/recipe) and
+  `algo::Algorithm` are identical; two reviewers suggested collapsing them via
+  `pub use crate::types::Algorithm;` in `algo`. Deferred to keep this task's diff
+  off the completed `algo-interface` module's type identity during parallel work;
+  left behind a documented `#[allow(dead_code)]`. Cheap, low-risk cleanup.
+- **Per-command `Report` enum.** A tagged `enum ReportBody { Convert/Inspect/
+  Estimate }` would make "field set for the wrong command" unrepresentable
+  (type-design review). Deferred as beyond Step-1 MVP; the flat all-`Option`
+  shape with `skip_serializing_if` is tested and produces correct per-command JSON.
+- **lcms handler** latches on *any* lcms log (can't see severity), so a benign
+  recoverable ICC-parse warning during a custom `--output-profile` could fail an
+  otherwise-good run — a *loud* false-positive (not a silent-wrong image), kept as
+  the fail-safe posture; refine by inspecting error codes if it ever bites.
+
+### Review
+- Ran `pr-review-toolkit:review-pr` (code / silent-failure / tests / type-design /
+  comments) — 1 full round + 1 confirmation round.
+  - **Fixed:** stale `cli.rs` module doc; `--quiet --report none` could hide a
+    non-finite fault (now always stderr-echoed); IR-present warning made
+    `--strict --export-ir` unusable (now gated); lossy `film_base_source` string
+    → structured enum; duplicated explicit-base validation → shared
+    `validate_explicit_film_base`; IR export reordered before main encode; lcms
+    flag cleared before render; dangling `Reporter::warn` doc link. Added tests:
+    determinism, sidecar recipe round-trip via `--params`, exact exit codes
+    (1/3/5), `-v` stdout-cleanliness, `--report-file`.
+  - **Deferred (above):** Algorithm-enum unification, per-command Report enum,
+    lcms severity discrimination. Confirmation re-review came back clean of
+    important issues.
+
+- 2026-07-14 — **PR #16 review fixes (data-loss guards).** (1) Every write
+  target (`--output`, the sidecar, `--dump-params`, `--report-file`,
+  `--export-ir`) is now checked against the input scan and against each other
+  before anything is decoded or written — previously `-o <input>` destroyed the
+  negative and `--report-file <output>` truncated the just-written TIFF, both
+  with exit 0. `encode::sidecar_path` extracted so the CLI can include the
+  sidecar in the check. (2) `--input-profile` / recipe `input.color.profile`
+  was a silent no-op (parsed, never applied); `convert` now rejects it with
+  exit 4 until input-side color management lands (§9 note added). Four new E2E
+  tests pin all of it.
+- 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
+  (gates re-run green: 110 unit + 13 integration tests; CLAUDE.md refreshed —
+  module map, dead-code note, and the lcms2 global-handler mechanism now match
+  the implementation; branch rebased onto post-docs main). **Step-1 MVP is
+  complete** — Phase 4 closes. Merge-time follow-up recorded for
+  `dmax-white-anchor` integration: switch `stages::render` to
+  `Converter::convert_reported`, carry `ConvertReport` on `Rendered`, add one
+  Option field to `Report`.
 
 ## auto-base-redesign
 **Status:** not started

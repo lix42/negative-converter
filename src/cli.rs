@@ -3,21 +3,28 @@
 //! This is the scriptable contract an agent drives: clap argument parsing for
 //! every subcommand and flag (design-spec §8–9), JSON recipe load/merge (flags
 //! override a loaded recipe), `--dump-params` / `params` for discovery, a JSON
-//! report, and stable exit codes via [`NcError`]. The actual conversion is wired
-//! by the `pipeline-orchestration` task; here `convert`/`inspect`/`estimate`
-//! resolve + validate their config and stop at the (not-yet-wired) pipeline.
+//! report, and stable exit codes via [`NcError`]. The conversion runs here:
+//! `convert` drives the full decode → film-base → algorithm → output color
+//! transform → encode pipeline (delegating the pure stages to `pipeline`/`algo`/
+//! `io`); `inspect` and `estimate` decode and report without writing an image.
 //!
 //! Determinism rule: stdout carries *only* the JSON report / params; all logs and
 //! warnings go to stderr, so an agent can pipe stdout straight into a parser.
 
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use crate::io::decode::{DecodeInfo, decode};
+use crate::io::encode;
+use crate::pipeline::{film_base, stages};
 use crate::types::{
-    Algorithm, BigTiff, DensityParams, FilmBase, FilmBaseParams, FilmBaseSource, InputColor,
-    InputParams, NcError, OutDepth, OutputParams, PrintParams, Result, SimpleParams,
+    Algorithm, BigTiff, DensityParams, EncodeReport, FilmBase, FilmBaseParams, FilmBaseSource,
+    InputColor, InputParams, NcError, OutDepth, OutputParams, PrintParams, Result, SimpleParams,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,7 +49,7 @@ pub enum Command {
     /// Inspect a scan and emit a JSON report (no output image).
     Inspect(IoArgs),
     /// Run only film-base / Dmin estimation; emit JSON.
-    Estimate(IoArgs),
+    Estimate(EstimateArgs),
     /// Print the full default parameter set as JSON (recipe scaffolding).
     Params,
 }
@@ -75,11 +82,24 @@ pub struct ReportArgs {
     pub quiet: bool,
 }
 
-/// `inspect` / `estimate`: an input scan plus reporting controls.
+/// `inspect`: an input scan plus reporting controls.
 #[derive(Args, Debug)]
 pub struct IoArgs {
     /// Input negative scan (SilverFast HDR/HDRi TIFF).
     pub input: PathBuf,
+    #[command(flatten)]
+    pub report: ReportArgs,
+}
+
+/// `estimate`: an input scan, the film-base source flags (so the
+/// calibrate-once-from-a-reference workflow works, design-spec §8), and
+/// reporting controls.
+#[derive(Args, Debug)]
+pub struct EstimateArgs {
+    /// Input negative scan (SilverFast HDR/HDRi TIFF).
+    pub input: PathBuf,
+    #[command(flatten)]
+    pub film_base: FilmBaseOverrides,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -254,19 +274,48 @@ pub struct ResolvedConfig {
 // Report
 // ---------------------------------------------------------------------------
 
-/// Machine-readable result emitted on stdout (or `--report-file`). Extended by
-/// `pipeline-orchestration` as real stages produce values; kept minimal here.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Machine-readable result emitted on stdout (or `--report-file`). One shape
+/// serves all three commands; irrelevant fields are `None`/empty and omitted
+/// from the JSON (`skip_serializing_if`), so an agent gets a clean object per
+/// command. Serialize-only — it embeds the serialize-only `DecodeInfo` /
+/// `EncodeReport`, and nothing deserializes a report.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Report {
-    /// Algorithm that ran.
-    pub algorithm: Option<Algorithm>,
-    /// Output image path, when one was written.
+    /// The subcommand that produced this report (`convert`/`inspect`/`estimate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<&'static str>,
+    /// Input scan path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<PathBuf>,
+    /// Output image path, when one was written (`convert`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<PathBuf>,
-    /// Estimated / resolved film base.
+    /// Algorithm that ran (`convert`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<Algorithm>,
+    /// What the decoder found (`inspect`): format, dimensions, channels, bit
+    /// depth, IR presence, scanner metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode: Option<DecodeInfo>,
+    /// Estimated / resolved film base (the `Dmin` anchor).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base: Option<FilmBase>,
+    /// How the film base was chosen, as the structured [`FilmBaseSource`]
+    /// (`"auto"` / `{"region":[…]}` / `{"explicit":[…]}`) so an agent gets the
+    /// sampled rectangle / explicit values without string-parsing a label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub film_base_source: Option<FilmBaseSource>,
+    /// Path the IR plane was exported to, when `--export-ir` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ir_exported: Option<PathBuf>,
+    /// Encode-time sample loss (clipped / non-finite counts), for `convert`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loss: Option<EncodeReport>,
     /// Non-fatal warnings (clipping, IR-ignored, BigTIFF auto-promote, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
-    /// Wall-clock conversion time in milliseconds.
+    /// Wall-clock time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<f64>,
 }
 
@@ -358,12 +407,8 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
 
     // film base: the three source flags are mutually exclusive (clap-enforced);
     // whichever is given replaces the recipe's source entirely.
-    if let Some(v) = args.film_base.film_base {
-        cfg.film_base.source = FilmBaseSource::Explicit(v);
-    } else if let Some(v) = args.film_base.base_region {
-        cfg.film_base.source = FilmBaseSource::Region(v);
-    } else if args.film_base.auto_base {
-        cfg.film_base.source = FilmBaseSource::Auto;
+    if let Some(src) = film_base_source_override(&args.film_base) {
+        cfg.film_base.source = src;
     }
 
     // density
@@ -416,6 +461,35 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     cfg
 }
 
+/// Map the (clap-mutually-exclusive) film-base flags to a [`FilmBaseSource`],
+/// or `None` when none was passed. Shared by `convert`'s [`merge`] and
+/// `estimate`, so the two resolve the source identically.
+fn film_base_source_override(o: &FilmBaseOverrides) -> Option<FilmBaseSource> {
+    if let Some(v) = o.film_base {
+        Some(FilmBaseSource::Explicit(v))
+    } else if let Some(v) = o.base_region {
+        Some(FilmBaseSource::Region(v))
+    } else if o.auto_base {
+        Some(FilmBaseSource::Auto)
+    } else {
+        None
+    }
+}
+
+/// Validate that an explicit film base is a per-channel transmission in `(0, 1]`
+/// — the one invariant that must hold wherever an explicit base enters (a recipe
+/// via [`validate`], or the `--film-base` flag on `estimate`). Non-positive /
+/// non-finite would divide into inf/NaN downstream; a value above 1.0 (e.g. a
+/// "90" typo for "0.90") would render every real sample above white.
+fn validate_explicit_film_base(base: &[f32; 3]) -> Result<()> {
+    if base.iter().any(|v| !v.is_finite() || *v <= 0.0 || *v > 1.0) {
+        return Err(NcError::Usage(format!(
+            "--film-base channels are transmissions in (0, 1] (got {base:?})"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a resolved config at the CLI boundary so the pure stages can trust
 /// their inputs. Every failure is a [`NcError::Usage`] (exit 2) — bad recipes and
 /// impossible parameters fail loudly, never producing a quietly wrong image.
@@ -444,14 +518,7 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     // "0.90") would silently render every real sample denser than the base; a
     // sampled region must have non-zero extent; auto needs nothing.
     match cfg.film_base.source {
-        FilmBaseSource::Explicit(b) => {
-            positive("--film-base", &b)?;
-            if let Some(v) = b.iter().find(|v| **v > 1.0) {
-                return Err(usage(format!(
-                    "--film-base channels are transmissions in (0, 1] (got {v})"
-                )));
-            }
-        }
+        FilmBaseSource::Explicit(b) => validate_explicit_film_base(&b)?,
         FilmBaseSource::Region([_, _, w, h]) if w == 0 || h == 0 => {
             return Err(usage("--base-region width and height must be > 0".into()));
         }
@@ -525,6 +592,92 @@ pub fn emit_report(report: &Report, format: ReportFormat, file: Option<&Path>) -
 }
 
 // ---------------------------------------------------------------------------
+// lcms2 runtime-error handler (see CLAUDE.md's lcms2 gotcha)
+// ---------------------------------------------------------------------------
+
+/// Set when lcms2 reports a runtime error through the process-global handler.
+static CMS_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// lcms2 error callback. Records that a color-management error occurred and
+/// echoes it to stderr (stdout stays report-only). `cmsDoTransform` (under
+/// `Transform::transform_in_place`) is infallible and Little CMS's *default*
+/// handler silently discards errors, so this hook is the only way a runtime
+/// transform/profile fault in `pipeline::color` becomes visible.
+unsafe extern "C" fn cms_error_handler(
+    _ctx: lcms2_sys::Context,
+    code: u32,
+    text: *const std::os::raw::c_char,
+) {
+    CMS_ERROR.store(true, Ordering::SeqCst);
+    let msg = if text.is_null() {
+        std::borrow::Cow::Borrowed("(no message)")
+    } else {
+        // SAFETY: lcms2 passes a NUL-terminated C string for the message text.
+        unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy()
+    };
+    eprintln!("nc: lcms2 error [{code}]: {msg}");
+}
+
+/// Install the process-global lcms2 error handler at startup. `pipeline::color`
+/// builds its profiles/transforms on lcms2's global context, and the safe `lcms2`
+/// wrapper exposes the handler only per-`ThreadContext`, so we set the global one
+/// through the `lcms2-sys` FFI directly.
+fn install_cms_error_handler() {
+    // SAFETY: `cms_error_handler` matches lcms2's LogErrorHandlerFunction ABI and
+    // only touches an atomic + stderr, so it is sound to call from C on any thread.
+    unsafe { lcms2_sys::cmsSetLogErrorHandler(Some(cms_error_handler)) }
+}
+
+/// Take and clear the "lcms2 logged an error" flag. The orchestrator checks it
+/// right after the color transform runs, which the infallible
+/// `transform_in_place` cannot report through its return value.
+fn cms_error_occurred() -> bool {
+    CMS_ERROR.swap(false, Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// stderr logging (never touches stdout — that stays report-only)
+// ---------------------------------------------------------------------------
+
+/// Verbosity-gated stderr logger. `--quiet` silences everything below an error;
+/// `-v`/`-vv` enable progress `info` lines. Warnings always go to the JSON
+/// report (via [`push_warning`]); this only controls the stderr echo.
+struct Log {
+    verbose: u8,
+    quiet: bool,
+}
+
+impl Log {
+    fn new(args: &ReportArgs) -> Self {
+        Self {
+            verbose: args.verbose,
+            quiet: args.quiet,
+        }
+    }
+
+    /// Progress line — only shown with `-v` (and never when `--quiet`).
+    fn info(&self, msg: impl Display) {
+        if !self.quiet && self.verbose >= 1 {
+            eprintln!("nc: {msg}");
+        }
+    }
+
+    /// Warning line — shown unless `--quiet` (the report keeps it either way).
+    fn warn(&self, msg: &str) {
+        if !self.quiet {
+            eprintln!("nc: warning: {msg}");
+        }
+    }
+}
+
+/// Record a warning into the report and echo it to stderr in one step, so the
+/// two never drift.
+fn push_warning(report: &mut Report, log: &Log, msg: String) {
+    log.warn(&msg);
+    report.warnings.push(msg);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point + dispatch
 // ---------------------------------------------------------------------------
 
@@ -532,6 +685,9 @@ pub fn emit_report(report: &Report, format: ReportFormat, file: Option<&Path>) -
 /// binary's `main` calls. clap handles `--help`/`--version` and usage errors with
 /// its own (exit-2-compatible) codes; everything else flows through [`NcError`].
 pub fn run() -> Result<()> {
+    // Install once at startup so any lcms2 runtime fault in `pipeline::color`
+    // surfaces instead of being silently swallowed by the default no-op handler.
+    install_cms_error_handler();
     let cli = Cli::parse();
     match cli.command {
         Command::Params => run_params(),
@@ -549,32 +705,366 @@ fn run_params() -> Result<()> {
     Ok(())
 }
 
+/// Best-effort stable key for path-collision checks. Canonicalize the path when
+/// it exists (resolves symlinks and `..`); for a not-yet-created write target,
+/// canonicalize its parent directory instead (`tmp/sub/../out.tiff` and
+/// `tmp/out.tiff` must compare equal — `std::path::absolute` alone keeps the
+/// `..` and would let them slip past the check), re-attaching the file name.
+/// When even the parent doesn't exist, fall back to a lexical normalization of
+/// the absolute form. A guard against accidental self-clobbering, not
+/// adversarial links.
+fn collision_key(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(p) = std::fs::canonicalize(parent) {
+            return p.join(name);
+        }
+    }
+    lexical_absolute(path)
+}
+
+/// Absolute form with `.`/`..` components removed lexically (no filesystem
+/// access). Last-resort key for paths whose parent doesn't exist yet; lexical
+/// `..` removal can disagree with the filesystem across symlinked directories,
+/// which is acceptable for an accident guard.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Reject write targets that would clobber the input scan or one another —
+/// e.g. `-o` equal to the input (destroys the negative), or `--report-file`
+/// equal to the output/sidecar (truncates a just-written artifact) — all of
+/// which would otherwise "succeed" with exit 0. Fail loudly up front instead.
+fn ensure_write_targets_distinct(input: &Path, targets: &[(&str, &Path)]) -> Result<()> {
+    let input_key = collision_key(input);
+    let mut seen: Vec<(&str, PathBuf)> = Vec::with_capacity(targets.len());
+    for (label, path) in targets {
+        let key = collision_key(path);
+        if key == input_key {
+            return Err(NcError::Usage(format!(
+                "{label} ({}) would overwrite the input scan",
+                path.display()
+            )));
+        }
+        if let Some((other, _)) = seen.iter().find(|(_, k)| *k == key) {
+            return Err(NcError::Usage(format!(
+                "{label} ({}) collides with {other}",
+                path.display()
+            )));
+        }
+        seen.push((label, key));
+    }
+    Ok(())
+}
+
+/// `nc convert` — the full pipeline: decode → film-base → algorithm → output
+/// color transform → encode (+ sidecar, + optional IR export). Warnings are
+/// collected into the report and echoed to stderr; `--strict` promotes any of
+/// them to a non-zero exit.
 fn run_convert(args: ConvertArgs) -> Result<()> {
+    let started = Instant::now();
+    let log = Log::new(&args.report);
+
     let cfg = merge(load_recipe(args.recipe_in.as_deref())?, &args);
     validate(&cfg)?;
+
+    // `input.color` profiles are parsed into the recipe shape, but input-side
+    // color management is not implemented yet — reject loudly rather than
+    // silently ignoring a documented knob (scans are decoded as linear).
+    if let InputColor::Profile(p) = &cfg.input.color {
+        return Err(NcError::Unsupported(format!(
+            "--input-profile {p}: input-side color management is not implemented              yet; SilverFast scans are decoded as linear (omit the flag or use              --assume-linear)"
+        )));
+    }
+
+    // Guard every write target against the input and against each other before
+    // anything is decoded or written.
+    let sidecar = encode::sidecar_path(&args.output);
+    let mut targets: Vec<(&str, &Path)> =
+        vec![("--output", &args.output), ("the sidecar", &sidecar)];
+    if let Some(p) = &args.dump_params {
+        targets.push(("--dump-params", p));
+    }
+    if let Some(p) = args.report.report_file.as_deref() {
+        targets.push(("--report-file", p));
+    }
+    if let Some(p) = cfg.input.export_ir.as_deref() {
+        targets.push(("--export-ir", Path::new(p)));
+    }
+    ensure_write_targets_distinct(&args.input, &targets)?;
+
     if let Some(path) = &args.dump_params {
         write_json(path, &cfg)?;
     }
-    // The decode→…→encode pipeline is wired by `pipeline-orchestration`, which
-    // also consumes the run-mode flags resolved here but not yet acted on:
-    // `args.strict` (promote warnings to errors), `args.seed` (reserved; no
-    // stochastic step in Step 1), and `args.report`.
-    let _ = (args.strict, args.seed);
-    Err(NcError::Other(
-        "conversion pipeline not yet wired (pipeline-orchestration)".into(),
-    ))
+    // `--seed` is reserved (no stochastic step in Step 1) but accepted so the
+    // documented flag isn't rejected; nothing consumes it yet.
+    let _ = args.seed;
+
+    let mut report = Report {
+        command: Some("convert"),
+        input: Some(args.input.clone()),
+        output: Some(args.output.clone()),
+        algorithm: Some(cfg.algorithm),
+        film_base_source: Some(cfg.film_base.source.clone()),
+        ..Report::default()
+    };
+
+    // Stage 1 — decode.
+    let (image, info) = decode(&args.input)?;
+    log.info(format_args!(
+        "decoded {:?} {}x{} (ir={})",
+        info.format, info.width, info.height, info.ir_present
+    ));
+    for w in &info.warnings {
+        push_warning(&mut report, &log, w.clone());
+    }
+
+    // `--export-ir` on a scan with no IR plane can't be honored: fail fast,
+    // before writing any output, rather than after the main encode.
+    let export_ir = cfg.input.export_ir.as_deref().map(PathBuf::from);
+    if export_ir.is_some() && !info.ir_present {
+        return Err(NcError::Unsupported(
+            "--export-ir requested but the input has no IR plane (HDRi input only)".into(),
+        ));
+    }
+    // Note an IR plane that's carried but not consumed — but only when it isn't
+    // being exported: `--export-ir` is the user handling it, so warning (and
+    // failing under `--strict`) would be wrong. This keeps `--strict --export-ir`
+    // a usable workflow on the primary HDRi format.
+    if info.ir_present && export_ir.is_none() {
+        push_warning(
+            &mut report,
+            &log,
+            "input carries an IR plane; it is preserved but not used in Step 1 \
+             (use --export-ir to write it out)"
+                .into(),
+        );
+    }
+
+    // Clear any stale lcms2 flag so only errors from *this* render are counted.
+    let _ = cms_error_occurred();
+    // Stages 2–4 — film-base estimate → algorithm → output color transform.
+    let rendered = stages::render(
+        &image,
+        &cfg.film_base,
+        stages::algo_params(cfg.algorithm, &cfg.simple, &cfg.density, &cfg.print),
+        &cfg.output,
+    )?;
+    // lcms2 transform/profile failures reach us only through the global handler
+    // (`transform_in_place` is infallible), so check the flag it sets.
+    if cms_error_occurred() {
+        return Err(NcError::Other(
+            "color management (lcms2) reported a runtime error; see stderr".into(),
+        ));
+    }
+    report.film_base = Some(rendered.film_base);
+
+    // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
+    // explicitly request).
+    if cfg.output.bigtiff == BigTiff::Auto
+        && encode::plans_bigtiff(&cfg.output, &rendered.image, rendered.icc.len())
+    {
+        push_warning(
+            &mut report,
+            &log,
+            "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+        );
+    }
+
+    // Optional IR export — before the main encode, so a failing IR write fails
+    // the run without first writing the primary output/sidecar.
+    if let Some(path) = &export_ir {
+        encode::export_ir(&image, cfg.output.out_depth, path)?;
+        log.info(format_args!("wrote IR plane {}", path.display()));
+        report.ir_exported = Some(path.clone());
+    }
+
+    // Stage 5 — encode + effective-recipe sidecar.
+    let loss = encode::encode(
+        &rendered.image,
+        &cfg.output,
+        Some(&rendered.icc),
+        &args.output,
+    )?;
+    report.loss = Some(loss);
+    if loss.any_loss() {
+        push_warning(
+            &mut report,
+            &log,
+            format!(
+                "output lost {} clipped and {} non-finite of {} samples ({:.2}%)",
+                loss.clipped_total(),
+                loss.non_finite,
+                loss.total_samples,
+                loss.loss_fraction() * 100.0,
+            ),
+        );
+    }
+    // A non-finite sample is a numerical fault, not routine gamut clipping — make
+    // sure it is never fully silenced (the `--quiet --report none` combination
+    // would otherwise suppress both channels of the warning above).
+    if loss.non_finite > 0 && log.quiet {
+        eprintln!(
+            "nc: warning: {} non-finite (NaN/inf) output sample(s) — numerical fault",
+            loss.non_finite
+        );
+    }
+
+    let recipe_json = serde_json::to_string_pretty(&cfg)
+        .map_err(|e| NcError::Other(format!("serializing recipe for sidecar: {e}")))?;
+    encode::write_sidecar(&args.output, &recipe_json)?;
+    log.info(format_args!("wrote {}", args.output.display()));
+
+    report.elapsed_ms = Some(elapsed_ms(started));
+
+    // Emit the report before the `--strict` gate so the machine-readable record
+    // lands even when a warning then fails the run. (A hard I/O error above
+    // returns earlier — its exit code and stderr message are the signal there.)
+    emit_report(
+        &report,
+        args.report.report,
+        args.report.report_file.as_deref(),
+    )?;
+    if args.strict && !report.warnings.is_empty() {
+        return Err(NcError::Other(format!(
+            "--strict: {} warning(s) present (see report)",
+            report.warnings.len()
+        )));
+    }
+    Ok(())
 }
 
-fn run_inspect(_args: IoArgs) -> Result<()> {
-    Err(NcError::Other(
-        "inspect not yet wired (pipeline-orchestration)".into(),
-    ))
+/// `nc inspect` — decode a scan and report what was found (format, dimensions,
+/// channels, bit depth, IR presence, scanner metadata) plus a best-effort
+/// suggested `Dmin`. No output image is written.
+fn run_inspect(args: IoArgs) -> Result<()> {
+    let started = Instant::now();
+    let log = Log::new(&args.report);
+
+    if let Some(rf) = args.report.report_file.as_deref() {
+        ensure_write_targets_distinct(&args.input, &[("--report-file", rf)])?;
+    }
+    let (image, info) = decode(&args.input)?;
+    log.info(format_args!(
+        "decoded {:?} {}x{} (ir={})",
+        info.format, info.width, info.height, info.ir_present
+    ));
+
+    let mut report = Report {
+        command: Some("inspect"),
+        input: Some(args.input.clone()),
+        ..Report::default()
+    };
+    for w in &info.warnings {
+        push_warning(&mut report, &log, w.clone());
+    }
+    if info.ir_present {
+        push_warning(
+            &mut report,
+            &log,
+            "input carries an IR plane; preserved but not used in Step 1 \
+             (use `convert --export-ir` to write it out)"
+                .into(),
+        );
+    }
+
+    // Suggested Dmin via best-effort auto detection. For inspect this is
+    // informational — real scans (holder → rebate → picture) usually need an
+    // explicit `--base-region`/`--film-base`, so a failure is a note, not fatal.
+    match film_base::estimate(&image, &FilmBaseParams::default()) {
+        Ok(base) => {
+            report.film_base = Some(base);
+            report.film_base_source = Some(FilmBaseSource::Auto);
+        }
+        // The estimate error already carries actionable advice (pass
+        // --base-region/--film-base); wrap it with a short lead-in, no duplicate.
+        Err(e) => push_warning(
+            &mut report,
+            &log,
+            format!("suggested Dmin unavailable — {e}"),
+        ),
+    }
+
+    report.decode = Some(info);
+    report.elapsed_ms = Some(elapsed_ms(started));
+    emit_report(
+        &report,
+        args.report.report,
+        args.report.report_file.as_deref(),
+    )
 }
 
-fn run_estimate(_args: IoArgs) -> Result<()> {
-    Err(NcError::Other(
-        "estimate not yet wired (pipeline-orchestration)".into(),
-    ))
+/// `nc estimate` — run only film-base / `Dmin` estimation from the selected
+/// source (default `auto`, or `--base-region`/`--film-base`) and emit the
+/// resolved [`FilmBase`] as JSON. Auto detection may fail loudly on real scans;
+/// that propagates as an error (the user asked for an estimate we can't give).
+fn run_estimate(args: EstimateArgs) -> Result<()> {
+    let started = Instant::now();
+    let log = Log::new(&args.report);
+
+    if let Some(rf) = args.report.report_file.as_deref() {
+        ensure_write_targets_distinct(&args.input, &[("--report-file", rf)])?;
+    }
+    let source = film_base_source_override(&args.film_base).unwrap_or_default();
+    // Guard an explicit base with the same check `convert` applies (a recipe
+    // never reaches estimate, but a bad `--film-base` must fail loudly rather
+    // than be echoed back). Region bounds are checked by `film_base::estimate`.
+    if let FilmBaseSource::Explicit(b) = &source {
+        validate_explicit_film_base(b)?;
+    }
+
+    let (image, info) = decode(&args.input)?;
+    log.info(format_args!(
+        "decoded {:?} {}x{} (ir={})",
+        info.format, info.width, info.height, info.ir_present
+    ));
+
+    let base = film_base::estimate(
+        &image,
+        &FilmBaseParams {
+            source: source.clone(),
+        },
+    )?;
+
+    let mut report = Report {
+        command: Some("estimate"),
+        input: Some(args.input.clone()),
+        film_base: Some(base),
+        film_base_source: Some(source),
+        ..Report::default()
+    };
+    for w in &info.warnings {
+        push_warning(&mut report, &log, w.clone());
+    }
+    report.elapsed_ms = Some(elapsed_ms(started));
+    emit_report(
+        &report,
+        args.report.report,
+        args.report.report_file.as_deref(),
+    )
+}
+
+/// Milliseconds elapsed since `started`, as an `f64` for the report.
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 // ---------------------------------------------------------------------------

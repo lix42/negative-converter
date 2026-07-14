@@ -29,6 +29,13 @@ pub trait Converter {
 }
 
 /// The shipped Step-1 algorithms. `density` is the default.
+///
+/// The wired CLI/recipe surface standardized on the identical
+/// [`crate::types::Algorithm`] (a neutral type with no `algo` dependency), so
+/// the Step-1 binary doesn't consume this copy — it survives as the `algo`
+/// module's own selector, exercised by the tests here and by `AlgoParams`.
+/// Unifying the two enums is a follow-up cleanup.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Algorithm {
@@ -68,7 +75,10 @@ pub enum AlgoParams {
 }
 
 impl AlgoParams {
-    /// The algorithm this parameter set selects.
+    /// The algorithm this parameter set selects. Not consumed by the Step-1
+    /// orchestrator (it derives the report's algorithm from the resolved config
+    /// directly); kept as part of the `AlgoParams` API and exercised by tests.
+    #[allow(dead_code)]
     pub fn algorithm(&self) -> Algorithm {
         match self {
             AlgoParams::Simple(_) => Algorithm::Simple,
