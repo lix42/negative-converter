@@ -22,9 +22,14 @@ do not pull input-format work into this task.
 - **Knob shape — one enum** (house rule for mutually-exclusive knobs):
   `ColorModel { Color (default) | Mono([f32; 3] weights) }`. Recipe shape like
   `film_base.source`: `"color"` or `{ "mono": [r, g, b] }`. CLI:
-  `--color-model color|mono` plus an optional `--mono-weights R,G,B` (usage
-  error without `mono`; whichever flags are given replace a recipe's
-  `color_model` wholesale). Weights are normalized to sum 1; pick and document
+  `--color-model color|mono` plus an optional `--mono-weights R,G,B`.
+  Validation is against the **post-merge resolved model**, not flag presence:
+  `--color-model mono --mono-weights …` sets the weights; `--mono-weights`
+  alone over a recipe whose `color_model` already resolves to mono overrides
+  just the weights; it is a usage error only when the resolved model is
+  `color` (weights with nothing to apply to). `--color-model` by itself
+  replaces a recipe's `color_model` wholesale (mono gets the documented
+  default weights). Weights are normalized to sum 1; pick and document
   a default (equal thirds or Rec. 709 luma — implementer's call, the point of
   exposing weights is emulating a green- or blue-heavy channel mix when one
   scanner channel is noisy).
@@ -34,12 +39,22 @@ do not pull input-format work into this task.
   linear working space, and keeps density conversion / print rendering
   untouched (core fidelity rule). Values pass through unclamped as always
   (clamping only at u16 encode).
+- **Interaction with the auto-`Dmax` anchor.** The white anchor's percentile
+  is measured *inside* the density render, pooled across all three channels —
+  before post-algorithm pooling can exclude anything. So under `Mono`, a noisy
+  channel the weights were chosen to avoid could still drive the anchor and
+  skew the pooled exposure. Thread the resolved color model into the density
+  algorithm's `Dmax` resolution: when `color_model = mono`, drop zero-weight
+  channels from (or weight the sample stream by) the percentile sample.
+  Deterministic either way; an explicit `--d-max` remains the escape hatch,
+  and `color` mode must keep today's pooled sampling bit-exactly.
 - **Recipe key: top-level `color_model`**, parallel to top-level `algorithm` —
   it is a cross-algorithm render selector, so it belongs to neither `density`
   nor `simple` nor `output` (§9 assigns keys by stage; this is a new small
   §9 section, "Color model (post-algorithm)"). Keep the recipe struct and §9
-  in sync — `deny_unknown_fields` means a misplaced key silently rejects
-  docs-shaped recipes. Update design-spec.md **and** .html together.
+  in sync — `deny_unknown_fields` means a misplaced key makes a docs-shaped
+  recipe fail to load (a loud `Usage` error, exit 2), so the key must land
+  exactly where §9 assigns it. Update design-spec.md **and** .html together.
 - **White balance under mono.** `print.white_balance` applies per-channel gains
   *before* pooling, so under mono it only re-weights the channel mix — the
   output carries no tint regardless. Do not reject it; document that it is
@@ -55,8 +70,13 @@ do not pull input-format work into this task.
   the shadow-side twin of the auto-`Dmax` white anchor (≈ NLP's BlackClip);
   today `--black-point` is manual only. Sketch: grow `print.black_point` into a
   source enum (`Explicit(f32)` default vs `Auto(percentile)`), resolved value
-  in the JSON report. Marked stretch rather than core because it is orthogonal
-  to the mono model (it benefits color conversions equally), reshapes an
+  in the JSON report. The recipe-shape change for `black_point` is acceptable
+  pre-release (same policy as the `output.hdr` rename): follow the house
+  tagged-enum wire form (`FilmBaseSource`/`DmaxSource` convention) and reject
+  old plain-float recipes loudly — no untagged back-compat shim, which would
+  also blur serde's error messages. Marked stretch rather than core because
+  it is orthogonal to the mono model (it benefits color conversions equally),
+  reshapes an
   existing print knob, and interacts with the `Dmax` auto anchor — if it grows,
   split it into its own task instead.
 
