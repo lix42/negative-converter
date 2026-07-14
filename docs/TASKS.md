@@ -60,6 +60,12 @@ graph TD
   film-base-estimation --> auto-base-redesign
   auto-base-redesign --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
+  algo-density --> dmax-white-anchor
+  algo-interface --> algo-sigmoid
+  dmax-white-anchor --> algo-sigmoid
+  algo-density --> auto-neutral-wb
+  pipeline-orchestration --> auto-neutral-wb
+  algo-density --> regional-color-balance
 ```
 
 Dependency list (a task is executable when all its deps are `[x]` done):
@@ -77,10 +83,15 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `auto-base-redesign` (post-MVP): `film-base-estimation`
 - `white-holder-support` (post-MVP): `auto-base-redesign`
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
+- `dmax-white-anchor` (post-MVP): `algo-density`
+- `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
+- `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
+- `regional-color-balance` (post-MVP): `algo-density`
 
-> **Post-MVP follow-ups** (Phase 5) are recorded for continuity and are **not**
-> blockers of `pipeline-orchestration` / the Step-1 MVP. They came out of
-> real-scan verification of `film-base-estimation` (see `progress.md`).
+> **Post-MVP follow-ups** (Phases 5–6) are recorded for continuity and are **not**
+> blockers of `pipeline-orchestration` / the Step-1 MVP. Phase 5 came out of
+> real-scan verification of `film-base-estimation`; Phase 6 out of the PR #12
+> review and the Negative Lab Pro feature comparison (see `progress.md`).
 
 ## Tasks
 
@@ -119,3 +130,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Robust auto film-base detection](tasks/auto-base-redesign.md)
 - [ ] [Light film holder support](tasks/white-holder-support.md)
 - [ ] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
+
+### Phase 6: Conversion quality (NLP-parity follow-ups)
+> Default-output quality gaps identified by the PR #12 review and the Negative
+> Lab Pro comparison (2026-07-13, see `progress.md`). Deterministic statistics
+> only — no ML (the "AI-friendly ≠ ML" rule holds).
+
+- [ ] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md)
+- [ ] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
+- [ ] [Auto neutral white balance](tasks/auto-neutral-wb.md)
+- [ ] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
