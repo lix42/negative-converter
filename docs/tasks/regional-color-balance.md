@@ -14,13 +14,21 @@ offset that varies with density. Extend the density-correction sub-stage (stage
 2) with density-weighted offsets:
 
 ```text
-D'_c = scale_c·D_c + offset_c + shadow_balance_c·w_lo(D_c) + highlight_balance_c·w_hi(D_c)
+D̄    = mean(D_r, D_g, D_b)                # scalar per-pixel density
+D'_c = scale_c·D_c + offset_c + shadow_balance_c·w_lo(D̄) + highlight_balance_c·w_hi(D̄)
 ```
 
 where `w_lo`/`w_hi` are smooth, documented weight ramps over the density range
 (low density = scene shadows, high density = scene highlights — note the
 negative's inversion when naming the knobs from the *positive*'s point of view;
 pick the user-facing convention deliberately and document it in §9).
+
+The weights take the **scalar** per-pixel density `D̄` (channel mean), not each
+channel's own `D_c`: per-channel weighting would let one channel of a cast
+pixel receive the shadow correction while another receives the highlight
+correction — misfiring on exactly the crossover pixels this control exists to
+fix. All three channels must agree on the tone region; the *offsets* stay
+per-channel.
 
 - New params in the `density` recipe section: `shadow_balance: [f32;3]`,
   `highlight_balance: [f32;3]` (defaults `[0,0,0]` = today's behavior,

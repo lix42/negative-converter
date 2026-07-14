@@ -31,8 +31,14 @@ lin = 10^(γ·(D' − Dmax))        # scene white (D' = Dmax) → 1.0, base → 
 - **Auto measurement is deterministic**, like `film_base::estimate`: a high
   percentile (e.g. 99.x) of the corrected-density distribution, computed after
   `to_density`. Same input + params ⇒ same anchor ⇒ same output. Report the
-  resolved value in the JSON report (and via `nc estimate`) so a roll can be
-  batch-converted with an explicit, reused anchor — mirroring the Dmin workflow.
+  resolved value in the JSON report.
+- **Unlike `Dmin`, `Dmax` is frame-local** — it is the frame's scene-white
+  density, a property of the scene, not of the roll/scanner. Per-frame `Auto`
+  is therefore the default. Reusing one frame's measured anchor across a roll
+  (via explicit `--d-max`) is supported as a *deliberate batch-consistency
+  choice* — the fixed-print-exposure look — but the docs must state the
+  tradeoff plainly: darker frames render dim and denser highlights clip against
+  a foreign anchor. It is **not** a calibrate-once pattern like Dmin.
 - **Spec updates ride along:** correct design-spec §7.2's stage-3 polarity
   (`10^(−γ·D')` → `10^(+γ·D')`, per the algo-density progress note), document the
   anchor in §7.2, add the keys to §9 — **edit design-spec.md and .html together**.
