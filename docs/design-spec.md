@@ -223,9 +223,10 @@ brighter print).
 corrected density of scene white: scene white (`D' = Dmax`) maps to display white
 `1.0`, and the base (`D' = 0`) to `10^(−gamma·Dmax) ≈ 0`. Without it the base maps
 to `1.0` and all real detail sits above `1.0`, so a default u16 encode clips the
-whole image; the anchor makes the default output fill the display range. The anchor
-factors out as a constant gain `10^(−gamma·Dmax)` and composes with `print_exposure`
-as a single multiplicative scalar. `Dmax` is **frame-local** — a property of the
+whole image; the anchor makes the default output fill the display range. Mathematically the
+anchor factors out as a constant gain `10^(−gamma·Dmax)`, but it is applied **in
+the exponent** — `10^(gamma·(D' − Dmax))` — so an extreme `gamma·D'` cannot
+overflow `f32` before the anchor cancels it. `Dmax` is **frame-local** — a property of the
 scene's own white, unlike the roll-level `Dmin` base — so it is measured per frame
 by default (`density.dmax = auto`); it can be fixed (`{ "explicit": <d> }`) or
 disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.

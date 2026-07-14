@@ -1042,6 +1042,15 @@ a task; update your own section as you work. Append entries — don't rewrite th
   (silent-failure Finding 2). `convert`/`convert_reported` can still return
   `NcError::Other` on a bad estimated base (unchanged from `algo-density`).
 
+- 2026-07-14 — **PR #17 review fixes.** (1) The anchor is now applied in the
+  exponent (`10^(γ·(D'−Dmax))`) instead of a folded `10^(−γ·Dmax)` gain — the
+  factored form overflowed f32 when `γ·D'` alone exceeded the pow10 range (e.g.
+  γ=5 with EPS-clamped D'≈8 rendered scene white as inf); regression test added.
+  `None` stays bit-exact (`d − 0.0 == d`). (2) The Auto anchor now measures a
+  deterministic strided sample capped at 2^20 values (~4 MB transient) instead
+  of copying the full density buffer — stride derived from length only, bumped
+  off multiples of 3 so interleaved RGB isn't single-channel biased; small
+  images are unaffected (stride 1). Spec §7.2 sentence updated to match.
 - 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
   (gates re-run green: 122 tests; branch rebased onto post-docs main). Unblocks
   `algo-sigmoid`. Merge-time follow-up with `pipeline-orchestration` stands:

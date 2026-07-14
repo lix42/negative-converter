@@ -153,9 +153,13 @@ pub(crate) fn to_density(
 ///   overall `2^print_exposure` gain (exposure is in **stops**), a `black_point`
 ///   floor subtraction, and a highlight soft-clip.
 ///
-/// The anchor factors out as a constant gain `10^(−γ·Dmax)` folded into the stage-4
-/// exposure gain (see [`resolve_dmax`] / [`anchor_gain`]). With [`DmaxSource::None`]
-/// that gain is exactly `1.0`, so this reproduces the pre-anchor render bit-for-bit.
+/// The anchor is applied **in the exponent** — `10^(γ·(D' − Dmax))` — not as a
+/// separate `10^(−γ·Dmax)` gain: mathematically equivalent, but the factored form
+/// overflows `f32` when `γ·D'` alone exceeds the pow10 range even though the
+/// anchored exponent is small (e.g. `γ = 5`, EPS-clamped `D' ≈ 8`), turning scene
+/// white into `inf` instead of `1.0`. With [`DmaxSource::None`] the anchor term is
+/// exactly `0.0`, so this reproduces the pre-anchor render bit-for-bit
+/// (`d − 0.0 == d` for every `f32`).
 ///
 /// Returns the rendered image and the **resolved anchor density** — `Some(Dmax)`
 /// for `Auto`/`Explicit`, `None` for `DmaxSource::None` — so the orchestrator can
@@ -171,11 +175,12 @@ pub(crate) fn render(
     print: &PrintParams,
 ) -> (LinearImage, Option<f32>) {
     // Resolve the anchor from the corrected-density buffer *before* the in-place
-    // transform overwrites it, then fold its constant gain into the exposure gain.
-    // `None`-anchor ⇒ gain 1.0 ⇒ `1.0 * 2^exposure == 2^exposure` exactly, so the
+    // transform overwrites it. The anchor is subtracted in the exponent (see the
+    // doc above); `None` ⇒ anchor 0.0 ⇒ `d − 0.0 == d` bit-exactly, so the
     // per-pixel arithmetic below is bit-identical to the pre-anchor render.
     let resolved = resolve_dmax(&density.density, dmax);
-    let exposure_gain = anchor_gain(resolved, density_gamma) * 2f32.powf(print.print_exposure);
+    let anchor = resolved.unwrap_or(0.0);
+    let exposure_gain = 2f32.powf(print.print_exposure);
     let wb = print.white_balance;
     let black = print.black_point;
     let hc = print.highlight_compress;
@@ -183,8 +188,8 @@ pub(crate) fn render(
     let mut rgb = density.density;
     rgb.par_chunks_exact_mut(3).for_each(|d| {
         for c in 0..3 {
-            let paper = 10f32.powf(density_gamma * d[c]); // stage 3 (D' term)
-            let exposed = paper * wb[c] * exposure_gain; // stage 4 (+ anchor gain)
+            let paper = 10f32.powf(density_gamma * (d[c] - anchor)); // stage 3, anchored
+            let exposed = paper * wb[c] * exposure_gain; // stage 4
             d[c] = soft_clip(exposed - black, hc);
         }
     });
@@ -220,29 +225,46 @@ fn resolve_dmax(densities: &[f32], source: DmaxSource) -> Option<f32> {
     }
 }
 
-/// The constant stage-3 gain `10^(−γ·Dmax)` for a resolved anchor. `None` ⇒ `1.0`
-/// (exactly), which is what makes the `DmaxSource::None` render bit-exact.
-fn anchor_gain(resolved: Option<f32>, density_gamma: f32) -> f32 {
-    match resolved {
-        None => 1.0,
-        Some(dmax) => 10f32.powf(-density_gamma * dmax),
+/// Cap on how many density samples the `Auto` anchor examines. A 99.5th
+/// percentile over ~1M samples is statistically indistinguishable from the full
+/// population for anchoring purposes, and the cap bounds the measuring pass to a
+/// ~4 MB transient buffer instead of a second image-sized allocation on large
+/// scans (the render itself is in-place).
+const AUTO_DMAX_MAX_SAMPLES: usize = 1 << 20;
+
+/// Deterministic sampling stride for a density buffer of `len` samples: the
+/// smallest stride that keeps the sample count under [`AUTO_DMAX_MAX_SAMPLES`],
+/// bumped off multiples of 3 — the buffer is interleaved RGB, so a stride
+/// divisible by 3 would sample a single channel and bias the pooled percentile.
+fn auto_dmax_stride(len: usize) -> usize {
+    let stride = len.div_ceil(AUTO_DMAX_MAX_SAMPLES).max(1);
+    if stride > 1 && stride.is_multiple_of(3) {
+        stride + 1
+    } else {
+        stride
     }
 }
 
-/// The [`AUTO_DMAX_PERCENTILE`] of the finite corrected densities, by nearest-rank.
+/// The [`AUTO_DMAX_PERCENTILE`] of the finite corrected densities, by nearest-rank
+/// over a deterministic strided sample (see [`auto_dmax_stride`]).
 ///
 /// Non-finite densities (`NaN` from corrupt/overflowed input) are excluded rather
 /// than ranked, so a stray non-finite pixel can't become the anchor. An empty /
-/// all-non-finite buffer yields `0.0` — a neutral anchor (gain `1.0`) rather than a
-/// panic; the encoder's non-finite counter still surfaces the underlying fault.
+/// all-non-finite buffer yields `0.0` — a neutral anchor rather than a panic; the
+/// encoder's non-finite counter still surfaces the underlying fault.
 /// Uses `select_nth_unstable` (O(n)) — the returned order-statistic value is
-/// independent of tie ordering, so the result stays deterministic.
+/// independent of tie ordering — and a fixed stride derived only from the buffer
+/// length, so the result stays deterministic: same buffer ⇒ same anchor.
 fn auto_dmax(densities: &[f32]) -> f32 {
-    let mut finite: Vec<f32> = densities
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .collect();
+    let stride = auto_dmax_stride(densities.len());
+    let mut finite: Vec<f32> = Vec::with_capacity(densities.len().div_ceil(stride));
+    finite.extend(
+        densities
+            .iter()
+            .step_by(stride)
+            .copied()
+            .filter(|v| v.is_finite()),
+    );
     if finite.is_empty() {
         return 0.0;
     }
@@ -637,6 +659,58 @@ mod tests {
     }
 
     #[test]
+    fn anchored_exponent_survives_extreme_gamma_and_dmax() {
+        // Regression (PR review): the anchor used to be a separate 10^(−γ·Dmax)
+        // gain, so γ·D' alone could overflow f32 before the gain cancelled it
+        // (γ = 5, D' = 8 ⇒ 10^40 = inf ⇒ scene white rendered inf/NaN). With the
+        // anchored exponent, D' = Dmax maps to exactly 1.0 regardless of scale.
+        let gamma = 5.0f32;
+        let dmax = 8.0f32;
+        let dimg = DensityImage {
+            width: 1,
+            height: 1,
+            density: vec![dmax, dmax, dmax],
+            ir: None,
+        };
+        let (out, resolved) = render(
+            dimg,
+            gamma,
+            DmaxSource::Explicit(dmax),
+            &PrintParams::default(),
+        );
+        assert_eq!(resolved, Some(dmax));
+        for v in &out.rgb {
+            assert!(v.is_finite(), "overflowed: {v}");
+            assert!(approx(*v, 1.0, 1e-5), "scene white should be 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn auto_dmax_stride_is_bounded_and_channel_unbiased() {
+        // Small buffers are sampled exhaustively.
+        assert_eq!(auto_dmax_stride(0), 1);
+        assert_eq!(auto_dmax_stride(3 * 100), 1);
+        assert_eq!(auto_dmax_stride(AUTO_DMAX_MAX_SAMPLES), 1);
+        // Large buffers are strided to stay under the cap...
+        let big = 10 * AUTO_DMAX_MAX_SAMPLES;
+        let stride = auto_dmax_stride(big);
+        assert!(big.div_ceil(stride) <= AUTO_DMAX_MAX_SAMPLES + 1);
+        // ...and the stride is never a multiple of 3 (interleaved RGB — a
+        // 3-divisible stride would sample one channel only).
+        for len in [
+            big,
+            3 * AUTO_DMAX_MAX_SAMPLES,
+            6 * AUTO_DMAX_MAX_SAMPLES + 5,
+        ] {
+            let s = auto_dmax_stride(len);
+            assert!(
+                s == 1 || !s.is_multiple_of(3),
+                "len {len}: stride {s} is 3-divisible"
+            );
+        }
+    }
+
+    #[test]
     fn convert_preserves_ir_plane() {
         let base = FilmBase::from([1.0, 1.0, 1.0]);
         let img = pixel([0.2, 0.2, 0.2], Some(0.33));
@@ -653,9 +727,9 @@ mod tests {
     #[test]
     fn none_anchor_is_bit_exact_with_pre_anchor_render() {
         // `DmaxSource::None` must reproduce the pre-anchor render bit-for-bit: the
-        // folded gain is `1.0 * 2^exposure`, exactly `2^exposure`, so every output
-        // sample must equal the direct pre-anchor arithmetic to the bit (HDR f32
-        // workflows depend on this). Uses `assert_eq!` on f32, not an epsilon.
+        // anchor term is exactly 0.0 and `d − 0.0 == d` for every f32, so every
+        // output sample must equal the direct pre-anchor arithmetic to the bit
+        // (HDR f32 workflows depend on this). Uses `assert_eq!`, not an epsilon.
         let density = vec![0.7f32, -0.3, 1.2, 0.0, 2.0, -1.1];
         let dimg = DensityImage {
             width: 2,
