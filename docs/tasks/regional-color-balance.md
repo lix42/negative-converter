@@ -25,9 +25,14 @@ pick the user-facing convention deliberately and document it in §9).
 - New params in the `density` recipe section: `shadow_balance: [f32;3]`,
   `highlight_balance: [f32;3]` (defaults `[0,0,0]` = today's behavior,
   bit-exact), plus CLI flags — four coupled spots + merge tests each.
-- Weight ramps anchored on the resolved density range (film base at `D = 0`;
-  `Dmax` if available) so the "shadow" and "highlight" regions track the actual
-  image range rather than fixed constants.
+- Weight ramps anchored on the density range so "shadow"/"highlight" track the
+  actual image rather than fixed constants — but **not** on an Auto `Dmax`,
+  which is measured *after* stage 2 and can't feed ramps *inside* it (would be
+  circular). Anchor on the pre-regional corrected density instead: compute
+  `D'_base = scale·D + offset`, derive its range deterministically (percentiles,
+  ignoring non-finite values), then apply the ramp terms — a documented
+  two-pass within stage 2. An explicit anchor from a recipe (e.g. a reused
+  measured `Dmax`) short-circuits the measuring pass for roll reuse.
 - Stays entirely inside stage 2 — print rendering untouched (core fidelity
   rule); `simple` untouched.
 - Spec: §7.2 formula and §9 keys updated (design-spec.md and .html together).

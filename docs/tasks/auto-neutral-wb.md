@@ -15,7 +15,7 @@ transform) that computes gains applied via the existing `print.white_balance`
 mechanism:
 
 ```text
-convert:  decode → film base → algorithm → [auto-wb analysis → re-render or gain pass] → color → encode
+convert:  decode → film base → algorithm → [auto-wb analysis → re-render stage 4 with gains] → color → encode
 ```
 
 - **Modes as one enum** (recipe key under the `print` section per §9):
@@ -36,8 +36,14 @@ convert:  decode → film base → algorithm → [auto-wb analysis → re-render
 
 ## Implementation Suggestion
 
-- Applying gains post-hoc to the rendered positive is a per-channel multiply —
-  cheap enough to run as a second pass; avoid re-running the full algorithm.
+- The *estimation* pass reads the rendered positive, but the *application* must
+  go through the standard stage-4 `print.white_balance` slot — NOT a post-hoc
+  multiply on the final output. Stage 4 applies `white_balance` *before* the
+  `black_point` subtraction and the `highlight_compress` soft-clip, so a
+  post-hoc multiply would differ from a later run reusing the same gains via
+  explicit `--white-balance`, breaking measure-once-reuse-for-the-roll. Re-run
+  the print render with the estimated gains (stage 3's density→linear output
+  can be cached to keep the second pass cheap).
 - Ignore non-finite samples and clipped extremes in the statistics; consider
   reusing the border/region conventions so rebate pixels don't skew the estimate.
 - Watch the four coupled knob spots + merge tests; `deny_unknown_fields` means
