@@ -388,6 +388,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <ul>
   <li><code>-o, --output &lt;path&gt;</code> (required)</li>
   <li><code>--output-hdr</code> — write a 32-bit float TIFF (full HDR, no precision loss); without the flag the output is 16-bit integer. Recipe key <code>output.hdr</code> (bool, default <code>false</code>).</li>
+  <li><code>--output-sdr</code> — force the default 16-bit integer output, overriding a recipe's <code>output.hdr = true</code> (the flags-win escape hatch; an absent presence flag never clobbers a recipe value). Conflicts with <code>--output-hdr</code>; passing both is a usage error.</li>
   <li><code>--output-profile &lt;srgb|prophoto|acescg|path-to-icc&gt;</code> (depth-aware default: <code>srgb</code> for the 16-bit default, <code>acescg</code> for <code>--output-hdr</code>)</li>
   <li><code>--bigtiff auto|on|off</code> (default <code>auto</code>)</li>
 </ul>

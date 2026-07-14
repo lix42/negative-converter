@@ -448,6 +448,10 @@ crossover.
 - `--output-hdr` — write a 32-bit float TIFF (full HDR, no precision loss);
   without the flag the output is 16-bit integer. Recipe key `output.hdr`
   (bool, default `false`).
+- `--output-sdr` — force the default 16-bit integer output, overriding a
+  recipe's `output.hdr = true` (the flags-win escape hatch; an absent
+  presence flag never clobbers a recipe value). Conflicts with
+  `--output-hdr`; passing both is a usage error.
 - `--output-profile <srgb|prophoto|acescg|path-to-icc>` (default is depth-aware:
   `srgb` for the 16-bit default, `acescg` for `--output-hdr`)
 - `--bigtiff auto|on|off` (default `auto`)

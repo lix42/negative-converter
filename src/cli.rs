@@ -262,8 +262,13 @@ pub struct SimpleOverrides {
 pub struct OutputOverrides {
     /// Write a 32-bit float TIFF (full HDR, no precision loss) instead of the
     /// default 16-bit integer TIFF.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "output_sdr")]
     pub output_hdr: bool,
+    /// Force the default 16-bit integer TIFF, overriding a recipe's
+    /// `output.hdr = true` (the flags-win escape hatch; without it a bool
+    /// presence flag could set HDR but never clear it).
+    #[arg(long)]
+    pub output_sdr: bool,
     /// Output ICC profile (`sRGB` / `prophoto` / `acescg` / path).
     #[arg(long, value_name = "PROFILE")]
     pub output_profile: Option<String>,
@@ -491,8 +496,14 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     // output: `--output-hdr` is a presence flag — passing it switches the output
     // to 32-bit float; when absent it must not clobber a recipe's `hdr: true`
     // (same convention as `--assume-linear`), so only a set flag merges.
+    // output depth: the two flags are mutually exclusive (clap-enforced);
+    // whichever is given replaces the recipe's choice — `--output-sdr` exists
+    // so a recipe `hdr: true` stays CLI-overridable (flags win), since an
+    // absent presence flag never clobbers a recipe value.
     if args.output_opts.output_hdr {
         cfg.output.hdr = true;
+    } else if args.output_opts.output_sdr {
+        cfg.output.hdr = false;
     }
     if let Some(v) = &args.output_opts.output_profile {
         cfg.output.output_profile = Some(v.clone());
@@ -1284,8 +1295,32 @@ mod tests {
         assert!(!cfg.output.hdr);
         // An absent (false) presence flag must not clobber a recipe `true`.
         let recipe: ResolvedConfig = serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap();
-        let cfg = merge(recipe, &parse_convert(&[]));
+        let cfg = merge(recipe.clone(), &parse_convert(&[]));
         assert!(cfg.output.hdr);
+        // `--output-sdr` is the explicit escape hatch: it forces a recipe
+        // `hdr: true` back to 16-bit (flags win by presence, not value).
+        let cfg = merge(recipe, &parse_convert(&["--output-sdr"]));
+        assert!(!cfg.output.hdr);
+        // ...and is a no-op on an already-SDR config.
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-sdr"]));
+        assert!(!cfg.output.hdr);
+    }
+
+    #[test]
+    fn mutually_exclusive_output_depth_flags_are_rejected() {
+        // clap must reject the conflicting pair rather than silently pick one.
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "i",
+                "-o",
+                "o",
+                "--output-hdr",
+                "--output-sdr"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
