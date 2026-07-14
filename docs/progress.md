@@ -916,6 +916,13 @@ a task; update your own section as you work. Append entries — don't rewrite th
   was a silent no-op (parsed, never applied); `convert` now rejects it with
   exit 4 until input-side color management lands (§9 note added). Four new E2E
   tests pin all of it.
+- 2026-07-14 — **rebased onto merged #16 and wired the report.** The rebase had
+  one trivial conflict (cli.rs import list). The merge-time follow-up landed in
+  this branch since orchestration is now underneath it: `stages::render` calls
+  `Converter::convert_reported`, `Rendered` carries the `ConvertReport`, and the
+  convert JSON report gains an optional `dmax` field (auto/explicit value;
+  absent for `--no-d-max` and `simple`). E2E test pins both presence and
+  absence.
 - 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
   (gates re-run green: 110 unit + 13 integration tests; CLAUDE.md refreshed —
   module map, dead-code note, and the lcms2 global-handler mechanism now match
@@ -947,12 +954,114 @@ a task; update your own section as you work. Append entries — don't rewrite th
   flag values), closing the measure-once-reuse-for-the-roll loop.
 
 ## dmax-white-anchor
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-13
 
 - Goal: anchor scene white (Dmax) in the density render so default u16 output
   fills the display range instead of clipping (PR #12 review finding; NLP
   comparison priority 1). Includes the design-spec §7.2 polarity correction.
+- **Done.** The `render` sub-stage (`src/algo/density.rs`) now renders density
+  relative to a display-white anchor `Dmax`; `to_density` is untouched and the two
+  sub-stages stay separate. Full CI gate clean; suite **122/122**.
+- **Exact formula + chosen form (for reproducibility):**
+  - Stage 3 is now `lin_c = 10^(density_gamma · (D'_c − Dmax))`.
+  - **Gain form (chosen):** this factors as `10^(γ·D') · 10^(−γ·Dmax)`, so the
+    constant `anchor_gain = 10^(−γ·Dmax)` is **folded into the stage-4 exposure
+    gain**: `exposure_gain = anchor_gain · 2^print_exposure`. Picked over
+    subtracting `Dmax` inside the exponent because the anchor and `print_exposure`
+    are both multiplicative scalars — folding makes the bit-exactness guarantee
+    trivial (see below) and keeps the per-pixel hot loop one multiply.
+  - **Auto percentile:** `AUTO_DMAX_PERCENTILE = 0.995` (99.5th) of the *finite*
+    corrected densities, **scalar/pooled across all channels** (a per-channel
+    anchor would double as color correction — deferred to `auto-neutral-wb`).
+    Nearest-rank via `select_nth_unstable_by(round((n−1)·p), f32::total_cmp)`
+    (O(n); the order-statistic value is tie-order-independent ⇒ deterministic).
+    Non-finite densities are filtered out first; empty/all-non-finite ⇒ `0.0`
+    (neutral gain 1.0, not a panic). 0.995 catches genuine scene white while
+    ignoring the top ~0.5% (specular sparkle / dust / hot pixels).
+- **Knob shape (one enum, per §9 conventions):** `DmaxSource { Auto (default) |
+  Explicit(f32) | None }` in `types.rs`, recipe key **`density.dmax`** (sits beside
+  `density_gamma` in `DensityParams`, and like `density_gamma` is applied in the
+  render sub-stage — that's why it lives under `density.*`, not `print.*`).
+  Serializes `"auto"` / `{"explicit":<d>}` / `"none"`, mirroring `FilmBaseSource`.
+  CLI: mutually-exclusive `--d-max <d>` / `--auto-d-max` / `--no-d-max` (clap
+  `conflicts_with_all`, dedicated `DmaxOverrides` group like `FilmBaseOverrides`).
+  Four coupled spots all wired: `DmaxOverrides` field + merge arm + `validate`
+  (explicit d-max must be finite & `> 0`) + recipe field, each with a test.
+- **Bit-exact `None` guarantee (HDR f32 workflows depend on it):** `DmaxSource::
+  None` ⇒ `resolve_dmax` returns `None` ⇒ `anchor_gain` returns the literal `1.0`
+  ⇒ `exposure_gain = 1.0 · 2^print_exposure`, which is `2^print_exposure`
+  bit-for-bit in IEEE-754, and the per-pixel arithmetic is otherwise unchanged.
+  Pinned by `none_anchor_is_bit_exact_with_pre_anchor_render`, which recomputes the
+  pre-anchor expression and asserts `assert_eq!` on f32 (not an epsilon).
+- **Default is now `Auto`** — this deliberately changes the default `density`
+  output from scene-referred (base → 1.0, everything above) to display-range-
+  filling (scene white → ≈1.0). That is the whole point of the task (closes PR #12's
+  "default u16 clips the whole image"). Verified on the real-scan fixture
+  (`tests/fixtures/hdr-48bit.tif`) via a throwaway `#[ignore]` probe (removed):
+  default `Auto` u16 clipped fraction **0.49%** (spot highlights only) vs
+  **99.9996%** with `--no-d-max`; resolved Dmax ≈ 1.087.
+- **Resolved anchor rides back for the report:** the `Converter` trait gained a
+  **defaulted** `convert_reported(&self, image, base) -> Result<(LinearImage,
+  ConvertReport)>` (`algo/mod.rs`); `ConvertReport { dmax: Option<f32> }`. `Density`
+  implements the real work in `convert_reported` and has `convert` delegate to it
+  (`.0`); `simple` inherits the default (no diagnostics). This is a *diagnostics
+  output* channel (analogous to `EncodeReport`), not a control knob, so it doesn't
+  reopen the "don't widen the trait for controls / associated-Params breaks
+  object-safety" decision — `Box<dyn Converter>` still works.
+- **Spec updated (md + html together):** §7.2 stage-3 corrected to `10^(+γ·D')`
+  (was the ambiguous "exponential back-transform"; polarity bug per the
+  `algo-density` note), plus new polarity + Dmax-anchor prose; §9 density-stage
+  gained the `--d-max`/`--auto-d-max`/`--no-d-max` keys under `density.dmax`.
+- **Review (pr-review-toolkit, 5 agents parallel):** code-reviewer, silent-failure,
+  type-design, tests, comments.
+  - code-reviewer: **no findings at threshold** — confirmed bit-exactness,
+    determinism, four-spot wiring, fail-loud all sound.
+  - silent-failure-hunter, 2 MEDIUM — both analyzed and **dismissed with rationale
+    (not code-changed):** (1) "Auto anchor can be non-positive → brightens" — this
+    is *correct* display-fill behavior for a dim frame (bring near-white content up
+    to 1.0); the explicit-path positivity guard exists for *typo* protection on user
+    input, whereas Auto is a trusted deterministic measurement, so the asymmetry is
+    intentional. (2) "pathological `--density-gamma`×`--d-max` underflows gain to 0 ⇒
+    all-black finite image the encoder backstop can't see" — reachable only with
+    absurd inputs, and in most such cases `10^(γ·D')` overflows to `+inf` first ⇒
+    `inf·0 = NaN` ⇒ *is* caught by the encoder's non-finite counter; the narrow
+    all-black-finite edge is best surfaced as an orchestration warning (see note
+    below), not speculative clamping in the pure stage.
+  - type-design: clean (DmaxSource is a textbook "one enum, not parallel fields",
+    defaulted `convert_reported` is a sound object-safe diagnostics channel).
+  - tests: added 5 (nearest-rank precision on distinct values, Auto→render
+    end-to-end scene-white→1.0, anchor×print_exposure composition at a known value,
+    scalar-pooled-across-channels guard, nested `density.dmax` recipe parse).
+  - comments: accurate; reworded the `Auto` doc ("no `--d-max` flag" → "none of the
+    three dmax flags").
+- **Notes for `algo-sigmoid`:** reuse this anchor — the S-curve tone map wants the
+  same "scene white → display white" reference. The resolved `Dmax` (frame-local
+  scene-white density) is the natural shoulder anchor; consume it via the same
+  `DmaxSource`/`convert_reported` path rather than re-measuring, and keep the
+  `None`-is-bit-exact escape hatch for HDR.
+- **Notes for `pipeline-orchestration`:** call `Converter::convert_reported` (not
+  `convert`) so `ConvertReport.dmax` reaches the JSON report — add it beside the
+  film base. **Nothing consumes `convert_reported` yet** (only tests), so wire it
+  or the reporting channel stays a no-op. Also consider a report warning when the
+  resolved anchor gain is degenerate (underflow → ~all-black, or overflow) since the
+  encoder's clip/non-finite counters can't see an all-zero-but-finite image
+  (silent-failure Finding 2). `convert`/`convert_reported` can still return
+  `NcError::Other` on a bad estimated base (unchanged from `algo-density`).
+
+- 2026-07-14 — **PR #17 review fixes.** (1) The anchor is now applied in the
+  exponent (`10^(γ·(D'−Dmax))`) instead of a folded `10^(−γ·Dmax)` gain — the
+  factored form overflowed f32 when `γ·D'` alone exceeded the pow10 range (e.g.
+  γ=5 with EPS-clamped D'≈8 rendered scene white as inf); regression test added.
+  `None` stays bit-exact (`d − 0.0 == d`). (2) The Auto anchor now measures a
+  deterministic strided sample capped at 2^20 values (~4 MB transient) instead
+  of copying the full density buffer — stride derived from length only, bumped
+  off multiples of 3 so interleaved RGB isn't single-channel biased; small
+  images are unaffected (stride 1). Spec §7.2 sentence updated to match.
+- 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
+  (gates re-run green: 122 tests; branch rebased onto post-docs main). Unblocks
+  `algo-sigmoid`. Merge-time follow-up with `pipeline-orchestration` stands:
+  wire `convert_reported`'s `ConvertReport.dmax` into the JSON report.
 
 ## algo-sigmoid
 **Status:** not started

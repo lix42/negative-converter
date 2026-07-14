@@ -26,6 +26,35 @@ use crate::types::{
 pub trait Converter {
     /// Convert `image` to a positive, using `base` as the `Dmin` anchor.
     fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
+
+    /// Convert and surface optional per-conversion diagnostics for the JSON report.
+    ///
+    /// This is the value-path a resolved-anchor (`Dmax`) or similar diagnostic
+    /// rides back on — analogous to how `io::encode` returns an `EncodeReport`
+    /// alongside its result: the algorithm *surfaces* values, the orchestrator
+    /// *reports* them. It is a reporting channel, not a new control knob (controls
+    /// still live in the param structs), so widening it doesn't reopen the
+    /// object-safety / associated-`Params` question the trait settled.
+    ///
+    /// The default runs [`Converter::convert`] and reports nothing, so algorithms
+    /// with no diagnostics (e.g. `simple`) need not implement it.
+    fn convert_reported(
+        &self,
+        image: &LinearImage,
+        base: &FilmBase,
+    ) -> Result<(LinearImage, ConvertReport)> {
+        Ok((self.convert(image, base)?, ConvertReport::default()))
+    }
+}
+
+/// Optional per-conversion diagnostics an algorithm may surface for the JSON
+/// report (see [`Converter::convert_reported`]). Empty by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ConvertReport {
+    /// The resolved display-white anchor density (`Dmax`) the density render used,
+    /// when one was applied. `None` for algorithms/config that don't anchor
+    /// (`simple`, or `density` with `dmax = none`).
+    pub dmax: Option<f32>,
 }
 
 /// The shipped Step-1 algorithms. `density` is the default.

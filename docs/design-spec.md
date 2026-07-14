@@ -206,11 +206,30 @@ The credible baseline for color negatives, following Kodak Cineon / darktable
 `negadoctor` ideas:
 
 ```
-1. transmission → density:   D = -log10(scan / Dmin_transmission)   (per channel)
-2. density correction:       per-channel scale/offset, orange-mask compensation
-3. map density → positive:   exponential / print-curve back-transform
-4. print render controls:    exposure, black point, gamma, highlight compression
+1. transmission → density:   D  = -log10(scan / Dmin_transmission)   (per channel)
+2. density correction:       D' = per-channel scale·D + offset (orange-mask comp)
+3. map density → positive:   lin = 10^(gamma · (D' − Dmax))          (per channel)
+4. print render controls:    exposure, black point, white balance, highlight compression
 ```
+
+**Polarity.** With `D = -log10(scan / Dmin)` the density is `≥ 0` and *grows* with
+the film's optical density — the unexposed base (scene black) sits at `D = 0`, a
+dense negative area (a scene highlight) at large `D`. A positive must brighten as
+`D` grows, so step 3 uses `10^(+gamma·D')`, **not** `10^(−gamma·D')` (which would
+reproduce the negative). This matches darktable `negadoctor` (denser negative →
+brighter print).
+
+**Display-white anchor (`Dmax`).** Step 3 renders density *relative to* `Dmax`, the
+corrected density of scene white: scene white (`D' = Dmax`) maps to display white
+`1.0`, and the base (`D' = 0`) to `10^(−gamma·Dmax) ≈ 0`. Without it the base maps
+to `1.0` and all real detail sits above `1.0`, so a default u16 encode clips the
+whole image; the anchor makes the default output fill the display range. Mathematically the
+anchor factors out as a constant gain `10^(−gamma·Dmax)`, but it is applied **in
+the exponent** — `10^(gamma·(D' − Dmax))` — so an extreme `gamma·D'` cannot
+overflow `f32` before the anchor cancels it. `Dmax` is **frame-local** — a property of the
+scene's own white, unlike the roll-level `Dmin` base — so it is measured per frame
+by default (`density.dmax = auto`); it can be fixed (`{ "explicit": <d> }`) or
+disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.
 
 Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as
 separate, independently parameterized sub-stages — the core fidelity rule from §3.
@@ -224,6 +243,12 @@ separate, independently parameterized sub-stages — the core fidelity rule from
 /// factory maps `--algorithm` + the resolved params to a boxed converter.
 pub trait Converter {
     fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
+
+    /// Optional per-conversion diagnostics for the JSON report (e.g. the
+    /// resolved `Dmax`). Defaulted to `convert` + an empty `ConvertReport`,
+    /// so algorithms with nothing to report only implement `convert`.
+    fn convert_reported(&self, image: &LinearImage, base: &FilmBase)
+        -> Result<(LinearImage, ConvertReport)> { /* default provided */ }
 }
 ```
 
@@ -277,15 +302,17 @@ writes the same shape with the resolved values. Example:
 ### Example invocations
 
 ```bash
-# Default density conversion, 16-bit TIFF out, auto Dmin, JSON report.
+# Default density conversion, 16-bit TIFF out, auto Dmin & Dmax, JSON report.
 nc convert in.tiff -o out.tiff --algorithm density --report json
 
-# Full HDR float output, manual film base, explicit print controls.
+# Full scene-referred HDR float output: --no-d-max disables the display-white
+# anchor (base → 1.0, detail above), and the depth-aware default profile
+# (acescg for f32) applies. Manual film base, explicit print controls.
 nc convert in.tiff -o out.tiff \
-  --algorithm density --out-depth f32 \
+  --algorithm density --out-depth f32 --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
-  --highlight-compress 0.3 --output-profile sRGB
+  --highlight-compress 0.3
 
 # Reuse a roll recipe but override one knob for this frame.
 nc convert frame12.tiff -o frame12_pos.tiff \
@@ -392,6 +419,19 @@ crossover.
 - `--density-scale R,G,B` — per-channel density gain.
 - `--density-offset R,G,B` — per-channel density offset (orange-mask comp).
 - `--density-gamma <f>` — film/print curve gamma.
+- Display-white anchor (`Dmax`) — a single mutually-exclusive choice, recipe key
+  `density.dmax` (default `"auto"`; see §7.2). The three flags conflict (passing
+  more than one is a usage error); whichever is given replaces a recipe's `dmax`:
+  - `--auto-d-max` (default) ⇒ `"auto"` — measure the anchor per frame from the
+    corrected-density distribution (a high percentile).
+  - `--d-max <d>` ⇒ `{ "explicit": <d> }` — fix the anchor to a scalar density.
+    Reusing one frame's measured value across a roll is a deliberate
+    fixed-print-exposure look; the tradeoff is that darker frames render dim and
+    denser highlights clip against the foreign anchor (it is **not** a
+    calibrate-once property like `Dmin`).
+  - `--no-d-max` ⇒ `"none"` — disable the anchor; scene-referred output (base →
+    `1.0`, detail above), reproducing the pre-anchor render bit-for-bit for HDR
+    f32 workflows.
 
 ### Print / tone render
 - `--print-exposure <f>` — overall positive exposure.
