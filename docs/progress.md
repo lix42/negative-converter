@@ -578,11 +578,80 @@ a task; update your own section as you work. Append entries — don't rewrite th
     `--assume-linear` over a `{"profile":…}` recipe resolves to `"linear"`.
 
 ## algo-simple
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-12
 
 - Goal: channel-inversion baseline converter (debug / B&W) with white balance and
   black/white points.
+- **Done.** `src/algo/simple.rs` implements `Converter::convert` on `Simple`. It's
+  the only file changed — `SimpleParams`' knobs (`invert_white_balance`,
+  `clip_low`, `clip_high`) were already fully wired by `cli-framework` (recipe
+  struct in `types.rs`, `SimpleOverrides` + merge arm + `validate` checks in
+  `cli.rs`), so **no new knobs** were added and no four-spot wiring was needed.
+- **Algorithm (pure, per channel, linear working space):**
+  1. neutralize the film base — `normalized = value / base[c]` (removes the
+     orange-mask multiplicative cast; an unexposed base pixel → 1.0);
+  2. invert — `positive = 1 - normalized`;
+  3. white balance — `* invert_white_balance[c]`;
+  4. black/white points — linear remap `(x - clip_low) / (clip_high - clip_low)`.
+  A neutral base `[1,1,1]` makes step 1 inert, giving the pure `1 - v` reference.
+  No density-domain math (log/exp) — that's what distinguishes `density`.
+- **Decisions:**
+  - **Base neutralization is a divide, using the pipeline-provided `FilmBase`** —
+    the task spec's step 1 ("optional normalize against base") and design-spec
+    §7.1's "border neutralization". It reuses the existing film-base knobs
+    (`--film-base`/`--base-region`/`--auto-base`); "optional" is expressed by a
+    neutral base being inert, not by a new flag.
+  - **No clamping** anywhere in the stage — output f32 may fall outside `[0,1]`
+    (HDR/scene-referred); clamping is the u16 encoder's job (CLAUDE.md clamp
+    boundary). Locked by `does_not_clamp_out_of_range_values`.
+  - **rayon** `par_chunks_exact(3).flat_map_iter(..).collect()` — per-pixel
+    independent, and rayon's ordered collect keeps it deterministic. `rgb.len()`
+    is a multiple of 3 (a `LinearImage` invariant), so every chunk is one triple.
+  - **IR plane carried through untouched** (`image.ir.clone()`), per Step-1 rule.
+- **Review loop (pr-review-toolkit, 4 agents parallel + 1 confirmation round):**
+  All four (code / silent-failure / tests / comments) converged on **one**
+  important finding: the original `convert` doc claimed `cli::validate` guarantees
+  a positive/finite `base` so the divide can't hit zero — **true only for
+  `FilmBaseSource::Explicit`.** For `Region`/`Auto` the base is runtime-estimated
+  by `film_base::estimate`, which has no positivity guarantee (a `--base-region`
+  over the dark holder → `percentile` returns `0.0`), so `value / 0.0` would emit
+  silent `inf`/`NaN` — a "quietly wrong image", violating fail-loudly.
+  - **Fix (kept inside this task's file):** `convert` now guards the base up front
+    — any channel that isn't finite-and-positive → `NcError::Other` (exit 1) with
+    an actionable message (pass `--film-base` / point `--base-region` at the
+    rebate). This stage is the first to divide by the base, so the guard is a
+    *first* validation of a runtime-derived value, not a redundant re-check of a
+    CLI-validated one (consistent with `film_base.rs`'s own defense-in-depth).
+    Doc comment corrected to attribute each guarantee to the right layer.
+  - Also added, per the test reviewer: `applies_base_then_invert_then_wb_then_clip_in_order`
+    (all four ops active with distinct per-channel values — catches a step
+    reorder that the one-op-at-a-time tests miss) and
+    `parallel_path_preserves_sample_order` (large multi-chunk image, position-
+    dependent samples — pins the rayon-collect ordering).
+  - Confirmation re-review came back clean (no remaining/new important issues).
+- **Notes for dependent tasks:**
+  - **`pipeline-orchestration`:** `Simple::convert` can now return an error
+    (degenerate base) as well as `LinearImage::new` failures — propagate its
+    `Result`, don't `unwrap`. Exit 1 on a degenerate estimated base.
+  - **`algo-density` (follow-up, not fixed here):** `density` will also divide by /
+    take `log10` of the base (`D = -log10(scan/Dmin)`) and needs the **same base
+    guard**; its `convert` is still a `todo!()` stub, so there's no live gap today.
+  - **`film-base-estimation` (recommended follow-up, out of this task's scope):**
+    the deeper fix is for `film_base::estimate` to reject a non-positive/non-finite
+    estimated base loudly at the point it's born (beside its existing uniformity /
+    brighter-than-interior gates), which would make the base valid for *every*
+    consumer, not just `simple`. Left to that task rather than editing its
+    completed file from here.
+- **Verify:** `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build`, `cargo test` all clean. Full suite **87/87** (11 new
+  `algo::simple` tests: inversion, base neutralization divides-before-invert, WB
+  scaling, clip endpoint remap, combined-ordering, no-clamp passthrough, IR
+  present/absent, dimension preservation, parallel order, degenerate-base error).
+- **2026-07-12 — closed out.** Manual review approved; shipped via `/ship`
+  (gates re-run green, CLAUDE.md gained the film-base guard gotcha, PR opened
+  from branch `algo-simple`). The notes above for `pipeline-orchestration` /
+  `algo-density` / `film-base-estimation` stand.
 
 ## algo-density
 **Status:** not started

@@ -104,7 +104,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 ### Phase 3: Algorithms
 > Goal: the two negative→positive converters, both selectable.
 
-- [ ] [Simple inversion algorithm](tasks/algo-simple.md)
+- [x] [Simple inversion algorithm](tasks/algo-simple.md)
 - [ ] [Density-domain algorithm](tasks/algo-density.md)
 
 ### Phase 4: Integration
