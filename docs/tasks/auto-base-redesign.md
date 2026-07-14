@@ -59,8 +59,8 @@ and a wrong one is not. Tune the confidence gates against the
 - **Content-based source (ladder Tier 3, explicit opt-in).** New
   `film_base.source = "content"` (flag e.g. `--base-content`) for scans cropped
   to the image with no unexposed film visible: per-channel high percentile of the
-  exposed content (thinnest area ≈ scene's deepest black ≈ base). Never a silent
-  fallback when auto refuses — the auto failure message *suggests* it, the user
+  exposed content (thinnest area ≈ scene's deepest black ≈ base). It is never a
+  silent fallback when auto refuses — the auto failure message *suggests* it, the user
   or agent opts in, and the report records the content source so such rolls are
   auditable. Document the failure mode (no near-black in scene → washed, cast
   blacks; recoverable downstream as a global cast).

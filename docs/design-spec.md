@@ -295,8 +295,9 @@ nc convert frame12.tiff -o frame12_pos.tiff \
 nc inspect in.tiff --report json
 
 # Calibrate once from an unexposed reference frame, then reuse for the roll.
-# (Product tip: shoot 1-2 lens-cap frames when loading the roll and scan one —
-# a full frame of clean base beats sampling the thin rebate. See §9 film-base.)
+# (Product tip: wind past the light-struck leader, shoot a lens-cap frame, and
+# scan it — a full frame of clean base beats sampling the thin rebate. Don't use
+# the auto-burned wind-on frames; they are fogged leader. See §9 film-base.)
 # `estimate` measures Dmin from the sampled rectangle and reports it in a form
 # ready to drop into --film-base or a recipe's film_base.source.
 nc estimate reference.tiff --base-region 200,0,300,3600 --report json
@@ -337,9 +338,13 @@ re-detecting per frame — measured this way the base is identical across frames
 keeping the roll color-consistent. The sources, in decreasing reliability:
 
 1. **A dedicated unexposed frame (best).** Recommended shooting workflow: after
-   loading a roll, fire 1–2 frames with the lens cap on (most cameras burn 1–2
-   wind-on frames anyway), then scan one of those blank frames alongside the
-   roll. It provides a full frame of clean base — far more area than the rebate
+   loading a roll and winding past the light-struck leader (the frame counter
+   reaching 1), take a deliberate exposure with the lens cap on, then scan that
+   blank frame alongside the roll. Do **not** rely on the 1–2 auto-burned
+   wind-on frames — that leader area was exposed while loading with the back
+   open, so it is fogged film, denser than clean base, and would bake a wrong
+   `Dmin` into the whole roll. A true cap-on frame provides a full frame of
+   clean base — far more area than the rebate
    — measured with `nc estimate` and frozen into the roll recipe (§8 example).
    The large area also enables multi-region sampling with an agreement check
    (roadmap §12), which doubles as a light-leak / illumination-falloff
@@ -352,8 +357,9 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    a narrow, uniform, bright band *inset behind the holder*, possibly on only
    some edges. Auto detection keeps **deliberately strict** confidence gates
    (uniformity, brighter-than-interior) and **fails loudly** rather than emit a
-   silently-wrong base; its thresholds are tuned against real scans
-   (`real-scan-verification`). A robust inward-scan detector and a
+   silently-wrong base — note the Step-1 heuristic often refuses on real
+   `holder → rebate → picture` layouts. The robust inward-scan detector,
+   thresholds tuned against real scans (`real-scan-verification`), and a
    `--holder white|black` control for light holders are roadmap items (§12).
 3. **Content-based estimation (last resort, opt-in).** When the scan is cropped
    to the image with no unexposed film visible, a per-channel high percentile of
@@ -362,7 +368,7 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    opt-in source** (roadmap §12): it changes the assumption from "physical base
    measured" to "scene contains a near-black", so the tool never falls back to
    it silently, and the report records that the base came from content
-   statistics. When the assumption fails (foggy/high-key scenes) blacks wash out
+   statistics. When the assumption fails (foggy/high-key scenes), blacks wash out
    and pick up a cast.
 
 **When every source is missing** (no explicit base, auto refuses, content mode
@@ -493,7 +499,7 @@ and `regional-color-balance` from the NLP feature comparison, Phase 6).
    march strips in from each edge and pick the brightest uniform band past the
    holder (the rebate can be thin and on only some edges). Keep deterministic;
    still fail loudly when no confident band exists, with thresholds tuned
-   against the real-scan verification results. Same task family: an explicit
+   against the real-scan verification results. This task family also includes: an explicit
    opt-in **content-based source** (`film_base.source = "content"`, §9 ladder
    tier 3) recorded in the report; a **uniformity warning on `--base-region`**
    (a mixed rebate/image rectangle currently yields a plausible-looking bad
@@ -506,7 +512,7 @@ and `regional-color-balance` from the NLP feature comparison, Phase 6).
 10. **Reuse-ready `nc estimate` output.** Emit the measured base in a directly
     reusable form — a `--film-base R,G,B` string and/or a `film_base` recipe
     fragment — so the calibrate-once → reuse workflow (§8) is copy-paste smooth.
-    Plus **grid / multi-region sampling with an agreement check** for
+    This includes **grid / multi-region sampling with an agreement check** for
     unexposed-frame calibration (§9 ladder tier 1): sample center + corners,
     require per-channel agreement within a tolerance, and report the spread —
     disagreement diagnoses light leaks and scanner illumination falloff.
