@@ -524,6 +524,14 @@ and `regional-color-balance` from the NLP feature comparison, Phase 6).
     candidates, and feedback when a chosen region fails the uniformity check
     (the CLI-side uniformity warning and inspect candidates above are the
     building blocks).
+12. **Crash reporting & opt-in telemetry.** Local first: a panic hook writing a
+    crash file (version, backtrace, params shape — never pixels or file paths)
+    the user can attach to a bug report. Remote collection (error reporting,
+    usage analytics) only later and strictly **opt-in**: documented event list,
+    an `NC_TELEMETRY=0`-style off switch, no stdout pollution, no blocking, no
+    effect on exit codes or output bytes. Performance instrumentation is *not*
+    deferred with this — per-stage timings/tracing are the tracked pre-release
+    `perf-instrumentation` task.
 
 ## 13. Open questions
 

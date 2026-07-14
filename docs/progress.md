@@ -985,3 +985,11 @@ a task; update your own section as you work. Append entries — don't rewrite th
 - Goal: run the verification matrix (inspect/estimate/convert/IR/determinism/
   resources) against the full-size real scans once the user prepares the assets;
   record results here, file follow-up tasks for defects.
+
+## perf-instrumentation
+**Status:** not started
+**Updated:** —
+
+- Goal: per-stage timings in the JSON report, tracing spans to stderr behind
+  `-v`, and criterion benches for the hot kernels — local-only, report-side
+  (byte-identical output untouched). Pre-release performance visibility.
