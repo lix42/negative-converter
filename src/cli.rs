@@ -23,7 +23,8 @@ use crate::io::decode::{DecodeInfo, decode};
 use crate::io::encode;
 use crate::pipeline::{film_base, stages};
 use crate::types::{
-    Algorithm, BigTiff, DensityParams, EncodeReport, FilmBase, FilmBaseParams, FilmBaseSource,
+    Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
+    FilmBaseSource,
     InputColor, InputParams, NcError, OutDepth, OutputParams, PrintParams, Result, SimpleParams,
 };
 
@@ -127,6 +128,8 @@ pub struct ConvertArgs {
     #[command(flatten)]
     pub density: DensityOverrides,
     #[command(flatten)]
+    pub dmax: DmaxOverrides,
+    #[command(flatten)]
     pub print: PrintOverrides,
     #[command(flatten)]
     pub simple: SimpleOverrides,
@@ -201,6 +204,26 @@ pub struct DensityOverrides {
     /// Film / print curve gamma.
     #[arg(long)]
     pub density_gamma: Option<f32>,
+}
+
+/// Display-white anchor (`Dmax`) overrides (design-spec §9, `density.dmax`).
+///
+/// One mutually-exclusive choice, like [`FilmBaseOverrides`]: the three flags
+/// conflict (clap rejects passing more than one) and whichever is given replaces
+/// the recipe's `density.dmax` entirely.
+#[derive(Args, Debug, Default)]
+pub struct DmaxOverrides {
+    /// Explicit display-white anchor density (`Dmax`); a scalar, applied to all
+    /// channels. Reuses one frame's value across a roll for a fixed-print look.
+    #[arg(long = "d-max", value_name = "D",
+          conflicts_with_all = ["auto_d_max", "no_d_max"])]
+    pub d_max: Option<f32>,
+    /// Measure the anchor per frame (the default behavior).
+    #[arg(long = "auto-d-max", conflicts_with = "no_d_max")]
+    pub auto_d_max: bool,
+    /// Disable the anchor — scene-referred output (base → 1.0, detail above).
+    #[arg(long = "no-d-max")]
+    pub no_d_max: bool,
 }
 
 /// Print / tone-render overrides (design-spec §9).
@@ -422,6 +445,16 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.density.density_gamma = v;
     }
 
+    // dmax anchor: the three flags are mutually exclusive (clap-enforced);
+    // whichever is given replaces the recipe's `density.dmax` entirely.
+    if let Some(v) = args.dmax.d_max {
+        cfg.density.dmax = DmaxSource::Explicit(v);
+    } else if args.dmax.auto_d_max {
+        cfg.density.dmax = DmaxSource::Auto;
+    } else if args.dmax.no_d_max {
+        cfg.density.dmax = DmaxSource::None;
+    }
+
     // print
     if let Some(v) = args.print.print_exposure {
         cfg.print.print_exposure = v;
@@ -529,6 +562,14 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     positive("--density-gamma", &[cfg.density.density_gamma])?;
     positive("--density-scale", &cfg.density.density_scale)?;
     finite("--density-offset", &cfg.density.density_offset)?;
+
+    // Dmax anchor: an explicit anchor is a corrected density — scene white sits at
+    // a positive density above the base's `D = 0`, so a non-positive / non-finite
+    // value (e.g. a sign typo) would brighten past white or blow out. Reject it
+    // loudly; `Auto`/`None` need no value check.
+    if let DmaxSource::Explicit(d) = cfg.density.dmax {
+        positive("--d-max", &[d])?;
+    }
 
     // Print: exposure / black point finite; gains positive. Highlight roll-off is a
     // non-negative amount — 0 disables it, and a negative value would be silently
@@ -1129,6 +1170,85 @@ mod tests {
         );
         assert_eq!(cfg.algorithm, Algorithm::Simple);
         assert_eq!(cfg.print.white_balance, [1.1, 1.0, 0.9]);
+    }
+
+    #[test]
+    fn merge_dmax_flags_map_to_the_source_enum() {
+        // Each flag maps to its variant; a forgotten merge arm would leave the
+        // default and silently make the flag a no-op (the four-spot-wiring trap).
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--d-max", "1.75"]),
+        );
+        assert_eq!(cfg.density.dmax, DmaxSource::Explicit(1.75));
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--no-d-max"]));
+        assert_eq!(cfg.density.dmax, DmaxSource::None);
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--auto-d-max"]));
+        assert_eq!(cfg.density.dmax, DmaxSource::Auto);
+
+        // No flag keeps the recipe's choice; a flag replaces it (flags win).
+        let mut recipe = ResolvedConfig::default();
+        recipe.density.dmax = DmaxSource::Explicit(2.0);
+        assert_eq!(
+            merge(recipe.clone(), &parse_convert(&[])).density.dmax,
+            DmaxSource::Explicit(2.0)
+        );
+        assert_eq!(
+            merge(recipe, &parse_convert(&["--no-d-max"])).density.dmax,
+            DmaxSource::None
+        );
+    }
+
+    #[test]
+    fn recipe_parses_nested_density_dmax_key() {
+        // The recipe key lives under `density.dmax`; with `deny_unknown_fields` at
+        // every level a misplaced key would silently reject, so pin the documented
+        // (§9) nesting and all three variant wire-forms through `ResolvedConfig`.
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"density":{"dmax":{"explicit":1.5}}}"#).unwrap();
+        assert_eq!(cfg.density.dmax, DmaxSource::Explicit(1.5));
+        let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"none"}}"#).unwrap();
+        assert_eq!(cfg.density.dmax, DmaxSource::None);
+        let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"auto"}}"#).unwrap();
+        assert_eq!(cfg.density.dmax, DmaxSource::Auto);
+    }
+
+    #[test]
+    fn mutually_exclusive_dmax_flags_are_rejected() {
+        for pair in [
+            ["--d-max", "1.5", "--no-d-max"].as_slice(),
+            ["--d-max", "1.5", "--auto-d-max"].as_slice(),
+            ["--auto-d-max", "--no-d-max"].as_slice(),
+        ] {
+            let mut argv = vec!["nc", "convert", "i", "-o", "o"];
+            argv.extend_from_slice(pair);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{pair:?} should conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_explicit_dmax() {
+        // A recipe can smuggle a non-positive / non-finite anchor past clap's
+        // value parser, so validate is the only guard once it's in the config.
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let mut cfg = ResolvedConfig::default();
+            cfg.density.dmax = DmaxSource::Explicit(bad);
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "explicit d-max {bad} should fail"
+            );
+        }
+        // A positive explicit anchor, and Auto / None, all validate.
+        let mut cfg = ResolvedConfig::default();
+        cfg.density.dmax = DmaxSource::Explicit(1.8);
+        validate(&cfg).unwrap();
+        cfg.density.dmax = DmaxSource::None;
+        validate(&cfg).unwrap();
+        cfg.density.dmax = DmaxSource::Auto;
+        validate(&cfg).unwrap();
     }
 
     #[test]

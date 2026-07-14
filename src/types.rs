@@ -241,6 +241,33 @@ pub struct FilmBaseParams {
     pub source: FilmBaseSource,
 }
 
+/// Where the density render's display-white anchor (`Dmax`) comes from
+/// (design-spec §7.2/§9, `density.dmax`).
+///
+/// A single mutually-exclusive choice, like [`FilmBaseSource`] — not independent
+/// flags. `Dmax` is the corrected density of scene white; the render maps it to
+/// display white (`1.0`) so the default u16 encode fills the display range instead
+/// of leaving all detail above `1.0`. Unlike `Dmin` (a roll/scanner property),
+/// `Dmax` is **frame-local** — the scene's own white — so per-frame `Auto` is the
+/// default. Serializes as `"auto"` / `{ "explicit": <d> }` / `"none"`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DmaxSource {
+    /// Measure the anchor per frame from the corrected-density distribution
+    /// (a high percentile). This is the default when none of the
+    /// `--d-max` / `--auto-d-max` / `--no-d-max` flags is given.
+    #[default]
+    Auto,
+    /// Explicit scalar anchor density. Reusing one frame's measured value across a
+    /// roll is a deliberate fixed-print-exposure look (batch consistency), with the
+    /// tradeoff that darker frames render dim and denser highlights clip against the
+    /// foreign anchor — it is not a calibrate-once property like `Dmin`.
+    Explicit(f32),
+    /// No anchor: scene-referred output (base → `1.0`, exposed detail above it).
+    /// Reproduces the pre-anchor render bit-for-bit — HDR f32 workflows rely on it.
+    None,
+}
+
 /// Density-domain algorithm knobs (design-spec §9, `algorithm = density`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -251,6 +278,9 @@ pub struct DensityParams {
     pub density_offset: [f32; 3],
     /// Film/print curve gamma.
     pub density_gamma: f32,
+    /// Display-white anchor source (default `auto`). Applied in the render
+    /// sub-stage at the density→linear boundary, beside `density_gamma`.
+    pub dmax: DmaxSource,
 }
 
 impl Default for DensityParams {
@@ -259,6 +289,7 @@ impl Default for DensityParams {
             density_scale: [1.0, 1.0, 1.0],
             density_offset: [0.0, 0.0, 0.0],
             density_gamma: 1.0,
+            dmax: DmaxSource::Auto,
         }
     }
 }
@@ -424,10 +455,42 @@ mod tests {
             density_scale: [1.2, 1.0, 0.8],
             density_offset: [0.1, 0.0, -0.05],
             density_gamma: 0.6,
+            dmax: DmaxSource::Explicit(1.8),
         };
         let json = serde_json::to_string(&params).unwrap();
         let back: DensityParams = serde_json::from_str(&json).unwrap();
         assert_eq!(params, back);
+    }
+
+    #[test]
+    fn dmax_source_serializes_like_film_base_source() {
+        // Unit variants are bare lowercase strings; the newtype variant is a
+        // tagged object — the same shape convention as `FilmBaseSource`.
+        assert_eq!(
+            serde_json::to_string(&DmaxSource::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DmaxSource::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DmaxSource::Explicit(1.5)).unwrap(),
+            r#"{"explicit":1.5}"#
+        );
+        for src in [
+            DmaxSource::Auto,
+            DmaxSource::None,
+            DmaxSource::Explicit(2.25),
+        ] {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(serde_json::from_str::<DmaxSource>(&json).unwrap(), src);
+        }
+    }
+
+    #[test]
+    fn density_params_default_dmax_is_auto() {
+        assert_eq!(DensityParams::default().dmax, DmaxSource::Auto);
     }
 
     #[test]

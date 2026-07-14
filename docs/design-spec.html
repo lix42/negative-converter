@@ -249,10 +249,12 @@
 
 <h3>7.2 <code>density</code> — density-domain inversion (default)</h3>
 <p>The credible baseline for color negatives, following Kodak Cineon / darktable <code>negadoctor</code> ideas:</p>
-<pre><code>1. transmission → density:   D = -log10(scan / Dmin_transmission)   (per channel)
-2. density correction:       per-channel scale/offset, orange-mask compensation
-3. map density → positive:   exponential / print-curve back-transform
-4. print render controls:    exposure, black point, gamma, highlight compression</code></pre>
+<pre><code>1. transmission → density:   D  = -log10(scan / Dmin_transmission)   (per channel)
+2. density correction:       D' = per-channel scale·D + offset (orange-mask comp)
+3. map density → positive:   lin = 10^(gamma · (D' − Dmax))          (per channel)
+4. print render controls:    exposure, black point, white balance, highlight compression</code></pre>
+<p><strong>Polarity.</strong> With <code>D = -log10(scan / Dmin)</code> the density is <code>≥ 0</code> and <em>grows</em> with the film's optical density — the unexposed base (scene black) sits at <code>D = 0</code>, a dense negative area (a scene highlight) at large <code>D</code>. A positive must brighten as <code>D</code> grows, so step 3 uses <code>10^(+gamma·D')</code>, <strong>not</strong> <code>10^(−gamma·D')</code> (which would reproduce the negative). This matches darktable <code>negadoctor</code> (denser negative → brighter print).</p>
+<p><strong>Display-white anchor (<code>Dmax</code>).</strong> Step 3 renders density <em>relative to</em> <code>Dmax</code>, the corrected density of scene white: scene white (<code>D' = Dmax</code>) maps to display white <code>1.0</code>, and the base (<code>D' = 0</code>) to <code>10^(−gamma·Dmax) ≈ 0</code>. Without it the base maps to <code>1.0</code> and all real detail sits above <code>1.0</code>, so a default u16 encode clips the whole image; the anchor makes the default output fill the display range. The anchor factors out as a constant gain <code>10^(−gamma·Dmax)</code> and composes with <code>print_exposure</code> as a single multiplicative scalar. <code>Dmax</code> is <strong>frame-local</strong> — a property of the scene's own white, unlike the roll-level <code>Dmin</code> base — so it is measured per frame by default (<code>density.dmax = auto</code>); it can be fixed (<code>{ "explicit": &lt;d&gt; }</code>) or disabled (<code>"none"</code>, for bit-exact scene-referred HDR output). See §9.</p>
 <p>Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as separate, independently parameterized sub-stages — the core fidelity rule.</p>
 
 <h4>Pluggable interface (sketch)</h4>
@@ -354,6 +356,13 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
   <li><code>--density-scale R,G,B</code> — per-channel density gain.</li>
   <li><code>--density-offset R,G,B</code> — per-channel density offset (orange-mask comp).</li>
   <li><code>--density-gamma &lt;f&gt;</code> — film/print curve gamma.</li>
+  <li>Display-white anchor (<code>Dmax</code>) — a single mutually-exclusive choice, recipe key <code>density.dmax</code> (default <code>"auto"</code>; see §7.2). The three flags conflict (passing more than one is a usage error); whichever is given replaces a recipe's <code>dmax</code>:
+    <ul>
+      <li><code>--auto-d-max</code> (default) ⇒ <code>"auto"</code> — measure the anchor per frame from the corrected-density distribution (a high percentile).</li>
+      <li><code>--d-max &lt;d&gt;</code> ⇒ <code>{ "explicit": &lt;d&gt; }</code> — fix the anchor to a scalar density. Reusing one frame's measured value across a roll is a deliberate fixed-print-exposure look; the tradeoff is that darker frames render dim and denser highlights clip against the foreign anchor (it is <strong>not</strong> a calibrate-once property like <code>Dmin</code>).</li>
+      <li><code>--no-d-max</code> ⇒ <code>"none"</code> — disable the anchor; scene-referred output (base → <code>1.0</code>, detail above), reproducing the pre-anchor render bit-for-bit for HDR f32 workflows.</li>
+    </ul>
+  </li>
 </ul>
 <h4>Print / tone render</h4>
 <ul>
