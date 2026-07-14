@@ -24,7 +24,7 @@ use crate::io::encode;
 use crate::pipeline::{film_base, stages};
 use crate::types::{
     Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
-    FilmBaseSource, InputColor, InputParams, NcError, OutDepth, OutputParams, PrintParams, Result,
+    FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams, Result,
     SimpleParams,
 };
 
@@ -260,9 +260,15 @@ pub struct SimpleOverrides {
 /// Output / encode overrides (design-spec §9, stage 5).
 #[derive(Args, Debug, Default)]
 pub struct OutputOverrides {
-    /// Output bit depth (default `u16`).
-    #[arg(long, value_enum)]
-    pub out_depth: Option<OutDepth>,
+    /// Write a 32-bit float TIFF (full HDR, no precision loss) instead of the
+    /// default 16-bit integer TIFF.
+    #[arg(long, conflicts_with = "output_sdr")]
+    pub output_hdr: bool,
+    /// Force the default 16-bit integer TIFF, overriding a recipe's
+    /// `output.hdr = true` (the flags-win escape hatch; without it a bool
+    /// presence flag could set HDR but never clear it).
+    #[arg(long)]
+    pub output_sdr: bool,
     /// Output ICC profile (`sRGB` / `prophoto` / `acescg` / path).
     #[arg(long, value_name = "PROFILE")]
     pub output_profile: Option<String>,
@@ -487,9 +493,17 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.simple.clip_high = v;
     }
 
-    // output
-    if let Some(v) = args.output_opts.out_depth {
-        cfg.output.out_depth = v;
+    // output: `--output-hdr` is a presence flag — passing it switches the output
+    // to 32-bit float; when absent it must not clobber a recipe's `hdr: true`
+    // (same convention as `--assume-linear`), so only a set flag merges.
+    // output depth: the two flags are mutually exclusive (clap-enforced);
+    // whichever is given replaces the recipe's choice — `--output-sdr` exists
+    // so a recipe `hdr: true` stays CLI-overridable (flags win), since an
+    // absent presence flag never clobbers a recipe value.
+    if args.output_opts.output_hdr {
+        cfg.output.hdr = true;
+    } else if args.output_opts.output_sdr {
+        cfg.output.hdr = false;
     }
     if let Some(v) = &args.output_opts.output_profile {
         cfg.output.output_profile = Some(v.clone());
@@ -941,7 +955,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     // Optional IR export — before the main encode, so a failing IR write fails
     // the run without first writing the primary output/sidecar.
     if let Some(path) = &export_ir {
-        encode::export_ir(&image, cfg.output.out_depth, path)?;
+        encode::export_ir(&image, cfg.output.depth(), path)?;
         log.info(format_args!("wrote IR plane {}", path.display()));
         report.ir_exported = Some(path.clone());
     }
@@ -1263,11 +1277,60 @@ mod tests {
     fn dump_params_round_trips_through_params() {
         let cfg = merge(
             ResolvedConfig::default(),
-            &parse_convert(&["--density-gamma", "1.8", "--out-depth", "f32"]),
+            &parse_convert(&["--density-gamma", "1.8", "--output-hdr"]),
         );
         let json = serde_json::to_string(&cfg).unwrap();
         let back: ResolvedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn merge_output_hdr_flag_sets_but_never_clears() {
+        // Flag present → hdr on (a forgotten merge arm would silently make the
+        // flag a no-op — the four-spot-wiring trap).
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-hdr"]));
+        assert!(cfg.output.hdr);
+        // No flag → the default stays off.
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[]));
+        assert!(!cfg.output.hdr);
+        // An absent (false) presence flag must not clobber a recipe `true`.
+        let recipe: ResolvedConfig = serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap();
+        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        assert!(cfg.output.hdr);
+        // `--output-sdr` is the explicit escape hatch: it forces a recipe
+        // `hdr: true` back to 16-bit (flags win by presence, not value).
+        let cfg = merge(recipe, &parse_convert(&["--output-sdr"]));
+        assert!(!cfg.output.hdr);
+        // ...and is a no-op on an already-SDR config.
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-sdr"]));
+        assert!(!cfg.output.hdr);
+    }
+
+    #[test]
+    fn mutually_exclusive_output_depth_flags_are_rejected() {
+        // clap must reject the conflicting pair rather than silently pick one.
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "i",
+                "-o",
+                "o",
+                "--output-hdr",
+                "--output-sdr"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recipe_rejects_removed_out_depth_key() {
+        // Breaking recipe change (pre-release): the old `output.out_depth` key
+        // must be rejected loudly by `deny_unknown_fields`, never silently
+        // ignored — an old recipe would otherwise quietly encode at 16-bit.
+        assert!(
+            serde_json::from_str::<ResolvedConfig>(r#"{"output":{"out_depth":"f32"}}"#).is_err()
+        );
     }
 
     #[test]

@@ -105,9 +105,12 @@ pub enum Algorithm {
     Density,
 }
 
-/// Output bit depth selector. Serializes as `"u16"` / `"f32"` to match the CLI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
+/// Output bit depth — an **internal** selector the encoder and the depth-aware
+/// profile default branch on. Not part of the CLI/recipe surface (no serde/clap
+/// derives on purpose): the user-facing knob is the `output.hdr` bool /
+/// `--output-hdr` flag, and [`OutputParams::depth`] is the single place it
+/// becomes a depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OutDepth {
     #[default]
     U16,
@@ -398,13 +401,28 @@ impl EncodeReport {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputParams {
-    /// Output bit depth (default `u16`).
-    pub out_depth: OutDepth,
+    /// HDR output switch (default `false`): `false` → 16-bit integer TIFF,
+    /// `true` → 32-bit float TIFF (full HDR, no precision loss).
+    pub hdr: bool,
     /// Output ICC profile selector (`sRGB`/`prophoto`/`acescg`/path). `None`
-    /// means the depth-aware default (sRGB for u16, wide-gamut for f32).
+    /// means the depth-aware default (sRGB for the 16-bit default, wide-gamut
+    /// linear for `hdr`).
     pub output_profile: Option<String>,
     /// BigTIFF promotion policy (default `auto`).
     pub bigtiff: BigTiff,
+}
+
+impl OutputParams {
+    /// The encoder bit depth implied by the HDR switch: `hdr = false` →
+    /// [`OutDepth::U16`], `true` → [`OutDepth::F32`]. The single place the
+    /// recipe bool becomes a depth, so encode and color can't disagree.
+    pub fn depth(&self) -> OutDepth {
+        if self.hdr {
+            OutDepth::F32
+        } else {
+            OutDepth::U16
+        }
+    }
 }
 
 #[cfg(test)]
@@ -494,9 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn out_depth_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&OutDepth::U16).unwrap(), "\"u16\"");
-        assert_eq!(serde_json::to_string(&OutDepth::F32).unwrap(), "\"f32\"");
+    fn output_hdr_bool_drives_depth() {
+        assert_eq!(OutputParams::default().depth(), OutDepth::U16);
+        let hdr = OutputParams {
+            hdr: true,
+            ..OutputParams::default()
+        };
+        assert_eq!(hdr.depth(), OutDepth::F32);
     }
 
     #[test]

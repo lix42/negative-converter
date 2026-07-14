@@ -79,7 +79,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FilmBaseSource, OutDepth};
+    use crate::types::FilmBaseSource;
 
     /// A small synthetic negative: a bright, uniform orange border (the film
     /// base) around a darker interior, so `Auto` estimation has a border to find.
@@ -150,7 +150,7 @@ mod tests {
             &fb,
             algo_params(Algorithm::Density, &s, &d, &p),
             &OutputParams {
-                out_depth: OutDepth::F32,
+                hdr: true,
                 ..OutputParams::default()
             },
         )

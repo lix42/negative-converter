@@ -123,14 +123,14 @@ algorithm consumes — nothing downstream needs to know the on-disk format.
 
 - **Container:** TIFF (BigTIFF when size requires 64-bit offsets).
 - **Bit depth (flag-controlled):**
-  - `--out-depth u16` → 16-bit integer TIFF (default; standard archival positive).
-  - `--out-depth f32` → 32-bit float TIFF (full HDR, no precision loss).
+  - default (no `--output-hdr`) → 16-bit integer TIFF (standard archival positive).
+  - `--output-hdr` → 32-bit float TIFF (full HDR, no precision loss).
 - **Color (selectable, depth-aware default):** the output color space is a CLI
   option (`--output-profile`). The default depends on output depth:
-  - `u16` output → **sRGB** (standard, display-ready positive).
-  - `f32` output → **linear ACEScg** (wide-gamut), avoiding clipping of the
-    extended range of HDR data. (`prophoto` and user ICC files are also
-    accepted.)
+  - 16-bit (default) output → **sRGB** (standard, display-ready positive).
+  - HDR (`--output-hdr`) output → **linear ACEScg** (wide-gamut), avoiding
+    clipping of the extended range of HDR data. (`prophoto` and user ICC files
+    are also accepted.)
   Either default can be overridden explicitly. Output is tagged with the embedded
   ICC profile for the chosen space.
 - **Metadata:** the effective parameter set (recipe) and key estimated values are
@@ -288,7 +288,7 @@ writes the same shape with the resolved values. Example:
   "algorithm": "density",
   "density": { "density_gamma": 1.8 },
   "print":   { "print_exposure": 0.0, "black_point": 0.002 },
-  "output":  { "out_depth": "f32" }
+  "output":  { "hdr": true }
 }
 ```
 
@@ -307,9 +307,9 @@ nc convert in.tiff -o out.tiff --algorithm density --report json
 
 # Full scene-referred HDR float output: --no-d-max disables the display-white
 # anchor (base → 1.0, detail above), and the depth-aware default profile
-# (acescg for f32) applies. Manual film base, explicit print controls.
+# (acescg for HDR) applies. Manual film base, explicit print controls.
 nc convert in.tiff -o out.tiff \
-  --algorithm density --out-depth f32 --no-d-max \
+  --algorithm density --output-hdr --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
   --highlight-compress 0.3
@@ -336,8 +336,8 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 ## 9. Parameter reference (grouped by stage)
 
 Every flag is also a recipe key, nested under the stage object shown in each
-heading below (e.g. `--density-gamma` ⇒ `density.density_gamma`, `--out-depth` ⇒
-`output.out_depth`, `--algorithm` ⇒ top-level `algorithm`). Names are binding —
+heading below (e.g. `--density-gamma` ⇒ `density.density_gamma`, `--output-hdr` ⇒
+`output.hdr`, `--algorithm` ⇒ top-level `algorithm`). Names are binding —
 the recipe structs and this section are kept in sync (`deny_unknown_fields`).
 Unknown keys are rejected (see §8).
 
@@ -431,7 +431,7 @@ crossover.
     calibrate-once property like `Dmin`).
   - `--no-d-max` ⇒ `"none"` — disable the anchor; scene-referred output (base →
     `1.0`, detail above), reproducing the pre-anchor render bit-for-bit for HDR
-    f32 workflows.
+    (`--output-hdr`) workflows.
 
 ### Print / tone render
 - `--print-exposure <f>` — overall positive exposure.
@@ -445,9 +445,15 @@ crossover.
 
 ### Output / encode (stage 5)
 - `-o, --output <path>` (required)
-- `--out-depth u16|f32` (default `u16`)
+- `--output-hdr` — write a 32-bit float TIFF (full HDR, no precision loss);
+  without the flag the output is 16-bit integer. Recipe key `output.hdr`
+  (bool, default `false`).
+- `--output-sdr` — force the default 16-bit integer output, overriding a
+  recipe's `output.hdr = true` (the flags-win escape hatch; an absent
+  presence flag never clobbers a recipe value). Conflicts with
+  `--output-hdr`; passing both is a usage error.
 - `--output-profile <srgb|prophoto|acescg|path-to-icc>` (default is depth-aware:
-  `srgb` for `u16`, `acescg` for `f32`)
+  `srgb` for the 16-bit default, `acescg` for `--output-hdr`)
 - `--bigtiff auto|on|off` (default `auto`)
 
 ### Global

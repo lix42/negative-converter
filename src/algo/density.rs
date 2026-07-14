@@ -45,7 +45,7 @@
 //! detail sits above it (HDR / **scene-referred**), consistent with the project's
 //! "don't clamp before encode" rule. Nothing is clamped here either way — the
 //! encode stage counts and reports any out-of-range samples. Keep the full HDR
-//! range with `--out-depth f32` (typically alongside `--no-d-max`).
+//! range with `--output-hdr` (typically alongside `--no-d-max`).
 
 use rayon::prelude::*;
 

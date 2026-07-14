@@ -116,7 +116,7 @@ pub fn to_output(image: &LinearImage, params: &OutputParams) -> Result<(LinearIm
         .as_deref()
         .map(OutputSpace::parse)
         .transpose()?;
-    let space = resolve_output_space(explicit, params.out_depth);
+    let space = resolve_output_space(explicit, params.depth());
 
     let working = working_profile()?;
     let output = build_profile(&space)?;
@@ -400,7 +400,7 @@ mod tests {
         // linear and wider than the working gamut, so neutral gray stays a
         // sensible near-0.5 value (no sRGB tone curve applied).
         let params = OutputParams {
-            out_depth: OutDepth::F32,
+            hdr: true, // → F32 → AcesCg
             ..Default::default()
         };
         let (out, icc) = to_output(&gray_image(0.5), &params).unwrap();
@@ -420,7 +420,7 @@ mod tests {
         // off 0 — this pins down the primaries/white-point, not just the TRC.
         let img = LinearImage::new(1, 1, vec![1.0, 0.0, 0.0], None).unwrap();
         let params = OutputParams {
-            out_depth: OutDepth::F32, // AcesCg
+            hdr: true, // → F32 → AcesCg
             ..Default::default()
         };
         let (out, _icc) = to_output(&img, &params).unwrap();

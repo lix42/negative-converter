@@ -37,7 +37,7 @@ Pre-implementation. The design and task plan are written; coding hasn't started.
 nc convert in.tiff -o out.tiff --algorithm density
 
 # Full HDR float output with explicit controls.
-nc convert in.tiff -o out.tiff --algorithm density --out-depth f32 \
+nc convert in.tiff -o out.tiff --algorithm density --output-hdr \
   --film-base 0.92,0.55,0.42 --density-gamma 1.8 --print-exposure 0.0
 
 # Inspect a scan and emit machine-readable JSON.
