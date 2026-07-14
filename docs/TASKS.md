@@ -61,6 +61,7 @@ graph TD
   auto-base-redesign --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
   pipeline-orchestration --> real-scan-verification
+  pipeline-orchestration --> perf-instrumentation
   dmax-white-anchor --> real-scan-verification
   algo-density --> dmax-white-anchor
   algo-interface --> algo-sigmoid
@@ -86,6 +87,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `white-holder-support` (post-MVP): `auto-base-redesign`
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
 - `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
+- `perf-instrumentation` (post-MVP): `pipeline-orchestration`
 - `dmax-white-anchor` (post-MVP): `algo-density`
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
@@ -150,3 +152,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > anchor — it validates the *default* output quality, not just plumbing.
 
 - [ ] [Real-scan verification](tasks/real-scan-verification.md)
+
+### Phase 8: Pre-release productization
+> Measurement and hardening before releasing to users (2026-07-14 telemetry
+> discussion). Local-only instrumentation first; remote telemetry stays a
+> deliberately separate, opt-in roadmap item (design-spec §12).
+
+- [ ] [Performance instrumentation](tasks/perf-instrumentation.md)
