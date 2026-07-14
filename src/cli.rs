@@ -24,8 +24,8 @@ use crate::io::encode;
 use crate::pipeline::{film_base, stages};
 use crate::types::{
     Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
-    FilmBaseSource,
-    InputColor, InputParams, NcError, OutDepth, OutputParams, PrintParams, Result, SimpleParams,
+    FilmBaseSource, InputColor, InputParams, NcError, OutDepth, OutputParams, PrintParams, Result,
+    SimpleParams,
 };
 
 // ---------------------------------------------------------------------------
@@ -323,6 +323,13 @@ pub struct Report {
     /// Estimated / resolved film base (the `Dmin` anchor).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base: Option<FilmBase>,
+    /// Resolved display-white anchor density (`Dmax`) the density render used
+    /// (`convert`): the auto-measured or explicit value, absent for
+    /// `dmax = none` or the `simple` algorithm. Reported so a roll can reuse a
+    /// frame's anchor deliberately (`--d-max`) — a batch-consistency choice,
+    /// not calibrate-once (design-spec §9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dmax: Option<f32>,
     /// How the film base was chosen, as the structured [`FilmBaseSource`]
     /// (`"auto"` / `{"region":[…]}` / `{"explicit":[…]}`) so an agent gets the
     /// sampled rectangle / explicit values without string-parsing a label.
@@ -917,6 +924,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         ));
     }
     report.film_base = Some(rendered.film_base);
+    report.dmax = rendered.convert.dmax;
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).

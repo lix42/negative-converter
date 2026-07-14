@@ -916,6 +916,13 @@ a task; update your own section as you work. Append entries — don't rewrite th
   was a silent no-op (parsed, never applied); `convert` now rejects it with
   exit 4 until input-side color management lands (§9 note added). Four new E2E
   tests pin all of it.
+- 2026-07-14 — **rebased onto merged #16 and wired the report.** The rebase had
+  one trivial conflict (cli.rs import list). The merge-time follow-up landed in
+  this branch since orchestration is now underneath it: `stages::render` calls
+  `Converter::convert_reported`, `Rendered` carries the `ConvertReport`, and the
+  convert JSON report gains an optional `dmax` field (auto/explicit value;
+  absent for `--no-d-max` and `simple`). E2E test pins both presence and
+  absence.
 - 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
   (gates re-run green: 110 unit + 13 integration tests; CLAUDE.md refreshed —
   module map, dead-code note, and the lcms2 global-handler mechanism now match

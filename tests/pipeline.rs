@@ -572,3 +572,43 @@ fn convert_rejects_unapplied_input_profile() {
     assert!(err.contains("not implemented"), "stderr: {err}");
     assert!(!out.exists());
 }
+
+#[test]
+fn density_report_carries_resolved_dmax() {
+    // The auto-measured anchor must ride into the convert report (merge-time
+    // wiring of Converter::convert_reported), and disappear with --no-d-max.
+    let dir = TempDir::new("dmaxreport");
+    let fix = fixture("hdr-48bit.tif");
+    let out = dir.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert!(
+        report["dmax"].as_f64().is_some_and(f64::is_finite),
+        "auto anchor must be reported: {report}"
+    );
+
+    let out2 = dir.path("out2.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out2.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--no-d-max",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert!(
+        report.get("dmax").is_none_or(|v| v.is_null()),
+        "no anchor must be reported for --no-d-max: {report}"
+    );
+}
