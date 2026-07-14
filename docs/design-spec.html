@@ -200,11 +200,11 @@
   <li><strong>Container:</strong> TIFF (BigTIFF when size requires 64-bit offsets).</li>
   <li><strong>Bit depth (flag-controlled):</strong>
     <ul>
-      <li><code>--out-depth u16</code> → 16-bit integer TIFF (default; standard archival positive).</li>
-      <li><code>--out-depth f32</code> → 32-bit float TIFF (full HDR, no precision loss).</li>
+      <li>default (no <code>--output-hdr</code>) → 16-bit integer TIFF (standard archival positive).</li>
+      <li><code>--output-hdr</code> → 32-bit float TIFF (full HDR, no precision loss).</li>
     </ul>
   </li>
-  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for <code>u16</code> (display-ready), <strong>linear ACEScg</strong> (wide-gamut) for <code>f32</code> to avoid clipping HDR range (<code>prophoto</code> and user ICC files are also accepted). Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
+  <li><strong>Color (selectable, depth-aware default):</strong> the output color space is a CLI option (<code>--output-profile</code>). Default depends on output depth — <strong>sRGB</strong> for the 16-bit default (display-ready), <strong>linear ACEScg</strong> (wide-gamut) for HDR (<code>--output-hdr</code>) to avoid clipping HDR range (<code>prophoto</code> and user ICC files are also accepted). Either default can be overridden; output is tagged with the embedded ICC profile for the chosen space.</li>
   <li><strong>Metadata:</strong> the effective parameter set (recipe) and key estimated values are written to a <strong>sidecar JSON</strong> next to the output (paired by name; the same shape as <code>--dump-params</code>). The TIFF itself embeds the ICC profile of the chosen output space; the recipe is deliberately <em>not</em> embedded in the TIFF (resolved, §13).</li>
 </ul>
 
@@ -294,7 +294,7 @@ pub trait Converter {
   "algorithm": "density",
   "density": { "density_gamma": 1.8 },
   "print":   { "print_exposure": 0.0, "black_point": 0.002 },
-  "output":  { "out_depth": "f32" }
+  "output":  { "hdr": true }
 }</code></pre>
 
 <h3>Reports &amp; determinism</h3>
@@ -310,9 +310,9 @@ nc convert in.tiff -o out.tiff --algorithm density --report json
 
 # Full scene-referred HDR float output: --no-d-max disables the display-white
 # anchor (base → 1.0, detail above), and the depth-aware default profile
-# (acescg for f32) applies. Manual film base, explicit print controls.
+# (acescg for HDR) applies. Manual film base, explicit print controls.
 nc convert in.tiff -o out.tiff \
-  --algorithm density --out-depth f32 --no-d-max \
+  --algorithm density --output-hdr --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
   --highlight-compress 0.3
@@ -336,7 +336,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # …or bake the value into roll-A.json (film_base.source = explicit) and batch it.</code></pre>
 
 <h2 id="params">9. Parameter reference (grouped by stage)</h2>
-<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--out-depth</code> ⇒ <code>output.out_depth</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are binding — the recipe structs and this section are kept in sync (<code>deny_unknown_fields</code>). Unknown keys are rejected (see the Recipes section).</p>
+<p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--output-hdr</code> ⇒ <code>output.hdr</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are binding — the recipe structs and this section are kept in sync (<code>deny_unknown_fields</code>). Unknown keys are rejected (see the Recipes section).</p>
 
 <h4>Input / decode</h4>
 <ul>
@@ -368,7 +368,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
     <ul>
       <li><code>--auto-d-max</code> (default) ⇒ <code>"auto"</code> — measure the anchor per frame from the corrected-density distribution (a high percentile).</li>
       <li><code>--d-max &lt;d&gt;</code> ⇒ <code>{ "explicit": &lt;d&gt; }</code> — fix the anchor to a scalar density. Reusing one frame's measured value across a roll is a deliberate fixed-print-exposure look; the tradeoff is that darker frames render dim and denser highlights clip against the foreign anchor (it is <strong>not</strong> a calibrate-once property like <code>Dmin</code>).</li>
-      <li><code>--no-d-max</code> ⇒ <code>"none"</code> — disable the anchor; scene-referred output (base → <code>1.0</code>, detail above), reproducing the pre-anchor render bit-for-bit for HDR f32 workflows.</li>
+      <li><code>--no-d-max</code> ⇒ <code>"none"</code> — disable the anchor; scene-referred output (base → <code>1.0</code>, detail above), reproducing the pre-anchor render bit-for-bit for HDR (<code>--output-hdr</code>) workflows.</li>
     </ul>
   </li>
 </ul>
@@ -387,8 +387,8 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <h4>Output / encode (stage 5)</h4>
 <ul>
   <li><code>-o, --output &lt;path&gt;</code> (required)</li>
-  <li><code>--out-depth u16|f32</code> (default <code>u16</code>)</li>
-  <li><code>--output-profile &lt;srgb|prophoto|acescg|path-to-icc&gt;</code> (depth-aware default: <code>srgb</code> for <code>u16</code>, <code>acescg</code> for <code>f32</code>)</li>
+  <li><code>--output-hdr</code> — write a 32-bit float TIFF (full HDR, no precision loss); without the flag the output is 16-bit integer. Recipe key <code>output.hdr</code> (bool, default <code>false</code>).</li>
+  <li><code>--output-profile &lt;srgb|prophoto|acescg|path-to-icc&gt;</code> (depth-aware default: <code>srgb</code> for the 16-bit default, <code>acescg</code> for <code>--output-hdr</code>)</li>
   <li><code>--bigtiff auto|on|off</code> (default <code>auto</code>)</li>
 </ul>
 <h4>Global</h4>

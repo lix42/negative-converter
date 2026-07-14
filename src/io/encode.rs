@@ -62,7 +62,7 @@ pub fn plans_bigtiff(params: &OutputParams, image: &LinearImage, icc_len: usize)
         image.width,
         image.height,
         3,
-        depth_bytes(params.out_depth),
+        depth_bytes(params.depth()),
         icc_len as u64,
     )
 }
@@ -110,14 +110,14 @@ fn encode_to_writer<W: Write + Seek>(
     icc: Option<&[u8]>,
 ) -> Result<EncodeReport> {
     let (w, h) = (image.width, image.height);
-    let bytes_per_sample = depth_bytes(params.out_depth);
+    let bytes_per_sample = depth_bytes(params.depth());
     let icc_bytes = icc.map_or(0, |b| b.len() as u64);
     let big = resolve_bigtiff(params.bigtiff, w, h, 3, bytes_per_sample, icc_bytes);
 
     // Only the u16 path quantizes and can clamp out-of-range samples. f32 is
     // written verbatim (HDR-preserving, no clamp), but we still scan it for
     // non-finite samples so a NaN/inf numerical fault surfaces at either depth.
-    match (params.out_depth, big) {
+    match (params.depth(), big) {
         (OutDepth::U16, false) => {
             let (data, report) = quantize_u16(&image.rgb);
             encode_planar::<_, TiffKindStandard, RGB16>(
@@ -374,7 +374,7 @@ mod tests {
 
     fn out(depth: OutDepth, bigtiff: BigTiff) -> OutputParams {
         OutputParams {
-            out_depth: depth,
+            hdr: depth == OutDepth::F32,
             output_profile: None,
             bigtiff,
         }
