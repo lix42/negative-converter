@@ -11,12 +11,24 @@
 //! ```text
 //! 1. transmission → density:   D_c  = -log10(max(scan_c, EPS) / base_c)
 //! 2. density correction:       D'_c = density_scale_c · D_c + density_offset_c
-//! 3. density → positive:       lin_c = 10^(density_gamma · D'_c)
+//! 3. density → positive:       lin_c = 10^(density_gamma · (D'_c − Dmax))
 //! 4. print render:             lin_c = white_balance_c · 2^print_exposure · lin_c
 //!                                      − black_point, then highlight soft-clip
 //! ```
 //!
 //! Stages 1–2 are [`to_density`]; 3–4 are [`render`].
+//!
+//! **Display-white anchor (`Dmax`).** Stage 3 renders density *relative to* the
+//! scene-white density `Dmax`: scene white (`D' = Dmax`) maps to `1.0` and the base
+//! (`D' = 0`) to `10^(−γ·Dmax) ≈ 0`, so the default u16 encode fills the display
+//! range instead of leaving every real sample above `1.0`. `10^(γ·(D'−Dmax))`
+//! factors into today's `10^(γ·D')` times a constant gain `10^(−γ·Dmax)`, so the
+//! anchor composes with `print_exposure` as one multiplicative scalar (both fold
+//! into the stage-4 exposure gain). The anchor source is [`DmaxSource`]: `Auto`
+//! (default) measures it per frame from the corrected-density distribution;
+//! `Explicit` fixes it; `None` disables it (gain `1.0`) and reproduces the
+//! scene-referred output bit-for-bit. `Dmax` is **frame-local** (scene white),
+//! unlike the roll-level `Dmin` base.
 //!
 //! **Polarity (deliberate correction to the task-file sketch).** With
 //! `D = -log10(scan/base)` the density is `≥ 0` and *grows* with the film's
@@ -28,15 +40,19 @@
 //! darktable `negadoctor`, whose print output increases with film density
 //! (verified against its source: denser negative → brighter print).
 //!
-//! Output is linear and **scene-referred**: with neutral defaults the base maps to
-//! `1.0` and exposed detail sits above it (HDR), consistent with the project's
-//! "don't clamp before encode" rule. Fit to a display range with a negative
-//! `--print-exposure` and/or `--black-point`, or keep it via `--out-depth f32`.
+//! Output is linear. With the default `Auto` anchor scene white lands at ≈ `1.0`
+//! (display-range-filling); with `--no-d-max` the base maps to `1.0` and exposed
+//! detail sits above it (HDR / **scene-referred**), consistent with the project's
+//! "don't clamp before encode" rule. Nothing is clamped here either way — the
+//! encode stage counts and reports any out-of-range samples. Keep the full HDR
+//! range with `--out-depth f32` (typically alongside `--no-d-max`).
 
 use rayon::prelude::*;
 
-use crate::algo::Converter;
-use crate::types::{DensityParams, FilmBase, LinearImage, NcError, PrintParams, Result};
+use crate::algo::{ConvertReport, Converter};
+use crate::types::{
+    DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result,
+};
 
 /// Floor applied to the scan transmission before the `log10`, so a zero / negative
 /// / denormal sample can't produce `-inf`/`NaN` density (design "fail loudly, never
@@ -127,17 +143,27 @@ pub(crate) fn to_density(
 
 /// Stages 3–4 — corrected density → positive linear (pure print render).
 ///
-/// - Stage 3 (density → positive): `lin_c = 10^(density_gamma · D'_c)`. Increases
-///   with density (correct positive polarity; see the module note). `density_gamma`
-///   is the film/print curve contrast; it lives in [`DensityParams`] but is applied
-///   here at the density→linear boundary, so it is passed in explicitly rather than
-///   the whole density-params struct.
+/// - Stage 3 (density → positive): `lin_c = 10^(density_gamma · (D'_c − Dmax))`.
+///   Increases with density (correct positive polarity; see the module note).
+///   `density_gamma` is the film/print curve contrast and `dmax` the display-white
+///   anchor; both live in [`DensityParams`] but are applied here at the
+///   density→linear boundary, so they are passed in explicitly rather than the
+///   whole density-params struct.
 /// - Stage 4 (print controls): per-channel highlight/neutral white balance, an
 ///   overall `2^print_exposure` gain (exposure is in **stops**), a `black_point`
 ///   floor subtraction, and a highlight soft-clip.
 ///
-/// No clamping: values may land outside `[0, 1]` (scene-referred / HDR); the encode
-/// stage counts and reports any clipping. The result preserves the carried IR plane.
+/// The anchor is applied **in the exponent** — `10^(γ·(D' − Dmax))` — not as a
+/// separate `10^(−γ·Dmax)` gain: mathematically equivalent, but the factored form
+/// overflows `f32` when `γ·D'` alone exceeds the pow10 range even though the
+/// anchored exponent is small (e.g. `γ = 5`, EPS-clamped `D' ≈ 8`), turning scene
+/// white into `inf` instead of `1.0`. With [`DmaxSource::None`] the anchor term is
+/// exactly `0.0`, so this reproduces the pre-anchor render bit-for-bit
+/// (`d − 0.0 == d` for every `f32`).
+///
+/// Returns the rendered image and the **resolved anchor density** — `Some(Dmax)`
+/// for `Auto`/`Explicit`, `None` for `DmaxSource::None` — so the orchestrator can
+/// report it (it does not clamp; values may land outside `[0, 1]`).
 ///
 /// Consumes the `DensityImage` (it is a use-once intermediate): the density buffer
 /// is transformed into the output in place and the IR plane is moved, so no
@@ -145,8 +171,15 @@ pub(crate) fn to_density(
 pub(crate) fn render(
     density: DensityImage,
     density_gamma: f32,
+    dmax: DmaxSource,
     print: &PrintParams,
-) -> LinearImage {
+) -> (LinearImage, Option<f32>) {
+    // Resolve the anchor from the corrected-density buffer *before* the in-place
+    // transform overwrites it. The anchor is subtracted in the exponent (see the
+    // doc above); `None` ⇒ anchor 0.0 ⇒ `d − 0.0 == d` bit-exactly, so the
+    // per-pixel arithmetic below is bit-identical to the pre-anchor render.
+    let resolved = resolve_dmax(&density.density, dmax);
+    let anchor = resolved.unwrap_or(0.0);
     let exposure_gain = 2f32.powf(print.print_exposure);
     let wb = print.white_balance;
     let black = print.black_point;
@@ -155,7 +188,7 @@ pub(crate) fn render(
     let mut rgb = density.density;
     rgb.par_chunks_exact_mut(3).for_each(|d| {
         for c in 0..3 {
-            let paper = 10f32.powf(density_gamma * d[c]); // stage 3
+            let paper = 10f32.powf(density_gamma * (d[c] - anchor)); // stage 3, anchored
             let exposed = paper * wb[c] * exposure_gain; // stage 4
             d[c] = soft_clip(exposed - black, hc);
         }
@@ -166,8 +199,78 @@ pub(crate) fn render(
     // validated constructor anyway — its checks are O(1) (buffer lengths, not a
     // per-sample scan), so a future regression that breaks the invariant panics
     // loudly here instead of minting a silently-malformed image.
-    LinearImage::new(density.width, density.height, rgb, density.ir)
-        .expect("render preserves the validated buffer-length invariants")
+    let image = LinearImage::new(density.width, density.height, rgb, density.ir)
+        .expect("render preserves the validated buffer-length invariants");
+    (image, resolved)
+}
+
+/// Percentile of the corrected-density distribution taken as the `Auto` anchor.
+/// High enough to sit at genuine scene white while ignoring the top fraction of a
+/// percent (specular sparkle, dust, hot pixels) that would otherwise anchor white
+/// too bright and leave the image dim. Mirrors the robustness intent of
+/// `film_base`'s sampling percentile, applied to the density (not transmission)
+/// distribution.
+const AUTO_DMAX_PERCENTILE: f32 = 0.995;
+
+/// Resolve the display-white anchor density for a corrected-density buffer.
+/// `Auto` measures a high percentile of the *finite* densities (scalar, pooled
+/// across channels — a per-channel anchor would double as color correction, which
+/// is the future auto-WB task's job); `Explicit` returns the given value; `None`
+/// yields no anchor. Deterministic: same buffer + params ⇒ same value.
+fn resolve_dmax(densities: &[f32], source: DmaxSource) -> Option<f32> {
+    match source {
+        DmaxSource::None => None,
+        DmaxSource::Explicit(d) => Some(d),
+        DmaxSource::Auto => Some(auto_dmax(densities)),
+    }
+}
+
+/// Cap on how many density samples the `Auto` anchor examines. A 99.5th
+/// percentile over ~1M samples is statistically indistinguishable from the full
+/// population for anchoring purposes, and the cap bounds the measuring pass to a
+/// ~4 MB transient buffer instead of a second image-sized allocation on large
+/// scans (the render itself is in-place).
+const AUTO_DMAX_MAX_SAMPLES: usize = 1 << 20;
+
+/// Deterministic sampling stride for a density buffer of `len` samples: the
+/// smallest stride that keeps the sample count under [`AUTO_DMAX_MAX_SAMPLES`],
+/// bumped off multiples of 3 — the buffer is interleaved RGB, so a stride
+/// divisible by 3 would sample a single channel and bias the pooled percentile.
+fn auto_dmax_stride(len: usize) -> usize {
+    let stride = len.div_ceil(AUTO_DMAX_MAX_SAMPLES).max(1);
+    if stride > 1 && stride.is_multiple_of(3) {
+        stride + 1
+    } else {
+        stride
+    }
+}
+
+/// The [`AUTO_DMAX_PERCENTILE`] of the finite corrected densities, by nearest-rank
+/// over a deterministic strided sample (see [`auto_dmax_stride`]).
+///
+/// Non-finite densities (`NaN` from corrupt/overflowed input) are excluded rather
+/// than ranked, so a stray non-finite pixel can't become the anchor. An empty /
+/// all-non-finite buffer yields `0.0` — a neutral anchor rather than a panic; the
+/// encoder's non-finite counter still surfaces the underlying fault.
+/// Uses `select_nth_unstable` (O(n)) — the returned order-statistic value is
+/// independent of tie ordering — and a fixed stride derived only from the buffer
+/// length, so the result stays deterministic: same buffer ⇒ same anchor.
+fn auto_dmax(densities: &[f32]) -> f32 {
+    let stride = auto_dmax_stride(densities.len());
+    let mut finite: Vec<f32> = Vec::with_capacity(densities.len().div_ceil(stride));
+    finite.extend(
+        densities
+            .iter()
+            .step_by(stride)
+            .copied()
+            .filter(|v| v.is_finite()),
+    );
+    if finite.is_empty() {
+        return 0.0;
+    }
+    let rank = ((finite.len() - 1) as f32 * AUTO_DMAX_PERCENTILE).round() as usize;
+    let (_, nth, _) = finite.select_nth_unstable_by(rank, f32::total_cmp);
+    *nth
 }
 
 /// Highlight soft-clip: a smooth roll-off of values above the nominal display
@@ -194,13 +297,27 @@ fn soft_clip(x: f32, amount: f32) -> f32 {
 
 impl Converter for Density {
     fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage> {
+        Ok(self.convert_reported(image, base)?.0)
+    }
+
+    fn convert_reported(
+        &self,
+        image: &LinearImage,
+        base: &FilmBase,
+    ) -> Result<(LinearImage, ConvertReport)> {
         // `to_density` divides by the per-channel base, so a zero / negative /
         // non-finite base would yield a silently-black or non-finite image. The CLI
         // validates an *explicit* base, but an auto/region-estimated one is only
         // guarded here — the base's consumption point. Fail loudly instead.
         check_base(base)?;
         let density = to_density(image, base, &self.density);
-        Ok(render(density, self.density.density_gamma, &self.print))
+        let (image, dmax) = render(
+            density,
+            self.density.density_gamma,
+            self.density.dmax,
+            &self.print,
+        );
+        Ok((image, ConvertReport { dmax }))
     }
 }
 
@@ -270,6 +387,7 @@ mod tests {
             density_scale: [2.0, 1.0, 0.5],
             density_offset: [0.5, -0.25, 0.0],
             density_gamma: 1.0,
+            dmax: DmaxSource::None, // unused by to_density
         };
         let d = to_density(&img, &base, &params);
         assert!(approx(d.density[0], 2.5, 1e-5));
@@ -312,7 +430,7 @@ mod tests {
             density: vec![1.0, 0.0, 2.0],
             ir: None,
         };
-        let out = render(d, 1.0, &PrintParams::default());
+        let (out, _) = render(d, 1.0, DmaxSource::None, &PrintParams::default());
         assert!(approx(out.rgb[0], 10.0, 1e-3));
         assert!(approx(out.rgb[1], 1.0, 1e-5));
         assert!(approx(out.rgb[2], 100.0, 1e-2));
@@ -327,7 +445,7 @@ mod tests {
             density: vec![1.0, 1.0, 1.0],
             ir: None,
         };
-        let out = render(d, 0.5, &PrintParams::default());
+        let (out, _) = render(d, 0.5, DmaxSource::None, &PrintParams::default());
         for c in 0..3 {
             assert!(approx(out.rgb[c], 10f32.powf(0.5), 1e-3), "channel {c}");
         }
@@ -348,7 +466,7 @@ mod tests {
             white_balance: [2.0, 1.0, 0.5],
             highlight_compress: 0.0,
         };
-        let out = render(d, 1.0, &print);
+        let (out, _) = render(d, 1.0, DmaxSource::None, &print);
         assert!(approx(out.rgb[0], 3.5, 1e-4)); // 1·2·2 − 0.5
         assert!(approx(out.rgb[1], 1.5, 1e-4)); // 1·1·2 − 0.5
         assert!(approx(out.rgb[2], 0.5, 1e-4)); // 1·0.5·2 − 0.5
@@ -362,7 +480,7 @@ mod tests {
             density: vec![0.3, 0.3, 0.3],
             ir: Some(vec![0.7]),
         };
-        let out = render(d, 1.0, &PrintParams::default());
+        let (out, _) = render(d, 1.0, DmaxSource::None, &PrintParams::default());
         assert_eq!(out.ir.as_deref(), Some(&[0.7_f32][..]));
     }
 
@@ -407,6 +525,7 @@ mod tests {
                 density_scale: [1.1, 1.0, 0.9],
                 density_offset: [0.05, 0.0, -0.05],
                 density_gamma: 1.4,
+                dmax: DmaxSource::Auto,
             },
             print: PrintParams {
                 print_exposure: -1.0,
@@ -416,9 +535,10 @@ mod tests {
             },
         };
         let via_convert = conv.convert(&img, &base).unwrap();
-        let via_parts = render(
+        let (via_parts, _) = render(
             to_density(&img, &base, &conv.density),
             conv.density.density_gamma,
+            conv.density.dmax,
             &conv.print,
         );
         assert_eq!(via_convert.rgb, via_parts.rgb);
@@ -493,7 +613,7 @@ mod tests {
             highlight_compress: 0.5,
             ..PrintParams::default()
         };
-        let out = render(d, 1.0, &print);
+        let (out, _) = render(d, 1.0, DmaxSource::None, &print);
         let expected_r = 1.0 + 0.5 * (1.0 - (-2.0f32).exp());
         assert!(approx(out.rgb[0], expected_r, 1e-4), "got {}", out.rgb[0]);
         assert!(approx(out.rgb[1], 1.0, 1e-5));
@@ -539,6 +659,58 @@ mod tests {
     }
 
     #[test]
+    fn anchored_exponent_survives_extreme_gamma_and_dmax() {
+        // Regression (PR review): the anchor used to be a separate 10^(−γ·Dmax)
+        // gain, so γ·D' alone could overflow f32 before the gain cancelled it
+        // (γ = 5, D' = 8 ⇒ 10^40 = inf ⇒ scene white rendered inf/NaN). With the
+        // anchored exponent, D' = Dmax maps to exactly 1.0 regardless of scale.
+        let gamma = 5.0f32;
+        let dmax = 8.0f32;
+        let dimg = DensityImage {
+            width: 1,
+            height: 1,
+            density: vec![dmax, dmax, dmax],
+            ir: None,
+        };
+        let (out, resolved) = render(
+            dimg,
+            gamma,
+            DmaxSource::Explicit(dmax),
+            &PrintParams::default(),
+        );
+        assert_eq!(resolved, Some(dmax));
+        for v in &out.rgb {
+            assert!(v.is_finite(), "overflowed: {v}");
+            assert!(approx(*v, 1.0, 1e-5), "scene white should be 1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn auto_dmax_stride_is_bounded_and_channel_unbiased() {
+        // Small buffers are sampled exhaustively.
+        assert_eq!(auto_dmax_stride(0), 1);
+        assert_eq!(auto_dmax_stride(3 * 100), 1);
+        assert_eq!(auto_dmax_stride(AUTO_DMAX_MAX_SAMPLES), 1);
+        // Large buffers are strided to stay under the cap...
+        let big = 10 * AUTO_DMAX_MAX_SAMPLES;
+        let stride = auto_dmax_stride(big);
+        assert!(big.div_ceil(stride) <= AUTO_DMAX_MAX_SAMPLES + 1);
+        // ...and the stride is never a multiple of 3 (interleaved RGB — a
+        // 3-divisible stride would sample one channel only).
+        for len in [
+            big,
+            3 * AUTO_DMAX_MAX_SAMPLES,
+            6 * AUTO_DMAX_MAX_SAMPLES + 5,
+        ] {
+            let s = auto_dmax_stride(len);
+            assert!(
+                s == 1 || !s.is_multiple_of(3),
+                "len {len}: stride {s} is 3-divisible"
+            );
+        }
+    }
+
+    #[test]
     fn convert_preserves_ir_plane() {
         let base = FilmBase::from([1.0, 1.0, 1.0]);
         let img = pixel([0.2, 0.2, 0.2], Some(0.33));
@@ -548,5 +720,238 @@ mod tests {
         };
         let out = conv.convert(&img, &base).unwrap();
         assert_eq!(out.ir.as_deref(), Some(&[0.33_f32][..]));
+    }
+
+    // --- Dmax white anchor -----------------------------------------------------
+
+    #[test]
+    fn none_anchor_is_bit_exact_with_pre_anchor_render() {
+        // `DmaxSource::None` must reproduce the pre-anchor render bit-for-bit: the
+        // anchor term is exactly 0.0 and `d − 0.0 == d` for every f32, so every
+        // output sample must equal the direct pre-anchor arithmetic to the bit
+        // (HDR f32 workflows depend on this). Uses `assert_eq!`, not an epsilon.
+        let density = vec![0.7f32, -0.3, 1.2, 0.0, 2.0, -1.1];
+        let dimg = DensityImage {
+            width: 2,
+            height: 1,
+            density: density.clone(),
+            ir: None,
+        };
+        let print = PrintParams {
+            print_exposure: -0.6,
+            black_point: 0.01,
+            white_balance: [1.0, 1.05, 0.9],
+            highlight_compress: 0.3,
+        };
+        let gamma = 1.3;
+        let (out, resolved) = render(dimg, gamma, DmaxSource::None, &print);
+        assert_eq!(resolved, None, "no anchor reported for None");
+        let exposure_gain = 2f32.powf(print.print_exposure);
+        for (i, &d) in density.iter().enumerate() {
+            let c = i % 3;
+            let paper = 10f32.powf(gamma * d);
+            let expected = soft_clip(
+                paper * print.white_balance[c] * exposure_gain - print.black_point,
+                print.highlight_compress,
+            );
+            assert_eq!(out.rgb[i], expected, "sample {i} not bit-exact");
+        }
+    }
+
+    #[test]
+    fn explicit_anchor_maps_that_density_to_display_white() {
+        // With a neutral print, the pixel at `D' = Dmax` (scene white) renders to
+        // exactly 1.0, and the base (`D' = 0`) to `10^(−γ·Dmax) < 1` (near black).
+        let dmax = 1.5f32;
+        let gamma = 2.0f32;
+        let dimg = DensityImage {
+            width: 2,
+            height: 1,
+            density: vec![dmax, dmax, dmax, 0.0, 0.0, 0.0],
+            ir: None,
+        };
+        let (out, resolved) = render(
+            dimg,
+            gamma,
+            DmaxSource::Explicit(dmax),
+            &PrintParams::default(),
+        );
+        assert_eq!(resolved, Some(dmax));
+        for c in 0..3 {
+            assert!(
+                approx(out.rgb[c], 1.0, 1e-5),
+                "scene white → 1.0 (chan {c})"
+            );
+            assert!(approx(out.rgb[3 + c], 10f32.powf(-gamma * dmax), 1e-6));
+            assert!(out.rgb[3 + c] < 1.0, "base below white (chan {c})");
+        }
+    }
+
+    #[test]
+    fn auto_dmax_high_percentile_resists_outliers() {
+        // 200 samples at 1.0 plus one blown 1000.0 (< 0.5% of the data): the
+        // 99.5th percentile stays on the bulk value, not the specular/dust outlier.
+        let mut d = vec![1.0f32; 200];
+        d.push(1000.0);
+        assert!(approx(auto_dmax(&d), 1.0, 1e-6), "got {}", auto_dmax(&d));
+    }
+
+    #[test]
+    fn auto_dmax_nearest_rank_matches_the_percentile_index() {
+        // Distinct values pin the exact nearest-rank index `round((n−1)·p)` in both
+        // directions (a constant-bulk test would pass for any rank ≤ the top).
+        // 1000 values 0..=999: index = round(999·0.995) = round(994.005) = 994.
+        let d: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        assert_eq!(auto_dmax(&d), 994.0);
+    }
+
+    #[test]
+    fn auto_dmax_ignores_non_finite() {
+        // Non-finite densities are excluded from the rank, never returned.
+        let d = vec![f32::NAN, 0.5, f32::INFINITY, 0.5, f32::NEG_INFINITY, 0.5];
+        assert!(approx(auto_dmax(&d), 0.5, 1e-6));
+        // All-non-finite / empty → 0.0 neutral fallback (gain 1.0), not a panic.
+        assert_eq!(auto_dmax(&[f32::NAN, f32::INFINITY]), 0.0);
+        assert_eq!(auto_dmax(&[]), 0.0);
+    }
+
+    #[test]
+    fn auto_anchor_is_deterministic() {
+        // Same input + params ⇒ identical output (the determinism contract).
+        let base = FilmBase::from([0.6, 0.3, 0.18]);
+        let img = LinearImage::new(
+            3,
+            1,
+            vec![0.5, 0.25, 0.15, 0.3, 0.15, 0.09, 0.1, 0.05, 0.03],
+            None,
+        )
+        .unwrap();
+        let conv = Density {
+            density: DensityParams::default(),
+            print: PrintParams::default(),
+        };
+        let a = conv.convert(&img, &base).unwrap();
+        let b = conv.convert(&img, &base).unwrap();
+        assert_eq!(a.rgb, b.rgb);
+    }
+
+    #[test]
+    fn convert_reported_surfaces_the_resolved_anchor() {
+        let base = FilmBase::from([0.6, 0.6, 0.6]);
+        let img = pixel([0.2, 0.2, 0.2], None);
+
+        // Explicit → reports exactly that value.
+        let conv = Density {
+            density: DensityParams {
+                dmax: DmaxSource::Explicit(1.25),
+                ..DensityParams::default()
+            },
+            print: PrintParams::default(),
+        };
+        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        assert_eq!(rep.dmax, Some(1.25));
+
+        // None → no anchor reported.
+        let conv = Density {
+            density: DensityParams {
+                dmax: DmaxSource::None,
+                ..DensityParams::default()
+            },
+            print: PrintParams::default(),
+        };
+        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        assert_eq!(rep.dmax, None);
+
+        // Auto → a finite measured anchor.
+        let conv = Density {
+            density: DensityParams::default(),
+            print: PrintParams::default(),
+        };
+        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        assert!(rep.dmax.is_some_and(f32::is_finite));
+    }
+
+    #[test]
+    fn auto_anchor_maps_measured_scene_white_to_display_white() {
+        // End-to-end: a uniform-density image has one density value, so the auto
+        // percentile equals it and the render maps it to display white ≈ 1.0. Ties
+        // the measured percentile to the render gain (catches an anchor_gain sign
+        // error the explicit test's separate path could miss).
+        let gamma = 1.8f32;
+        let base = FilmBase::from([0.8, 0.8, 0.8]);
+        let img = LinearImage::new(4, 1, vec![0.2f32; 12], None).unwrap(); // scan < base ⇒ D > 0
+        let dimg = to_density(
+            &img,
+            &base,
+            &DensityParams {
+                density_gamma: gamma,
+                ..DensityParams::default()
+            },
+        );
+        let (out, resolved) = render(dimg, gamma, DmaxSource::Auto, &PrintParams::default());
+        let dmax = resolved.unwrap();
+        assert!(
+            dmax > 0.0,
+            "measured scene-white density should be positive"
+        );
+        for v in &out.rgb {
+            assert!(
+                approx(*v, 1.0, 1e-4),
+                "scene white → 1.0, got {v} (dmax {dmax})"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_anchor_composes_with_print_exposure() {
+        // The anchor and print exposure fold into one multiplicative scalar: scene
+        // white (D' = Dmax) at `print_exposure = k` renders to exactly `2^k`
+        // (`10^(γ·(Dmax−Dmax)) · 1 · 2^k − 0`). Pins the composition at a known value.
+        let dmax = 1.2f32;
+        let dimg = DensityImage {
+            width: 1,
+            height: 1,
+            density: vec![dmax, dmax, dmax],
+            ir: None,
+        };
+        let print = PrintParams {
+            print_exposure: 2.0,
+            ..PrintParams::default()
+        };
+        let (out, _) = render(dimg, 1.5, DmaxSource::Explicit(dmax), &print);
+        for c in 0..3 {
+            assert!(approx(out.rgb[c], 4.0, 1e-4), "chan {c}: {}", out.rgb[c]); // 2^2
+        }
+    }
+
+    #[test]
+    fn auto_anchor_is_a_scalar_pooled_across_channels() {
+        // Channel-asymmetric densities (R high, B low): the anchor is a single
+        // pooled scalar — the *same* gain on every channel — so it can't double as
+        // color correction (that's the future auto-WB task). Prove the per-channel
+        // ratio `out_c / 10^(γ·D'_c)` is identical across channels (== anchor gain).
+        let dimg = DensityImage {
+            width: 2,
+            height: 1,
+            density: vec![2.0, 1.0, 0.1, 2.0, 1.0, 0.1],
+            ir: None,
+        };
+        let gamma = 1.0f32;
+        let (out, resolved) = render(
+            dimg.clone(),
+            gamma,
+            DmaxSource::Auto,
+            &PrintParams::default(),
+        );
+        let dmax = resolved.unwrap();
+        let gain = 10f32.powf(-gamma * dmax);
+        for c in 0..3 {
+            let expected = 10f32.powf(gamma * dimg.density[c]) * gain;
+            assert!(
+                approx(out.rgb[c], expected, 1e-4),
+                "chan {c}: {}",
+                out.rgb[c]
+            );
+        }
     }
 }

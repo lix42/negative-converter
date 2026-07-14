@@ -6,7 +6,7 @@
 //! orchestrator (`cli`); everything here is pure `(input, params) -> output` so
 //! it composes and unit-tests without touching the filesystem.
 
-use crate::algo::{self, AlgoParams};
+use crate::algo::{self, AlgoParams, ConvertReport};
 use crate::pipeline::{color, film_base};
 use crate::types::{
     Algorithm, DensityParams, FilmBase, FilmBaseParams, LinearImage, OutputParams, PrintParams,
@@ -20,6 +20,9 @@ pub struct Rendered {
     pub image: LinearImage,
     pub icc: Vec<u8>,
     pub film_base: FilmBase,
+    /// Algorithm-reported diagnostics (e.g. the resolved `Dmax` anchor) for the
+    /// JSON report.
+    pub convert: ConvertReport,
 }
 
 /// Assemble the algorithm's parameter set for the selected `algorithm` from the
@@ -63,12 +66,13 @@ pub fn render(
 ) -> Result<Rendered> {
     let film_base = film_base::estimate(image, film_base_params)?;
     let converter = algo::build(algo_params);
-    let positive = converter.convert(image, &film_base)?;
+    let (positive, convert) = converter.convert_reported(image, &film_base)?;
     let (image, icc) = color::to_output(&positive, output_params)?;
     Ok(Rendered {
         image,
         icc,
         film_base,
+        convert,
     })
 }
 

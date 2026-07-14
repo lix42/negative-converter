@@ -139,7 +139,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > Lab Pro comparison (2026-07-13, see `progress.md`). Deterministic statistics
 > only — no ML (the "AI-friendly ≠ ML" rule holds).
 
-- [ ] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md)
+- [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md)
 - [ ] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [ ] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [ ] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
