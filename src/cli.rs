@@ -439,10 +439,19 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
         Ok(())
     };
 
-    // Film base: an explicit base is a per-channel transmission (must be
-    // positive); a sampled region must have non-zero extent; auto needs nothing.
+    // Film base: an explicit base is a per-channel transmission in (0, 1] — the
+    // decoded scan is [0, 1]-normalized, so a value above 1 (e.g. a "90" typo for
+    // "0.90") would silently render every real sample denser than the base; a
+    // sampled region must have non-zero extent; auto needs nothing.
     match cfg.film_base.source {
-        FilmBaseSource::Explicit(b) => positive("--film-base", &b)?,
+        FilmBaseSource::Explicit(b) => {
+            positive("--film-base", &b)?;
+            if let Some(v) = b.iter().find(|v| **v > 1.0) {
+                return Err(usage(format!(
+                    "--film-base channels are transmissions in (0, 1] (got {v})"
+                )));
+            }
+        }
         FilmBaseSource::Region([_, _, w, h]) if w == 0 || h == 0 => {
             return Err(usage("--base-region width and height must be > 0".into()));
         }
@@ -454,10 +463,18 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     positive("--density-scale", &cfg.density.density_scale)?;
     finite("--density-offset", &cfg.density.density_offset)?;
 
-    // Print: exposure / black point / highlight roll-off finite; gains positive.
+    // Print: exposure / black point finite; gains positive. Highlight roll-off is a
+    // non-negative amount — 0 disables it, and a negative value would be silently
+    // ignored by the density render's soft-clip, so reject it loudly here.
     finite("--print-exposure", &[cfg.print.print_exposure])?;
     finite("--black-point", &[cfg.print.black_point])?;
     finite("--highlight-compress", &[cfg.print.highlight_compress])?;
+    if cfg.print.highlight_compress < 0.0 {
+        return Err(usage(format!(
+            "--highlight-compress must be >= 0 (got {})",
+            cfg.print.highlight_compress
+        )));
+    }
     positive("--white-balance", &cfg.print.white_balance)?;
 
     // Simple: gains positive; clip range finite and ordered.
@@ -674,6 +691,16 @@ mod tests {
         cfg.print.white_balance = [1.0, f32::NAN, 1.0];
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
+        // Negative highlight compression is rejected (the density render silently
+        // treats it as "off", so a wrong-sign value must fail loudly, not no-op).
+        let mut cfg = ResolvedConfig::default();
+        cfg.print.highlight_compress = -0.3;
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+        // Zero is valid (disables the roll-off).
+        let mut cfg = ResolvedConfig::default();
+        cfg.print.highlight_compress = 0.0;
+        validate(&cfg).unwrap();
+
         // A clean default passes.
         validate(&ResolvedConfig::default()).unwrap();
     }
@@ -685,6 +712,13 @@ mod tests {
         let mut cfg = ResolvedConfig::default();
         cfg.film_base.source = FilmBaseSource::Explicit([0.9, 0.0, 0.4]); // zero transmission
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
+        let mut cfg = ResolvedConfig::default();
+        cfg.film_base.source = FilmBaseSource::Explicit([0.9, 90.0, 0.4]); // "90" typo for "0.90"
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+        let mut cfg = ResolvedConfig::default();
+        cfg.film_base.source = FilmBaseSource::Explicit([1.0, 1.0, 1.0]); // 1.0 exactly is valid
+        validate(&cfg).unwrap();
 
         let mut cfg = ResolvedConfig::default();
         cfg.film_base.source = FilmBaseSource::Region([0, 0, 0, 0]); // zero-area region

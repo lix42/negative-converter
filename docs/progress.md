@@ -654,11 +654,111 @@ a task; update your own section as you work. Append entries — don't rewrite th
   `algo-density` / `film-base-estimation` stand.
 
 ## algo-density
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-12
 
 - Goal: density-domain converter (Cineon/negadoctor style) with separate density
   and print-render sub-stages; the default algorithm.
+- **Done.** `src/algo/density.rs` implements the `density` converter as two pure,
+  independently-testable sub-stage fns composed by `Converter::convert`:
+  - `to_density(image, base, &DensityParams) -> DensityImage` — stages 1–2.
+  - `render(&DensityImage, density_gamma, &PrintParams) -> LinearImage` — stages 3–4.
+  - `DensityImage` is the algo-internal intermediate (corrected density + carried
+    IR + dims), `pub(crate)`, no validated constructor (its length invariants hold
+    by construction from a validated `LinearImage`).
+- **Exact equations chosen (per channel `c`), for reproducibility:**
+  1. transmission → density: `D_c = -log10(max(scan_c, EPS) / base_c)`, `EPS = 1e-6`.
+  2. density correction: `D'_c = density_scale_c · D_c + density_offset_c`.
+  3. density → positive: `lin_c = 10^(density_gamma · D'_c)`.
+  4. print render: `lin_c = white_balance_c · 2^print_exposure · lin_c − black_point`,
+     then per-channel highlight soft-clip.
+  - **Highlight soft-clip:** identity for `x ≤ 1.0` (nominal display white) or
+    `amount ≤ 0`; above white, `out = 1 + amount·(1 − e^(−(x−1)/amount))`, an
+    exponential knee asymptoting to `1 + amount`. `amount = highlight_compress`.
+    The `1.0` threshold is a documented anchor (definition of "highlight"), not a
+    hidden knob — the exposed control is `highlight_compress`.
+  - **Orange-mask compensation is structural:** dividing by the *per-channel* base
+    lands an unexposed sample on `D = 0` in every channel, so a neutral patch stays
+    neutral with default params; `density_offset`/`density_scale` trim the residual
+    per-channel balance/contrast.
+- **Key decision — polarity sign fix (deliberate deviation from the task-file /
+  design-spec §7.2 sketch).** The sketch wrote stage 3 as `10^(−D'·gamma)`. With
+  `D = -log10(scan/base)` (which is `≥ 0` and *grows* with the film's optical
+  density: base = scene black at `D=0`, dense negative = scene highlight at large
+  `D`), that formula yields `scan/base` — i.e. the original **negative** — not a
+  positive. A true positive must brighten as `D` grows, so stage 3 uses
+  `10^(+gamma·D')`. **Verified against darktable `negadoctor`'s source** (via
+  WebFetch): its print output increases with film density (denser negative →
+  brighter print), confirming the `+` sign. Guarded by
+  `convert_is_positive_polarity_denser_is_brighter` so a regression to the `−` sign
+  fails the build.
+- **No new knobs.** All params consumed (`density_scale/offset/gamma`,
+  `print_exposure/black_point/white_balance/highlight_compress`) were already wired
+  across the four coupled spots by `algo-interface` + `cli-framework`, so no
+  `cli.rs`/`types.rs` param additions were needed — only a validation tightening
+  (below).
+- **`cli.rs` change (validation only):** `--highlight-compress` now must be `>= 0`
+  (was finite-only). A negative value is silently a no-op in the soft-clip, so it
+  now fails loudly at the CLI boundary (exit 2) per the "no silent no-op knob" rule.
+- **Fail-loudly hardening (from review):**
+  - `Density::convert` guards the film base via `check_base` (finite & `> 0` per
+    channel, else `NcError::Other`/exit 1). The CLI validates an *explicit* base,
+    but an **auto/region-estimated** base is never CLI-checked and could be `0`
+    (e.g. a `--base-region` over a black holder) → division by zero → a silently
+    black image. Guarded at the base's consumption point instead.
+  - Non-finite scan input (`NaN`/`±inf`) propagates as `NaN` density (not laundered
+    by the `EPS` floor), and the soft-clip passes non-finite through unchanged, so
+    `io::encode`'s non-finite counter still surfaces corrupt/overflowed values. The
+    `EPS` floor applies only to *finite* zero/negative/denormal transmission.
+  - `render` builds its output via `LinearImage::new(...).expect(...)` (O(1) length
+    checks) so a future invariant regression panics loudly instead of minting a
+    malformed image.
+- **Output is scene-referred / HDR.** With neutral defaults the base maps to `1.0`
+  and exposed detail sits above it; nothing is clamped here (per the project rule —
+  clamping is the u16 encode's job, which counts/report clips). Fit to a display
+  range with a negative `--print-exposure` and/or `--black-point`, or keep the HDR
+  range via `--out-depth f32`.
+- **Notes for `pipeline-orchestration`:** call `algo::build(AlgoParams::Density{..})`
+  and `Converter::convert` as usual; `convert` can now return `NcError::Other` when
+  the resolved/estimated film base is invalid — surface it as a normal pipeline
+  error. The density-domain default is intentionally exposure-hot (base → 1.0);
+  when wiring `inspect`/reports, remember output may exceed `[0,1]` (expected, HDR).
+- **Verify:** `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, build,
+  and `cargo test` all clean — full suite **95/95** (21 new density tests + a cli
+  validate case). Density tests cover: `-log10` ratio, per-channel/orange-mask base,
+  scale-then-offset order, epsilon floor on finite zero/negative, non-finite scan
+  propagation, IR carry-through (both sub-stages + convert), the `10^` curve, gamma
+  exponent, wb→exposure→black order, soft-clip (disabled/below-white/rolloff/bounded/
+  non-finite pass-through), soft-clip routed through `render`, composition
+  (`convert == render∘to_density`), positive polarity (denser → brighter), neutral
+  patch stays neutral, default output finite/no-blow-up, and the base guard
+  (zero/negative/NaN/inf → error).
+- **Review:** ran `pr-review-toolkit:review-pr` (code-reviewer, silent-failure-hunter,
+  type-design-analyzer, pr-test-analyzer) — 2 rounds.
+  - Round 1 findings fixed: negative `--highlight-compress` no-op → CLI reject;
+    NaN/inf scan laundering → propagate NaN; zero-base silent-black → `check_base`;
+    `pub` → `pub(crate)` + validated-constructor in `render`; test gaps (non-finite
+    input, non-tautological soft-clip-in-render, no-blow-up) → added.
+  - Round 2: code-reviewer clean; silent-failure-hunter flagged `soft_clip` still
+    masking `+inf` → `1+amount` under compression → fixed with the `!x.is_finite()`
+    guard + test. Re-ran gates: clean.
+  - Minor/dismissed: `check_base` uses exit-1 (`Other`) rather than exit-4
+    (`Unsupported`) for a bad *estimated* base — a defensible judgment call, kept
+    (explicit bad base is already exit-2 at the CLI).
+- **2026-07-12 — closed out.** Manual review approved; shipped via `/ship` (gates
+  re-run green, PR opened from branch `algo-density`). **Follow-up for the spec:**
+  design-spec §7.2's stage-3 sketch (`10^(−D'·gamma)`) has the polarity bug
+  described above — correct it (and design-spec.html together) to `10^(+gamma·D')`.
+- **2026-07-13 — PR-review follow-ups.** From bot review on the PR: `render` now
+  consumes its `DensityImage` (in-place transform, IR moved not cloned); film-base
+  transmissions are bounded to `(0, 1]` at both the CLI (`--film-base`, exit 2) and
+  `check_base` (estimated/recipe base, exit 1) — a `90`-for-`0.90` typo previously
+  blew out silently. **Deferred design finding (for `pipeline-orchestration` /
+  spec):** with default params the render maps scene black (base) to `1.0` and all
+  detail *above* it, so the default u16 encode clips the whole image (loudly, via
+  the clip report, but still unusable). Needs a display-range anchor — e.g. a
+  Dmax-style white anchor or different default `print_exposure`/`black_point` —
+  decided at the spec level (§7.2/§9 defaults) alongside the polarity correction.
 
 ## pipeline-orchestration
 **Status:** not started
