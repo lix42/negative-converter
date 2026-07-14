@@ -1,6 +1,6 @@
 # Negative Converter — High-Level Design Spec (Step 1)
 
-> Status: Living document (updated as tasks land) · Target: Step 1 (MVP) · Language: Rust
+> Target: Step 1 (MVP) · Language: Rust
 >
 > This document is the machine-readable (Markdown) companion to `design-spec.html`.
 > Both contain the same content; the HTML version is for humans, this one is for agents.
