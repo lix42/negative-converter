@@ -50,9 +50,11 @@ do not pull input-format work into this task.
   Deterministic either way; an explicit `--d-max` remains the escape hatch,
   and `color` mode must keep today's pooled sampling bit-exactly.
   Channel weighting alone still doesn't address **spatial** outliers: on an
-  uncropped frame the dark holder / rebate / dust can occupy more than the
-  top 0.5% of densities and become the anchor, dimming the render (NLP's
-  guide likewise says to crop or buffer non-film area before evaluation).
+  uncropped frame the dark holder or dust/scratches (all high-density —
+  the thin rebate is Dmin and sits at the *low* end, so it can't drive the
+  anchor) can occupy more than the top 0.5% of densities and become the
+  anchor, dimming the render (NLP's guide likewise says to crop or buffer
+  non-film area before evaluation).
   Spatially excluding border pixels from the anchor statistics (reusing the
   border/region conventions) benefits color conversions equally — treat it
   as a shared consideration and split it into its own task if it grows.
