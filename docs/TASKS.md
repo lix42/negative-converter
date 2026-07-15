@@ -71,6 +71,7 @@ graph TD
   algo-density --> regional-color-balance
   algo-density --> bw-support
   pipeline-orchestration --> bw-support
+  dmax-white-anchor --> bw-support
 ```
 
 Dependency list (a task is executable when all its deps are `[x]` done):
@@ -94,7 +95,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
 - `regional-color-balance` (post-MVP): `algo-density`
-- `bw-support` (post-MVP): `algo-density`, `pipeline-orchestration`
+- `bw-support` (post-MVP): `algo-density`, `pipeline-orchestration`, `dmax-white-anchor`
 
 > **Post-MVP follow-ups** (Phases 5–6) are recorded for continuity and are **not**
 > blockers of `pipeline-orchestration` / the Step-1 MVP. Phase 5 came out of

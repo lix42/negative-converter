@@ -17,8 +17,9 @@ do not pull input-format work into this task.
 - **The density path already is the B&W renderer.** Mapping to NLP's B&W
   controls: `--density-gamma` ≈ paper grade (contrast), `--print-exposure` ≈
   brightness, the auto-`Dmax` percentile white anchor ≈ NLP's WhiteClip. The
-  only missing piece is the mono color model; white balance is a no-op under
-  mono (see below), matching NLP's "no white balance needed in B&W mode".
+  only missing piece is the mono color model; under mono, white balance can
+  no longer tint the output (see below), matching NLP's "no white balance
+  needed in B&W mode".
 - **Knob shape — one enum** (house rule for mutually-exclusive knobs):
   `ColorModel { Color (default) | Mono([f32; 3] weights) }`. Recipe shape like
   `film_base.source`: `"color"` or `{ "mono": [r, g, b] }`. CLI:
@@ -48,6 +49,15 @@ do not pull input-format work into this task.
   channels from (or weight the sample stream by) the percentile sample.
   Deterministic either way; an explicit `--d-max` remains the escape hatch,
   and `color` mode must keep today's pooled sampling bit-exactly.
+  Channel weighting alone still doesn't address **spatial** outliers: on an
+  uncropped frame the dark holder or dust/scratches (all high-density —
+  the thin rebate is Dmin and sits at the *low* end, so it can't drive the
+  anchor) can occupy more than the top 0.5% of densities and become the
+  anchor, dimming the render (NLP's guide likewise says to crop or buffer
+  non-film area before evaluation).
+  Spatially excluding border pixels from the anchor statistics (reusing the
+  border/region conventions) benefits color conversions equally — treat it
+  as a shared consideration and split it into its own task if it grows.
 - **Recipe key: top-level `color_model`**, parallel to top-level `algorithm` —
   it is a cross-algorithm render selector, so it belongs to neither `density`
   nor `simple` nor `output` (§9 assigns keys by stage; this is a new small
@@ -55,17 +65,24 @@ do not pull input-format work into this task.
   in sync — `deny_unknown_fields` means a misplaced key makes a docs-shaped
   recipe fail to load (a loud `Usage` error, exit 2), so the key must land
   exactly where §9 assigns it. Update design-spec.md **and** .html together.
-- **White balance under mono.** `print.white_balance` applies per-channel gains
-  *before* pooling, so under mono it only re-weights the channel mix — the
-  output carries no tint regardless. Do not reject it; document that it is
-  redundant in mono mode.
+- **White balance under mono is tint-free but NOT a no-op.** The gains apply
+  inside the render, *before* the black-point subtraction / highlight
+  soft-clip (`density`) or the clip remap (`simple`), and pooling happens
+  after those — so white balance still shifts the pooled gray values
+  (tonality); it just cannot tint. Nor is it equivalent to `--mono-weights`,
+  which mixes *after* the non-linear print steps. Do not reject it; document
+  the distinction so a mono recipe isn't "simplified" by folding WB gains
+  into the weights.
 - **Output stays 3-channel RGB with R==G==B.** True grayscale TIFF encode is a
   possible follow-up, not this task — keeping the encode/ICC path untouched is
   what makes this change small.
 - **IR note.** Silver B&W film blocks IR, so the HDRi IR channel is useless for
-  dust removal on B&W. Nothing to do now (Step 1 preserves but never consumes
-  IR), but the future IR dust-removal task (roadmap item 1) must be
-  disabled/guarded when `color_model = mono`.
+  dust removal on traditional B&W negatives. Nothing to do now (Step 1
+  preserves but never consumes IR) — but the future IR dust-removal task
+  (roadmap item 1) must key its guard on the **film type** (a knob that task
+  introduces), *not* on `color_model = mono`: color film rendered mono and
+  chromogenic (C-41) B&W both keep a usable IR plane, while a silver B&W scan
+  rendered in color mode still doesn't.
 - **Stretch item (do not let it block shipping): auto black-clip percentile** —
   the shadow-side twin of the auto-`Dmax` white anchor (≈ NLP's BlackClip);
   today `--black-point` is manual only. Sketch: grow `print.black_point` into a
@@ -114,5 +131,7 @@ do not pull input-format work into this task.
 
 - [Density-domain algorithm](algo-density.md)
 - [Pipeline orchestration](pipeline-orchestration.md)
+- [Display-range white anchor (Dmax)](dmax-white-anchor.md) — the design
+  changes the auto-`Dmax` measurement path that task introduced.
 
-Both are complete — this task is immediately unblocked.
+All are complete — this task is immediately unblocked.
