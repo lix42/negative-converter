@@ -231,6 +231,16 @@ scene's own white, unlike the roll-level `Dmin` base — so it is measured per f
 by default (`density.dmax = auto`); it can be fixed (`{ "explicit": <d> }`) or
 disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.
 
+> **Under reconsideration (2026-07).** Treating `Dmax` as frame-local `auto`
+> effectively *normalizes exposure per frame* — it brightens underexposed frames
+> and forces an overcast scene's grey to display white — which conflicts with NC's
+> "convert, don't grade" purpose (exposure belongs in Lightroom). The planned
+> direction makes `Dmax` a **roll-fixed calibration** measured once from a
+> fully-exposed reference frame (the light-struck leader), reused like `Dmin`, with
+> per-frame `--auto-d-max` demoted to an opt-in exposure-normalizing mode. See §12
+> item 14 (`dmax-reference`). The frame-local `auto` behavior described above is
+> what currently ships.
+
 Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as
 separate, independently parameterized sub-stages — the core fidelity rule from §3.
 
@@ -552,13 +562,14 @@ the NLP feature comparison, Phase 6).
    march strips in from each edge and pick the brightest uniform band past the
    holder (the rebate can be thin and on only some edges). Keep deterministic;
    still fail loudly when no confident band exists, with thresholds tuned
-   against the real-scan verification results. This task family also includes: an explicit
-   opt-in **content-based source** (`film_base.source = "content"`, §9 ladder
-   tier 3) recorded in the report; a **uniformity warning on `--base-region`**
-   (a mixed rebate/image rectangle currently yields a plausible-looking bad
-   base silently); and `nc inspect` reporting **candidate rebate regions**
-   (coordinates + confidence) so CLI users confirm instead of measuring — the
-   same data a future UI would highlight.
+   against the real-scan verification results. This task family also includes: a
+   **uniformity warning on `--base-region`** (a mixed rebate/image rectangle
+   currently yields a plausible-looking bad base silently); and `nc inspect`
+   reporting **candidate rebate regions** (coordinates + confidence) so CLI users
+   confirm instead of measuring — the same data a future UI would highlight. The
+   opt-in **content-based source** (`film_base.source = "content"` / `--base-content`,
+   §9 ladder tier 3) is **reassigned** to the dedicated `film-base-content-fallback`
+   task (see item 13) — it is **not** implemented here.
 9. **Light film holders.** Auto/border logic assumes a dark holder surround; some
    holders are white. Add a `--holder white|black` control (recipe key
    `film_base.holder`) so detection knows the surround polarity.
@@ -582,6 +593,48 @@ the NLP feature comparison, Phase 6).
     effect on exit codes or output bytes. Performance instrumentation is *not*
     deferred with this — per-stage timings/tracing are the tracked pre-release
     `perf-instrumentation` task.
+13. **Roll workflow & base-acquisition planner** (extends item 6). Two
+    conversion workflows: **roll** (resolve `Dmin` + `Dmax` once, convert the
+    whole roll from a frozen shared recipe — strongly preferred, keeps frames
+    consistent) and **single** (per-frame best-effort). Roll-fixed params
+    (`Dmin`, `Dmax`) vs frame-local (print/exposure) is the real model. An
+    automatic **acquisition cascade** (unexposed reference → rebate region →
+    `--auto-base` → cross-frame agreement → drop-to-single; content estimation
+    only on **explicit opt-in**, never automatic) runs as a **plan** phase that
+    emits the frozen recipe with provenance +
+    confidence; conversion is deterministic replay. "Auto mode" is just roll
+    conversion's default on a batch. Tracked: `roll-conversion`,
+    `base-acquisition-planner`, `film-base-content-fallback`.
+14. **Roll-fixed `Dmax` from a fully-exposed reference frame.** Supersedes the
+    frame-local `auto` default (item in §7.2): `Dmax` is a film+scanner
+    calibration, measured once from the light-struck leader (near-opaque in RGB,
+    the max-density endpoint — always available) and reused per roll like `Dmin`.
+    Fixed anchor resolves reference → per-stock constant → a nominal
+    corrected-density anchor (in density units, *not* base transmission plus a
+    range); `--auto-d-max` (per-frame exposure normalization) demoted to opt-in. Tracked:
+    `dmax-reference`.
+15. **IR-assisted film-holder detection.** First consumer of the IR channel
+    besides item 1. Chromogenic dyes are IR-transparent, so all such film (base,
+    picture, even fully-exposed leader) is bright in IR while the opaque holder is
+    dark — a content-independent holder mask that RGB can't produce (holder and
+    dense film are both dark in RGB). The mask is classified in **sub-edge
+    segments** (a holder may cover only part of an edge), and holder segments are
+    excluded before the RGB rebate search. Gated by an **explicit film-type signal
+    (silver vs chromogenic)** — chromogenic B&W keeps a usable IR plane; silver
+    B&W / no-IR (HDR 48-bit) → RGB-only fallback — *not* by color model or IR-plane
+    presence. Also sidesteps holder *color* (item 9), since opacity, not color, is
+    the IR signal. Tracked: `ir-holder-detection`.
+16. **Conversion versioning & baseline comparison.** Stamp every output with
+    build identity (crate semver + git commit), a behavioral `pipeline_version`
+    (bumps *only* on default-behavior changes, gated by golden-output tests;
+    `v0` = current baseline), and a resolved-params hash — in the **report**, and
+    mirrored into the sidecar only via a backward-compatible metadata envelope
+    (never as bare recipe keys, which would break the `--params`
+    `deny_unknown_fields` round-trip). A benchmark manifest + `compare` step diffs the same scan/recipe set
+    across two builds (per-channel ΔRGB / clip / timing) so quality and
+    performance are trackable version-to-version. Quality metrics (ΔE2000/SSIM)
+    extend via item 7's QA harness; timings via `perf-instrumentation`. `v0` is
+    recorded in `docs/reports/v0-baseline.md`. Tracked: `conversion-versioning`.
 
 ## 13. Open questions
 
