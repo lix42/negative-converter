@@ -66,13 +66,14 @@ const SCAN_EPSILON: f32 = 1e-6;
 /// [`render`] (stages 3–4). The IR plane is carried through untouched (Step-1 rule:
 /// preserve, don't consume).
 ///
-/// Algo-internal (`pub(crate)`), not a cross-stage contract type — the neutral
-/// contract lives in `types.rs`. It has no validated constructor; its length
-/// invariants (`density.len() == w*h*3`, `ir.len() == w*h`) hold by construction
-/// because [`to_density`], its only producer, derives them from a validated
-/// [`LinearImage`].
+/// Algo-internal, not a cross-stage contract type — the neutral contract lives
+/// in `types.rs` (it is `pub` only so the criterion benches can drive
+/// [`to_density`]/[`render`] in isolation through the library target). It has no
+/// validated constructor; its length invariants (`density.len() == w*h*3`,
+/// `ir.len() == w*h`) hold by construction because [`to_density`], its only
+/// producer, derives them from a validated [`LinearImage`].
 #[derive(Clone, Debug)]
-pub(crate) struct DensityImage {
+pub struct DensityImage {
     pub width: u32,
     pub height: u32,
     /// Corrected density `D'`, interleaved `r,g,b, r,g,b, …`, `len == w*h*3`.
@@ -108,11 +109,7 @@ pub struct Density {
 /// than laundered by the floor, so `io::encode`'s non-finite counter still surfaces
 /// corrupt input downstream. The `SCAN_EPSILON` floor applies only to *finite*
 /// zero/negative/denormal transmission (the physically-real dead-pixel case).
-pub(crate) fn to_density(
-    image: &LinearImage,
-    base: &FilmBase,
-    params: &DensityParams,
-) -> DensityImage {
+pub fn to_density(image: &LinearImage, base: &FilmBase, params: &DensityParams) -> DensityImage {
     let base = [base.r, base.g, base.b];
     let scale = params.density_scale;
     let offset = params.density_offset;
@@ -168,7 +165,7 @@ pub(crate) fn to_density(
 /// Consumes the `DensityImage` (it is a use-once intermediate): the density buffer
 /// is transformed into the output in place and the IR plane is moved, so no
 /// image-sized buffer is allocated or cloned here.
-pub(crate) fn render(
+pub fn render(
     density: DensityImage,
     density_gamma: f32,
     dmax: DmaxSource,

@@ -186,7 +186,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > discussion). Local-only instrumentation first; remote telemetry stays a
 > deliberately separate, opt-in roadmap item (design-spec §12).
 
-- [ ] [Performance instrumentation](tasks/perf-instrumentation.md)
+- [x] [Performance instrumentation](tasks/perf-instrumentation.md)
 - [ ] [Conversion versioning & baseline comparison](tasks/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
 
 ### Phase 9: Roll workflow (batch conversion)

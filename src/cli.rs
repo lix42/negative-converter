@@ -18,6 +18,9 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
+use tracing::info_span;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::io::decode::{DecodeInfo, decode};
 use crate::io::encode;
@@ -75,10 +78,11 @@ pub struct ReportArgs {
     /// Write the report here instead of stdout.
     #[arg(long, value_name = "PATH")]
     pub report_file: Option<PathBuf>,
-    /// Increase stderr logging (-v, -vv). Never pollutes stdout.
+    /// Increase stderr logging (-v: progress + per-stage span timings,
+    /// -vv: debug). Never pollutes stdout.
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
-    /// Suppress non-error stderr logging.
+    /// Suppress non-error stderr logging (a set RUST_LOG still applies).
     #[arg(long)]
     pub quiet: bool,
 }
@@ -350,9 +354,37 @@ pub struct Report {
     /// Non-fatal warnings (clipping, IR-ignored, BigTIFF auto-promote, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Per-stage wall-clock timings (`convert` only). Report-only diagnostics —
+    /// never part of the recipe sidecar, so byte-identical output determinism
+    /// is untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<Timings>,
     /// Wall-clock time in milliseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<f64>,
+}
+
+/// Per-stage wall-clock timings for the `convert` report, in milliseconds.
+/// One field per pipeline stage (design-spec §6) plus the optional IR export;
+/// the stages are disjoint sub-intervals of the run, so their sum is ≤ the
+/// report's total `elapsed_ms` (the remainder is orchestration: recipe
+/// load/merge, collision checks, sidecar I/O). Serialize-only, like the rest
+/// of [`Report`].
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Timings {
+    /// Stage 1 — decode (input read + IFD walk + f32 normalization).
+    pub decode_ms: f64,
+    /// Stage 2 — film-base / Dmin estimation.
+    pub film_base_ms: f64,
+    /// Stage 3 — the negative→positive algorithm (incl. auto-Dmax measurement).
+    pub algorithm_ms: f64,
+    /// Stage 4 — output color transform (lcms2).
+    pub color_ms: f64,
+    /// IR-plane export, when `--export-ir` ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ir_export_ms: Option<f64>,
+    /// Stage 5 — encode (quantization + TIFF write; excludes the sidecar).
+    pub encode_ms: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +771,62 @@ fn push_warning(report: &mut Report, log: &Log, msg: String) {
     report.warnings.push(msg);
 }
 
+/// Install the global `tracing` subscriber: span-close timings (and any future
+/// structured events) rendered to **stderr** — stdout stays report-only.
+///
+/// The filter level derives from the same `-v`/`--quiet` knobs as [`Log`]:
+/// quiet ⇒ `error`, default ⇒ `warn` (spans silent), `-v` ⇒ `info` (per-stage
+/// span timings), `-vv` ⇒ `debug`. Precedence: a `RUST_LOG` set to a non-empty
+/// value overrides the flag-derived default entirely (the explicit opt-in for
+/// finer directives; empty-but-set counts as unset, the ecosystem convention);
+/// an *invalid* (unparsable or non-UTF-8) `RUST_LOG` is reported on stderr and
+/// the flag-derived default is used — never silently misconfigured logging.
+///
+/// If a global subscriber is already installed (impossible via the `nc` binary,
+/// which calls this once, but reachable for a library embedder of [`run`]),
+/// this warns on stderr and leaves the existing subscriber in place rather than
+/// panicking away a valid conversion over a diagnostics feature.
+fn init_tracing(report_args: Option<&ReportArgs>) {
+    let (verbose, quiet) = report_args.map_or((0, false), |r| (r.verbose, r.quiet));
+    let default = if quiet {
+        "error"
+    } else {
+        match verbose {
+            0 => "warn",
+            1 => "info",
+            _ => "debug",
+        }
+    };
+    let fallback = |why: &str| {
+        eprintln!("nc: warning: {why}; using log filter `{default}`");
+        EnvFilter::new(default)
+    };
+    let filter = match std::env::var_os("RUST_LOG") {
+        None => EnvFilter::new(default),
+        Some(os) => match os.to_str() {
+            Some("") => EnvFilter::new(default),
+            Some(spec) => EnvFilter::try_new(spec)
+                .unwrap_or_else(|e| fallback(&format!("invalid RUST_LOG `{spec}` ({e})"))),
+            None => fallback("RUST_LOG is set but not valid UTF-8"),
+        },
+    };
+    let installed = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_target(false)
+        // Color only on a real terminal — piped/captured stderr stays clean of
+        // ANSI escapes (agents redirect stderr to logs).
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .try_init();
+    if installed.is_err() {
+        eprintln!(
+            "nc: warning: a tracing subscriber is already installed; \
+             per-stage span timings keep its configuration"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point + dispatch
 // ---------------------------------------------------------------------------
@@ -751,6 +839,14 @@ pub fn run() -> Result<()> {
     // surfaces instead of being silently swallowed by the default no-op handler.
     install_cms_error_handler();
     let cli = Cli::parse();
+    // The tracing subscriber needs the parsed verbosity, so it is installed
+    // right after parsing and before any pipeline work emits spans.
+    init_tracing(match &cli.command {
+        Command::Convert(a) => Some(&a.report),
+        Command::Inspect(a) => Some(&a.report),
+        Command::Estimate(a) => Some(&a.report),
+        Command::Params => None,
+    });
     match cli.command {
         Command::Params => run_params(),
         Command::Convert(args) => run_convert(args),
@@ -890,7 +986,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     };
 
     // Stage 1 — decode.
-    let (image, info) = decode(&args.input)?;
+    let stage_started = Instant::now();
+    let (image, info) = info_span!("decode").in_scope(|| decode(&args.input))?;
+    let decode_ms = elapsed_ms(stage_started);
     log.info(format_args!(
         "decoded {:?} {}x{} (ir={})",
         info.format, info.width, info.height, info.ir_present
@@ -954,19 +1052,33 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
     // Optional IR export — before the main encode, so a failing IR write fails
     // the run without first writing the primary output/sidecar.
+    let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
-        encode::export_ir(&image, cfg.output.depth(), path)?;
+        let stage_started = Instant::now();
+        info_span!("ir_export").in_scope(|| encode::export_ir(&image, cfg.output.depth(), path))?;
+        ir_export_ms = Some(elapsed_ms(stage_started));
         log.info(format_args!("wrote IR plane {}", path.display()));
         report.ir_exported = Some(path.clone());
     }
 
     // Stage 5 — encode + effective-recipe sidecar.
-    let loss = encode::encode(
-        &rendered.image,
-        &cfg.output,
-        Some(&rendered.icc),
-        &args.output,
-    )?;
+    let stage_started = Instant::now();
+    let loss = info_span!("encode").in_scope(|| {
+        encode::encode(
+            &rendered.image,
+            &cfg.output,
+            Some(&rendered.icc),
+            &args.output,
+        )
+    })?;
+    report.timings = Some(Timings {
+        decode_ms,
+        film_base_ms: rendered.timings.film_base_ms,
+        algorithm_ms: rendered.timings.algorithm_ms,
+        color_ms: rendered.timings.color_ms,
+        ir_export_ms,
+        encode_ms: elapsed_ms(stage_started),
+    });
     report.loss = Some(loss);
     if loss.any_loss() {
         push_warning(

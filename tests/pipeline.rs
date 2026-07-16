@@ -43,12 +43,21 @@ impl Drop for TempDir {
     }
 }
 
-/// Run `nc` with `args`; return (exit code, stdout, stderr).
+/// Run `nc` with `args`; return (exit code, stdout, stderr). `RUST_LOG` is
+/// scrubbed so an ambient value on the developer/CI machine can't override the
+/// `-v`-derived tracing filter and flip the stderr assertions.
 fn run(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(NC)
-        .args(args)
-        .output()
-        .expect("failed to spawn nc binary");
+    run_env(args, &[])
+}
+
+/// [`run`] with extra environment variables set for the child.
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(NC);
+    cmd.args(args).env_remove("RUST_LOG");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to spawn nc binary");
     (
         out.status.code().expect("process terminated by signal"),
         String::from_utf8(out.stdout).expect("stdout is not UTF-8"),
@@ -249,7 +258,16 @@ fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
     ]);
     assert_eq!(code, 0, "HDRi export-ir should succeed:\n{stdout}");
     assert!(is_tiff(&ir), "IR plane TIFF must be written");
-    assert_eq!(json(&stdout)["ir_exported"], ir.to_str().unwrap());
+    let report = json(&stdout);
+    assert_eq!(report["ir_exported"], ir.to_str().unwrap());
+    // The optional ir_export_ms timing must appear exactly when the export ran
+    // (its absence is pinned by `convert_report_carries_per_stage_timings`).
+    assert!(
+        report["timings"]["ir_export_ms"]
+            .as_f64()
+            .is_some_and(|ms| ms >= 0.0),
+        "ir_export_ms must be reported when --export-ir runs: {report}"
+    );
 
     // HDR: no IR plane, so --export-ir fails loudly with exit 4 (Unsupported),
     // before writing the main output.
@@ -437,6 +455,90 @@ fn verbose_keeps_stdout_clean_json_and_logs_to_stderr() {
         !stdout.contains("decoded"),
         "stdout must not carry log lines"
     );
+    // -v also enables the tracing span-close timing lines (per stage), which
+    // must land on stderr only — e.g. `film_base: close time.busy=…`.
+    // `time.busy` pins the actual span-close line, not incidental substrings.
+    assert!(
+        stderr.contains("film_base") && stderr.contains("time.busy"),
+        "per-stage span timings should be on stderr with -v: {stderr}"
+    );
+    assert!(
+        !stdout.contains("time.busy"),
+        "stdout must not carry span timing lines"
+    );
+}
+
+#[test]
+fn invalid_rust_log_warns_and_falls_back() {
+    // A bad RUST_LOG must not break the run or pollute stdout: the run succeeds
+    // on the flag-derived filter and the rejection is reported on stderr
+    // (never silently misconfigured logging).
+    let (code, stdout, stderr) = run_env(
+        &["inspect", fixture("hdr-48bit.tif").to_str().unwrap()],
+        &[("RUST_LOG", "not[a=filter")],
+    );
+    assert_eq!(code, 0, "invalid RUST_LOG must not fail the run: {stderr}");
+    let report = json(&stdout);
+    assert_eq!(report["command"], "inspect");
+    assert!(
+        stderr.contains("invalid RUST_LOG"),
+        "the rejected filter must be reported on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn convert_report_carries_per_stage_timings() {
+    // The convert report gains a `timings` block: one wall-clock entry per
+    // pipeline stage. The stages are disjoint sub-intervals of the run, so
+    // their sum can never exceed the total `elapsed_ms`. Report-only —
+    // determinism of the image/sidecar is pinned by `convert_is_deterministic`.
+    let tmp = TempDir::new("timings");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, _err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0);
+    let report = json(&stdout);
+    let timings = report["timings"]
+        .as_object()
+        .unwrap_or_else(|| panic!("convert report must carry timings: {report}"));
+    let mut sum = 0.0;
+    for stage in [
+        "decode_ms",
+        "film_base_ms",
+        "algorithm_ms",
+        "color_ms",
+        "encode_ms",
+    ] {
+        let ms = timings[stage]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{stage} must be a number: {report}"));
+        assert!(ms >= 0.0, "{stage} must be non-negative: {ms}");
+        sum += ms;
+    }
+    // No --export-ir ⇒ no ir_export_ms entry.
+    assert!(timings.get("ir_export_ms").is_none(), "{report}");
+    let elapsed = report["elapsed_ms"].as_f64().unwrap();
+    assert!(
+        sum <= elapsed,
+        "stage sum ({sum} ms) cannot exceed the total ({elapsed} ms)"
+    );
+
+    // inspect keeps its existing shape: total only, no timings (`estimate`
+    // shares the same Report plumbing).
+    let (code, stdout, _err) = run(&["inspect", fixture("hdr-48bit.tif").to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let report = json(&stdout);
+    assert!(
+        report.get("timings").is_none_or(|v| v.is_null()),
+        "inspect must not report stage timings: {report}"
+    );
+    assert!(report["elapsed_ms"].is_number());
 }
 
 #[test]

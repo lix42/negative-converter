@@ -60,25 +60,30 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
   don't consume it.
 - Module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages}.rs`
-  (`stages::render` is the pure decode-to-encode core),
+  (`stages::render` is the pure decode-to-encode core; its `Instant`/span
+  instrumentation is report-only and never feeds back into the pixels),
   `algo/{mod,simple,density}.rs`, `cli.rs`, `main.rs`. `main`/`cli` are the only
   orchestrators; stages stay pure.
 
 ### Stack / commands
 
-Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
-`tiff`, `image`, `palette`, `lcms2`, `serde`/`serde_json`, `rayon`,
-`kamadak-exif` (see `Cargo.toml` for versions; bump with `cargo add`).
+Rust (edition 2024), crate `nc`: a library target (`lib.rs`, exists so the
+criterion benches in `benches/` can reach the pipeline) plus the thin `main.rs`
+binary — the CLI remains the only shipped interface. Dependencies: `clap`
+(`derive`), `tiff`, `image`, `palette`, `lcms2`, `serde`/`serde_json`, `rayon`,
+`kamadak-exif`, `tracing`/`tracing-subscriber` (see `Cargo.toml` for versions;
+bump with `cargo add`).
 
 - `cargo build` — build · `cargo test` — all tests · `cargo test <name>` — one test
 - `cargo clippy --all-targets` — lint (keep clean)
+- `cargo bench` — kernel benches (not a CI gate; baselines in `docs/progress.md`)
 - **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
   `cargo build` → `cargo test`. The gate is strict — warnings fail the build.
-- `Cargo.lock` is committed (binary crate). The crate-level `#![allow(dead_code)]`
-  is gone; the only remaining allows are three narrow, documented item-level ones
-  (`algo/mod.rs`, `pipeline/color.rs`) for API surface the single Step-1 path
-  doesn't exercise — don't add new ones without a comment saying who will use it.
+- `Cargo.lock` is committed (the crate ships a binary). No `#[allow(dead_code)]`
+  remains — but note the lib target makes every `pub` item "reachable", so the
+  dead-code lint no longer guards public API: don't add `pub` surface without a
+  consumer (the benches count; see `lib.rs`'s module doc).
 
 ## Conventions
 

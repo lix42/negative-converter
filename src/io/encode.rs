@@ -1,11 +1,12 @@
 //! [`LinearImage`] → 16-bit / 32-bit-float TIFF, embedded ICC, sidecar JSON,
 //! optional IR export.
 //!
-//! Pure-ish encode stage: the public `&Path` entry points wrap a thin
-//! `*_to_writer` core generic over `Write + Seek`, so the unit tests can encode
-//! into an in-memory `Cursor` and decode the bytes straight back — no temp files,
-//! fully deterministic. Crate-specific `tiff` types stay confined to this module
-//! (the neutral contract lives in [`crate::types`]).
+//! Pure-ish encode stage: the `&Path` entry points wrap a `*_to_writer` core
+//! generic over `Write + Seek`, so the unit tests (and, for [`encode_to_writer`],
+//! the criterion benches) can encode into an in-memory `Cursor` and decode the
+//! bytes straight back — no temp files, fully deterministic. Crate-specific
+//! `tiff` types stay confined to this module (the neutral contract lives in
+//! [`crate::types`]).
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -103,7 +104,11 @@ pub fn sidecar_path(output_path: &Path) -> PathBuf {
 // Writer-generic core (the testable seam)
 // ---------------------------------------------------------------------------
 
-fn encode_to_writer<W: Write + Seek>(
+/// The writer-generic encode core: quantize/scan + TIFF-encode into any
+/// `Write + Seek`. `pub` so the unit tests here and the criterion benches can
+/// encode into an in-memory `Cursor` (isolating the encode kernel from disk
+/// I/O); production callers use [`encode`], which owns file creation/flushing.
+pub fn encode_to_writer<W: Write + Seek>(
     writer: W,
     image: &LinearImage,
     params: &OutputParams,

@@ -302,7 +302,7 @@ pub trait Converter {
 
 <h3>Reports &amp; determinism</h3>
 <ul>
-  <li><code>--report json</code> — emit a machine-readable result (estimated values, clip warnings, timings, output path) to stdout or <code>--report-file</code>.</li>
+  <li><code>--report json</code> — emit a machine-readable result (estimated values, clip warnings, timings, output path) to stdout or <code>--report-file</code>. The <code>convert</code> report carries a per-stage <code>timings</code> block (<code>decode_ms</code>, <code>film_base_ms</code>, <code>algorithm_ms</code>, <code>color_ms</code>, <code>encode_ms</code>, plus <code>ir_export_ms</code> when <code>--export-ir</code> ran) alongside the total <code>elapsed_ms</code>; <code>inspect</code>/<code>estimate</code> report the total only. Timings live in the <strong>report only</strong> — never the image or the recipe sidecar — so byte-identical output determinism is untouched.</li>
   <li><code>--seed &lt;n&gt;</code> — fix any stochastic step (none in Step 1, reserved).</li>
   <li>Stable, documented exit codes (see Errors section).</li>
 </ul>
@@ -400,15 +400,18 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
   <li><code>--params &lt;json&gt;</code>, <code>--dump-params &lt;json&gt;</code></li>
   <li><code>--report json|none</code>, <code>--report-file &lt;path&gt;</code></li>
   <li><code>--strict</code> — promote report warnings (clipping, non-finite samples, …) to a failing exit (see the Errors section)</li>
-  <li><code>-v/--verbose</code>, <code>--quiet</code></li>
+  <li><code>-v/--verbose</code>, <code>--quiet</code> — stderr verbosity (stdout stays report-only). <code>-v</code> enables progress lines and structured per-stage <code>tracing</code> span timings (<code>-vv</code> for debug). Precedence: a set <code>RUST_LOG</code> overrides the flag-derived filter entirely (the explicit opt-in for finer directives); an invalid <code>RUST_LOG</code> is warned about on stderr and the flags apply.</li>
 </ul>
 
 <h2 id="code">10. Code architecture (Rust)</h2>
 <p>Pure functions per stage; the CLI is the only orchestrator. Suggested layout:</p>
 <pre><code>nc/
 ├── Cargo.toml
+├── benches/
+│   └── kernels.rs        # criterion benches for the per-pixel hot kernels
 └── src/
-    ├── main.rs           # CLI parsing (clap) → orchestration only
+    ├── main.rs           # binary entry point → exit-code mapping only
+    ├── lib.rs            # library target (so benches reach the pipeline)
     ├── cli.rs            # arg structs, recipe load/merge, report emit
     ├── io/
     │   ├── decode.rs     # SilverFast HDR/HDRi (TIFF) → LinearImage(+IR)
@@ -422,6 +425,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
     │   ├── simple.rs     # baseline inversion
     │   └── density.rs    # density-domain inversion
     └── types.rs          # LinearImage, FilmBase, params, errors</code></pre>
+<p><code>cargo bench</code> runs the kernel benches (density conversion, anchored render, simple inversion, u16/f32 encode) on deterministic synthetic images. Not a CI gate — bench runners are too noisy for a hard gate; baseline numbers live in <code>progress.md</code> and are compared manually when a kernel changes.</p>
 <h4>Candidate crates</h4>
 <table>
   <thead><tr><th>Concern</th><th>Crate(s)</th></tr></thead>
@@ -434,6 +438,8 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
     <tr><td>EXIF/metadata</td><td><code>kamadak-exif</code> (read), <code>rexiv2</code> if richer writing needed</td></tr>
     <tr><td>Recipe / report JSON</td><td><code>serde</code>, <code>serde_json</code></td></tr>
     <tr><td>Parallelism</td><td><code>rayon</code></td></tr>
+    <tr><td>Structured stderr logging / spans</td><td><code>tracing</code>, <code>tracing-subscriber</code></td></tr>
+    <tr><td>Benchmarks (dev-only)</td><td><code>criterion</code></td></tr>
   </tbody>
 </table>
 

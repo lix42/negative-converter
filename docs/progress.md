@@ -1133,9 +1133,113 @@ Both are tracked in `TASKS.md` as dependents of this task.
   record results here, file follow-up tasks for defects.
 
 ## perf-instrumentation
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-14
 
 - Goal: per-stage timings in the JSON report, tracing spans to stderr behind
   `-v`, and criterion benches for the hot kernels — local-only, report-side
   (byte-identical output untouched). Pre-release performance visibility.
+- **Done.** All three layers landed; full CI gate clean (`fmt --check`,
+  `clippy --all-targets -D warnings`, `build`, `test`); suite is **152 tests**
+  (132 unit + 20 E2E — this task added two E2E plus extended assertions in two
+  existing; unit count reflects the rebase onto the `--output-hdr` rename #20).
+
+### What was built
+- **Per-stage `timings` in the convert report.** `Report` gained
+  `timings: Option<Timings>` (serialize-only, `skip_serializing_if`, like the
+  rest of the report): `decode_ms`, `film_base_ms`, `algorithm_ms`, `color_ms`,
+  `encode_ms`, plus `ir_export_ms` only when `--export-ir` ran. Populated from
+  `Instant` pairs; the stages are disjoint sub-intervals of the run so their sum
+  is ≤ `elapsed_ms` (pinned by the new `convert_report_carries_per_stage_timings`
+  E2E, which also pins that `inspect` stays total-only — `estimate` shares the
+  same Report plumbing). **No new
+  knob:** timings are report-side observability, not a conversion parameter, so
+  there is no CLI flag / recipe key / merge arm — the recipe sidecar and output
+  bytes are untouched (determinism E2E still byte-identical).
+- **How `render` reports its stage times.** The task spec offered "time inside
+  `render`" vs "split the calls in the orchestrator"; splitting would have
+  dissolved the pure in-memory core `pipeline-orchestration` established, so
+  `stages::render` measures its three stages and returns a `StageTimings`
+  (plain `f64` ms) on `Rendered` — the same reporting-channel pattern as
+  `ConvertReport`. The clock reads are the one documented impurity; nothing
+  reads back into the pixel path (same inputs ⇒ bit-identical pixels/ICC).
+- **`tracing` spans to stderr.** `tracing` + `tracing-subscriber` (env-filter
+  feature); `cli::init_tracing` installs a `fmt` subscriber writing to
+  **stderr** with `FmtSpan::CLOSE`, so each stage span (`decode`, `film_base`,
+  `algorithm`, `color`, `ir_export`, `encode`) prints a close line with
+  `time.busy`/`time.idle` at `-v`. Filter derives from the existing flags:
+  `--quiet` ⇒ `error`, default ⇒ `warn` (spans silent), `-v` ⇒ `info`, `-vv` ⇒
+  `debug`. **Precedence:** a set `RUST_LOG` overrides the flag-derived default
+  (the explicit opt-in); an *invalid* `RUST_LOG` warns on stderr and falls back
+  — never silently misconfigured. ANSI only when stderr is a terminal (piped
+  logs stay escape-free). The existing `Log` (progress lines, `nc: warning:`
+  echo) is kept — its exact wording is E2E-pinned and warnings must print
+  *without* `-v`; tracing is additive structure, and future work (e.g.
+  `tracing-chrome`) hooks in without new plumbing.
+- **Criterion benches (`benches/kernels.rs`).** Deterministic synthetic 2048 ×
+  1536 (~3.1 MP) negative (fixed arithmetic pattern, no RNG). Benches:
+  `to_density`, `render_auto` / `render_none` (their delta isolates the
+  auto-Dmax percentile), `simple_invert`, `encode_u16` / `encode_f32` (into an
+  in-memory cursor — no disk I/O). Not a CI gate (spec: bench runners are too
+  noisy); compare against the baselines below.
+- **Crate became lib + thin bin** (`src/lib.rs` + `main.rs` delegating to
+  `nc::cli`) because criterion benches can only link a library target. Newly
+  `pub` for the benches: `density::{DensityImage, to_density, render}` and
+  `encode::encode_to_writer` (the bench consumer is noted on the
+  `DensityImage` and `encode_to_writer` docs). The
+  three documented `#[allow(dead_code)]`s (algo/mod.rs ×2, color.rs) were
+  removed — moot now that `pub` items are reachable via the lib target.
+  **Hygiene caveat for dependents:** with a lib target rustc's dead-code lint
+  no longer flags unused `pub` items, so don't add public surface casually
+  (noted in `lib.rs`'s module doc).
+
+### Baseline numbers (2026-07-14, M-series macOS dev machine, `cargo bench`)
+| bench | time (median) | throughput |
+|---|---|---|
+| `kernels/to_density` | 3.11 ms | ~1.01 Gelem/s |
+| `kernels/render_auto` | 3.48 ms | ~904 Melem/s |
+| `kernels/render_none` | 1.98 ms | ~1.59 Gelem/s |
+| `kernels/simple_invert` | 1.39 ms | ~2.26 Gelem/s |
+| `kernels/encode_u16` | 8.87 ms | ~355 Melem/s |
+| `kernels/encode_f32` | 1.81 ms | ~1.73 Gelem/s |
+
+(~3.1 MP synthetic image, elements = pixels. `render_auto − render_none` ≈
+1.5 ms ⇒ the auto-Dmax percentile costs roughly as much as the pow10 pass
+itself at this size; fine, it's capped at ~1M samples on large scans.)
+
+### Overhead spot-check (hyperfine unavailable; 25-run loop on the committed
+  502×462 fixture, release build, default verbosity)
+- Wall clock: baseline (pre-change HEAD) mean 56 ms vs instrumented 59 ms —
+  process-spawn slop dominates; in-process `elapsed_ms` mean **22.3 ms baseline
+  vs 21.6 ms instrumented** (median 21.9 vs 21.6). Within noise — with the
+  filter at `warn`, disabled tracing spans cost nanoseconds and the report adds
+  five `Instant` reads. Real-scan fixture run showed a sane breakdown:
+  decode 0.9 / film_base 0.01 / algorithm 2.8 / color 17.9 / encode 1.1 ms
+  (sum 22.7 ≤ elapsed 22.9) — the lcms2 color transform is the dominant stage,
+  a useful lead for `real-scan-verification`'s resource row.
+
+### Review
+- Ran `pr-review-toolkit:review-pr` (code / tests / silent-failure / comments)
+  on the working-tree diff. **Fixed from round 1:** non-UTF-8 `RUST_LOG` was
+  silently ignored (now `var_os` + a stderr warning; empty-but-set documented
+  as unset); `tracing_subscriber`'s `init()` would panic if an embedder of the
+  new lib target had already installed a subscriber (now `try_init()` + stderr
+  warning, keeping the run alive); `--quiet` help text notes a set `RUST_LOG`
+  still applies (documented precedence); E2E harness scrubs `RUST_LOG` so an
+  ambient value can't flip the stderr assertions (`run_env` variant added);
+  new `invalid_rust_log_warns_and_falls_back` E2E; `ir_export_ms` presence
+  asserted in the export-ir E2E; the verbose test pins the actual span-close
+  line via `time.busy`.
+
+### Notes for dependents
+- `real-scan-verification` can now fill its resource row from `--report json`'s
+  `timings` (plus `/usr/bin/time -l` for peak RSS) on the full-size scans, and
+  `cargo flamegraph` remains the tool for intra-stage hotspots (the one-off
+  analyses the task file mentions were deferred to that task since the big
+  assets are absent in this environment).
+- `conversion-versioning`'s `compare` step wants "timing per frame" — read it
+  straight off the convert report's `timings` block (total via `elapsed_ms`,
+  per-stage breakdown in `timings`); no new plumbing needed on that side.
+- The report shape change is documented in design-spec §8 (Reports &
+  determinism) and §9 Global (`-v` semantics, `RUST_LOG` precedence); §10 shows
+  the lib/benches layout and the new crates. Both `.md` and `.html` updated.

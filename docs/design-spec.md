@@ -305,7 +305,12 @@ writes the same shape with the resolved values. Example:
 ### Reports & determinism
 
 - `--report json` — emit a machine-readable result (estimated values, clip
-  warnings, timings, output path) to stdout or `--report-file`.
+  warnings, timings, output path) to stdout or `--report-file`. The `convert`
+  report carries a per-stage `timings` block (`decode_ms`, `film_base_ms`,
+  `algorithm_ms`, `color_ms`, `encode_ms`, plus `ir_export_ms` when
+  `--export-ir` ran) alongside the total `elapsed_ms`; `inspect`/`estimate`
+  report the total only. Timings live in the **report only** — never the image
+  or the recipe sidecar — so byte-identical output determinism is untouched.
 - `--seed <n>` — fix any stochastic step (none in Step 1, reserved).
 - Stable, documented **exit codes** (see §11).
 
@@ -471,7 +476,11 @@ crossover.
 - `--report json|none`, `--report-file <path>`
 - `--strict` — promote report warnings (clipping, non-finite samples, …) to a
   failing exit (see §11)
-- `-v/--verbose`, `--quiet`
+- `-v/--verbose`, `--quiet` — stderr verbosity (stdout stays report-only). `-v`
+  enables progress lines and structured per-stage `tracing` span timings
+  (`-vv` for debug). Precedence: a set `RUST_LOG` overrides the flag-derived
+  filter entirely (the explicit opt-in for finer directives); an invalid
+  `RUST_LOG` is warned about on stderr and the flags apply.
 
 ## 10. Code architecture (Rust)
 
@@ -480,8 +489,11 @@ Pure functions per stage; the CLI is the only orchestrator. Suggested layout:
 ```
 nc/
 ├── Cargo.toml
+├── benches/
+│   └── kernels.rs        # criterion benches for the per-pixel hot kernels
 └── src/
-    ├── main.rs           # CLI parsing (clap) → orchestration only
+    ├── main.rs           # binary entry point → exit-code mapping only
+    ├── lib.rs            # library target (so benches reach the pipeline)
     ├── cli.rs            # arg structs, recipe load/merge, report emit
     ├── io/
     │   ├── decode.rs     # SilverFast HDR/HDRi (TIFF) → LinearImage(+IR)
@@ -497,6 +509,11 @@ nc/
     └── types.rs          # LinearImage, FilmBase, params, errors
 ```
 
+`cargo bench` runs the kernel benches (density conversion, anchored render,
+simple inversion, u16/f32 encode) on deterministic synthetic images. Not a CI
+gate — bench runners are too noisy for a hard gate; baseline numbers live in
+`progress.md` and are compared manually when a kernel changes.
+
 ### Candidate crates
 
 | Concern | Crate(s) |
@@ -509,6 +526,8 @@ nc/
 | EXIF/metadata | `kamadak-exif` (read), `rexiv2` if richer writing needed |
 | Recipe / report JSON | `serde`, `serde_json` |
 | Parallelism | `rayon` |
+| Structured stderr logging / spans | `tracing`, `tracing-subscriber` |
+| Benchmarks (dev-only) | `criterion` |
 
 ## 11. Error handling & exit codes
 

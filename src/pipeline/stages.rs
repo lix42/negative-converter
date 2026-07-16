@@ -4,7 +4,14 @@
 //! This is the in-memory core of the `convert` pipeline (design-spec §6, stages
 //! 2–4). Decode (stage 1) and encode (stage 5) are I/O and stay with the
 //! orchestrator (`cli`); everything here is pure `(input, params) -> output` so
-//! it composes and unit-tests without touching the filesystem.
+//! it composes and unit-tests without touching the filesystem — with one
+//! documented exception: [`render`] reads wall clocks and emits `tracing` spans
+//! for the report/stderr diagnostics (see its doc; the pixels stay
+//! deterministic).
+
+use std::time::Instant;
+
+use tracing::info_span;
 
 use crate::algo::{self, AlgoParams, ConvertReport};
 use crate::pipeline::{color, film_base};
@@ -23,6 +30,22 @@ pub struct Rendered {
     /// Algorithm-reported diagnostics (e.g. the resolved `Dmax` anchor) for the
     /// JSON report.
     pub convert: ConvertReport,
+    /// Wall-clock per-stage timings measured around the calls above, for the
+    /// JSON report's `timings` block (like [`ConvertReport`], a reporting
+    /// channel — it never influences the rendered pixels).
+    pub timings: StageTimings,
+}
+
+/// Wall-clock durations of the three in-memory stages [`render`] runs, in
+/// milliseconds. Report-only diagnostics: the orchestrator folds them into the
+/// convert report's `timings` block alongside its own decode/encode timings.
+/// Never serialized into the recipe sidecar and never consumed by any stage, so
+/// the byte-identical-output determinism contract is untouched.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimings {
+    pub film_base_ms: f64,
+    pub algorithm_ms: f64,
+    pub color_ms: f64,
 }
 
 /// Assemble the algorithm's parameter set for the selected `algorithm` from the
@@ -53,27 +76,56 @@ pub fn algo_params(
 /// into the output color space. Returns the color-transformed image, the ICC
 /// blob to embed, and the resolved film base.
 ///
-/// Pure and total in its inputs: any failure (a degenerate estimated film base,
-/// an out-of-bounds `--base-region`, an unreadable custom ICC profile) surfaces
-/// as an [`NcError`](crate::types::NcError) with the right exit code, never a
-/// silently-wrong image. The IR plane is carried through untouched (Step-1 rule:
-/// preserve, don't consume).
+/// Deterministic and total in its inputs: any failure (a degenerate estimated
+/// film base, an out-of-bounds `--base-region`, an unreadable custom ICC
+/// profile) surfaces as an [`NcError`](crate::types::NcError) with the right
+/// exit code, never a silently-wrong image. The IR plane is carried through
+/// untouched (Step-1 rule: preserve, don't consume).
+///
+/// Instrumentation (the one deliberate impurity): each stage is timed with
+/// [`Instant`] pairs (returned as [`StageTimings`] for the JSON report) and
+/// wrapped in a `tracing` span, so `-v` shows per-stage close timings on
+/// stderr. Neither reads back into the pipeline — same inputs still produce
+/// bit-identical pixels/ICC.
 pub fn render(
     image: &LinearImage,
     film_base_params: &FilmBaseParams,
     algo_params: AlgoParams,
     output_params: &OutputParams,
 ) -> Result<Rendered> {
-    let film_base = film_base::estimate(image, film_base_params)?;
-    let converter = algo::build(algo_params);
-    let (positive, convert) = converter.convert_reported(image, &film_base)?;
-    let (image, icc) = color::to_output(&positive, output_params)?;
+    let started = Instant::now();
+    let film_base =
+        info_span!("film_base").in_scope(|| film_base::estimate(image, film_base_params))?;
+    let film_base_ms = ms_since(started);
+
+    let started = Instant::now();
+    let (positive, convert) = info_span!("algorithm").in_scope(|| {
+        let converter = algo::build(algo_params);
+        converter.convert_reported(image, &film_base)
+    })?;
+    let algorithm_ms = ms_since(started);
+
+    let started = Instant::now();
+    let (image, icc) =
+        info_span!("color").in_scope(|| color::to_output(&positive, output_params))?;
+    let color_ms = ms_since(started);
+
     Ok(Rendered {
         image,
         icc,
         film_base,
         convert,
+        timings: StageTimings {
+            film_base_ms,
+            algorithm_ms,
+            color_ms,
+        },
     })
+}
+
+/// Milliseconds elapsed since `started`, as the `f64` the report carries.
+fn ms_since(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]
