@@ -123,6 +123,68 @@ After decode, the image is normalized to **linear `f32` scanner RGB** in `[0,1]`
 (plus an optional `f32` IR plane). This is the single input contract every
 algorithm consumes — nothing downstream needs to know the on-disk format.
 
+### Terminology & value domains
+
+**Read this before using "high", "low", "bright", or "dark" anywhere in the code
+or docs.** A pixel passes through several value *spaces* between scan and output,
+and one runs **backwards** relative to the others, so an unqualified "high value"
+is ambiguous. Everything below is **per channel** (RGB) — each pixel carries three
+values in every space; the lone exception is `Dmax` (a scalar, below). The IR
+plane is a separate single channel, carried but not consumed (§6.1).
+
+| Space | Meaning | "Higher" means | Range (`f32`) | Where in code |
+|---|---|---|---|---|
+| **transmission** (raw scan value) | fraction of light the film passes | more transparent film, thinner negative, brighter pixel *in the raw scan* — a **darker** scene | `[0, 1]` (= `u16`/65535) | `io::decode`, `LinearImage.rgb` |
+| **film base / `Dmin`** | the unexposed rebate's transmission — the per-channel *relative* maximum transmission | (the ceiling of transmission) | `(0, 1]` | `FilmBase`, `film_base::estimate` |
+| **density `D` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `D′ = density_scale·D + density_offset` (corrected) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `D′` shifted by the offset | `density::to_density`, `DensityImage.density` |
+| **positive** (scene-referred linear) | the rendered positive: `10^(γ·(D′ − Dmax))` then print controls | **brighter** positive — a **brighter** scene | `[0, ∞)`, nominally `~[0, 1]`, **unclamped** (HDR); may dip `< 0` after black-point | `density::render`, `stages::render` |
+| **output sample** (terminal) | the written TIFF value | brighter | `u16 [0, 65535]` (clamped to `[0,1]` first) or `f32` (unclamped) | `io::encode` |
+
+**The one rule.** As the depicted **scene luminance rises**:
+`transmission ↓ · density ↑ · positive ↑ · output ↑`. Transmission is the only
+axis that falls.
+
+**"bright" / "dark" / "highlight" / "shadow" always mean the *scene's*
+luminance** — never a raw pixel value. A scene highlight is the **densest**
+negative and the **lowest** transmission; a scene shadow (including the unexposed
+base) is the **thinnest** negative and the **highest** transmission. So never call
+a high-transmission value "bright" — say "high-transmission". When naming a numeric
+value, name its space: "high density", "high transmission", "bright positive".
+
+**The film-base paradox.** The unexposed base is at once the **highest
+transmission**, **zero density** (`D = 0`), and renders to **near-black positive** —
+it depicts scene black. *Brightest in the scan = darkest in the positive.*
+
+**`Dmin`** is the film base **transmission** — the divisor the conversion anchors
+on. It is the per-channel *relative* maximum (no image pixel out-transmits it),
+**not** a value near 1: the orange mask and scanner gain pull channels down (real
+Ektar base ≈ `[0.53, 0.26, 0.16]`, blue near the bottom). Named for minimum
+*density* but stored as a transmission.
+
+**`Dmax`** is nc's **display-white density anchor**: the corrected density `D′`
+the render maps to positive `1.0`. It lives in **density space** (a `D′` value,
+where the base is `0`) and is a **scalar** pooled across channels — a per-channel
+`Dmax` would apply three gains in `10^(γ·(D′ − Dmax))`, i.e. a white balance, which
+is the print-render stage's job, not the anchor's. ⚠️ **Distinct from classic
+photographic film `Dmax`** (the negative's physical maximum optical density, at the
+most-exposed point): nc's `Dmax` is a rendering anchor, though the `dmax-reference`
+design derives it *from* a fully-exposed reference frame (near the film's physical
+Dmax). Its **acquisition** (per-frame `auto` vs roll-fixed reference) is being
+decided in `dmax-reference` (§12); its **meaning here — a scalar display-white
+anchor in density units — is fixed.** Never mix it with a transmission (a base
+transmission plus a range is a unit error).
+
+**Domain glossary.** *auto-base* — auto-detecting `Dmin` from the unexposed rebate
+(`FilmBaseSource::Auto`). *rebate* — the unexposed film leader between holder and
+picture; maximum transmission, zero density. *holder* — the opaque scanner carrier;
+near-zero transmission (`< 0.05`). *base-region* — a user rectangle sampled for
+`Dmin` (`FilmBaseSource::Region`). *scene white / scene black* — the brightest /
+darkest depicted scene luminance (highest / lowest `D′`). *display (paper) white /
+black* — the output extremes (`1.0` / `0.0`). *uniform / spread* — a region is
+uniform when its per-channel relative spread `(p_hi − p_lo) / p_hi ≤ 0.15`; "spread"
+is that confidence figure. *candidate* — a holder-backed uniform band the auto
+detector proposes as possible rebate.
+
 ## 5. Output formats
 
 - **Container:** TIFF (BigTIFF when size requires 64-bit offsets).

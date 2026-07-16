@@ -111,6 +111,13 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 
 ## Conventions
 
+- **Value terms (high/low/bright/dark).** Before using these in code or docs, read
+  design-spec §4 "Terminology & value domains". A pixel lives in several
+  **per-channel** spaces; as scene luminance rises, `transmission ↓ · density ↑ ·
+  positive ↑ · output ↑` (transmission runs backwards). "bright"/"dark" always mean
+  the *scene*, never a raw pixel value — the film base is the highest transmission
+  yet renders to black. `Dmin` is a transmission (the film base); `Dmax` is a
+  **scalar** display-white anchor in **density** units — never conflate the two.
 - **Prefer pure functions over classes/structs-with-behavior.** Each pipeline
   stage is a pure `(input, params) -> output` function; the CLI is the only
   orchestrator. (Matches the global guidance in `~/.claude/CLAUDE.md`.)
