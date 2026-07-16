@@ -72,6 +72,18 @@ graph TD
   algo-density --> bw-support
   pipeline-orchestration --> bw-support
   dmax-white-anchor --> bw-support
+  film-base-estimation --> film-base-content-fallback
+  auto-base-redesign --> ir-holder-detection
+  auto-base-redesign --> auto-base-neutral-stock
+  dmax-white-anchor --> dmax-reference
+  pipeline-orchestration --> roll-conversion
+  dmax-white-anchor --> roll-conversion
+  pipeline-orchestration --> conversion-versioning
+  roll-conversion --> base-acquisition-planner
+  auto-base-redesign --> base-acquisition-planner
+  ir-holder-detection --> base-acquisition-planner
+  film-base-content-fallback --> base-acquisition-planner
+  dmax-reference --> base-acquisition-planner
 ```
 
 Dependency list (a task is executable when all its deps are `[x]` done):
@@ -96,6 +108,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
 - `regional-color-balance` (post-MVP): `algo-density`
 - `bw-support` (post-MVP): `algo-density`, `pipeline-orchestration`, `dmax-white-anchor`
+- `film-base-content-fallback` (post-MVP): `film-base-estimation`
+- `ir-holder-detection` (post-MVP): `auto-base-redesign`
+- `auto-base-neutral-stock` (post-MVP): `auto-base-redesign`
+- `dmax-reference` (post-MVP): `dmax-white-anchor`
+- `roll-conversion` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
+- `base-acquisition-planner` (post-MVP): `roll-conversion`, `auto-base-redesign`, `ir-holder-detection`, `film-base-content-fallback`, `dmax-reference`
+- `conversion-versioning` (post-MVP): `pipeline-orchestration`
 
 > **Post-MVP follow-ups** (Phases 5–6) are recorded for continuity and are **not**
 > blockers of `pipeline-orchestration` / the Step-1 MVP. Phase 5 came out of
@@ -139,6 +158,9 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Robust auto film-base detection](tasks/auto-base-redesign.md)
 - [ ] [Light film holder support](tasks/white-holder-support.md)
 - [ ] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
+- [ ] [IR-assisted film-holder detection](tasks/ir-holder-detection.md)
+- [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base-content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `auto-base-redesign` (tell that task's owner)
+- [ ] [Neutral-base robustness for auto film-base detection](tasks/auto-base-neutral-stock.md)
 
 ### Phase 6: Conversion quality (NLP-parity follow-ups)
 > Default-output quality gaps identified by the PR #12 review and the Negative
@@ -146,6 +168,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > only — no ML (the "AI-friendly ≠ ML" rule holds).
 
 - [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md)
+- [ ] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md)
 - [ ] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [ ] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [ ] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
@@ -164,3 +187,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > deliberately separate, opt-in roadmap item (design-spec §12).
 
 - [ ] [Performance instrumentation](tasks/perf-instrumentation.md)
+- [ ] [Conversion versioning & baseline comparison](tasks/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
+
+### Phase 9: Roll workflow (batch conversion)
+> Two conversion workflows established in the 2026-07 design discussion: **roll**
+> (detect the base + Dmax once, convert the whole roll with a frozen recipe —
+> strongly preferred) and **single** (per-frame best-effort). "Auto mode" is just
+> roll conversion's default behavior on a batch. Roll-fixed `Dmin` / `Dmax`
+> depend on `dmax-reference`; the cascade depends on the detectors above.
+
+- [ ] [Roll conversion (batch + frozen recipe)](tasks/roll-conversion.md)
+- [ ] [Base-acquisition planner (the cascade)](tasks/base-acquisition-planner.md)

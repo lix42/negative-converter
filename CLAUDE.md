@@ -24,6 +24,9 @@ explicitly corrected once already.
 - `docs/tasks/<name>.md` — per-task spec (goal / design / how-to-verify / deps).
 - `docs/progress.md` — execution log; read the relevant section before starting a
   task, append to your task's section as you work.
+- `docs/reports/<name>.md` — versioned conversion baselines / comparisons.
+  `v0-baseline.md` records the current default-output behavior (the reference point
+  future versions are measured against; see the `conversion-versioning` task).
 - `docs/negative-convertor-research-report.md` — background research (image
   science, library survey). Context, not spec.
 

@@ -939,6 +939,43 @@ a task; update your own section as you work. Append entries — don't rewrite th
 - Goal: robust `--auto-base` film-base detection on real scan layouts (dark
   holder → rebate → picture), replacing the best-effort Step-1 heuristic.
 
+### Scope change — content-based source reassigned (2026-07-15)
+
+A design pass (Phoenix/Ektar real-scan verification + workflow discussion) moved
+work out of this task. The task file couldn't be edited during the pass (agents
+active on it), so this note is the authoritative redirect for whoever picks it up.
+
+**Remove from scope — the Content-based source bullet.** The "Also in this task's
+scope" section lists a **Content-based source (ladder Tier 3)** item — the
+`film_base.source = "content"` variant, the `--base-content` flag, per-channel
+high-percentile of exposed content, its report wiring, and its tests. **That is
+now owned solely by the new `film-base-content-fallback` task**
+(`docs/tasks/film-base-content-fallback.md`). Drop it from this task's
+implementation *and its verification* so the two tasks don't both build the same
+enum/flag/report/tests.
+
+**Keep in scope (unchanged):** the inward-scan detector, the **uniformity warning
+on `--base-region`**, and **`nc inspect` reporting candidate rebate regions**. The
+only remaining content-mode responsibility here is a **one-line cross-reference**:
+when auto-detection refuses, the failure message should *suggest* `--base-content`
+(never implement it or silently fall back).
+
+**Two follow-ups now layer on top of this task (no action needed here, but read
+them so you don't bake in assumptions they'll have to unwind):**
+
+- `ir-holder-detection` — uses the IR plane to mask the holder (0–4 edges)
+  content-independently, feeding the RGB rebate search; may replace the RGB-only
+  holder-classification step where IR is present. Largely sidesteps
+  `white-holder-support` (opacity, not color, is the IR signal).
+- `auto-base-neutral-stock` — hardens detection for near-neutral bases (Harman
+  Phoenix, R/B ≈ 0.84) where base color isn't a usable discriminator. Real-scan
+  verification found opposite bases across stocks (Ektar orange R/B 2.73, Phoenix
+  neutral 0.85), so any confidence gate that assumes a colored/orange base needs a
+  color-independent corroborator (flatness / geometry / cross-frame value
+  agreement). **Don't hard-code an orange-mask assumption.**
+
+Both are tracked in `TASKS.md` as dependents of this task.
+
 ## white-holder-support
 **Status:** not started
 **Updated:** —
