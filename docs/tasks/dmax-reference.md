@@ -53,9 +53,14 @@ machinery stays; the default and the acquisition change.
   reference-derived, fallback, and CLI `Dmax` behave identically. Measure a
   **single scalar** from the fully-exposed reference's uniform interior — a
   documented reduction of its corrected R/G/B density to one value (e.g. the
-  luma/gray density) — and freeze it into the roll recipe (`density.dmax =
-  { "reference": … }` resolving to a scalar, or `{ "explicit": <d> }`). Add a flag
-  to point at the reference frame / region (mirror `--base-region`).
+  luma/gray density). **Freeze the resolved *scalar* into the roll recipe**
+  (`density.dmax = { "explicit": <d> }`), and record the reference frame/region as
+  **provenance** (report/`meta`), *not* as a re-read directive in the recipe. A
+  `{ "reference": … }` form baked into the frozen recipe would make the apply phase
+  re-read an external file — so the same recipe hash could yield different output
+  if that file changes or is missing, breaking the plan→recipe→**deterministic
+  apply** contract (`roll-conversion`). Add a flag to point at the reference frame
+  / region during the *plan* phase (mirror `--base-region`).
 - **Default becomes a fixed `Dmax`**, resolved in order: measured reference →
   per-stock constant → a nominal **corrected-density** anchor (e.g. `Dmax ≈ 2.0`,
   a scene-independent placement expressed *in density units*). Note `Dmax` lives
@@ -66,6 +71,11 @@ machinery stays; the default and the acquisition change.
   exposure normalization (lower priority per the user).
 - Keep `--d-max` (scalar) and `--no-d-max` (scene-referred HDR) as today.
 - Interacts with `roll-conversion` (`Dmax` is roll-fixed alongside `Dmin`).
+- **This changes the default render** (frame-local auto-`Dmax` → fixed anchor) — a
+  default-output change that **must bump `pipeline_version`** per
+  `conversion-versioning` (its golden-output gate enforces this when that task has
+  shipped; if `dmax-reference` lands first, bump the version by hand so outputs
+  aren't mislabeled `v0`). Coordinate the release of the two.
 
 ## How to Verify
 
