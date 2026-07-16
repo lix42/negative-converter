@@ -65,7 +65,12 @@ visible on all six:
 
 1. **Too dark.** Even the daylight portrait (936) renders the white tee as dark
    grey. Auto-Dmax anchors the 99.5th-percentile corrected density to white and
-   the contrasty default gamma crushes everything below.
+   the contrasty default gamma crushes everything below. These frames are
+   **uncropped** (rebate/holder borders in-frame), and the dark holder pixels
+   have the *highest* density of anything, so they likely capture much of the top
+   0.5% and pull the anchor high — dimming the scene (`bw-support` PR #21, finding
+   4). So the darkness is **anchor pollution + contrasty gamma**, not just
+   exposure; `ir-holder-detection` + `dmax-reference` are the fixes.
 2. **Blue color cast.** Ektar → cool/blue; Phoenix → blue-magenta. The per-channel
    base division neutralizes the *shadow* anchor, but there is **no neutral white
    balance** on the mid/highlights, so a cast rides through the tones.

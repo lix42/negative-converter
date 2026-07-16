@@ -32,6 +32,13 @@ roll. The leader is uniform and always present (film is light-struck during
 loading), so it is a reliable per-roll `Dmax` reference, measured per-channel from
 its interior just as `Dmin` is measured from the unexposed frame.
 
+A second failure of per-frame auto-`Dmax` (noted in `bw-support`, PR #21 finding
+4): on **uncropped** frames the dark holder / dust sit at the *top* of the
+corrected-density distribution and can capture the 99.5th-percentile anchor,
+dimming the render. A roll-fixed reference `Dmax` sidesteps per-frame anchoring
+entirely; `ir-holder-detection`'s holder mask is the complementary
+border-exclusion fix for anyone who keeps per-frame auto-`Dmax`.
+
 **Superseding note:** this task **supersedes the "Dmax is frame-local, auto by
 default" decision from the shipped `dmax-white-anchor` task** — the render
 machinery stays; the default and the acquisition change.

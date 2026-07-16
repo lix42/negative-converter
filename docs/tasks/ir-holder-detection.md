@@ -46,15 +46,27 @@ holder, bottom/left = film, right = partial, matching the RGB heatmap.
   whole-edge label is just the degenerate all-segments-agree case.
 - IR finds the holder, **not** the rebate — base / picture / leader are all bright
   in IR — so this is a masking pre-step, not a base estimator on its own.
-- **Gate to C-41 color negative — by an explicit signal, not IR-plane presence.**
-  An IR plane does **not** imply C-41: a silver B&W negative can be scanned as
-  HDRi *with* an IR plane, and the decoded image carries no film-type signal —
-  silver blocks IR, so dense silver regions are dark in IR and would be
-  *misclassified as holder*. So enable this path only under an **explicit
-  color-negative declaration** (e.g. a `--film-type` / color-model selection,
-  coordinated with `bw-support`), default **off** when the stock is unknown or
-  B&W. HDR 48-bit scans (no IR plane) fall back to RGB-only holder logic
-  regardless.
+- **Gate on film type (silver vs chromogenic) — by an explicit signal, not
+  IR-plane presence and not `color_model`.** The axis that matters is IR
+  transmission: **chromogenic** dyes (C-41 — colour *and* C-41 B&W) are
+  IR-transparent, so this path works; **silver** B&W blocks IR (dense silver
+  reads dark → misclassified as holder), so it must be off. IR-plane presence
+  does **not** imply chromogenic (a silver B&W scan can be HDRi with an IR
+  plane), and the decoded image carries no film-type signal — so enable this
+  path only under an explicit **`--film-type` (silver | chromogenic)**
+  declaration. That is the **same knob the IR dust-removal task (roadmap item 1)
+  needs** — `bw-support` (per PR #21) specifies that guard keys on *film type*,
+  not `color_model = mono` — so it is a **shared dependency neither task owns
+  yet**; coordinate rather than each inventing it. Default **off** when the film
+  type is unknown or silver; HDR 48-bit scans (no IR plane) fall back to
+  RGB-only holder logic regardless.
+- **Second consumer — auto-`Dmax` border exclusion.** The holder mask this
+  produces is exactly what `bw-support` (PR #21, finding 4) flags as needed: on
+  an uncropped frame the dark holder/dust sit at the *top* of the corrected-
+  density distribution and can capture the 99.5th-percentile auto-`Dmax` anchor,
+  dimming the render. Excluding holder pixels from the anchor statistics is a
+  natural reuse of this mask (and complements `dmax-reference`, which avoids
+  per-frame anchoring altogether).
 - First real consumer of the IR channel (design-spec §6.1; roadmap item 1 dust
   removal is the other). Keep it a pure function over the decoded IR plane.
 - Optionally surface the per-edge holder classification in `nc inspect`.
