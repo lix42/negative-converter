@@ -155,7 +155,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > Deferred improvements from real-scan verification; not blockers of the MVP.
 > See design-spec §12 (roadmap) and the `film-base-estimation` progress notes.
 
-- [ ] [Robust auto film-base detection](tasks/auto-base-redesign.md)
+- [x] [Robust auto film-base detection](tasks/auto-base-redesign.md)
 - [ ] [Light film holder support](tasks/white-holder-support.md)
 - [ ] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
 - [ ] [IR-assisted film-holder detection](tasks/ir-holder-detection.md)

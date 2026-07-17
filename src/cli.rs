@@ -101,6 +101,12 @@ pub struct EstimateArgs {
     pub input: PathBuf,
     #[command(flatten)]
     pub film_base: FilmBaseOverrides,
+    /// Treat estimation warnings (e.g. a non-uniform `--base-region`) as a hard
+    /// error. `estimate` produces the `Dmin` a roll is calibrated on, so a
+    /// script baking the result into a recipe wants a plausible-looking-but-bad
+    /// base to fail loudly rather than be echoed back.
+    #[arg(long)]
+    pub strict: bool,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -187,7 +193,8 @@ pub struct FilmBaseOverrides {
     #[arg(long, value_name = "X,Y,W,H", value_parser = parse_region,
           conflicts_with = "auto_base")]
     pub base_region: Option<[u32; 4]>,
-    /// Estimate the base from the detected border (the default behavior).
+    /// Detect the unexposed rebate band behind the film holder (the default
+    /// behavior; fails loudly when no confident band exists).
     #[arg(long)]
     pub auto_base: bool,
 }
@@ -341,6 +348,13 @@ pub struct Report {
     /// sampled rectangle / explicit values without string-parsing a label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base_source: Option<FilmBaseSource>,
+    /// Candidate unexposed-rebate bands from the inward-scan detector
+    /// (`inspect` only): edge, a rectangle usable verbatim as `--base-region`,
+    /// the proposed base, and the measured spread (lower = more uniform). Lets
+    /// a user confirm a region instead of measuring one in an image viewer —
+    /// and a future UI draws its highlight rectangles from the same data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_candidates: Option<Vec<film_base::RebateCandidate>>,
     /// Path the IR plane was exported to, when `--export-ir` was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ir_exported: Option<PathBuf>,
@@ -441,7 +455,7 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.input.export_ir = Some(p.clone());
     }
 
-    // film base: the three source flags are mutually exclusive (clap-enforced);
+    // film base: the four source flags are mutually exclusive (clap-enforced);
     // whichever is given replaces the recipe's source entirely.
     if let Some(src) = film_base_source_override(&args.film_base) {
         cfg.film_base.source = src;
@@ -921,12 +935,22 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         );
     }
 
+    // Stage 2 — film-base estimate. Resolved before the render so its quality
+    // warnings (non-uniform region, cross-edge disagreement) reach the report
+    // even if a later render stage then errors — a downstream failure must not
+    // swallow the one line explaining why the base was bad.
+    let base = film_base::estimate(&image, &cfg.film_base)?;
+    report.film_base = Some(base.base);
+    for w in base.warnings {
+        push_warning(&mut report, &log, w);
+    }
+
     // Clear any stale lcms2 flag so only errors from *this* render are counted.
     let _ = cms_error_occurred();
-    // Stages 2–4 — film-base estimate → algorithm → output color transform.
+    // Stages 3–4 — algorithm → output color transform.
     let rendered = stages::render(
         &image,
-        &cfg.film_base,
+        &base.base,
         stages::algo_params(cfg.algorithm, &cfg.simple, &cfg.density, &cfg.print),
         &cfg.output,
     )?;
@@ -937,7 +961,6 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             "color management (lcms2) reported a runtime error; see stderr".into(),
         ));
     }
-    report.film_base = Some(rendered.film_base);
     report.dmax = rendered.convert.dmax;
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
@@ -1049,20 +1072,37 @@ fn run_inspect(args: IoArgs) -> Result<()> {
         );
     }
 
-    // Suggested Dmin via best-effort auto detection. For inspect this is
-    // informational — real scans (holder → rebate → picture) usually need an
-    // explicit `--base-region`/`--film-base`, so a failure is a note, not fatal.
-    match film_base::estimate(&image, &FilmBaseParams::default()) {
-        Ok(base) => {
-            report.film_base = Some(base);
-            report.film_base_source = Some(FilmBaseSource::Auto);
+    // Candidate rebate bands + suggested Dmin via the inward-scan detector. For
+    // inspect this is informational — a refusal is a note, not fatal — and the
+    // candidates are reported even when selection refuses, so the user can
+    // confirm a rectangle for `--base-region` instead of measuring one.
+    match film_base::rebate_candidates(&image) {
+        Ok(candidates) => {
+            match film_base::select_auto_base(&image, &candidates) {
+                Ok(est) => {
+                    report.film_base = Some(est.base);
+                    report.film_base_source = Some(FilmBaseSource::Auto);
+                    for w in est.warnings {
+                        push_warning(&mut report, &log, w);
+                    }
+                }
+                // The selection error already carries actionable advice (pass
+                // --base-region/--film-base, or --base-content per the
+                // film-base-content-fallback task); short lead-in only.
+                Err(e) => push_warning(
+                    &mut report,
+                    &log,
+                    format!("suggested Dmin unavailable — {e}"),
+                ),
+            }
+            if !candidates.is_empty() {
+                report.base_candidates = Some(candidates);
+            }
         }
-        // The estimate error already carries actionable advice (pass
-        // --base-region/--film-base); wrap it with a short lead-in, no duplicate.
         Err(e) => push_warning(
             &mut report,
             &log,
-            format!("suggested Dmin unavailable — {e}"),
+            format!("film-base detection skipped — {e}"),
         ),
     }
 
@@ -1100,7 +1140,7 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         info.format, info.width, info.height, info.ir_present
     ));
 
-    let base = film_base::estimate(
+    let est = film_base::estimate(
         &image,
         &FilmBaseParams {
             source: source.clone(),
@@ -1110,19 +1150,31 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     let mut report = Report {
         command: Some("estimate"),
         input: Some(args.input.clone()),
-        film_base: Some(base),
+        film_base: Some(est.base),
         film_base_source: Some(source),
         ..Report::default()
     };
     for w in &info.warnings {
         push_warning(&mut report, &log, w.clone());
     }
+    for w in est.warnings {
+        push_warning(&mut report, &log, w);
+    }
     report.elapsed_ms = Some(elapsed_ms(started));
+    // Emit the report before the `--strict` gate so the machine-readable record
+    // (the measured base) lands even when a warning then fails the run.
     emit_report(
         &report,
         args.report.report,
         args.report.report_file.as_deref(),
-    )
+    )?;
+    if args.strict && !report.warnings.is_empty() {
+        return Err(NcError::Other(format!(
+            "--strict: {} warning(s) present (see report)",
+            report.warnings.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Milliseconds elapsed since `started`, as an `f64` for the report.

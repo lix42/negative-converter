@@ -273,7 +273,7 @@ no interactive prompts.
 | Command | Purpose |
 |---|---|
 | `nc convert` | The main pipeline: negative file → positive TIFF. |
-| `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, detected film border, suggested `Dmin`. No output image. |
+| `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
 | `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON. |
 | `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). |
 
@@ -369,7 +369,15 @@ The base source is a single mutually-exclusive choice, recipe key
 than one is a usage error); whichever is given replaces a recipe's source:
 - `--film-base R,G,B` ⇒ `{ "explicit": [r, g, b] }` — explicit base transmission.
 - `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this rectangle.
-- `--auto-base` (default) ⇒ `"auto"` — best-effort estimate from the film border.
+  A non-uniform rectangle (one that mixes rebate with image content) keeps its
+  sampled value but raises a **uniformity warning** in the report (`--strict`
+  promotes it) — a mixed rectangle otherwise yields a plausible-looking bad base
+  with no signal.
+- `--auto-base` (default) ⇒ `"auto"` — detect the unexposed rebate band behind
+  the film holder (the inward-scan detector; see the ladder below). On no
+  confident band it **fails loudly** and *suggests* `--base-content` — the opt-in
+  content source owned by the separate `film-base-content-fallback` task (ladder
+  tier 3 below); auto never silently falls back to it.
 
 **How to obtain `Dmin` — the acquisition ladder.** `Dmin` is a property of the
 *film stock + development + scanner settings*, not of an individual frame, so
@@ -390,31 +398,45 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    (roadmap §12), which doubles as a light-leak / illumination-falloff
    diagnostic.
 2. **The rebate (the unexposed strip around each frame).** Reliable form: point
-   `--base-region` at a visible rebate patch manually (read the coordinates from
-   any image viewer; UI-assisted picking is a roadmap item, §12). Convenience
-   form: `--auto-base` (the default) — real scans are laid out as
+   `--base-region` at a visible rebate patch manually — `nc inspect` reports the
+   detector's candidate rectangles (edge, coordinates, value, spread) so you can
+   confirm one instead of measuring it in an image viewer (UI-assisted picking
+   is a roadmap item, §12). Convenience form: `--auto-base` (the default) — real
+   scans are laid out as
    `dark film holder → thin unexposed rebate → exposed picture`, the rebate being
    a narrow, uniform, bright band *inset behind the holder*, possibly on only
-   some edges. Auto detection keeps **deliberately strict** confidence gates
-   (uniformity, brighter-than-interior) and **fails loudly** rather than emit a
-   silently-wrong base — note the Step-1 heuristic often refuses on real
-   `holder → rebate → picture` layouts. The robust inward-scan detector,
-   thresholds tuned against real scans (`real-scan-verification`), and a
+   some edges. The **inward-scan detector** marches 1-px strips in from each edge
+   and keeps the first bright, uniform, value-continuous band sitting **behind**
+   a contiguous dark-holder run; the base is the brightest such candidate that is
+   brighter than the frame interior on *every* channel (the rebate is per-channel
+   minimum density — nothing genuine can out-bright clean base). Requiring the
+   holder outside the band defeats the bright-surround false positive (a uniform
+   bright scene region bleeding to the frame edge has no holder outside it);
+   cross-edge disagreement between surviving candidates is surfaced as a report
+   warning. Confidence gates stay **deliberately strict** and detection **fails
+   loudly** (naming the recovery flags) rather than emit a silently-wrong base.
+   Threshold tuning against full-size scans (`real-scan-verification`) and a
    `--holder white|black` control for light holders are roadmap items (§12).
 3. **Content-based estimation (last resort, opt-in).** When the scan is cropped
    to the image with no unexposed film visible, a per-channel high percentile of
    the *exposed content* approximates the base (the thinnest area of a negative
    is the scene's deepest black, close to true base). This is an **explicit
-   opt-in source** (roadmap §12): it changes the assumption from "physical base
-   measured" to "scene contains a near-black", so the tool never falls back to
-   it silently, and the report records that the base came from content
-   statistics. When the assumption fails (foggy/high-key scenes), blacks wash out
-   and pick up a cast.
+   opt-in source** owned by the dedicated `film-base-content-fallback` task
+   (`--base-content` / `film_base.source = "content"`) — it is **not** part of
+   the auto detector: auto refusal only *suggests* it and never silently falls
+   back, and the report will record that the base came from content statistics.
+   When the assumption fails (foggy/high-key scenes), blacks wash out and pick up
+   a cast — recoverable downstream as a global cast (`density_offset` / white
+   balance).
 
 **When every source is missing** (no explicit base, auto refuses, content mode
 not requested), `convert` **fails loudly** with an actionable message naming the
 recovery flags — an agent can catch the exit code and re-run with an explicit
-choice. Estimator selection is never silent. A neutral base `[1,1,1]` is
+choice. Estimator selection is never silent. **A degenerate resolved base** (a
+zero / negative / non-finite channel — e.g. a `--base-region` on the dark holder)
+is likewise rejected at the estimation stage rather than left to poison the
+density divide or be echoed back by `nc estimate` as a trustworthy `Dmin`. A
+neutral base `[1,1,1]` is
 representable but not recommended: it forfeits the per-channel orange-mask
 neutralization (content estimation strictly dominates it). Note the failure
 geometry is forgiving: because `D = -log10(scan/base)`, a base error is a
@@ -557,19 +579,19 @@ the NLP feature comparison, Phase 6).
    `Dmin`, curve params, neutral spots) applied across many frames.
 7. **Scanner ICC profiling workflow & QA harness.** IT8/target-based calibration
    and ΔE2000 / SSIM regression testing against standard test negatives.
-8. **Robust auto film-base detection.** Replace the Step-1 margin heuristic with an
-   inward-scan detector for the real `holder → thin rebate → picture` layout:
-   march strips in from each edge and pick the brightest uniform band past the
-   holder (the rebate can be thin and on only some edges). Keep deterministic;
-   still fail loudly when no confident band exists, with thresholds tuned
-   against the real-scan verification results. This task family also includes: a
-   **uniformity warning on `--base-region`** (a mixed rebate/image rectangle
-   currently yields a plausible-looking bad base silently); and `nc inspect`
-   reporting **candidate rebate regions** (coordinates + confidence) so CLI users
-   confirm instead of measuring — the same data a future UI would highlight. The
-   opt-in **content-based source** (`film_base.source = "content"` / `--base-content`,
-   §9 ladder tier 3) is **reassigned** to the dedicated `film-base-content-fallback`
-   task (see item 13) — it is **not** implemented here.
+8. **Robust auto film-base detection.** *(Done — implemented as the inward-scan
+   detector, see §9 film-base.)* The kept scope shipped together: the detector
+   for the real `holder → thin rebate → picture` layout (deterministic,
+   fail-loud), the **uniformity warning on `--base-region`** (a mixed
+   rebate/image rectangle otherwise yields a plausible-looking bad base
+   silently), and `nc inspect` reporting **candidate rebate regions**
+   (coordinates + spread) so CLI users confirm instead of measuring — the same
+   data a future UI would highlight. The opt-in **content-based source**
+   (`film_base.source = "content"` / `--base-content`, §9 ladder tier 3) is
+   **reassigned** to the dedicated `film-base-content-fallback` task (item 13)
+   and is **not** implemented here — the auto-refusal message only *suggests* it.
+   Remaining: threshold tuning against full-size scans rides
+   `real-scan-verification`.
 9. **Light film holders.** Auto/border logic assumes a dark holder surround; some
    holders are white. Add a `--holder white|black` control (recipe key
    `film_base.holder`) so detection knows the surround polarity.

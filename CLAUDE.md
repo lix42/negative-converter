@@ -60,7 +60,8 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
   don't consume it.
 - Module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages}.rs`
-  (`stages::render` is the pure decode-to-encode core),
+  (`film_base::estimate` is stage 2, resolved by the orchestrator before the
+  render; `stages::render` is the pure algorithm→output-color core, stages 3–4),
   `algo/{mod,simple,density}.rs`, `cli.rs`, `main.rs`. `main`/`cli` are the only
   orchestrators; stages stay pure.
 
@@ -110,12 +111,13 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
     startup (sets an `AtomicBool` + logs to stderr); `run_convert` clears the
     flag before the render and checks it after, turning a CMS fault into a loud
     error instead of a silently unconverted image.
-  - *Film-base gotcha:* only an explicit `--film-base` is CLI-validated; a
-    `Region`/`Auto` base is estimated from pixels at runtime with no positivity
-    guarantee (a region on the dark holder → zero channel). Any stage that
-    divides by or takes the log of the base must guard finite-and-positive and
-    error loudly (see `algo/simple.rs`) — until `film_base::estimate` rejects
-    degenerate bases at birth (planned follow-up).
+  - *Film-base gotcha:* an explicit `--film-base` is CLI-validated; a
+    `Region`/`Auto` base is estimated from pixels at runtime. Since
+    the `auto-base-redesign` task, `film_base::estimate` **guards the resolved
+    base finite-and-positive on every channel at birth** (a region on the dark
+    holder → zero channel now errors loudly there, not silently downstream). The
+    per-algo guards (`algo/simple.rs`, `algo/density.rs`) remain as
+    defense-in-depth for any base reaching a converter directly.
   - *Clamping boundary:* range-clamp to the output gamut **only** at the u16
     encode step; color/algo stages pass values through unclamped (f32 output is
     HDR/scene-referred). `io::encode` counts every clamped and non-finite (`NaN`)

@@ -224,10 +224,16 @@ pub struct InputParams {
 /// A single mutually-exclusive choice, not independent flags: more-specific
 /// sources always win with no fallback, so this is one selection. Serializes as
 /// `"auto"` / `{ "region": [x, y, w, h] }` / `{ "explicit": [r, g, b] }`.
+///
+/// The acquisition-ladder tier 3 **content-based source**
+/// (`film_base.source = "content"` / `--base-content`) is owned by the separate
+/// `film-base-content-fallback` task and is deliberately **not** a variant here —
+/// the auto detector only *suggests* it on refusal, never falls back to it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FilmBaseSource {
-    /// Estimate the base from the detected unexposed border.
+    /// Estimate the base from the detected unexposed rebate band behind the
+    /// film holder (the inward-scan detector; fails loudly on low confidence).
     #[default]
     Auto,
     /// Sample the base from this border region `[x, y, w, h]`.
@@ -503,6 +509,24 @@ mod tests {
         ] {
             let json = serde_json::to_string(&src).unwrap();
             assert_eq!(serde_json::from_str::<DmaxSource>(&json).unwrap(), src);
+        }
+    }
+
+    #[test]
+    fn film_base_source_serializes_all_variants() {
+        // Unit variants are bare lowercase strings; data variants are tagged
+        // objects.
+        assert_eq!(
+            serde_json::to_string(&FilmBaseSource::Auto).unwrap(),
+            "\"auto\""
+        );
+        for src in [
+            FilmBaseSource::Auto,
+            FilmBaseSource::Region([1, 2, 3, 4]),
+            FilmBaseSource::Explicit([0.9, 0.5, 0.4]),
+        ] {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(serde_json::from_str::<FilmBaseSource>(&json).unwrap(), src);
         }
     }
 

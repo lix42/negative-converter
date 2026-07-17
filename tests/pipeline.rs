@@ -230,6 +230,60 @@ fn estimate_from_region_reports_film_base() {
 }
 
 #[test]
+fn mixed_base_region_warns_and_strict_refuses_it() {
+    // A rectangle mixing image content is a plausible-looking bad base; the
+    // uniformity warning must ride the report (estimate), and --strict must
+    // promote it to a failure (convert) — while the non-strict convert still
+    // succeeds with the warning recorded.
+    let (code, stdout, _err) = run(&[
+        "estimate",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--base-region",
+        "0,0,502,462",
+    ]);
+    assert_eq!(code, 0, "a mixed region is a warning, not an error");
+    let report = json(&stdout);
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("not uniform")),
+        "uniformity warning expected: {report}"
+    );
+
+    let tmp = TempDir::new("region-warn");
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--base-region",
+        "0,0,502,462",
+        "--strict",
+    ]);
+    assert_eq!(
+        code, 1,
+        "--strict must refuse a non-uniform base region: {err}"
+    );
+
+    // `estimate --strict` refuses it too — the command that bakes the Dmin a
+    // roll is calibrated on must not echo a plausible-looking-but-bad base.
+    let (code, _stdout, err) = run(&[
+        "estimate",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--base-region",
+        "0,0,502,462",
+        "--strict",
+    ]);
+    assert_eq!(
+        code, 1,
+        "estimate --strict must refuse a mixed region: {err}"
+    );
+}
+
+#[test]
 fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
     let tmp = TempDir::new("ir");
     // HDRi: the IR plane is written.

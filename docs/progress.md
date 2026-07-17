@@ -933,11 +933,134 @@ a task; update your own section as you work. Append entries — don't rewrite th
   Option field to `Report`.
 
 ## auto-base-redesign
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-15
 
 - Goal: robust `--auto-base` film-base detection on real scan layouts (dark
   holder → rebate → picture), replacing the best-effort Step-1 heuristic.
+- **Scope note (2026-07-15):** the content-based source (`--base-content` /
+  `film_base.source = "content"`) was **reassigned out of this task** to the new
+  `film-base-content-fallback` task (see the authoritative "Scope change" note
+  below). I had implemented it here; it has since been **removed** from this
+  worktree — enum variant, flag + wiring, content-estimate logic, report shape,
+  and its tests are gone. What remains of content mode here is a **one-line
+  cross-reference**: the auto-refusal error message *suggests* `--base-content`
+  (naming the owning task) and never silently falls back to it.
+- **Done (kept scope).** `pipeline/film_base.rs` rewritten around an inward-scan
+  detector, plus the two same-family items retained by the scope change: the
+  `--base-region` uniformity warning, and `nc inspect` candidate regions. Whole
+  task is pure functions; `cli`/`stages` only ferry warnings.
+- **Detector shape** (`rebate_candidates` + `select_auto_base`; `auto_estimate`
+  is their composition):
+  - Per edge, march 1-px strips inward, up to `REBATE_SCAN_FRAC = 10%` of the
+    short side (min 3 px). Strips are **trimmed by the scan depth at both
+    ends**, otherwise the perpendicular edges' holder margins contaminate every
+    strip (the reason the probe strips in the original verification looked
+    dirty at the corners).
+  - Per strip: per-channel p97 (`SAMPLE_PERCENTILE`) + worst-channel relative
+    spread `(p97−p10)/p97`. Classes: **holder** (all channels p97 <
+    `HOLDER_MAX_TRANSMISSION = 0.05`; real holder ≈ 0.01, dimmest real rebate
+    channel ≈ 0.14, so 0.05 splits with margin), **uniform** (all-channel
+    spread ≤ 0.15 — kept the strict all-channel gate), else **other**.
+  - A candidate band is the **first** run of ≥ `MIN_BAND_STRIPS = 2` uniform,
+    value-continuous strips (adjacent-strip step ≤ 10% per channel — this is
+    what stops the band merging into an adjacent flat picture region) sitting
+    **immediately behind a contiguous holder run**; the whole band is then
+    re-measured as one region and must pass the spread gate again (catches slow
+    drift). Bands at depth 0 (no holder outside) are rejected.
+  - Selection: candidates must beat the frame-interior **median** on **every**
+    channel by ≥5% (`INTERIOR_BRIGHTNESS_MARGIN`, replacing the old lenient
+    any-channel/2% gate); the **brightest** survivor wins.
+- **Key decisions and why:**
+  - **The corroborating anti-bright-surround signal is holder-backing, not
+    mandatory cross-edge agreement.** A bright surround bleeding to the frame
+    edge has no dark holder outside it → no candidate → refusal. Mandatory
+    cross-edge agreement was rejected because a real rebate legitimately appears
+    on a single edge (verified: `48bit-full/2` left-only). Cross-edge
+    *disagreement* between surviving candidates is a report **warning**
+    (`--strict`-promotable), not an error.
+  - **"Brightest candidate wins" is physically grounded:** the rebate is Dmin =
+    per-channel max transmission; no genuine picture area can out-bright clean
+    base. This is also why a uniform dark band behind the holder can never
+    out-rank a real rebate (unit-tested).
+  - `estimate` now returns **`BaseEstimate { base, warnings }`**; the region
+    path's uniformity check emits a warning (never alters the value), rides
+    `Rendered.film_base_warnings` through `stages::render` into the report, and
+    `--strict` refuses it (e2e-tested).
+  - `percentile` switched from full sort to `retain(finite)` +
+    `select_nth_unstable_by` (O(n), still deterministic — an order statistic is
+    tie-order independent).
+  - `inspect` now reports `base_candidates` (edge, `--base-region`-ready rect,
+    value, spread) even when selection refuses, so users confirm a rectangle
+    instead of measuring one.
+- **Verification:** unit tests in `film_base.rs` (single/two-edge rebate,
+  bright-surround refusal naming the recovery flags, dark-band out-ranking,
+  disagreement warning + within-tolerance no-warning, mixed-region warning with
+  unchanged value, degenerate-region-base rejection, candidate serde-shape +
+  rect round-trips through `Region` incl. the mirrored bottom-edge arithmetic,
+  plus the retained explicit/region/percentile suite); e2e test (mixed
+  `--base-region` warning + `--strict` refusal on both `convert` and `estimate`).
+  Full gate clean on the rebased base: fmt / clippy `-D warnings` / build /
+  **145 unit + 19 e2e**.
+- **Post-review pass (2026-07-14, pr-review-toolkit 5-agent review of the
+  working-tree diff; findings fixed):**
+  - **Degenerate base rejected at birth** (type-design + silent-failure, HIGH):
+    `estimate` now runs `guard_base` over every source, erroring loudly on any
+    zero / negative / non-finite channel. Previously a region on the holder could
+    return a poison base with exit 0 and no warning — `nc estimate` has no
+    downstream algo to catch it. Closes the "reject degenerate bases at birth"
+    follow-up noted in the CLAUDE.md film-base gotcha (per-algo guards stay as
+    defense-in-depth); CLAUDE.md updated to match.
+  - **Estimation moved out of `stages::render`** (silent-failure, MEDIUM):
+    `run_convert` now resolves the base and pushes its warnings *before* the
+    fallible render, so a downstream render error can't swallow the "non-uniform
+    region" line explaining a bad base. `render` takes a resolved `&FilmBase`;
+    `Rendered` lost its `film_base`/`film_base_warnings` fields (the orchestrator
+    owns them). This also tightens the stage split (estimation = stage 2,
+    render = stages 3–4).
+  - **`nc estimate --strict`** (silent-failure, MEDIUM): the base-producing
+    command now promotes its warnings to a failing exit, so a script baking a
+    Dmin into a recipe fails on a plausible-looking-but-bad region instead of
+    echoing it. Makes the `BaseEstimate` "`--strict` promotes" doc true on every
+    warning-producing path.
+  - **Minor:** unified auto-refusal recovery wording into one `RECOVERY_ADVICE`
+    const (all refusals, incl. the too-small case, *suggest* `--base-content` as
+    the owned-elsewhere fallback); doc fixes (candidates are pre-brightness-gate;
+    `percentile` is rounded-rank not nearest-rank; `select_auto_base` names the
+    5% margin + same-image contract). Declined: `base_candidates: Some(vec![])`
+    for "ran, found nothing" — the adjacent "unavailable" warning already
+    disambiguates; not worth the shape change. Review came back clean after the
+    fixes.
+- **Rebased onto origin/main `3c7f5bd` (2026-07-15)** to pick up #20's
+  `--out-depth`→`--output-hdr` rename, the merged bw-support docs (#19/#21), and
+  the #22 scope-change note. Conflicts resolved in `design-spec.{md,html}` and
+  `stages.rs` (the render test now uses `hdr: true`, not `OutDepth::F32`); then
+  the content-source removal above was applied on the new base.
+- **Real-scan status:** the full-size scans (`../nc-assets`, `~/Pictures/scan`)
+  are **not present in this environment** — only the committed 502×462 fixture
+  crops, which are picture-interior crops (probe: all strips high-spread, no
+  holder). On them the detector correctly refuses and the region-warning behaves
+  as designed. Thresholds are set from the numbers recorded in the
+  `film-base-estimation` real-scan verification (holder ≈0.01, rebate
+  ≈[0.53,0.26,0.16], picture spread ≫0.15); **running the detector's happy path
+  on the full-size scans still needs doing — fold it into
+  `real-scan-verification`** (its task already covers default-output checks).
+  Note the follow-ups `ir-holder-detection` and `auto-base-neutral-stock` layer
+  on this: the detector deliberately uses **no** orange/colored-base assumption
+  (holder-backing + flatness + brightness are color-independent), so a
+  near-neutral base (Harman Phoenix, R/B ≈ 0.84) does not break the confidence
+  gates.
+- **Notes for dependents:**
+  - `white-holder-support`: the polarity assumption lives in exactly two spots —
+    `StripClass::Holder` classification (`HOLDER_MAX_TRANSMISSION`) and the
+    doc'd "holder-backing" rationale. A `film_base.holder = white` knob should
+    flip the holder test to "very bright on all channels" (and then the
+    "brightest survivor" rule needs care: a white holder is brighter than the
+    rebate, but it sits *outside* the band, so selection logic is unchanged —
+    only classification flips). `Edge`/`RebateCandidate` are already public.
+  - `estimate-reuse-output`: `BaseEstimate.warnings` and
+    `Report.base_candidates` are the hooks for the reuse-ready output; the
+    candidate `region` is already `--base-region`-shaped.
 
 ### Scope change — content-based source reassigned (2026-07-15)
 
