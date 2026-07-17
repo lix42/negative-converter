@@ -156,7 +156,7 @@
 <h3><span class="pill out">Out of scope</span> Step 1 — see Roadmap</h3>
 <ul>
   <li>IR-based dust/scratch removal (follow-up task).</li>
-  <li>Additional algorithms beyond the two above, e.g. sigmoid / explicit H&amp;D curve (follow-up task).</li>
+  <li>Additional algorithms beyond the two above (follow-up tasks; the sigmoid / explicit H&amp;D curve has since shipped post-MVP as <code>--algorithm sigmoid</code>, §7.3).</li>
   <li>Black &amp; white film support, incl. plain 16-bit RAW scans (follow-up task).</li>
   <li>Camera RAW (Bayer/X-Trans) input, DNG processing.</li>
   <li>ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).</li>
@@ -221,7 +221,7 @@
                                      ▼
                  ┌──────────────────────────────────────────────┐
                  │ 3. Algorithm: negative → positive             │
-                 │    (simple | density)  — pluggable            │
+                 │    (simple | density | sigmoid) — pluggable   │
                  │    sub-stages: density convert, correct,      │
                  │    invert, tone/print render                  │
                  └──────────────────────────────────────────────┘
@@ -260,6 +260,16 @@
 </blockquote>
 <p>Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as separate, independently parameterized sub-stages — the core fidelity rule.</p>
 
+<h3>7.3 <code>sigmoid</code> — density-domain S-curve (H&amp;D / paper response)</h3>
+<p>An S-shaped tone curve in density space, giving the shoulder/toe control of a photographic H&amp;D / print-paper characteristic instead of the <code>density</code> algorithm's straight <code>10^(gamma·(D'−Dmax))</code> line. Shares steps 1–2 (and their parameters, §9) and step 4 (the print render, <code>print.*</code>) with <code>density</code>; only step 3 — the density → positive curve — is replaced:</p>
+<pre><code>t = contrast·(D' − Dmax)                       the straight line, in log10-output space
+F = −contrast·Dmax                             paper-black floor (the line's value at D' = 0)
+p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skipped if toe = 0)
+v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skipped if shoulder = 0)
+lin = 10^v</code></pre>
+<p>i.e. the straight line passed through two soft knees — a <strong>toe</strong> compressing the approach to paper black, then a <strong>shoulder</strong> compressing the approach to display white. <strong>The knee order is deliberate:</strong> the shoulder (soft-min with the log-output-<code>0</code> ceiling) is applied <em>last</em>, so nothing lifts the result back above white — for <code>shoulder &gt; 0</code>, this <strong>stage-3 output</strong> is <code>≤ 1.0</code> for every finite density, for any valid params (including a small <code>Dmax</code> or low-contrast auto anchor), so under neutral print params the default u16 encode <strong>cannot clip highlights</strong> (the stage-4 print render — exposure/gains — can still lift samples above <code>1.0</code>). With <code>shoulder = 0</code> there is no roll-off and highlights follow the (toe-shaped) line, which can exceed <code>1.0</code> like <code>density</code>. The toe holds shadows to the paper-black floor <code>≈ 10^(−contrast·Dmax)</code> (exact when <code>shoulder = 0</code>; the shoulder nudges it imperceptibly lower otherwise). <code>toe</code>/<code>shoulder</code> are knee widths in log10 density units; <code>contrast</code> is the mid-density slope in log-output space. The curve is strictly monotonic; with <code>toe = shoulder = 0</code> both knees are skipped and it reproduces <code>density</code>'s step 3 <strong>bit-for-bit</strong> (<code>contrast</code> standing in for <code>density_gamma</code>), so <code>density</code> remains the debuggable straight-line reference. <code>contrast</code> is capped (§9) — an extreme slope would collapse the curve into a hard threshold that silently destroys tonal detail.</p>
+<p>Because both the white knee and the black floor derive from the anchor, the S-curve is anchored on <code>[0, Dmax]</code> and <strong>requires</strong> one: <code>density.dmax = none</code> (<code>--no-d-max</code>) with <code>--algorithm sigmoid</code> is a usage error (exit 2) — scene-referred output stays a <code>density</code>-algorithm feature. The anchor is resolved by the same <code>density.dmax</code> machinery (<code>auto</code> percentile / explicit value) and reported the same way. <code>density.density_gamma</code> parameterizes the straight line the S-curve replaces and is <strong>ignored</strong> under <code>sigmoid</code> (a report warning fires when it was customized); <code>sigmoid.contrast</code> is the analogue. <code>--highlight-compress</code> (a linear-space soft-clip after exposure/WB) composes with the shoulder rather than being disabled — with the shoulder on and neutral print params it simply never engages, since nothing exceeds <code>1.0</code>.</p>
+
 <h4>Pluggable interface (sketch)</h4>
 <pre><code>/// A negative→positive conversion algorithm.
 /// Pure: no I/O, no hidden state. Parameters live in the implementing struct
@@ -292,7 +302,7 @@ pub trait Converter {
   <li><code>--params recipe.json</code> — load a full parameter set from JSON.</li>
   <li><code>--dump-params out.json</code> — write the effective parameters (defaults + overrides) to JSON. Individual <code>--flag</code> overrides take precedence over the loaded recipe, so an agent can load a roll recipe and tweak one value per frame.</li>
 </ul>
-<p>The recipe JSON is <strong>grouped into per-stage objects</strong> (<code>input</code>, <code>film_base</code>, <code>density</code>, <code>print</code>, <code>simple</code>, <code>output</code>, plus the top-level <code>algorithm</code>) rather than one flat bag of keys. The grouping lets the tool <strong>reject unknown/typo'd keys at every level</strong> (a misspelled knob is a hard error, not a silently-ignored default → a quietly wrong image). A recipe may be <strong>partial</strong> — any omitted key or section falls back to its default. <code>nc params</code> prints this exact shape fully populated with defaults, so it doubles as a recipe template; <code>--dump-params</code> writes the same shape with the resolved values. Example:</p>
+<p>The recipe JSON is <strong>grouped into per-stage objects</strong> (<code>input</code>, <code>film_base</code>, <code>density</code>, <code>sigmoid</code>, <code>print</code>, <code>simple</code>, <code>output</code>, plus the top-level <code>algorithm</code>) rather than one flat bag of keys. The grouping lets the tool <strong>reject unknown/typo'd keys at every level</strong> (a misspelled knob is a hard error, not a silently-ignored default → a quietly wrong image). A recipe may be <strong>partial</strong> — any omitted key or section falls back to its default. <code>nc params</code> prints this exact shape fully populated with defaults, so it doubles as a recipe template; <code>--dump-params</code> writes the same shape with the resolved values. Example:</p>
 <pre><code>{
   "algorithm": "density",
   "density": { "density_gamma": 1.8 },
@@ -361,8 +371,8 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 </ol>
 <p><strong>When every source is missing</strong> (no explicit base, auto refuses, content mode not requested), <code>convert</code> <strong>fails loudly</strong> with an actionable message naming the recovery flags — an agent can catch the exit code and re-run with an explicit choice. Estimator selection is never silent. <strong>A degenerate resolved base</strong> (a zero / negative / non-finite channel — e.g. a <code>--base-region</code> on the dark holder) is likewise rejected at the estimation stage rather than left to poison the density divide or be echoed back by <code>nc estimate</code> as a trustworthy <code>Dmin</code>. A neutral base <code>[1,1,1]</code> is representable but not recommended: it forfeits the per-channel orange-mask neutralization (content estimation strictly dominates it). Note the failure geometry is forgiving: because <code>D = -log10(scan/base)</code>, a base error is a <em>constant per-channel density offset</em> — a global cast/exposure error correctable downstream (<code>density_offset</code>, white balance) — never a shadow/highlight crossover.</p>
 <h4>Algorithm select</h4>
-<ul><li><code>--algorithm simple|density</code></li></ul>
-<h4>Density stage (algorithm = density)</h4>
+<ul><li><code>--algorithm simple|density|sigmoid</code></li></ul>
+<h4>Density stage (algorithm = density, shared by sigmoid)</h4>
 <ul>
   <li><code>--density-scale R,G,B</code> — per-channel density gain.</li>
   <li><code>--density-offset R,G,B</code> — per-channel density offset (orange-mask comp).</li>
@@ -371,10 +381,19 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
     <ul>
       <li><code>--auto-d-max</code> (default) ⇒ <code>"auto"</code> — measure the anchor per frame from the corrected-density distribution (a high percentile).</li>
       <li><code>--d-max &lt;d&gt;</code> ⇒ <code>{ "explicit": &lt;d&gt; }</code> — fix the anchor to a scalar density. Reusing one frame's measured value across a roll is a deliberate fixed-print-exposure look; the tradeoff is that darker frames render dim and denser highlights clip against the foreign anchor (it is <strong>not</strong> a calibrate-once property like <code>Dmin</code>).</li>
-      <li><code>--no-d-max</code> ⇒ <code>"none"</code> — disable the anchor; scene-referred output (base → <code>1.0</code>, detail above), reproducing the pre-anchor render bit-for-bit for HDR (<code>--output-hdr</code>) workflows.</li>
+      <li><code>--no-d-max</code> ⇒ <code>"none"</code> — disable the anchor; scene-referred output (base → <code>1.0</code>, detail above), reproducing the pre-anchor render bit-for-bit for HDR (<code>--output-hdr</code>) workflows. <strong>Density algorithm only</strong> — the sigmoid S-curve is anchored on <code>[0, Dmax]</code>, so <code>sigmoid</code> + <code>none</code> is a usage error (§7.3).</li>
     </ul>
   </li>
+  <li>The <code>sigmoid</code> algorithm shares this whole section <strong>except <code>density_gamma</code></strong>, which parameterizes the straight-line curve it replaces and is ignored under <code>--algorithm sigmoid</code> (a report warning fires when it was customized; <code>sigmoid.contrast</code> is the analogue).</li>
 </ul>
+<h4>Sigmoid stage (algorithm = sigmoid)</h4>
+<p>The stage-3 S-curve knobs (§7.3); stages 1–2 and 4 use the <code>density.*</code> and <code>print.*</code> sections above. Recipe keys drop the flag prefix (<code>sigmoid.contrast</code>, <code>sigmoid.toe</code>, <code>sigmoid.shoulder</code>):</p>
+<ul>
+  <li><code>--sigmoid-contrast &lt;f&gt;</code> — mid-density slope of the curve in log-output space (the <code>--density-gamma</code> analogue). Finite and in <code>(0, 50]</code>; default <code>1.0</code>. The upper cap guards against an extreme slope collapsing the S-curve into a hard black/white threshold that silently destroys tonal detail (use <code>--algorithm density</code> for genuinely extreme contrast).</li>
+  <li><code>--sigmoid-toe &lt;f&gt;</code> — toe (shadow) knee width in log10 density units; <code>0</code> disables the toe. In <code>[0, 10]</code>; default <code>0.2</code>. The upper cap is far beyond the ~<code>0.05–0.9</code> photographic range and rejects a degenerate width that would flatten the image into near-uniform tone without tripping the clip/non-finite counters.</li>
+  <li><code>--sigmoid-shoulder &lt;f&gt;</code> — shoulder (highlight) knee width in log10 density units; <code>0</code> disables the shoulder. In <code>[0, 10]</code>; default <code>0.2</code> (same cap rationale as <code>--sigmoid-toe</code>).</li>
+</ul>
+<p>These caps reject only <em>nonsense / degenerate-asymptote</em> values (a knee of <code>10000</code> that flattens the frame); within them, aggressive-but-valid contrast/knees produce faithful, deliberate output that may posterize or crush — that is the user's choice and is intentionally <strong>not</strong> warned (a degenerate-band warning would false-positive on legitimate high-contrast conversions).</p>
 <h4>Print / tone render</h4>
 <ul>
   <li><code>--print-exposure &lt;f&gt;</code> — overall positive exposure.</li>
@@ -455,7 +474,7 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 <p>Deliberately deferred and recorded here so they aren't lost. Items graduate into tracked tasks in <code>docs/TASKS.md</code> — several already have (item 2's sigmoid → <code>algo-sigmoid</code>; item 3's B&amp;W rendering → <code>bw-support</code>; plus <code>dmax-white-anchor</code>, <code>auto-neutral-wb</code>, and <code>regional-color-balance</code> from the NLP feature comparison, Phase 6).</p>
 <ol>
   <li><strong>IR-based dust &amp; scratch removal.</strong> Consume the IR channel (already preserved in Step 1) to build a defect mask and inpaint defects. Parameters: IR threshold, mask dilation/morphology, inpainting method/strength. Must handle the known limits — disable/guard for silver B&amp;W film and Kodachrome. New stages: <code>defect_mask</code>, <code>inpaint</code>; new flags under an <code>--ir-*</code> namespace.</li>
-  <li><strong>Additional algorithms.</strong> At minimum a <strong>sigmoid / explicit H&amp;D-curve</strong> model (NegPy-style) for more photographically meaningful controls; possibly a power-law/exponent model (RawTherapee-style) for camera-scanned negatives. Added via the existing <code>Converter</code> trait, selectable with <code>--algorithm</code>.</li>
+  <li><strong>Additional algorithms.</strong> The <strong>sigmoid / explicit H&amp;D-curve</strong> model has since <strong>shipped</strong> as <code>--algorithm sigmoid</code> (§7.3, task <code>algo-sigmoid</code>); still open: possibly a power-law/exponent model (RawTherapee-style) for camera-scanned negatives. Added via the existing <code>Converter</code> trait, selectable with <code>--algorithm</code>.</li>
   <li><strong>Black &amp; white film support.</strong> The <em>rendering</em> half has graduated into the tracked <code>bw-support</code> task (Phase 6): B&amp;W film is still a density medium, so the <code>density</code> algorithm is the B&amp;W renderer, plus a mono color model that pools R,G,B into one gray so scanner channel mismatch can't tint the output. What remains here is the <em>input</em> half: plain <strong>16-bit RAW</strong> scan files (not the SilverFast HDR/HDRi container). Note B&amp;W negatives have no usable orange mask and no IR defect channel (silver blocks IR) — item 1's IR dust removal must be disabled/guarded for B&amp;W.</li>
   <li><strong>Camera RAW input.</strong> Bayer/X-Trans and DNG ingestion (e.g. <code>rawler</code>/LibRaw) for camera-scanning workflows.</li>
   <li><strong>More output formats.</strong> JPEG/PNG for proofs, EXR for HDR interchange.</li>

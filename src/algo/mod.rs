@@ -1,17 +1,20 @@
 //! Pluggable negative→positive converters behind a [`Converter`] trait.
 //!
 //! The trait is finalized by the `algo-interface` task; `simple` and `density`
-//! are its two Step-1 implementations. Density is the default.
+//! are the two Step-1 implementations (density is the default), joined post-MVP
+//! by `sigmoid` (the density-domain S-curve, `algo-sigmoid`).
 
 pub mod density;
+pub mod sigmoid;
 pub mod simple;
 
 use std::str::FromStr;
 
 use crate::algo::density::Density;
+use crate::algo::sigmoid::Sigmoid;
 use crate::algo::simple::Simple;
 use crate::types::{
-    DensityParams, FilmBase, LinearImage, NcError, PrintParams, Result, SimpleParams,
+    DensityParams, FilmBase, LinearImage, NcError, PrintParams, Result, SigmoidParams, SimpleParams,
 };
 
 /// A negative→positive conversion algorithm. Implementations are pure: given the
@@ -73,6 +76,8 @@ pub enum Algorithm {
     /// Density-domain inversion (Cineon / negadoctor style). The default.
     #[default]
     Density,
+    /// Density-domain S-curve (H&D / paper-response) tone mapping.
+    Sigmoid,
 }
 
 impl FromStr for Algorithm {
@@ -84,8 +89,9 @@ impl FromStr for Algorithm {
         match s.to_ascii_lowercase().as_str() {
             "simple" => Ok(Algorithm::Simple),
             "density" => Ok(Algorithm::Density),
+            "sigmoid" => Ok(Algorithm::Sigmoid),
             _ => Err(NcError::Usage(format!(
-                "unknown algorithm '{s}' (expected: simple|density)"
+                "unknown algorithm '{s}' (expected: simple|density|sigmoid)"
             ))),
         }
     }
@@ -101,6 +107,14 @@ pub enum AlgoParams {
         density: DensityParams,
         print: PrintParams,
     },
+    /// `sigmoid` shares stages 1–2 (`density`, whose `density_gamma` it ignores)
+    /// and stage 4 (`print`) with the density algorithm; `sigmoid` parameterizes
+    /// its replacement stage-3 S-curve.
+    Sigmoid {
+        density: DensityParams,
+        sigmoid: SigmoidParams,
+        print: PrintParams,
+    },
 }
 
 impl AlgoParams {
@@ -112,6 +126,7 @@ impl AlgoParams {
         match self {
             AlgoParams::Simple(_) => Algorithm::Simple,
             AlgoParams::Density { .. } => Algorithm::Density,
+            AlgoParams::Sigmoid { .. } => Algorithm::Sigmoid,
         }
     }
 }
@@ -133,6 +148,15 @@ pub fn build(params: AlgoParams) -> Box<dyn Converter> {
     match params {
         AlgoParams::Simple(params) => Box::new(Simple { params }),
         AlgoParams::Density { density, print } => Box::new(Density { density, print }),
+        AlgoParams::Sigmoid {
+            density,
+            sigmoid,
+            print,
+        } => Box::new(Sigmoid {
+            density,
+            sigmoid,
+            print,
+        }),
     }
 }
 
@@ -144,11 +168,12 @@ mod tests {
     fn from_str_parses_known_algorithms() {
         assert_eq!(Algorithm::from_str("simple").unwrap(), Algorithm::Simple);
         assert_eq!(Algorithm::from_str("density").unwrap(), Algorithm::Density);
+        assert_eq!(Algorithm::from_str("sigmoid").unwrap(), Algorithm::Sigmoid);
     }
 
     #[test]
     fn from_str_rejects_unknown_name_as_usage() {
-        let err = Algorithm::from_str("sigmoid").unwrap_err();
+        let err = Algorithm::from_str("filmic").unwrap_err();
         assert_eq!(err.exit_code(), 2); // NcError::Usage
     }
 
@@ -166,6 +191,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Algorithm::Simple).unwrap(),
             "\"simple\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Algorithm::Sigmoid).unwrap(),
+            "\"sigmoid\""
         );
     }
 
@@ -197,6 +226,11 @@ mod tests {
             density: DensityParams::default(),
             print: PrintParams::default(),
         });
+        let _sigmoid = build(AlgoParams::Sigmoid {
+            density: DensityParams::default(),
+            sigmoid: SigmoidParams::default(),
+            print: PrintParams::default(),
+        });
     }
 
     #[test]
@@ -213,6 +247,15 @@ mod tests {
             .algorithm(),
             Algorithm::Density
         );
+        assert_eq!(
+            AlgoParams::Sigmoid {
+                density: DensityParams::default(),
+                sigmoid: SigmoidParams::default(),
+                print: PrintParams::default(),
+            }
+            .algorithm(),
+            Algorithm::Sigmoid
+        );
     }
 
     #[test]
@@ -220,7 +263,7 @@ mod tests {
         // `FromStr` and serde's `rename_all = "lowercase"` map the same strings to
         // the same variants, but are written independently — pin them together so
         // adding a variant can't let the two drift apart.
-        for algo in [Algorithm::Simple, Algorithm::Density] {
+        for algo in [Algorithm::Simple, Algorithm::Density, Algorithm::Sigmoid] {
             let wire = serde_json::to_string(&algo).unwrap(); // e.g. "\"simple\""
             let name = wire.trim_matches('"');
             assert_eq!(Algorithm::from_str(name).unwrap(), algo);

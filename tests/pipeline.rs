@@ -433,6 +433,62 @@ fn sidecar_recipe_round_trips_through_recipe_in() {
 }
 
 #[test]
+fn sigmoid_sidecar_recipe_round_trips_through_recipe_in() {
+    // Same measure-once-reuse workflow for `sigmoid`, with NON-default toe/shoulder
+    // so the round-trip actually exercises the sigmoid four-spot serialization +
+    // merge (a dropped `sigmoid.*` key or a forgotten merge arm would change the
+    // reloaded output). Run A writes the sidecar; run B consumes it and must be
+    // byte-identical.
+    let tmp = TempDir::new("sigmoid-recipe");
+    let out_a = tmp.path("a.tiff");
+    let (ca, _, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out_a.to_str().unwrap(),
+        "--algorithm",
+        "sigmoid",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--sigmoid-contrast",
+        "1.4",
+        "--sigmoid-toe",
+        "0.12",
+        "--sigmoid-shoulder",
+        "0.33",
+        "--report",
+        "none",
+    ]);
+    assert_eq!(ca, 0, "{err}");
+    let sidecar = format!("{}.json", out_a.display());
+    // The sidecar carries the sigmoid section verbatim.
+    let recipe: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(recipe["algorithm"], "sigmoid");
+    assert_eq!(recipe["sigmoid"]["contrast"], 1.4);
+    assert_eq!(recipe["sigmoid"]["toe"], 0.12);
+    assert_eq!(recipe["sigmoid"]["shoulder"], 0.33);
+
+    let out_b = tmp.path("b.tiff");
+    let (cb, _, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out_b.to_str().unwrap(),
+        "--params",
+        &sidecar,
+        "--report",
+        "none",
+    ]);
+    assert_eq!(cb, 0, "sigmoid recipe reload should succeed:\n{err}");
+    assert_eq!(
+        std::fs::read(&out_a).unwrap(),
+        std::fs::read(&out_b).unwrap(),
+        "reloading the sigmoid sidecar recipe must reproduce the output"
+    );
+}
+
+#[test]
 fn unreadable_input_is_decode_error_exit_three() {
     let tmp = TempDir::new("decode");
     let bad = tmp.path("not-a.tiff");
@@ -622,6 +678,173 @@ fn convert_rejects_unapplied_input_profile() {
     assert_eq!(code, 4, "unapplied input profile must exit 4: {err}");
     assert!(err.contains("not implemented"), "stderr: {err}");
     assert!(!out.exists());
+}
+
+#[test]
+fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
+    // `--algorithm sigmoid` selects the S-curve converter end to end: the JSON
+    // report names the algorithm, carries the resolved Dmax anchor, and the
+    // sidecar recipe round-trips the sigmoid section.
+    let tmp = TempDir::new("sigmoid");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "sigmoid",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--sigmoid-contrast",
+        "1.2",
+    ]);
+    assert_eq!(code, 0, "sigmoid convert should succeed: {err}");
+    assert!(is_tiff(&out));
+    let report = json(&stdout);
+    assert_eq!(report["algorithm"], "sigmoid");
+    assert!(
+        report["dmax"].as_f64().is_some_and(f64::is_finite),
+        "the shared anchor must be reported: {report}"
+    );
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{}.json", out.display())).unwrap())
+            .unwrap();
+    assert_eq!(sidecar["algorithm"], "sigmoid");
+    assert_eq!(sidecar["sigmoid"]["contrast"], 1.2);
+
+    // The anchored shoulder keeps every rendered sample at or below display
+    // white, so — unlike the straight line — the default u16 encode cannot
+    // clip highlights.
+    assert_eq!(
+        report["loss"]["clipped_high"], 0,
+        "the shoulder must prevent u16 highlight clipping: {report}"
+    );
+}
+
+#[test]
+fn sigmoid_small_anchor_does_not_clip_highlights() {
+    // Regression for the toe-lift overshoot bug: a small explicit anchor
+    // (`--d-max 0.1`) with the default toe (0.2) made the old shoulder-then-toe
+    // order lift the white asymptote to ≈ 1.056, so the u16 encode clipped
+    // highlights — defeating sigmoid's headline "shoulder means highlights can't
+    // clip" guarantee. With the toe-then-shoulder reorder the ceiling is
+    // inviolable: clipped_high must be 0.
+    let tmp = TempDir::new("sigmoid-smallanchor");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "sigmoid",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--d-max",
+        "0.1",
+    ]);
+    assert_eq!(
+        code, 0,
+        "sigmoid small-anchor convert should succeed: {err}"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["loss"]["clipped_high"], 0,
+        "a small anchor must not overshoot display white / clip highlights: {report}"
+    );
+}
+
+#[test]
+fn sigmoid_warns_when_density_gamma_is_ignored() {
+    // `--algorithm sigmoid` consumes the density section except density_gamma
+    // (the S-curve replaces the straight line it parameterizes), so a customized
+    // gamma is a silent no-op unless surfaced — run_convert warns, and --strict
+    // promotes that warning to exit 1. The warning must NOT fire at the default
+    // gamma, nor under --algorithm density (where gamma is consumed).
+    let tmp = TempDir::new("gamma-warn");
+    let gamma_warns = |algo: &str, gamma: &str, out: &Path| -> serde_json::Value {
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--algorithm",
+            algo,
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--density-gamma",
+            gamma,
+        ]);
+        assert_eq!(code, 0, "{err}");
+        json(&stdout)
+    };
+    // `warnings` is omitted from the report when empty (skip_serializing_if), so
+    // a missing array counts as "no warnings".
+    let has_gamma_warning = |r: &serde_json::Value| {
+        r["warnings"].as_array().is_some_and(|ws| {
+            ws.iter()
+                .any(|w| w.as_str().unwrap().contains("ignores --density-gamma"))
+        })
+    };
+
+    // sigmoid + custom gamma → warns.
+    let r = gamma_warns("sigmoid", "1.5", &tmp.path("a.tiff"));
+    assert!(
+        has_gamma_warning(&r),
+        "sigmoid must warn on custom gamma: {r}"
+    );
+    // sigmoid + default gamma (1.0) → no warning.
+    let r = gamma_warns("sigmoid", "1.0", &tmp.path("b.tiff"));
+    assert!(
+        !has_gamma_warning(&r),
+        "no warning at the default gamma: {r}"
+    );
+    // density + custom gamma → no warning (gamma is consumed there).
+    let r = gamma_warns("density", "1.5", &tmp.path("c.tiff"));
+    assert!(
+        !has_gamma_warning(&r),
+        "density consumes gamma, must not warn: {r}"
+    );
+
+    // --strict promotes the sigmoid warning to a non-zero exit.
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("d.tiff").to_str().unwrap(),
+        "--algorithm",
+        "sigmoid",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--density-gamma",
+        "1.5",
+        "--strict",
+    ]);
+    assert_eq!(
+        code, 1,
+        "--strict must fail on the gamma-ignored warning: {err}"
+    );
+}
+
+#[test]
+fn sigmoid_rejects_no_d_max() {
+    // The S-curve is anchored on [0, Dmax]; --no-d-max must be a usage error.
+    let tmp = TempDir::new("sigmoid-nodmax");
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "sigmoid",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--no-d-max",
+    ]);
+    assert_eq!(code, 2, "sigmoid + --no-d-max must exit 2: {err}");
+    assert!(!out.exists(), "no output on a usage error");
 }
 
 #[test]
