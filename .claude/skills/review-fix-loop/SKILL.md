@@ -26,9 +26,9 @@ Running both, and verifying before acting, is the point — do not drop one.
 
 ## Inputs
 
-- **Which worktree.** A path (`~/src/nc/<name>` or
-  `.../.claude/worktrees/agent-…`) or a task name to resolve to one
-  (`git worktree list`, then grep the diff/task docs to identify it).
+- **Which worktree.** A path (a sibling checkout like `../<name>`, or one under
+  `.git/worktrees` / `.claude/worktrees/agent-…`) or a task name to resolve to
+  one (`git worktree list`, then grep the diff/task docs to identify it).
 - Confirm before reviewing: the worktree is **rebased onto current
   `origin/main`**, its **CI gates are green**, and the changes are
   **uncommitted** (`git status` = modified/untracked, no commits ahead). If the
@@ -51,19 +51,25 @@ every reviewer prompt so they share context. Note new types, new CLI knobs
 ## Step 2 — Launch reviewers in parallel (all background, all review-only)
 
 **Codex** (independent engine) — run from *inside* the worktree so it reviews the
-right git state; `--scope working-tree` diffs the uncommitted changes vs `HEAD`:
+right git state. The portable way is the plugin **command** `/codex:review`,
+which resolves its own plugin path; pass `--scope working-tree` to diff the
+uncommitted changes vs `HEAD`. To run it as a captured background job, invoke the
+companion script the command wraps — but **discover** the path, never hard-code
+the version (the cache dir is `~/.claude/plugins/cache/openai-codex/codex/<ver>/`
+and the plugin auto-updates):
 
 ```
-node "$HOME/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs" \\
-  review --wait --scope working-tree
+# Resolve the installed companion script (any version), then review the worktree.
+codex_mjs=$(ls -t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs | head -1)
+node "$codex_mjs" review --wait --scope working-tree
 ```
 
 Launch it with `run_in_background: true` (the `--wait` keeps it foreground
 *inside* that background shell so the output is captured verbatim). If you need
-custom framing/focus, route through the `codex:codex-rescue` subagent instead
-(the plain `/codex:review` command takes no focus text). Gotcha: if the review
-400s on the reviewer model, the Codex CLI is too old / its default model needs a
-switch (see CLAUDE.md "Codex review on a worktree").
+custom framing/focus, use the **`/codex:adversarial-review`** command instead
+(the plain `/codex:review` takes no focus text). Gotcha: if the review 400s on
+the reviewer model, the Codex CLI is too old / its default model needs a switch
+(see CLAUDE.md "Codex review on a worktree").
 
 **pr-review-toolkit lenses** — spawn each as a named background `Agent` (so it's
 addressable for follow-up rounds via `SendMessage`). Pick the lenses the diff
