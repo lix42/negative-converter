@@ -39,10 +39,15 @@ For resolve state and thread node IDs, use GraphQL (REST doesn't expose either):
 
 ```
 gh api graphql -f query='
-query($o:String!,$n:String!){ repository(owner:$o,name:$n){ pullRequest(number:<n>){
+query($o:String!,$n:String!,$pr:Int!){ repository(owner:$o,name:$n){ pullRequest(number:$pr){
   reviewThreads(first:100){ nodes { id isResolved isOutdated
-    comments(first:1){ nodes { databaseId author{login} body } } } } } } }' -f o=OWNER -f n=REPO
+    comments(first:1){ nodes { databaseId author{login} body } } } } } } }' \
+  -f o=OWNER -f n=REPO -F pr=NUMBER
 ```
+
+Pass the PR number as the typed variable `$pr` (`-F pr=NUMBER`, capital `-F` for a
+number) — don't string-substitute it into the query; keeping it a variable avoids
+the classic `$n`-vs-literal collision and lets `gh` validate it.
 
 Note two distinct IDs: the **comment** `databaseId`/`.id` (REST, for replying via
 `in_reply_to`) and the **thread** node `id` (`PRRT_…`, GraphQL, for resolving).
@@ -50,10 +55,16 @@ Don't cross them.
 
 ## Step 2 — Filter to what's actionable
 
-Drop, without ceremony: already-**resolved** threads, **outdated** threads whose
-code changed out from under them, and bot **boilerplate** (e.g. a "this bot has
-been sunset" notice, CI-sandbox "couldn't run tests" asides). What remains is the
-real work list. Note each comment's severity label if it has one.
+The work list spans **all three** sources from Step 1, not just inline threads: an
+actionable finding can live only in an **issue-level comment** or in a **review
+summary body**, so fold those in too — don't triage threads alone.
+
+Drop, without ceremony, only: already-**resolved** threads and bot **boilerplate**
+(a "this bot has been sunset" notice, CI-sandbox "couldn't run tests" asides).
+**Outdated ≠ handled:** a thread GitHub marks `isOutdated` (its cited line moved or
+was edited) can still carry live, unaddressed feedback — skim it and drop it only
+if the point is genuinely obsolete, never on the `isOutdated` flag alone. Note each
+comment's severity label if it has one.
 
 ## Step 3 — VERIFY each finding against the code
 
@@ -125,8 +136,9 @@ won't iterate as separate args — loop with `for id in $(…)` / `while read -r
 and pass one ID per call. Verify at the end:
 
 ```
-gh api graphql -f query='query($o:String!,$n:String!){repository(owner:$o,name:$n){pullRequest(number:<n>){reviewThreads(first:100){nodes{isResolved}}}}}' \
-  -f o=OWNER -f n=REPO -q '[.data...reviewThreads.nodes[].isResolved]|"resolved=\(map(select(.==true))|length)/\(length)"'
+gh api graphql -f query='query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}' \
+  -f o=OWNER -f n=REPO -F pr=NUMBER \
+  -q '[.data.repository.pullRequest.reviewThreads.nodes[].isResolved]|"resolved=\(map(select(.==true))|length)/\(length)"'
 ```
 
 ## Step 8 — Loop until quiet
