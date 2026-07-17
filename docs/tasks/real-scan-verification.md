@@ -11,8 +11,10 @@ every defect found. The user prepares the assets.
 ## Design
 
 Not a code task — a structured verification pass driving the compiled `nc`
-binary. Asset locations (from CLAUDE.md): `../nc-assets/{48,64}bit-full/` and
-`~/Pictures/scan/`. **Never read image files into context**: run the binary,
+binary. Asset locations (from CLAUDE.md): the `nc-assets` Google Drive folder
+(https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6), synced
+locally to `../nc-assets/{48,64}bit-full/` (and `~/Pictures/scan/`). **Never read
+image files into context**: run the binary,
 inspect only exit codes, JSON reports, and derived numbers (`tiffinfo` for
 structure).
 
