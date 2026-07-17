@@ -62,8 +62,17 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
   `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure algorithm→output-color core, stages 3–4),
-  `algo/{mod,simple,density}.rs`, `cli.rs`, `main.rs`. `main`/`cli` are the only
-  orchestrators; stages stay pure.
+  `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `cli.rs`, `main.rs`.
+  `main`/`cli` are the only orchestrators; stages stay pure. `build.rs` exposes
+  the compile target triple as `NC_TARGET` for the telemetry record.
+- **Telemetry is operational, not a conversion knob.** `src/telemetry.rs` emits
+  an opt-in, fail-soft, schema-versioned JSON record per `nc convert` run (image
+  facts, per-stage timings, conversion summary) to a JSONL log / one-off file.
+  Its flags (`--telemetry`, `--telemetry-file`, env `NC_TELEMETRY_LOG`) are the
+  **exception** to the "every knob is a CLI flag *and* a recipe key" rule: like
+  `--report`, they're operational, so they live only on the CLI arg struct, are
+  **not** recipe keys, and must never perturb the deterministic image output.
+  How-to lives in the `perf-telemetry` skill; record shape in design-spec §9.
 
 ### Stack / commands
 

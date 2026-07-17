@@ -57,11 +57,15 @@ graph TD
   algo-simple --> pipeline-orchestration
   algo-density --> pipeline-orchestration
   cli-framework --> pipeline-orchestration
+  cli-framework --> stdout-broken-pipe-safety
   film-base-estimation --> auto-base-redesign
   auto-base-redesign --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
   pipeline-orchestration --> real-scan-verification
   pipeline-orchestration --> perf-instrumentation
+  pipeline-orchestration --> perf-telemetry
+  perf-telemetry --> telemetry-strategy
+  telemetry-strategy --> telemetry-upload
   dmax-white-anchor --> real-scan-verification
   algo-density --> dmax-white-anchor
   algo-interface --> algo-sigmoid
@@ -102,7 +106,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `white-holder-support` (post-MVP): `auto-base-redesign`
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
 - `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
-- `perf-instrumentation` (post-MVP): `pipeline-orchestration`
+- `perf-instrumentation` (post-MVP, **parked**): `pipeline-orchestration` — LAB
+  criterion benches; prototyped and parked on branch
+  `prototype/perf-bench-instrumentation`, superseded by `perf-telemetry` as the
+  real (real-world, not lab) direction
+- `perf-telemetry` (post-MVP): `pipeline-orchestration`
+- `telemetry-strategy` (post-MVP, spike): `perf-telemetry`
+- `telemetry-upload` (post-MVP): `telemetry-strategy`
+- `stdout-broken-pipe-safety` (post-MVP, hardening): `cli-framework`
 - `dmax-white-anchor` (post-MVP): `algo-density`
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
@@ -186,7 +197,27 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > discussion). Local-only instrumentation first; remote telemetry stays a
 > deliberately separate, opt-in roadmap item (design-spec §12).
 
-- [ ] [Performance instrumentation](tasks/perf-instrumentation.md)
+- [~] [Performance instrumentation](tasks/perf-instrumentation.md) — **parked**:
+  the LAB criterion-benchmark approach was prototyped and parked on branch
+  `prototype/perf-bench-instrumentation` (not merged; see its
+  `docs/prototypes/perf-bench-instrumentation.md`). The real, real-world direction
+  shipped as `perf-telemetry` below.
+- [x] [Embedded performance + context telemetry](tasks/perf-telemetry.md) — the
+  real-world successor to `perf-instrumentation`: an opt-in JSON telemetry record
+  per `nc convert` run (image + timing + context) to a local JSONL log / one-off
+  file, no new entrypoint. Lifts the prototype's per-stage timing.
+- [ ] [Telemetry strategy spike](tasks/telemetry-strategy.md) — investigate +
+  decide the telemetry infra (backend/service, OTel export vs custom ingestion,
+  how the local JSONL queue drains) and the expanded data set (error/failure
+  events, crash/panic hooks, coarse usage events) plus privacy/consent; outputs a
+  design note and concretely-scoped child tasks.
+- [ ] [Background telemetry upload](tasks/telemetry-upload.md) — ship the local
+  JSONL queue to a server; strictly opt-in. Scoped/informed by `telemetry-strategy`
+  (design-spec §12).
+- [ ] [Stdout broken-pipe safety](tasks/stdout-broken-pipe-safety.md) — make every
+  stdout JSON write (the report via `emit_report`, `nc params`) tolerate a closed
+  pipe (e.g. `nc … | head`) without a panic/backtrace. Pre-existing on `main`, not
+  caused by the telemetry work.
 - [ ] [Conversion versioning & baseline comparison](tasks/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
 
 ### Phase 9: Roll workflow (batch conversion)

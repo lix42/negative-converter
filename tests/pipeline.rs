@@ -45,10 +45,19 @@ impl Drop for TempDir {
 
 /// Run `nc` with `args`; return (exit code, stdout, stderr).
 fn run(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(NC)
-        .args(args)
-        .output()
-        .expect("failed to spawn nc binary");
+    run_env(args, &[])
+}
+
+/// Like [`run`], but with extra environment variables set for the child (used to
+/// point `NC_TELEMETRY_LOG` at a temp file so telemetry tests never touch the
+/// real user data dir).
+fn run_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(NC);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to spawn nc binary");
     (
         out.status.code().expect("process terminated by signal"),
         String::from_utf8(out.stdout).expect("stdout is not UTF-8"),
@@ -678,6 +687,656 @@ fn convert_rejects_unapplied_input_profile() {
     assert_eq!(code, 4, "unapplied input profile must exit 4: {err}");
     assert!(err.contains("not implemented"), "stderr: {err}");
     assert!(!out.exists());
+}
+
+// --- telemetry (opt-in performance + context record) -------------------------
+
+#[test]
+fn telemetry_file_writes_full_record() {
+    // `--telemetry-file <path>` writes one valid JSON record with every schema
+    // field populated (schema_version=1, finite timings, correct dims/bytes).
+    let tmp = TempDir::new("tel-file");
+    let out = tmp.path("out.tiff");
+    let rec = tmp.path("run.json");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--telemetry-file",
+        rec.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "convert with --telemetry-file should succeed:\n{err}"
+    );
+
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+
+    assert_eq!(record["schema_version"], 1);
+    assert!(record["timestamp_ms"].as_u64().unwrap() > 0);
+    assert!(record["nc_version"].is_string());
+    assert!(record["target"].is_string());
+    assert!(record["cpu_count"].is_number() || record["cpu_count"].is_null());
+
+    // Image facts match the known HDR fixture (502x462, 3ch, 16-bit, no IR).
+    let image = &record["image"];
+    assert_eq!(image["format"], "hdr");
+    assert_eq!(image["width"], 502);
+    assert_eq!(image["height"], 462);
+    assert_eq!(image["channels"], 3);
+    assert_eq!(image["bit_depth"], 16);
+    assert_eq!(image["ir_present"], false);
+    let mp = image["megapixels"].as_f64().unwrap();
+    assert!(
+        (mp - (502.0 * 462.0 / 1_000_000.0)).abs() < 1e-9,
+        "megapixels: {mp}"
+    );
+    assert!(image["input_bytes"].as_u64().unwrap() > 0);
+    assert!(image["output_bytes"].as_u64().unwrap() > 0);
+
+    // Per-stage timings are all present and finite.
+    let timing = &record["timing_ms"];
+    for key in [
+        "total",
+        "decode",
+        "film_base",
+        "algorithm",
+        "color",
+        "encode",
+    ] {
+        assert!(
+            timing[key].as_f64().is_some_and(f64::is_finite),
+            "timing_ms.{key} must be finite: {timing}"
+        );
+    }
+    // No IR plane in this fixture → no ir_export timing.
+    assert!(timing.get("ir_export").is_none() || timing["ir_export"].is_null());
+
+    let conv = &record["conversion"];
+    assert_eq!(conv["algorithm"], "density");
+    assert!(conv["params_hash"].as_str().unwrap().len() == 16);
+    assert_eq!(
+        conv["film_base_source"]["explicit"],
+        serde_json::json!([0.9, 0.55, 0.42])
+    );
+    assert_eq!(conv["output_hdr"], false);
+
+    let outcome = &record["outcome"];
+    // No `success` field today — a record is emitted only on success, so a
+    // constant flag would carry no information (see OutcomeInfo).
+    assert!(
+        outcome.get("success").is_none(),
+        "no success field: {outcome}"
+    );
+    assert!(outcome["warnings"].is_number());
+    assert!(outcome["clipped"].is_number());
+    assert!(outcome["non_finite"].is_number());
+}
+
+#[test]
+fn strict_failure_writes_no_telemetry_record() {
+    // A telemetry record's existence is the success signal (there is no
+    // `outcome.success` field). A `--strict` run that exits non-zero on a warning
+    // must therefore leave NO record — otherwise the log would count a failed run
+    // as a successful one. Force a clipping warning with a large `--print-exposure`
+    // (as in `u16_clipping_is_reported_and_strict_promotes_it`), add `--strict`,
+    // and assert exit 1 with no telemetry file created.
+    let tmp = TempDir::new("tel-strict");
+    let out = tmp.path("out.tiff");
+    let rec = tmp.path("run.json");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--print-exposure",
+        "12",
+        "--strict",
+        "--telemetry-file",
+        rec.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "--strict clipping run must exit 1: {err}");
+    assert!(
+        !rec.exists(),
+        "no telemetry record may be written for a --strict failure"
+    );
+}
+
+#[test]
+fn telemetry_file_records_ir_export_timing() {
+    // An HDRi conversion with --export-ir carries the ir_export stage timing.
+    let tmp = TempDir::new("tel-ir");
+    let out = tmp.path("out.tiff");
+    let ir = tmp.path("ir.tiff");
+    let rec = tmp.path("run.json");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--export-ir",
+        ir.to_str().unwrap(),
+        "--telemetry-file",
+        rec.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "HDRi export-ir + telemetry should succeed:\n{err}");
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+    assert_eq!(record["image"]["ir_present"], true);
+    assert!(
+        record["timing_ms"]["ir_export"]
+            .as_f64()
+            .is_some_and(f64::is_finite),
+        "ir_export timing must be present when --export-ir ran: {record}"
+    );
+}
+
+#[test]
+fn telemetry_log_appends_one_line_per_run() {
+    // `--telemetry` appends exactly one JSONL line per run to NC_TELEMETRY_LOG.
+    let tmp = TempDir::new("tel-log");
+    let log = tmp.path("telemetry.jsonl");
+    let convert = |out: &Path| {
+        run_env(
+            &[
+                "convert",
+                fixture("hdr-48bit.tif").to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--film-base",
+                "0.9,0.55,0.42",
+                "--telemetry",
+                "--report",
+                "none",
+            ],
+            &[("NC_TELEMETRY_LOG", log.to_str().unwrap())],
+        )
+    };
+    let out1 = tmp.path("a.tiff");
+    let out2 = tmp.path("b.tiff");
+    let (c1, _, e1) = convert(&out1);
+    let (c2, _, e2) = convert(&out2);
+    assert_eq!(
+        (c1, c2),
+        (0, 0),
+        "telemetry runs should succeed:\n{e1}\n{e2}"
+    );
+
+    let contents = std::fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 2, "two runs must append two lines: {contents}");
+    // Each line is an independent, valid JSON object.
+    for line in lines {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["schema_version"], 1);
+    }
+}
+
+#[test]
+fn telemetry_both_sinks_receive_the_record() {
+    // `--telemetry` + `--telemetry-file` together write to both the JSONL log and
+    // the one-off file ("Both").
+    let tmp = TempDir::new("tel-both");
+    let out = tmp.path("out.tiff");
+    let log = tmp.path("telemetry.jsonl");
+    let rec = tmp.path("run.json");
+    let (code, _stdout, err) = run_env(
+        &[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--telemetry",
+            "--telemetry-file",
+            rec.to_str().unwrap(),
+            "--report",
+            "none",
+        ],
+        &[("NC_TELEMETRY_LOG", log.to_str().unwrap())],
+    );
+    assert_eq!(code, 0, "both-sink telemetry should succeed:\n{err}");
+    assert!(log.exists(), "JSONL log must be written");
+    assert!(rec.exists(), "one-off file must be written");
+    let log_line = std::fs::read_to_string(&log).unwrap();
+    let file_line = std::fs::read_to_string(&rec).unwrap();
+    // Same record content in both sinks (the one-off adds a trailing newline).
+    assert_eq!(log_line.trim(), file_line.trim());
+}
+
+#[test]
+fn telemetry_does_not_perturb_output_or_sidecar() {
+    // THE determinism invariant: telemetry on vs off must produce byte-identical
+    // output TIFF AND sidecar JSON — telemetry never touches the deterministic
+    // path. Point NC_TELEMETRY_LOG at a temp file for the on-run so the default
+    // log is never touched.
+    let tmp = TempDir::new("tel-invariant");
+    let log = tmp.path("telemetry.jsonl");
+    let base = |out: &Path| {
+        vec![
+            "convert".to_string(),
+            fixture("hdri-64bit.tif").to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--algorithm".to_string(),
+            "density".to_string(),
+            "--film-base".to_string(),
+            "0.9,0.55,0.42".to_string(),
+            "--report".to_string(),
+            "none".to_string(),
+        ]
+    };
+
+    // Telemetry OFF.
+    let off = tmp.path("off.tiff");
+    let (c_off, _, _) = run(&base(&off).iter().map(String::as_str).collect::<Vec<_>>());
+
+    // Telemetry ON (both sinks).
+    let on = tmp.path("on.tiff");
+    let rec = tmp.path("on-run.json");
+    let mut on_args = base(&on);
+    on_args.extend(["--telemetry", "--telemetry-file", rec.to_str().unwrap()].map(String::from));
+    let (c_on, _, _) = run_env(
+        &on_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        &[("NC_TELEMETRY_LOG", log.to_str().unwrap())],
+    );
+
+    assert_eq!((c_off, c_on), (0, 0));
+    assert_eq!(
+        std::fs::read(&off).unwrap(),
+        std::fs::read(&on).unwrap(),
+        "output TIFF must be byte-identical with telemetry on vs off"
+    );
+    assert_eq!(
+        std::fs::read(format!("{}.json", off.display())).unwrap(),
+        std::fs::read(format!("{}.json", on.display())).unwrap(),
+        "sidecar must be byte-identical with telemetry on vs off"
+    );
+    // The telemetry record itself was produced (sanity: the feature actually ran).
+    assert!(rec.exists() && log.exists());
+}
+
+#[test]
+fn telemetry_write_failure_is_fail_soft_even_under_strict() {
+    // A telemetry write failure must NOT fail a successful conversion, and
+    // --strict must not promote it (the image already succeeded). Force a write
+    // failure by pointing --telemetry-file under a path whose parent is a regular
+    // file (so create_dir_all fails). Use --output-hdr so the conversion itself
+    // raises no warnings (f32 never clips; the HDR fixture has no IR plane), which
+    // isolates the telemetry failure from any legitimate --strict trigger.
+    let tmp = TempDir::new("tel-failsoft");
+    let out = tmp.path("out.tiff");
+    let blocker = tmp.path("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let bad = tmp.path("blocker/rec.json"); // parent is a file → write fails
+
+    let (code, _stdout, stderr) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "density",
+        "--output-hdr",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--telemetry-file",
+        bad.to_str().unwrap(),
+        "--strict",
+    ]);
+    assert_eq!(
+        code, 0,
+        "a telemetry write failure must not fail the run, even with --strict:\n{stderr}"
+    );
+    assert!(is_tiff(&out), "the output TIFF must still be written");
+    assert!(
+        stderr.to_lowercase().contains("telemetry"),
+        "the telemetry failure must be warned on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn telemetry_file_colliding_with_output_is_usage_error() {
+    // A --telemetry-file that would clobber the output (a config error, distinct
+    // from a runtime write failure) fails loudly up front, before decoding.
+    let tmp = TempDir::new("tel-collide");
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--telemetry-file",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 2,
+        "telemetry-file over the output must be a usage error: {err}"
+    );
+    assert!(
+        !out.exists(),
+        "no artifact may be written on a rejected run"
+    );
+}
+
+#[test]
+fn telemetry_file_colliding_with_sidecar_is_usage_error() {
+    // The sidecar (`out.tiff.json`) is the likeliest footgun for --telemetry-file;
+    // it must be caught by the same collision guard as the output.
+    let tmp = TempDir::new("tel-collide-sidecar");
+    let out = tmp.path("out.tiff");
+    let sidecar = tmp.path("out.tiff.json");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--telemetry-file",
+        sidecar.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 2,
+        "telemetry-file over the sidecar must be a usage error: {err}"
+    );
+    assert!(
+        !out.exists(),
+        "no artifact may be written on a rejected run"
+    );
+}
+
+#[test]
+fn telemetry_log_colliding_with_output_is_usage_error() {
+    // The persistent `--telemetry` log (here via NC_TELEMETRY_LOG) is guarded the
+    // same way as --telemetry-file: a path that would append into the output is a
+    // loud usage error up front, not a silent post-write corruption.
+    let tmp = TempDir::new("tel-log-collide");
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run_env(
+        &[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--telemetry",
+        ],
+        &[("NC_TELEMETRY_LOG", out.to_str().unwrap())],
+    );
+    assert_eq!(
+        code, 2,
+        "telemetry log over the output must be a usage error: {err}"
+    );
+    assert!(
+        !out.exists(),
+        "no artifact may be written on a rejected run"
+    );
+}
+
+#[test]
+fn telemetry_file_dash_writes_json_to_stdout() {
+    // `-` = stdout. Paired with --report none so stdout is exactly the one
+    // telemetry line (a single parseable JSON object), and it must NOT be rejected
+    // as a collision.
+    let tmp = TempDir::new("tel-stdout");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--telemetry-file",
+        "-",
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 0, "telemetry to stdout should succeed:\n{err}");
+    let record = json(&stdout);
+    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["image"]["format"], "hdr");
+}
+
+#[test]
+fn telemetry_params_hash_matches_identical_conversions() {
+    // The load-bearing dedup contract: identical params ⇒ identical params_hash
+    // (and identical sidecar bytes); a changed knob ⇒ a different hash.
+    let tmp = TempDir::new("tel-hash");
+    let fix = fixture("hdr-48bit.tif");
+    let convert = |out: &Path, extra: &[&str]| -> serde_json::Value {
+        let out = out.to_str().unwrap();
+        let mut argv = vec![
+            "convert",
+            fix.to_str().unwrap(),
+            "-o",
+            out,
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--telemetry-file",
+            "-",
+            "--report",
+            "none",
+        ];
+        argv.extend_from_slice(extra);
+        let (code, stdout, err) = run(&argv);
+        assert_eq!(code, 0, "{err}");
+        json(&stdout)
+    };
+    let a = tmp.path("a.tiff");
+    let b = tmp.path("b.tiff");
+    let c = tmp.path("c.tiff");
+    let ra = convert(&a, &[]);
+    let rb = convert(&b, &[]);
+    let rc = convert(&c, &["--density-gamma", "1.8"]);
+
+    let ha = ra["conversion"]["params_hash"].as_str().unwrap();
+    let hb = rb["conversion"]["params_hash"].as_str().unwrap();
+    let hc = rc["conversion"]["params_hash"].as_str().unwrap();
+    assert_eq!(ha, hb, "identical params must share a hash");
+    assert_ne!(ha, hc, "a changed knob must change the hash");
+    // The hash tracks the sidecar bytes, so equal hashes ⇒ equal sidecars.
+    assert_eq!(
+        std::fs::read(format!("{}.json", a.display())).unwrap(),
+        std::fs::read(format!("{}.json", b.display())).unwrap(),
+    );
+}
+
+#[test]
+fn telemetry_log_write_failure_is_fail_soft() {
+    // The JSONL-log sink is fail-soft too: point NC_TELEMETRY_LOG under a path
+    // whose parent is a regular file (create_dir_all fails), and the conversion
+    // must still exit 0 with a stderr warning.
+    let tmp = TempDir::new("tel-log-failsoft");
+    let out = tmp.path("out.tiff");
+    let blocker = tmp.path("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let bad_log = tmp.path("blocker/telemetry.jsonl"); // parent is a file
+
+    let (code, _stdout, stderr) = run_env(
+        &[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--telemetry",
+            "--report",
+            "none",
+        ],
+        &[("NC_TELEMETRY_LOG", bad_log.to_str().unwrap())],
+    );
+    assert_eq!(
+        code, 0,
+        "a JSONL-log write failure must not fail the run:\n{stderr}"
+    );
+    assert!(is_tiff(&out), "the output TIFF must still be written");
+    assert!(
+        stderr.to_lowercase().contains("telemetry"),
+        "the log write failure must be warned on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn telemetry_outcome_reports_clipping_and_warnings() {
+    // End-to-end pinning of the orchestrator → record `outcome` wiring
+    // (`report.warnings.len()` and `EncodeReport::clipped_total`), which the
+    // shape-only tests never exercise. A +12-stop `--print-exposure` guarantees
+    // u16 clipping (and thus a clipping warning), so both counters must be > 0.
+    let tmp = TempDir::new("tel-outcome-clip");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "density",
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--print-exposure",
+        "12",
+        "--telemetry-file",
+        "-",
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 0, "clipping run should still succeed:\n{err}");
+    let record = json(&stdout);
+    let outcome = &record["outcome"];
+    assert!(
+        outcome["clipped"].as_u64().unwrap() > 0,
+        "a +12-stop exposure must report clipped samples: {outcome}"
+    );
+    assert!(
+        outcome["warnings"].as_u64().unwrap() >= 1,
+        "the clipping warning must be counted in outcome.warnings: {outcome}"
+    );
+}
+
+#[test]
+fn telemetry_outcome_counts_ir_ignored_warning() {
+    // A separate warning source than clipping: converting an HDRi scan *without*
+    // --export-ir raises the "IR plane preserved but not used" warning, which must
+    // flow into outcome.warnings — proving the count isn't clipping-specific.
+    let tmp = TempDir::new("tel-outcome-ir");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "density",
+        "--output-hdr", // f32 never clips, so the IR-ignored warning is isolated
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--telemetry-file",
+        "-",
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 0, "HDRi convert should succeed:\n{err}");
+    let record = json(&stdout);
+    let outcome = &record["outcome"];
+    assert_eq!(outcome["clipped"].as_u64().unwrap(), 0, "f32 must not clip");
+    assert!(
+        outcome["warnings"].as_u64().unwrap() >= 1,
+        "the IR-ignored warning must be counted in outcome.warnings: {outcome}"
+    );
+}
+
+#[test]
+fn telemetry_key_in_recipe_is_rejected() {
+    // Telemetry flags are *operational*, not recipe keys: a recipe (`--params`)
+    // carrying a `telemetry` key must be rejected by `deny_unknown_fields` (exit 2,
+    // usage), never silently accepted as if telemetry were a conversion knob.
+    let tmp = TempDir::new("tel-recipe-key");
+    let recipe = tmp.path("recipe.json");
+    std::fs::write(&recipe, r#"{"algorithm":"density","telemetry":true}"#).unwrap();
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 2,
+        "a telemetry key in a recipe must be a usage error (exit 2): {err}"
+    );
+    assert!(
+        !out.exists(),
+        "no artifact may be written on a rejected recipe"
+    );
+}
+
+#[test]
+fn telemetry_records_sigmoid_algorithm_and_params_hash() {
+    // The record's conversion summary must handle `--algorithm sigmoid`: the
+    // Algorithm enum serializes "sigmoid", and params_hash (over the effective
+    // recipe JSON) must cover the sigmoid.* keys, so tweaking one changes the hash.
+    let tmp = TempDir::new("tel-sigmoid");
+    let fix = fixture("hdr-48bit.tif");
+    let convert = |out: &Path, extra: &[&str]| -> serde_json::Value {
+        let out = out.to_str().unwrap();
+        let mut argv = vec![
+            "convert",
+            fix.to_str().unwrap(),
+            "-o",
+            out,
+            "--algorithm",
+            "sigmoid",
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--telemetry-file",
+            "-",
+            "--report",
+            "none",
+        ];
+        argv.extend_from_slice(extra);
+        let (code, stdout, err) = run(&argv);
+        assert_eq!(code, 0, "sigmoid + telemetry should succeed:\n{err}");
+        json(&stdout)
+    };
+    let a = tmp.path("a.tiff");
+    let b = tmp.path("b.tiff");
+    let ra = convert(&a, &[]);
+    let rb = convert(&b, &["--sigmoid-contrast", "1.5"]);
+
+    assert_eq!(
+        ra["conversion"]["algorithm"], "sigmoid",
+        "the record must name the sigmoid algorithm: {ra}"
+    );
+    // sigmoid shares the density anchor, so a resolved dmax still rides along.
+    assert!(
+        ra["conversion"]["dmax"]
+            .as_f64()
+            .is_some_and(f64::is_finite),
+        "sigmoid should report a resolved dmax anchor: {ra}"
+    );
+    assert_ne!(
+        ra["conversion"]["params_hash"], rb["conversion"]["params_hash"],
+        "a changed sigmoid knob must change params_hash"
+    );
 }
 
 #[test]

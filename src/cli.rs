@@ -12,6 +12,7 @@
 //! warnings go to stderr, so an agent can pipe stdout straight into a parser.
 
 use std::fmt::Display;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::io::decode::{DecodeInfo, decode};
 use crate::io::encode;
 use crate::pipeline::{film_base, stages};
+use crate::telemetry;
 use crate::types::{
     Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
     FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams, Result,
@@ -156,6 +158,17 @@ pub struct ConvertArgs {
     /// Fix any stochastic step for reproducibility (none in Step 1; reserved).
     #[arg(long, value_name = "N")]
     pub seed: Option<u64>,
+
+    /// Append a telemetry record for this run to the local JSONL log (under the
+    /// platform data dir, e.g. `$XDG_DATA_HOME/nc/telemetry.jsonl` or
+    /// `~/.local/share/nc/telemetry.jsonl`; override with `NC_TELEMETRY_LOG`).
+    /// Operational flag — not a recipe key; never affects the output image.
+    #[arg(long)]
+    pub telemetry: bool,
+    /// Also write this run's telemetry record to `<path>` (`-` = stdout). May be
+    /// combined with `--telemetry`. Operational flag — not a recipe key.
+    #[arg(long, value_name = "PATH")]
+    pub telemetry_file: Option<String>,
 
     #[command(flatten)]
     pub report: ReportArgs,
@@ -824,6 +837,16 @@ impl Log {
             eprintln!("nc: warning: {msg}");
         }
     }
+
+    /// Warning line shown *regardless* of `--quiet`. For fail-soft telemetry
+    /// failures, which are deliberately kept out of the JSON report (so `--strict`
+    /// can't promote them) and would otherwise vanish entirely under `--quiet` —
+    /// an opted-in feature failing must never be silent. Ordinary warnings use
+    /// [`warn`](Self::warn), which `--quiet` suppresses since the report still
+    /// records them.
+    fn warn_always(&self, msg: &str) {
+        eprintln!("nc: warning: {msg}");
+    }
 }
 
 /// Record a warning into the report and echo it to stderr in one step, so the
@@ -868,7 +891,9 @@ fn run_params() -> Result<()> {
 /// `..` and would let them slip past the check), re-attaching the file name.
 /// When even the parent doesn't exist, fall back to a lexical normalization of
 /// the absolute form. A guard against accidental self-clobbering, not
-/// adversarial links.
+/// adversarial links. Casing is preserved here; [`keys_collide`] applies the
+/// case-insensitive comparison so a not-yet-created `out.tiff`/`OUT.TIFF` pair
+/// (which can't be canonicalized to a shared casing) still collides.
 fn collision_key(path: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(path) {
         return c;
@@ -905,22 +930,40 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     out
 }
 
+/// Whether two collision keys refer to the same write target. Compares exactly
+/// **or** ignoring ASCII case: on a case-insensitive filesystem (macOS/Windows
+/// default) `out.tiff` and `OUT.TIFF` are the same file, but when neither exists
+/// yet [`collision_key`] can't canonicalize them to a shared casing, so a
+/// case-sensitive `==` would wrongly let one write clobber the other. Detecting
+/// per-volume case sensitivity portably isn't cheap, so we **conservatively
+/// over-reject**: this is an accident guard, and false-rejecting `out.tiff` vs
+/// `OUT.TIFF` in a single invocation (a harmless annoyance) is the right trade
+/// against false-accepting and silently overwriting the just-written output.
+fn keys_collide(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
 /// Reject write targets that would clobber the input scan or one another —
 /// e.g. `-o` equal to the input (destroys the negative), or `--report-file`
 /// equal to the output/sidecar (truncates a just-written artifact) — all of
 /// which would otherwise "succeed" with exit 0. Fail loudly up front instead.
+/// Comparison is case-insensitivity-aware (see [`keys_collide`]) so a
+/// case-only difference can't slip a second write onto the same file on a
+/// case-insensitive filesystem.
 fn ensure_write_targets_distinct(input: &Path, targets: &[(&str, &Path)]) -> Result<()> {
     let input_key = collision_key(input);
     let mut seen: Vec<(&str, PathBuf)> = Vec::with_capacity(targets.len());
     for (label, path) in targets {
         let key = collision_key(path);
-        if key == input_key {
+        if keys_collide(&key, &input_key) {
             return Err(NcError::Usage(format!(
                 "{label} ({}) would overwrite the input scan",
                 path.display()
             )));
         }
-        if let Some((other, _)) = seen.iter().find(|(_, k)| *k == key) {
+        if let Some((other, _)) = seen.iter().find(|(_, k)| keys_collide(k, &key)) {
             return Err(NcError::Usage(format!(
                 "{label} ({}) collides with {other}",
                 path.display()
@@ -954,6 +997,16 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     // Guard every write target against the input and against each other before
     // anything is decoded or written.
     let sidecar = encode::sidecar_path(&args.output);
+    // The persistent `--telemetry` log is also a write target: a
+    // `NC_TELEMETRY_LOG` / default path that collides with the input or an
+    // artifact is rejected up front like `--telemetry-file`, so an odd log path
+    // can't silently append into (and corrupt) the input scan or the output.
+    // Resolved here so the borrow outlives `targets`.
+    let telemetry_log = if args.telemetry {
+        telemetry::default_log_path()
+    } else {
+        None
+    };
     let mut targets: Vec<(&str, &Path)> =
         vec![("--output", &args.output), ("the sidecar", &sidecar)];
     if let Some(p) = &args.dump_params {
@@ -964,6 +1017,17 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     }
     if let Some(p) = cfg.input.export_ir.as_deref() {
         targets.push(("--export-ir", Path::new(p)));
+    }
+    // A `--telemetry-file` pointing at a real artifact would clobber it (the
+    // record is written last, after the output). A path collision is a config
+    // error, so it fails loudly up front like the other targets — distinct from a
+    // telemetry *write* failure, which is fail-soft (handled after the conversion).
+    // `-` (stdout) is not a filesystem target, so it's excluded from the check.
+    if let Some(p) = telemetry_file_target(&args) {
+        targets.push(("--telemetry-file", p));
+    }
+    if let Some(p) = &telemetry_log {
+        targets.push(("the telemetry log", p));
     }
     ensure_write_targets_distinct(&args.input, &targets)?;
 
@@ -1002,8 +1066,12 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         );
     }
 
-    // Stage 1 — decode.
+    // Stage 1 — decode. Per-stage wall clocks feed the telemetry record only
+    // (they never touch the image/sidecar); measure them regardless of whether
+    // telemetry is enabled so the render path is uniform.
+    let stage_started = Instant::now();
     let (image, info) = decode(&args.input)?;
+    let decode_ms = elapsed_ms(stage_started);
     log.info(format_args!(
         "decoded {:?} {}x{} (ir={})",
         info.format, info.width, info.height, info.ir_present
@@ -1040,7 +1108,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     // JSON report on a successful run. (A hard render failure propagates its error
     // and exit code like every other error path and emits no report; the stderr
     // warnings still stand.)
+    let stage_started = Instant::now();
     let base = film_base::estimate(&image, &cfg.film_base)?;
+    let film_base_ms = elapsed_ms(stage_started);
     report.film_base = Some(base.base);
     for w in base.warnings {
         push_warning(&mut report, &log, w);
@@ -1084,19 +1154,24 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
     // Optional IR export — before the main encode, so a failing IR write fails
     // the run without first writing the primary output/sidecar.
+    let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
+        let stage_started = Instant::now();
         encode::export_ir(&image, cfg.output.depth(), path)?;
+        ir_export_ms = Some(elapsed_ms(stage_started));
         log.info(format_args!("wrote IR plane {}", path.display()));
         report.ir_exported = Some(path.clone());
     }
 
     // Stage 5 — encode + effective-recipe sidecar.
+    let stage_started = Instant::now();
     let loss = encode::encode(
         &rendered.image,
         &cfg.output,
         Some(&rendered.icc),
         &args.output,
     )?;
+    let encode_ms = elapsed_ms(stage_started);
     report.loss = Some(loss);
     if loss.any_loss() {
         push_warning(
@@ -1126,7 +1201,8 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     encode::write_sidecar(&args.output, &recipe_json)?;
     log.info(format_args!("wrote {}", args.output.display()));
 
-    report.elapsed_ms = Some(elapsed_ms(started));
+    let total_ms = elapsed_ms(started);
+    report.elapsed_ms = Some(total_ms);
 
     // Emit the report before the `--strict` gate so the machine-readable record
     // lands even when a warning then fails the run. (A hard I/O error above
@@ -1136,7 +1212,45 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         args.report.report,
         args.report.report_file.as_deref(),
     )?;
-    if args.strict && !report.warnings.is_empty() {
+
+    // `--strict` promotes any present warning to a non-zero exit. Decide it here,
+    // *before* telemetry: a telemetry record's existence is the success signal
+    // (there is no `outcome.success` field — see telemetry-strategy), so a run
+    // that is about to exit non-zero must not leave a record that would read as a
+    // successful run. The report emitted above already carries the warning detail
+    // either way.
+    let strict_failure = args.strict && !report.warnings.is_empty();
+
+    // Telemetry (opt-in) is emitted after the deterministic output + sidecar are
+    // written and only reads their facts, so it can't perturb them. It is
+    // best-effort: a write failure is warned on stderr and never fails the run
+    // (and `--strict` does not promote it), so it runs *after* the report and is
+    // kept out of `report.warnings` — see `emit_telemetry`. Skipped on a
+    // `--strict` failure so the log stays "one record per successful run".
+    if telemetry_requested(&args) && !strict_failure {
+        let timings = telemetry::TimingInfo {
+            total: total_ms,
+            decode: decode_ms,
+            film_base: film_base_ms,
+            algorithm: rendered.timings.algorithm_ms,
+            color: rendered.timings.color_ms,
+            encode: encode_ms,
+            ir_export: ir_export_ms,
+        };
+        emit_telemetry(
+            &args,
+            &cfg,
+            &info,
+            timings,
+            loss,
+            &recipe_json,
+            &report,
+            &log,
+            telemetry_log.as_deref(),
+        );
+    }
+
+    if strict_failure {
         return Err(NcError::Other(format!(
             "--strict: {} warning(s) present (see report)",
             report.warnings.len()
@@ -1282,6 +1396,123 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether this run should collect telemetry — opt-in via either flag.
+fn telemetry_requested(args: &ConvertArgs) -> bool {
+    args.telemetry || args.telemetry_file.is_some()
+}
+
+/// The `--telemetry-file` value as a filesystem write target, or `None` when it's
+/// absent or `-` (stdout, which is not a file and needs no collision check).
+fn telemetry_file_target(args: &ConvertArgs) -> Option<&Path> {
+    match args.telemetry_file.as_deref() {
+        Some(p) if p != "-" => Some(Path::new(p)),
+        _ => None,
+    }
+}
+
+/// Build the telemetry record for a finished conversion and write it to the
+/// requested sink(s): the persistent JSONL log (`--telemetry`) and/or a one-off
+/// file or stdout (`--telemetry-file`). `telemetry_log` is the pre-resolved log
+/// path the caller already collision-checked, so the guarded and written paths
+/// are the same by construction (and the env is read only once). Best-effort —
+/// every failure is warned on stderr and swallowed (the conversion already
+/// succeeded), and nothing here enters `report.warnings`, so `--strict` cannot
+/// turn a telemetry write failure into a conversion failure. This is the one
+/// documented deviation from the house fail-loudly rule (telemetry is
+/// non-critical observability).
+#[allow(clippy::too_many_arguments)]
+fn emit_telemetry(
+    args: &ConvertArgs,
+    cfg: &ResolvedConfig,
+    info: &DecodeInfo,
+    timings: telemetry::TimingInfo,
+    loss: EncodeReport,
+    recipe_json: &str,
+    report: &Report,
+    log: &Log,
+    telemetry_log: Option<&Path>,
+) {
+    let record = telemetry::build_record(telemetry::RecordInputs {
+        info,
+        // The ambient reads live here in the orchestrator; `build_record` stays a
+        // pure function of its inputs (mirrors `default_log_path`/`resolve_log_path`).
+        timestamp_ms: telemetry::now_unix_millis(),
+        cpu_count: telemetry::cpu_count(),
+        timings,
+        loss,
+        input_bytes: file_len(&args.input),
+        output_bytes: file_len(&args.output),
+        algorithm: cfg.algorithm,
+        params_hash: telemetry::params_hash(recipe_json),
+        film_base_source: cfg.film_base.source.clone(),
+        dmax: report.dmax,
+        output_hdr: cfg.output.hdr,
+        warnings: report.warnings.len(),
+    });
+
+    // A telemetry write failure warns but never fails the run. Unlike ordinary
+    // warnings, these are deliberately kept out of `report.warnings` (so
+    // `--strict` can't promote them), which means the report can't carry them
+    // either — so they must show even under `--quiet` (the `non_finite` precedent
+    // above): an opted-in feature failing silently would defeat the opt-in.
+    // `warn_always` is the one-liner for exactly this. The successful-write
+    // notices stay `log.info` (visible only under `-v`).
+    let warn = |msg: String| log.warn_always(&msg);
+
+    // One compact JSON object (one line for the JSONL log).
+    let line = match serde_json::to_string(&record) {
+        Ok(line) => line,
+        Err(e) => {
+            warn(format!("telemetry: could not serialize record: {e}"));
+            return;
+        }
+    };
+
+    if args.telemetry {
+        match telemetry_log {
+            Some(path) => {
+                if let Err(e) = telemetry::append_jsonl(path, &line) {
+                    warn(format!(
+                        "telemetry: could not append to {}: {e}",
+                        path.display()
+                    ));
+                } else {
+                    log.info(format_args!("telemetry: appended to {}", path.display()));
+                }
+            }
+            None => warn(
+                "telemetry: could not locate a data dir for the log \
+                 (set NC_TELEMETRY_LOG)"
+                    .into(),
+            ),
+        }
+    }
+
+    if let Some(target) = args.telemetry_file.as_deref() {
+        if target == "-" {
+            // `-` = stdout. Written fail-soft with `writeln!` (not `println!`,
+            // which panics on a broken pipe) so a closed stdout reader can't turn
+            // a succeeded conversion into a panic. Note: if the JSON report is
+            // also on stdout (the default), stdout then carries the report plus
+            // this one line — pair `--telemetry-file -` with
+            // `--report none`/`--report-file` when a parser consumes stdout.
+            if let Err(e) = writeln!(std::io::stdout(), "{line}") {
+                warn(format!("telemetry: could not write to stdout: {e}"));
+            }
+        } else if let Err(e) = telemetry::write_oneoff(Path::new(target), &line) {
+            warn(format!("telemetry: could not write {target}: {e}"));
+        } else {
+            log.info(format_args!("telemetry: wrote {target}"));
+        }
+    }
+}
+
+/// Best-effort file size in bytes for the telemetry record; `None` if the file
+/// can't be stat'd (never fails the run).
+fn file_len(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).map(|m| m.len()).ok()
 }
 
 /// Milliseconds elapsed since `started`, as an `f64` for the report.
@@ -1813,5 +2044,45 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert_eq!(got.density.density_gamma, 1.8);
         assert_eq!(got.print, PrintParams::default());
+    }
+
+    #[test]
+    fn keys_collide_is_case_insensitivity_aware() {
+        assert!(keys_collide(
+            Path::new("/d/out.tiff"),
+            Path::new("/d/out.tiff")
+        ));
+        // Case-only difference must collide (conservative over-reject).
+        assert!(keys_collide(
+            Path::new("/d/out.tiff"),
+            Path::new("/d/OUT.TIFF")
+        ));
+        // Genuinely different names must not.
+        assert!(!keys_collide(
+            Path::new("/d/out.tiff"),
+            Path::new("/d/other.tiff")
+        ));
+    }
+
+    #[test]
+    fn write_targets_reject_case_only_collision_before_creation() {
+        // `-o out.tiff --telemetry-file OUT.TIFF` on a case-insensitive FS is the
+        // same file; with neither pre-existing, `collision_key` can't canonicalize
+        // to a shared casing, so the guard must catch it via the case-insensitive
+        // comparison. Use a real (existing) parent dir with non-existent children.
+        let dir = std::env::temp_dir().join(format!("nc-case-collide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.tiff");
+        let tel = dir.join("OUT.TIFF");
+        let input = dir.join("in.tiff");
+        let got = ensure_write_targets_distinct(
+            &input,
+            &[("--output", &out), ("--telemetry-file", &tel)],
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            matches!(got, Err(NcError::Usage(_))),
+            "a case-only telemetry-file/output collision must be a usage error: {got:?}"
+        );
     }
 }
