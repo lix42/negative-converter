@@ -26,7 +26,7 @@ Running both, and verifying before acting, is the point — do not drop one.
 
 ## Inputs
 
-- **Which worktree.** A path (`/Users/li.xu/src/nc/<name>` or
+- **Which worktree.** A path (`~/src/nc/<name>` or
   `.../.claude/worktrees/agent-…`) or a task name to resolve to one
   (`git worktree list`, then grep the diff/task docs to identify it).
 - Confirm before reviewing: the worktree is **rebased onto current
