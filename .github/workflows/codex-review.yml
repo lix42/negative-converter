@@ -22,6 +22,10 @@ jobs:
   codex:
     name: Codex review
     runs-on: ubuntu-latest
+    # Secrets (OPENAI_API_KEY) are not shared with pull_request runs from
+    # forks, so a fork PR would only produce a failed check. Skip them cleanly
+    # rather than fail; PRs from branches in this repo still run.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
     outputs:
@@ -33,14 +37,16 @@ jobs:
           ref: refs/pull/${{ github.event.pull_request.number }}/merge
           persist-credentials: false
 
-      - name: Pre-fetch base and head refs for the PR
+      # Fetch the base branch into a named remote-tracking ref so Codex can run
+      # a real diff. A bare `git fetch origin <base>` writes only FETCH_HEAD and
+      # leaves no resolvable `origin/<base>` ref. The merge checkout above
+      # already contains the PR head, so `origin/<base>...HEAD` is the diff.
+      - name: Fetch the PR base branch for diffing
         env:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           git fetch --no-tags origin \
-            "$PR_BASE_REF" \
-            "+refs/pull/$PR_NUMBER/head"
+            "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF"
 
       - name: Run Codex
         id: run_codex
@@ -90,9 +96,10 @@ jobs:
             }
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} for
-            ${{ github.repository }}. Compare the PR head against the base
-            branch (${{ github.event.pull_request.base.ref }}) and focus only
-            on the lines this PR changes.
+            ${{ github.repository }}. The checkout is the PR merge commit; diff
+            it against `origin/${{ github.event.pull_request.base.ref }}` (e.g.
+            `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD`)
+            and focus only on the lines this PR changes.
 
             Report correctness bugs, security issues, and clear deviations from
             the conventions in CLAUDE.md and docs/design-spec.md. Prefer a small
@@ -114,7 +121,8 @@ jobs:
     needs: codex
     if: needs.codex.outputs.final_message != ''
     permissions:
-      contents: read
+      # createReview / listFiles need pull-requests; the plain-comment fallback
+      # needs issues. No checkout here, so contents access is unnecessary.
       issues: write
       pull-requests: write
     steps:
