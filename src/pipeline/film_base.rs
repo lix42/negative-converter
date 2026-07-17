@@ -414,6 +414,14 @@ fn edge_candidate(image: &LinearImage, edge: Edge, cap: u32) -> Result<Option<Re
         prev = Some(hi);
         depth += 1;
     }
+    // A genuine thin rebate transitions into picture within the scan window. A
+    // uniform run that reaches the scan cap without ever hitting picture is far
+    // more likely uniform scene content (sky / wall) sitting behind the holder —
+    // refuse it rather than anchor the roll on a guess. Auto must fail loudly when
+    // there is no confident *thin* rebate; the user can still `--base-region` it.
+    if depth == cap {
+        return Ok(None);
+    }
     if depth - start < MIN_BAND_STRIPS {
         return Ok(None);
     }
@@ -510,7 +518,10 @@ fn percentile(values: &mut Vec<f32>, p: f32) -> f32 {
     if values.is_empty() {
         return 0.0;
     }
-    let k = ((values.len() - 1) as f32 * p.clamp(0.0, 1.0)).round() as usize;
+    // f64 for the index: a region can exceed 2^24 samples (a 24 MP interior),
+    // above which an `as f32` rank cast loses integer precision and would pick a
+    // slightly wrong order statistic. f64 is exact here with no measurable cost.
+    let k = ((values.len() - 1) as f64 * p.clamp(0.0, 1.0) as f64).round() as usize;
     *values.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
 }
 
@@ -669,6 +680,30 @@ mod tests {
         for flag in ["--film-base", "--base-region", "--base-content"] {
             assert!(msg.contains(flag), "error must name {flag}: {msg}");
         }
+    }
+
+    #[test]
+    fn auto_rejects_uniform_band_spanning_the_scan_window() {
+        // Holder then a uniform-bright run that never transitions to picture
+        // within the 10% scan window (a sky/wall bleeding behind the holder) is
+        // scene content, not a thin rebate — the detector must produce no
+        // candidate for that edge rather than anchor the roll on it.
+        let (w, h) = (100u32, 100u32); // scan cap = 10
+        let mut buf = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let t = (x + y) as f32 / (w + h) as f32; // varied interior
+                buf.extend_from_slice(&[0.06 + 0.34 * t, 0.03 + 0.20 * t, 0.02 + 0.10 * t]);
+            }
+        }
+        let mut img = LinearImage::new(w, h, buf, None).unwrap();
+        fill_rect(&mut img, [0, 0, w, 3], HOLDER); // top holder, 3 px
+        fill_rect(&mut img, [0, 3, w, 7], REBATE); // uniform rows 3..10 → reaches cap
+        let cands = rebate_candidates(&img).unwrap();
+        assert!(
+            !cands.iter().any(|c| c.edge == Edge::Top),
+            "a cap-spanning uniform band must not be a candidate: {cands:?}"
+        );
     }
 
     #[test]
