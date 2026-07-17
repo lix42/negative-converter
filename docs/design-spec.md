@@ -602,9 +602,11 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    a narrow, uniform, bright band *inset behind the holder*, possibly on only
    some edges. The **inward-scan detector** marches 1-px strips in from each edge
    and keeps the first bright, uniform, value-continuous band sitting **behind**
-   a contiguous dark-holder run; the base is the brightest such candidate that is
-   brighter than the frame interior on *every* channel (the rebate is per-channel
-   minimum density — nothing genuine can out-bright clean base). Requiring the
+   a contiguous dark-holder run; the base is the highest-transmission such
+   candidate, higher-transmission than the frame interior on *every* channel (the
+   rebate is per-channel minimum density = maximum transmission — nothing genuine
+   can out-transmit clean base; "bright" here is raw-scan transmission, see §4
+   Terminology). Requiring the
    holder outside the band defeats the bright-surround false positive (a uniform
    bright scene region bleeding to the frame edge has no holder outside it);
    cross-edge disagreement between surviving candidates is surfaced as a report

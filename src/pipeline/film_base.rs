@@ -19,8 +19,11 @@
 //! holder run ([`rebate_candidates`]). Requiring the holder outside the band is
 //! the corroborating signal that defeats the classic false positive (a bright,
 //! uniform scene region bleeding to the frame edge has no holder outside it),
-//! and "brightest candidate wins" is physically grounded: the rebate is `Dmin`,
-//! so no genuine picture area can out-bright it. Gates stay deliberately strict
+//! and "highest-transmission candidate wins" is physically grounded: the rebate
+//! is `Dmin` (per-channel maximum transmission), so no genuine picture area can
+//! out-transmit it. (In this detector "bright" is the *raw-scan transmission*
+//! domain — the rebate is scan-brightest yet renders to scene-black; see
+//! design-spec §4 "Terminology & value domains".) Gates stay deliberately strict
 //! — auto is a convenience tier (design-spec §9 ladder), so a refused detection
 //! is acceptable and a wrong one is not.
 //!
@@ -86,7 +89,7 @@ const INTERIOR_BRIGHTNESS_MARGIN: f32 = 1.05;
 
 /// Cross-edge agreement tolerance: per-channel relative difference above which
 /// surviving candidates on different edges are reported as disagreeing (a
-/// warning — the brightest still wins, but the ambiguity is surfaced and
+/// warning — the highest-transmission candidate still wins, but the ambiguity is surfaced and
 /// `--strict` can refuse it).
 const CROSS_EDGE_AGREE_TOL: f32 = 0.15;
 
@@ -261,11 +264,12 @@ pub fn rebate_candidates(image: &LinearImage) -> Result<Vec<RebateCandidate>> {
     Ok(found)
 }
 
-/// Pick the film base from the detector's candidates: filter to bands brighter
-/// than the frame-interior median by [`INTERIOR_BRIGHTNESS_MARGIN`] on **every**
-/// channel (the rebate is per-channel `Dmin`), then take the brightest survivor
-/// — nothing genuine can out-bright clean base, so a uniform dark picture band
-/// can never out-rank a real rebate. Disagreement between surviving edges
+/// Pick the film base from the detector's candidates: filter to bands with
+/// higher transmission than the frame-interior median by
+/// [`INTERIOR_BRIGHTNESS_MARGIN`] on **every** channel (the rebate is per-channel
+/// `Dmin` = maximum transmission), then take the highest-transmission survivor
+/// — nothing genuine can out-transmit clean base, so a uniform low-transmission
+/// picture band can never out-rank a real rebate. Disagreement between surviving edges
 /// (beyond [`CROSS_EDGE_AGREE_TOL`]) is surfaced as a warning rather than
 /// silently ignored. Fails loudly, naming every recovery flag, when no candidate
 /// survives.
@@ -309,9 +313,10 @@ pub fn select_auto_base(
         })
     else {
         return Err(NcError::Other(format!(
-            "auto film-base detection found candidate band(s) but none brighter than \
-             the frame interior on every channel (the unexposed rebate is per-channel \
-             minimum density, i.e. maximum transmission); {RECOVERY_ADVICE}"
+            "auto film-base detection found candidate band(s) but none with higher \
+             transmission than the frame interior on every channel (the unexposed \
+             rebate is per-channel minimum density, i.e. maximum transmission); \
+             {RECOVERY_ADVICE}"
         )));
     };
 
@@ -335,7 +340,7 @@ pub fn select_auto_base(
     Ok(est)
 }
 
-/// Mean of the three channels — the brightness used to rank candidates.
+/// Mean of the three channels — the mean transmission used to rank candidates.
 fn mean(rgb: &[f32; 3]) -> f32 {
     (rgb[0] + rgb[1] + rgb[2]) / 3.0
 }
@@ -904,8 +909,8 @@ mod tests {
         fill_rect(&mut img, [0, 3, 100, 4], [0.30, 0.30, 0.30]); // dark band
         let err = estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err();
         assert!(
-            err.to_string().contains("brighter"),
-            "should fail the brightness gate: {err}"
+            err.to_string().contains("higher transmission"),
+            "should fail the transmission gate: {err}"
         );
     }
 
