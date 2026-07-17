@@ -171,7 +171,7 @@
   <li><strong>Float-first, lossless internal pipeline.</strong> All math is <code>f32</code> in a linear working space; bit-depth reduction happens only at the final encode.</li>
   <li><strong>Deterministic and reproducible.</strong> Same inputs + same params ⇒ identical output.</li>
   <li><strong>Every knob is a flag.</strong> No conversion behavior is reachable only through code.</li>
-  <li><strong>Pure functions over classes.</strong> Each stage is a pure function <code>(input, params) -&gt; output</code>; the CLI is the only orchestrator.</li>
+  <li><strong>Pure functions over classes.</strong> Each stage is a pure function <code>(input, params) -&gt; output</code>, deterministic in its image output and free of filesystem access; the CLI is the only orchestrator. One narrow exception: the <code>render</code> stage reads a monotonic wall clock to fill the telemetry record's per-stage timings — a report-only channel that leaves the pixels deterministic and untouched by the measurement.</li>
   <li><strong>Fail loudly, never silently.</strong> Bad input, clipped data, or impossible parameters produce explicit errors/warnings with non-zero exit codes — never a quietly wrong image.</li>
 </ol>
 

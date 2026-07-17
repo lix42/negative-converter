@@ -73,8 +73,12 @@ The deterministic core owns the image science. Any future ML assistance (see
 4. **Deterministic and reproducible.** Same inputs + same params ⇒ identical output.
 5. **Every knob is a flag.** No conversion behavior is reachable only through code.
 6. **Pure functions over classes.** Each pipeline stage is a pure function
-   `(input, params) -> output`. The CLI layer is the only orchestrator. (Aligns
-   with the project's Rust style guidance.)
+   `(input, params) -> output`, deterministic in its image output and free of
+   filesystem access. The CLI layer is the only orchestrator. (Aligns with the
+   project's Rust style guidance.) *One narrow exception:* the `render` stage
+   reads a monotonic wall clock to fill the telemetry record's per-stage
+   timings — a report-only channel that leaves the pixels deterministic and
+   untouched by the measurement.
 7. **Fail loudly, never silently.** Bad input, clipped data, or impossible
    parameters produce explicit errors/warnings with non-zero exit codes — never
    a quietly wrong image.

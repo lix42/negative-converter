@@ -323,14 +323,24 @@ pub fn params_hash(recipe_json: &str) -> String {
 ///
 /// The record — body *and* its trailing newline — is assembled into one buffer and
 /// emitted with a single [`write_all`](Write::write_all) to a file opened
-/// `O_APPEND` (`append(true)`). A file opened `O_APPEND` seeks-to-end and writes
-/// as one atomic step on a local POSIX filesystem, so two concurrent
-/// `nc convert --telemetry` sharing one log can't interleave one record's body
-/// with another's newline and corrupt the one-object-per-line JSONL the uploader
-/// drains. `writeln!` would split the body and the newline into separate `write`
-/// calls — two independent atomic appends another writer could slip between —
-/// forfeiting that guarantee. (This is the `O_APPEND` offset-then-write atomicity
-/// guarantee, distinct from the `PIPE_BUF` bound that governs *pipe* writes.)
+/// `O_APPEND` (`append(true)`). Under `O_APPEND` each `write` syscall seeks to
+/// end-of-file and appends atomically on a local POSIX filesystem, so a record
+/// written in one `write` can't interleave its body with another writer's newline
+/// and corrupt the one-object-per-line JSONL the uploader drains. Buffering the
+/// whole `line + '\n'` into one `write_all` (vs. `writeln!`, which splits the body
+/// and the newline into separate `write`s another appender could slip between)
+/// keeps a small record — a single JSON line, well under the size at which a
+/// regular-file `write` returns short — to one `write` in practice, preserving
+/// that atomicity.
+///
+/// Boundary (why this is best-effort, not a hard guarantee): `write_all` *loops*
+/// when a `write` returns short (EINTR / ENOSPC / rlimit), and only each
+/// individual `write` is atomic under `O_APPEND` — so a partial write could let a
+/// concurrent appender interleave. For a small line to a regular file that path is
+/// vanishingly rare, and telemetry is best-effort/fail-soft, so we accept it here;
+/// true cross-process serialization would need advisory file locking (`flock`),
+/// deferred to the telemetry-infra spike. (Distinct from the `PIPE_BUF` bound that
+/// governs *pipe* writes.)
 pub fn append_jsonl(path: &Path, line: &str) -> io::Result<()> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
