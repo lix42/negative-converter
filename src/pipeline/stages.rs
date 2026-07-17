@@ -4,7 +4,12 @@
 //! This is the in-memory core of the `convert` pipeline (design-spec §6, stages
 //! 2–4). Decode (stage 1) and encode (stage 5) are I/O and stay with the
 //! orchestrator (`cli`); everything here is pure `(input, params) -> output` so
-//! it composes and unit-tests without touching the filesystem.
+//! it composes and unit-tests without touching the filesystem — with one
+//! documented exception: [`render`] reads a wall clock to fill [`StageTimings`]
+//! for the telemetry record (a report-only channel; the pixels stay
+//! deterministic and untouched by the measurement).
+
+use std::time::Instant;
 
 use crate::algo::{self, AlgoParams, ConvertReport};
 use crate::pipeline::color;
@@ -22,6 +27,21 @@ pub struct Rendered {
     /// Algorithm-reported diagnostics (e.g. the resolved `Dmax` anchor) for the
     /// JSON report.
     pub convert: ConvertReport,
+    /// Wall-clock per-stage timings measured around the calls in [`render`], for
+    /// the telemetry record's `timing_ms` block. Like [`ConvertReport`], a
+    /// report-only channel: it is never serialized into the recipe sidecar and
+    /// never read back by any stage, so the byte-identical-output determinism
+    /// contract is untouched.
+    pub timings: StageTimings,
+}
+
+/// Wall-clock durations of the two in-memory stages [`render`] runs, in
+/// milliseconds. Report-only diagnostics the orchestrator folds into the
+/// telemetry record alongside its own decode / film-base / encode timings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StageTimings {
+    pub algorithm_ms: f64,
+    pub color_ms: f64,
 }
 
 /// Assemble the algorithm's parameter set for the selected `algorithm` from the
@@ -64,25 +84,47 @@ pub fn algo_params(
 /// orchestrator resolves the base first (via [`film_base::estimate`]) so it can
 /// surface the estimate's quality warnings before this fallible render runs (a
 /// downstream failure must not swallow the "non-uniform region" warning that
-/// explains a bad base). Pure and total in its inputs: any failure (a
-/// degenerate film base, an unreadable custom ICC profile) surfaces as an
+/// explains a bad base). Total in its inputs: any failure (a degenerate film
+/// base, an unreadable custom ICC profile) surfaces as an
 /// [`NcError`](crate::types::NcError) with the right exit code, never a
 /// silently-wrong image. The IR plane is carried through untouched (Step-1 rule:
 /// preserve, don't consume).
+///
+/// The algorithm and output-color stages are each timed with [`Instant`] pairs
+/// (returned as [`StageTimings`] for the telemetry record; the film-base stage is
+/// timed by the orchestrator, which now owns that estimation). The measurement is
+/// the one deliberate impurity here; it never reads back into the pipeline, so the
+/// same inputs still produce bit-identical pixels and ICC whether or not telemetry
+/// is collected.
 pub fn render(
     image: &LinearImage,
     film_base: &FilmBase,
     algo_params: AlgoParams,
     output_params: &OutputParams,
 ) -> Result<Rendered> {
+    let started = Instant::now();
     let converter = algo::build(algo_params);
     let (positive, convert) = converter.convert_reported(image, film_base)?;
+    let algorithm_ms = ms_since(started);
+
+    let started = Instant::now();
     let (image, icc) = color::to_output(&positive, output_params)?;
+    let color_ms = ms_since(started);
+
     Ok(Rendered {
         image,
         icc,
         convert,
+        timings: StageTimings {
+            algorithm_ms,
+            color_ms,
+        },
     })
+}
+
+/// Milliseconds elapsed since `started`, as an `f64` for the telemetry record.
+fn ms_since(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]

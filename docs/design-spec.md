@@ -582,6 +582,56 @@ false-positive on legitimate high-contrast conversions).
   failing exit (see §11)
 - `-v/--verbose`, `--quiet`
 
+**Telemetry (operational, `convert` only — NOT recipe keys).** Opt-in
+performance + context telemetry. These are operational flags like `--report`, so
+they are **not** conversion knobs: they never enter the recipe/sidecar and never
+affect the output bytes (telemetry on or off ⇒ byte-identical TIFF + sidecar).
+- `--telemetry` — append one JSON record for this run to the local JSONL log
+  (default `$XDG_DATA_HOME/nc/telemetry.jsonl`, else `$HOME/.local/share/nc/…` on
+  Unix / `%APPDATA%\nc\…` on Windows; override with the `NC_TELEMETRY_LOG` env
+  var). Create-append; one object per line.
+- `--telemetry-file <path>` — also write the record to `<path>` (`-` = stdout;
+  overwrites a one-off file). May be combined with `--telemetry` (record lands in
+  both sinks). Telemetry is collected iff at least one of these flags is present.
+- **Best-effort:** a telemetry *write* failure is warned on stderr and never fails
+  the run (exit stays 0; `--strict` does not promote it) — the one deliberate
+  deviation from the fail-loudly rule, since telemetry is non-critical
+  observability and the image already succeeded. A `--telemetry-file` **or**
+  `--telemetry` log path (`NC_TELEMETRY_LOG` or the default path) that would *collide* with the
+  input/output/sidecar/report-file is still a loud usage error (a config mistake,
+  caught up front — an odd log path must never silently append into the scan).
+
+**Telemetry record shape (`schema_version` 1, serialize-only JSON).** Designed for
+a future background uploader (§12, `telemetry-upload`) to drain and ship:
+```json
+{
+  "schema_version": 1,
+  "timestamp_ms": 1752566400000,
+  "nc_version": "0.1.0",
+  "target": "aarch64-apple-darwin",
+  "cpu_count": 14,
+  "image": {
+    "format": "hdri", "width": 502, "height": 462, "megapixels": 0.231924,
+    "bit_depth": 16, "channels": 3, "ir_present": true,
+    "input_bytes": 2017230, "output_bytes": 1392370
+  },
+  "timing_ms": {
+    "total": 30.0, "decode": 5.0, "film_base": 0.0, "algorithm": 4.4,
+    "color": 18.4, "encode": 1.0, "ir_export": 0.6
+  },
+  "conversion": {
+    "algorithm": "density", "params_hash": "92a827ffd2d0aebd",
+    "film_base_source": { "explicit": [0.9, 0.55, 0.42] },
+    "dmax": 1.6195, "output_hdr": false
+  },
+  "outcome": { "warnings": 1, "clipped": 3419, "non_finite": 0 }
+}
+```
+`timing_ms.ir_export` is present only when `--export-ir` ran; `conversion.dmax` only
+when the density render applied an anchor. `params_hash` is a stable hash of the
+effective recipe JSON (the same bytes as the sidecar), so identical conversions
+share a hash without the record carrying the whole recipe.
+
 ## 10. Code architecture (Rust)
 
 Pure functions per stage; the CLI is the only orchestrator. Suggested layout:
@@ -695,14 +745,27 @@ the NLP feature comparison, Phase 6).
     candidates, and feedback when a chosen region fails the uniformity check
     (the CLI-side uniformity warning and inspect candidates above are the
     building blocks).
-12. **Crash reporting & opt-in telemetry.** Local first: a panic hook writing a
-    crash file (version, backtrace, params shape — never pixels or file paths)
-    the user can attach to a bug report. Remote collection (error reporting,
-    usage analytics) only later and strictly **opt-in**: documented event list,
-    an `NC_TELEMETRY=0`-style off switch, no stdout pollution, no blocking, no
-    effect on exit codes or output bytes. Performance instrumentation is *not*
-    deferred with this — per-stage timings/tracing are the tracked pre-release
-    `perf-instrumentation` task.
+12. **Crash reporting & opt-in telemetry.** The **local, opt-in telemetry
+    record** has **shipped** as the `perf-telemetry` task: an embedded, opt-in
+    JSON record per `nc convert` (image + per-stage timing + run context) written
+    to a local JSONL log and/or one-off file (`--telemetry` / `--telemetry-file`,
+    `NC_TELEMETRY_LOG`; see §9), best-effort and byte-identical-output-preserving.
+    **Remaining follow-ups are gated behind a strategy spike** (`telemetry-strategy`)
+    that decides the shape before anything is built — because the questions are
+    coupled (the data you collect drives the backend you need and the consent you
+    must obtain): (a) **infrastructure** — a hosted/owned collection service, **OTel
+    export vs custom ingestion**, and how the local JSONL queue drains (the
+    `telemetry-upload` child: background/out-of-critical-path drain, strictly opt-in
+    with a documented event list and an `NC_TELEMETRY=0`-style off switch, no stdout
+    pollution/blocking/exit-code/output effect); (b) **expanded data** — error/failure
+    events (today only successful runs emit a record; likely an `outcome.status` enum),
+    a **panic/crash hook** (version, backtrace, params *shape* — never pixels or file
+    paths), and coarse usage events (which flags/algorithms were used); and
+    (c) **privacy/consent** — the opt-in model for upload and explicit PII/path
+    scrubbing rules upholding the no-pixels/no-paths invariant. Note: the original
+    LAB-benchmark `perf-instrumentation` task is **parked** (prototype on
+    `prototype/perf-bench-instrumentation`); `perf-telemetry` is the real-world
+    successor.
 13. **Roll workflow & base-acquisition planner** (extends item 6). Two
     conversion workflows: **roll** (resolve `Dmin` + `Dmax` once, convert the
     whole roll from a frozen shared recipe — strongly preferred, keeps frames
@@ -745,6 +808,16 @@ the NLP feature comparison, Phase 6).
     performance are trackable version-to-version. Quality metrics (ΔE2000/SSIM)
     extend via item 7's QA harness; timings via `perf-instrumentation`. `v0` is
     recorded in `docs/reports/v0-baseline.md`. Tracked: `conversion-versioning`.
+17. **Stdout broken-pipe safety.** Every stdout JSON write — `emit_report`
+    (convert/inspect/estimate) and `nc params` — uses `println!`, which
+    panics on a closed pipe — the `nc … | head` / `… | jq 'first'` case, where the
+    reader exits after
+    enough bytes — printing a backtrace and returning failure though the conversion
+    already succeeded. Route all stdout writes through a broken-pipe-tolerant helper
+    (clean quiet exit on `BrokenPipe`, or reset `SIGPIPE` to `SIG_DFL` at startup),
+    reusing the fail-soft `writeln!(stdout)` pattern the `--telemetry-file -` sink
+    already uses. Pre-existing on `main`, independent of the telemetry work.
+    Tracked: `stdout-broken-pipe-safety`.
 
 ## 13. Open questions
 

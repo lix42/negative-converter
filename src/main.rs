@@ -8,6 +8,7 @@ mod algo;
 mod cli;
 mod io;
 mod pipeline;
+mod telemetry;
 mod types;
 
 use std::process::ExitCode;
