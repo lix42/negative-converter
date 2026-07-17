@@ -54,7 +54,7 @@ every reviewer prompt so they share context. Note new types, new CLI knobs
 right git state; `--scope working-tree` diffs the uncommitted changes vs `HEAD`:
 
 ```
-node "/Users/li.xu/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs" \
+node "$HOME/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs" \\
   review --wait --scope working-tree
 ```
 
