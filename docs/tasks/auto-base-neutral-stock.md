@@ -60,6 +60,33 @@ depend on base color:
 - Phoenix unexposed / rebate regions → still detected as base.
 - Ektar (orange) results unchanged — no regression on the easy case.
 
+## Additional hardening (from PR #23 review)
+
+Two candidate-**selection** weaknesses surfaced reviewing `auto-base-redesign`;
+both are the same "don't trust brightness/color alone" theme this task owns, so
+fold them in here rather than spawn separate tasks:
+
+- **Mean-brightness tiebreak can prefer a non-rebate.** Selection ranks surviving
+  candidates by the mean of their three channels, so a colored edge artifact like
+  `[0.8, 0.3, 0.1]` (mean 0.40) can out-rank a true orange rebate
+  `[0.53, 0.26, 0.16]` (mean 0.32) even though it is *lower* in blue. Today this
+  only fires a cross-edge disagreement warning (and `--strict` refuses); in the
+  default path it silently anchors on the artifact. Prefer a **per-channel
+  dominance** rule (a winner must be ≥ every other survivor on every channel);
+  when no candidate dominates, that is genuine ambiguity → refuse (or keep the
+  warning) rather than pick by mean.
+- **A single uncorroborated bright band = content estimation in disguise.** With a
+  holder present but no real rebate, a thin high-transmission picture strip on one
+  edge can be the sole survivor and is accepted with no cross-edge warning — auto
+  then behaves like content-based estimation, which is supposed to be explicit
+  opt-in (`--base-content`). **Do not "fix" this by requiring cross-edge
+  corroboration** — single-edge rebate is legitimate and common (the user's own
+  stock scans have rebate on one edge only; `auto-base-redesign` supports and
+  tests it). Instead lean on the color-independent corroborators above (flatness,
+  geometry/holder-adjacency, cross-frame value agreement) to tell a real thin
+  rebate from a bright content strip. (The related "uniform band spanning the
+  whole scan window" case was fixed in `auto-base-redesign` itself.)
+
 ## Dependencies
 
 - [Robust auto film-base detection](auto-base-redesign.md)

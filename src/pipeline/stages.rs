@@ -7,19 +7,18 @@
 //! it composes and unit-tests without touching the filesystem.
 
 use crate::algo::{self, AlgoParams, ConvertReport};
-use crate::pipeline::{color, film_base};
+use crate::pipeline::color;
 use crate::types::{
-    Algorithm, DensityParams, FilmBase, FilmBaseParams, LinearImage, OutputParams, PrintParams,
-    Result, SimpleParams,
+    Algorithm, DensityParams, FilmBase, LinearImage, OutputParams, PrintParams, Result,
+    SimpleParams,
 };
 
 /// The in-memory pipeline result the orchestrator hands to the encoder: the
-/// output-color-transformed positive image, the ICC blob to embed alongside it,
-/// and the film base that was resolved (for the JSON report).
+/// output-color-transformed positive image and the ICC blob to embed alongside
+/// it.
 pub struct Rendered {
     pub image: LinearImage,
     pub icc: Vec<u8>,
-    pub film_base: FilmBase,
     /// Algorithm-reported diagnostics (e.g. the resolved `Dmax` anchor) for the
     /// JSON report.
     pub convert: ConvertReport,
@@ -48,30 +47,32 @@ pub fn algo_params(
     }
 }
 
-/// Run pipeline stages 2–4 on a decoded image: estimate the film base, convert
-/// negative → positive with the selected algorithm, then transform the result
-/// into the output color space. Returns the color-transformed image, the ICC
-/// blob to embed, and the resolved film base.
+/// Run pipeline stages 3–4 on a decoded image and an **already-resolved** film
+/// base: convert negative → positive with the selected algorithm, then
+/// transform the result into the output color space. Returns the
+/// color-transformed image and the ICC blob to embed.
 ///
-/// Pure and total in its inputs: any failure (a degenerate estimated film base,
-/// an out-of-bounds `--base-region`, an unreadable custom ICC profile) surfaces
-/// as an [`NcError`](crate::types::NcError) with the right exit code, never a
+/// Film-base estimation (stage 2) is deliberately **not** done here — the
+/// orchestrator resolves the base first (via [`film_base::estimate`]) so it can
+/// surface the estimate's quality warnings before this fallible render runs (a
+/// downstream failure must not swallow the "non-uniform region" warning that
+/// explains a bad base). Pure and total in its inputs: any failure (a
+/// degenerate film base, an unreadable custom ICC profile) surfaces as an
+/// [`NcError`](crate::types::NcError) with the right exit code, never a
 /// silently-wrong image. The IR plane is carried through untouched (Step-1 rule:
 /// preserve, don't consume).
 pub fn render(
     image: &LinearImage,
-    film_base_params: &FilmBaseParams,
+    film_base: &FilmBase,
     algo_params: AlgoParams,
     output_params: &OutputParams,
 ) -> Result<Rendered> {
-    let film_base = film_base::estimate(image, film_base_params)?;
     let converter = algo::build(algo_params);
-    let (positive, convert) = converter.convert_reported(image, &film_base)?;
+    let (positive, convert) = converter.convert_reported(image, film_base)?;
     let (image, icc) = color::to_output(&positive, output_params)?;
     Ok(Rendered {
         image,
         icc,
-        film_base,
         convert,
     })
 }
@@ -79,19 +80,29 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::FilmBaseSource;
+    use crate::pipeline::film_base;
+    use crate::types::{FilmBaseParams, FilmBaseSource};
 
-    /// A small synthetic negative: a bright, uniform orange border (the film
-    /// base) around a darker interior, so `Auto` estimation has a border to find.
+    /// A small synthetic negative with the real scan layout — a near-black
+    /// holder ring, then a bright, uniform orange rebate band (the film base),
+    /// then a varied interior — so `Auto` estimation has a rebate to find.
     fn synthetic_negative(w: u32, h: u32) -> LinearImage {
-        let border = [0.9, 0.55, 0.42];
-        let interior = [0.3, 0.22, 0.18];
-        let margin = 3;
+        let holder = [0.01, 0.01, 0.01];
+        let rebate = [0.9, 0.55, 0.42];
+        let (holder_px, rebate_px) = (1, 2);
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for y in 0..h {
             for x in 0..w {
-                let edge = x < margin || y < margin || x >= w - margin || y >= h - margin;
-                rgb.extend_from_slice(if edge { &border } else { &interior });
+                let depth = x.min(y).min(w - 1 - x).min(h - 1 - y);
+                if depth < holder_px {
+                    rgb.extend_from_slice(&holder);
+                } else if depth < holder_px + rebate_px {
+                    rgb.extend_from_slice(&rebate);
+                } else {
+                    // Varied picture content, darker than the rebate.
+                    let t = (x + y) as f32 / (w + h) as f32;
+                    rgb.extend_from_slice(&[0.1 + 0.3 * t, 0.08 + 0.2 * t, 0.05 + 0.15 * t]);
+                }
             }
         }
         LinearImage::new(w, h, rgb, None).unwrap()
@@ -118,36 +129,40 @@ mod tests {
         ));
     }
 
+    /// Resolve the film base the way the orchestrator does (stage 2), so the
+    /// render tests exercise the same estimate → render sequence as `cli`.
+    fn resolve(img: &LinearImage, source: FilmBaseSource) -> FilmBase {
+        film_base::estimate(img, &FilmBaseParams { source })
+            .unwrap()
+            .base
+    }
+
     #[test]
     fn render_runs_the_full_simple_path_and_transforms_color() {
         let img = synthetic_negative(40, 40);
         let (s, d, p) = density_params();
-        let fb = FilmBaseParams {
-            source: FilmBaseSource::Auto,
-        };
+        // The auto estimate lands on the bright orange base (r > b).
+        let base = resolve(&img, FilmBaseSource::Auto);
+        assert!(base.r > base.b, "orange base: r > b");
         let out = render(
             &img,
-            &fb,
+            &base,
             algo_params(Algorithm::Simple, &s, &d, &p),
             &OutputParams::default(),
         )
         .unwrap();
         assert_eq!((out.image.width, out.image.height), (40, 40));
         assert!(!out.icc.is_empty(), "an ICC profile must be produced");
-        // The auto border estimate lands on the bright orange base.
-        assert!(out.film_base.r > out.film_base.b, "orange base: r > b");
     }
 
     #[test]
     fn render_runs_the_density_path_with_explicit_base() {
         let img = synthetic_negative(16, 16);
         let (s, d, p) = density_params();
-        let fb = FilmBaseParams {
-            source: FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
-        };
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
         let out = render(
             &img,
-            &fb,
+            &base,
             algo_params(Algorithm::Density, &s, &d, &p),
             &OutputParams {
                 hdr: true,
@@ -155,25 +170,20 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(out.film_base, FilmBase::from([0.9, 0.55, 0.42]));
         assert_eq!(out.image.rgb.len(), 16 * 16 * 3);
     }
 
     #[test]
-    fn render_propagates_a_degenerate_estimated_base() {
-        // A base region over a black (zero-transmission) patch yields a zero
-        // channel; both converters must reject it rather than divide by zero.
-        let mut img = synthetic_negative(20, 20);
-        for px in img.rgb.chunks_exact_mut(3).take(20) {
-            px.copy_from_slice(&[0.0, 0.0, 0.0]);
-        }
+    fn render_rejects_a_degenerate_base() {
+        // Defense-in-depth: even if a zero-channel base reached `render` (estimate
+        // now rejects it at birth), the converter must reject it rather than
+        // divide by zero — exit 1, never a silently-wrong image.
+        let img = synthetic_negative(20, 20);
         let (s, d, p) = density_params();
-        let fb = FilmBaseParams {
-            source: FilmBaseSource::Region([0, 0, 20, 1]),
-        };
+        let base = FilmBase::from([0.0, 0.55, 0.42]);
         match render(
             &img,
-            &fb,
+            &base,
             algo_params(Algorithm::Density, &s, &d, &p),
             &OutputParams::default(),
         ) {
