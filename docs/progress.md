@@ -1019,10 +1019,12 @@ a task; update your own section as you work. Append entries — don't rewrite th
     owns them). This also tightens the stage split (estimation = stage 2,
     render = stages 3–4).
   - **`nc estimate --strict`** (silent-failure, MEDIUM): the base-producing
-    command now promotes its warnings to a failing exit, so a script baking a
-    Dmin into a recipe fails on a plausible-looking-but-bad region instead of
-    echoing it. Makes the `BaseEstimate` "`--strict` promotes" doc true on every
-    warning-producing path.
+    command now promotes its warnings to a failing (non-zero) exit, so a script
+    baking a Dmin into a recipe short-circuits on a plausible-looking-but-bad
+    region. The report (including the warnings) still emits *before* the gate —
+    matching `convert` — so the signal is the non-zero exit code, not a suppressed
+    value; a consumer must gate on the exit code. Makes the `BaseEstimate`
+    "`--strict` promotes" doc true on every warning-producing path.
   - **Minor:** unified auto-refusal recovery wording into one `RECOVERY_ADVICE`
     const (all refusals, incl. the too-small case, *suggest* `--base-content` as
     the owned-elsewhere fallback); doc fixes (candidates are pre-brightness-gate;

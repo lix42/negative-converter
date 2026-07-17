@@ -80,9 +80,10 @@ const CROSS_EDGE_AGREE_TOL: f32 = 0.15;
 /// here — it is owned by the separate `film-base-content-fallback` task and is
 /// never a silent fallback (design-spec §9 ladder tier 3).
 const RECOVERY_ADVICE: &str = "pass --film-base or --base-region (design-spec §9: measure once \
-     from an unexposed reference and reuse it); if the scan is cropped with no \
-     unexposed film visible, opt in to content-based estimation with \
-     --base-content (owned by the film-base-content-fallback task)";
+     from an unexposed reference and reuse it). For a cropped scan with no unexposed \
+     film visible, content-based estimation is planned but not yet available (the \
+     --base-content flag is owned by the film-base-content-fallback task); until it \
+     ships, use --film-base or --base-region";
 
 /// A resolved film base plus any non-fatal quality warnings the estimation
 /// raised (e.g. a non-uniform `--base-region`, cross-edge disagreement). The

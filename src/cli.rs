@@ -936,9 +936,11 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     }
 
     // Stage 2 — film-base estimate. Resolved before the render so its quality
-    // warnings (non-uniform region, cross-edge disagreement) reach the report
-    // even if a later render stage then errors — a downstream failure must not
-    // swallow the one line explaining why the base was bad.
+    // warnings (non-uniform region, cross-edge disagreement) are pushed — and so
+    // echoed to stderr — *before* the fallible render runs, and ride out in the
+    // JSON report on a successful run. (A hard render failure propagates its error
+    // and exit code like every other error path and emits no report; the stderr
+    // warnings still stand.)
     let base = film_base::estimate(&image, &cfg.film_base)?;
     report.film_base = Some(base.base);
     for w in base.warnings {
