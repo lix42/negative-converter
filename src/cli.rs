@@ -1213,12 +1213,21 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         args.report.report_file.as_deref(),
     )?;
 
+    // `--strict` promotes any present warning to a non-zero exit. Decide it here,
+    // *before* telemetry: a telemetry record's existence is the success signal
+    // (there is no `outcome.success` field — see telemetry-strategy), so a run
+    // that is about to exit non-zero must not leave a record that would read as a
+    // successful run. The report emitted above already carries the warning detail
+    // either way.
+    let strict_failure = args.strict && !report.warnings.is_empty();
+
     // Telemetry (opt-in) is emitted after the deterministic output + sidecar are
     // written and only reads their facts, so it can't perturb them. It is
     // best-effort: a write failure is warned on stderr and never fails the run
     // (and `--strict` does not promote it), so it runs *after* the report and is
-    // kept out of `report.warnings` — see `emit_telemetry`.
-    if telemetry_requested(&args) {
+    // kept out of `report.warnings` — see `emit_telemetry`. Skipped on a
+    // `--strict` failure so the log stays "one record per successful run".
+    if telemetry_requested(&args) && !strict_failure {
         let timings = telemetry::TimingInfo {
             total: total_ms,
             decode: decode_ms,
@@ -1241,7 +1250,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         );
     }
 
-    if args.strict && !report.warnings.is_empty() {
+    if strict_failure {
         return Err(NcError::Other(format!(
             "--strict: {} warning(s) present (see report)",
             report.warnings.len()

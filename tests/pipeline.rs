@@ -778,6 +778,37 @@ fn telemetry_file_writes_full_record() {
 }
 
 #[test]
+fn strict_failure_writes_no_telemetry_record() {
+    // A telemetry record's existence is the success signal (there is no
+    // `outcome.success` field). A `--strict` run that exits non-zero on a warning
+    // must therefore leave NO record — otherwise the log would count a failed run
+    // as a successful one. Force a clipping warning with a large `--print-exposure`
+    // (as in `u16_clipping_is_reported_and_strict_promotes_it`), add `--strict`,
+    // and assert exit 1 with no telemetry file created.
+    let tmp = TempDir::new("tel-strict");
+    let out = tmp.path("out.tiff");
+    let rec = tmp.path("run.json");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--print-exposure",
+        "12",
+        "--strict",
+        "--telemetry-file",
+        rec.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "--strict clipping run must exit 1: {err}");
+    assert!(
+        !rec.exists(),
+        "no telemetry record may be written for a --strict failure"
+    );
+}
+
+#[test]
 fn telemetry_file_records_ir_export_timing() {
     // An HDRi conversion with --export-ir carries the ir_export stage timing.
     let tmp = TempDir::new("tel-ir");

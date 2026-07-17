@@ -12,10 +12,12 @@ description: >-
 
 # nc perf telemetry
 
-`nc convert` can emit one JSON **telemetry record** per run — image facts, per-stage
-timings, a compact conversion summary, and the outcome — to a local append-only
-JSONL log and/or a one-off file. It is **opt-in**, **best-effort**, and never
-perturbs the converted image. Full design: design-spec §9 (record shape) and §12
+`nc convert` can emit one JSON **telemetry record** per **successful** run — image
+facts, per-stage timings, a compact conversion summary, and the outcome — to a
+local append-only JSONL log and/or a one-off file. It is **opt-in**,
+**best-effort**, and never perturbs the converted image. A record's existence is
+the success signal (there is no `outcome.success` field), so a run that exits
+non-zero — including a `--strict` warning promotion — writes **no** record. Full design: design-spec §9 (record shape) and §12
 (roadmap). Code: `src/telemetry.rs` (record + builder + sinks), wired from
 `cli::run_convert` / `cli::emit_telemetry`; per-stage timings come from
 `pipeline::stages::render` via `StageTimings`.
