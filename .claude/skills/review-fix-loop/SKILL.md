@@ -26,9 +26,11 @@ Running both, and verifying before acting, is the point — do not drop one.
 
 ## Inputs
 
-- **Which worktree.** A path (a sibling checkout like `../<name>`, or one under
-  `.git/worktrees` / `.claude/worktrees/agent-…`) or a task name to resolve to
-  one (`git worktree list`, then grep the diff/task docs to identify it).
+- **Which worktree.** A checkout path (a sibling like `../<name>`, or an agent
+  worktree under `.claude/worktrees/agent-…`) or a task name to resolve to one.
+  Get the real checkout path from `git worktree list` — not `.git/worktrees/<name>`,
+  which is Git's internal metadata dir, not the working tree — then grep the
+  diff/task docs to identify it.
 - Confirm before reviewing: the worktree is **rebased onto current
   `origin/main`**, its **CI gates are green**, and the changes are
   **uncommitted** (`git status` = modified/untracked, no commits ahead). If the
@@ -39,14 +41,21 @@ Running both, and verifying before acting, is the point — do not drop one.
 From inside the worktree:
 
 ```
-git diff --stat HEAD          # size + files touched
-git diff --name-only HEAD     # what changed
+git status --short            # AUTHORITATIVE change list — includes untracked (??) files
+git diff --stat HEAD          # sizes for tracked (modified) changes
 ```
+
+**`git diff HEAD` omits untracked files** — a brand-new module or test file (the
+whole point of a feature) shows only as `??` in `git status`, never in the diff.
+Scope from `git status --short`, and enumerate every untracked file so a new file
+can't slip through unreviewed. (If you prefer diff-based framing, `git add -N .`
+makes new files appear in `git diff HEAD` as intent-to-add — no commit — but then
+`git reset` afterward to leave the tree exactly as found.)
 
 Read the worktree's `CLAUDE.md` (conventions differ per branch after rebases).
 Write a 2–3 sentence framing of *what the change does* — you will paste it into
-every reviewer prompt so they share context. Note new types, new CLI knobs
-(four-coupled-spots), new error paths, and which docs changed.
+every reviewer prompt so they share context. Note new files/modules, new types,
+new CLI knobs (four-coupled-spots), new error paths, and which docs changed.
 
 ## Step 2 — Launch reviewers in parallel (all background, all review-only)
 
@@ -84,8 +93,10 @@ warrants:
 | `pr-review-toolkit:comment-analyzer` | docs/comments/design-spec changed |
 | `pr-review-toolkit:code-simplifier` | optional final polish, after it's otherwise clean |
 
-Every reviewer prompt must include: the worktree **path**; scope = **`git diff
-HEAD`, uncommitted, no GitHub PR**; the shared change-framing; a **per-lens
+Every reviewer prompt must include: the worktree **path**; scope = **all
+uncommitted changes, no GitHub PR** — the `git diff HEAD` *plus the untracked
+files listed by `git status --short`* (name the new files explicitly so they're
+reviewed, not just the modified ones); the shared change-framing; a **per-lens
 focus**; "read the worktree's CLAUDE.md first"; "report findings **by severity**
 with file:line"; and **"do NOT modify any files — review only."** Only the fix
 agent edits.
