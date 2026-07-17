@@ -3,8 +3,12 @@ name: Codex Review
 # Run OpenAI Codex as a PR reviewer. Split into two jobs on purpose: the
 # `codex` job runs the model with read-only permissions (so a compromised
 # review can't reach write scopes while the OPENAI_API_KEY secret is in the
-# environment), and a separate `post_feedback` job posts the result back as a
-# PR comment with the minimal write scopes it needs.
+# environment), and a separate `post_feedback` job posts the result back with
+# the minimal write scopes it needs.
+#
+# Codex is constrained to emit JSON (see `output-schema` below) so we can post
+# each finding as an inline PR review comment anchored to a file and line,
+# rather than one opaque top-level comment.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -44,17 +48,65 @@ jobs:
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           permission-profile: ":read-only"
+          # Force machine-readable output so `post_feedback` can map each
+          # finding onto a line of the diff.
+          output-schema: |
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["summary", "findings"],
+              "properties": {
+                "summary": {
+                  "type": "string",
+                  "description": "Overall assessment of the PR, one short paragraph."
+                },
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "line", "severity", "comment"],
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "description": "Repo-relative path of the changed file."
+                      },
+                      "line": {
+                        "type": "integer",
+                        "description": "Line number in the NEW version of the file that the comment anchors to. Must be a line added or changed by this PR."
+                      },
+                      "severity": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"]
+                      },
+                      "comment": {
+                        "type": "string",
+                        "description": "The review comment for this line."
+                      }
+                    }
+                  }
+                }
+              }
+            }
           prompt: |
             Review pull request #${{ github.event.pull_request.number }} for
             ${{ github.repository }}. Compare the PR head against the base
-            branch (${{ github.event.pull_request.base.ref }}) and focus on the
-            changed files.
+            branch (${{ github.event.pull_request.base.ref }}) and focus only
+            on the lines this PR changes.
 
             Report correctness bugs, security issues, and clear deviations from
             the conventions in CLAUDE.md and docs/design-spec.md. Prefer a small
-            number of high-confidence findings over an exhaustive list; if the
-            change looks good, say so briefly. Reference findings as
-            `path:line`.
+            number of high-confidence findings over an exhaustive list.
+
+            Return your answer as JSON matching the provided schema:
+            - `summary`: a short overall assessment (say so briefly if the
+              change looks good).
+            - `findings`: one entry per issue. Each `line` MUST be a line added
+              or modified by this PR, numbered against the NEW version of the
+              file, so it can be anchored as an inline review comment. If a
+              concern is not tied to a specific changed line, fold it into
+              `summary` instead of inventing a line number. Return an empty
+              array when there is nothing to flag.
 
   post_feedback:
     name: Post Codex feedback
@@ -66,16 +118,100 @@ jobs:
       issues: write
       pull-requests: write
     steps:
-      - name: Comment Codex feedback on the PR
+      - name: Post Codex review with inline comments
         uses: actions/github-script@v7
         env:
           CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
         with:
           github-token: ${{ github.token }}
           script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: process.env.CODEX_FINAL_MESSAGE,
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const raw = process.env.CODEX_FINAL_MESSAGE || '';
+
+            // Codex should return bare JSON (output-schema), but tolerate a
+            // ```json fenced block just in case.
+            const stripFence = (s) => {
+              const m = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+              return (m ? m[1] : s).trim();
+            };
+
+            let data;
+            try {
+              data = JSON.parse(stripFence(raw));
+            } catch (e) {
+              // Non-JSON output: don't lose the review, post it as a comment.
+              core.warning(`Codex output was not valid JSON: ${e.message}`);
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pull_number,
+                body: `### Codex review\n\n${raw || '_No output._'}`,
+              });
+              return;
+            }
+
+            const summary = (data.summary || '').trim();
+            const findings = Array.isArray(data.findings) ? data.findings : [];
+
+            // Work out which (path, line) pairs are actually part of the diff on
+            // the RIGHT (new-file) side; createReview 422s on anything else.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number, per_page: 100,
             });
+            const commentable = new Map(); // path -> Set<newLineNumber>
+            for (const f of files) {
+              if (!f.patch) continue; // binary / too large: no anchors
+              const lines = new Set();
+              let newLine = 0;
+              for (const l of f.patch.split('\n')) {
+                const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (h) { newLine = parseInt(h[1], 10); continue; }
+                if (l.startsWith('+')) { lines.add(newLine); newLine++; }
+                else if (l.startsWith('-') || l.startsWith('\\')) { /* left side / no-newline marker */ }
+                else { lines.add(newLine); newLine++; } // context line
+              }
+              commentable.set(f.filename, lines);
+            }
+
+            const sev = (s) => (s ? `**[${String(s).toUpperCase()}]** ` : '');
+            const inline = [];
+            const unanchored = [];
+            for (const fn of findings) {
+              const set = commentable.get(fn.path);
+              if (set && set.has(fn.line)) {
+                inline.push({
+                  path: fn.path,
+                  line: fn.line,
+                  side: 'RIGHT',
+                  body: `${sev(fn.severity)}${fn.comment}`,
+                });
+              } else {
+                unanchored.push(fn);
+              }
+            }
+
+            let body = summary || 'Codex review';
+            if (unanchored.length) {
+              body += '\n\n### Findings not tied to a changed line\n';
+              for (const fn of unanchored) {
+                body += `\n- \`${fn.path}:${fn.line}\` ${sev(fn.severity)}${fn.comment}`;
+              }
+            }
+
+            try {
+              await github.rest.pulls.createReview({
+                owner, repo, pull_number,
+                event: 'COMMENT',
+                body,
+                comments: inline,
+              });
+            } catch (e) {
+              // Fall back to a plain comment so feedback is never dropped.
+              core.warning(`createReview failed: ${e.message}; posting a plain comment`);
+              const dump = inline
+                .map((c) => `- \`${c.path}:${c.line}\` ${c.body}`)
+                .join('\n');
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: pull_number,
+                body: `### Codex review\n\n${body}${dump ? `\n\n${dump}` : ''}`,
+              });
+            }
