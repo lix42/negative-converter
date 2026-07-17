@@ -1,0 +1,81 @@
+name: Codex Review
+
+# Run OpenAI Codex as a PR reviewer. Split into two jobs on purpose: the
+# `codex` job runs the model with read-only permissions (so a compromised
+# review can't reach write scopes while the OPENAI_API_KEY secret is in the
+# environment), and a separate `post_feedback` job posts the result back as a
+# PR comment with the minimal write scopes it needs.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Cancel superseded runs on the same PR to save minutes.
+concurrency:
+  group: codex-review-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codex:
+    name: Codex review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      final_message: ${{ steps.run_codex.outputs.final-message }}
+    steps:
+      - name: Checkout PR merge ref
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          persist-credentials: false
+
+      - name: Pre-fetch base and head refs for the PR
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin \
+            "$PR_BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head"
+
+      - name: Run Codex
+        id: run_codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          permission-profile: ":read-only"
+          prompt: |
+            Review pull request #${{ github.event.pull_request.number }} for
+            ${{ github.repository }}. Compare the PR head against the base
+            branch (${{ github.event.pull_request.base.ref }}) and focus on the
+            changed files.
+
+            Report correctness bugs, security issues, and clear deviations from
+            the conventions in CLAUDE.md and docs/design-spec.md. Prefer a small
+            number of high-confidence findings over an exhaustive list; if the
+            change looks good, say so briefly. Reference findings as
+            `path:line`.
+
+  post_feedback:
+    name: Post Codex feedback
+    runs-on: ubuntu-latest
+    needs: codex
+    if: needs.codex.outputs.final_message != ''
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Comment Codex feedback on the PR
+        uses: actions/github-script@v7
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.codex.outputs.final_message }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: process.env.CODEX_FINAL_MESSAGE,
+            });
