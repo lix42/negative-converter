@@ -80,6 +80,21 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
   is gone; the only remaining allows are three narrow, documented item-level ones
   (`algo/mod.rs`, `pipeline/color.rs`) for API surface the single Step-1 path
   doesn't exercise — don't add new ones without a comment saying who will use it.
+- **Codex review on a worktree.** `/codex:review` is a codex-plugin *command*
+  (not a skill) that reviews the **current directory's** git state — so run it
+  *from inside the worktree you want reviewed*. Feature worktrees here are usually
+  based on an older `main`, so pass **`--scope working-tree`** (diff vs `HEAD` =
+  the uncommitted change); the default base compare shows confusing reverse-diffs
+  of already-merged work when the worktree's base lags `origin/main`. The command
+  wraps `node "<codex-plugin>/scripts/codex-companion.mjs" review --wait
+  --scope working-tree` (`--wait` = foreground/verbatim, `--background` = detach;
+  the plugin path is under `~/.claude/plugins/cache/openai-codex/…`). It is
+  review-only — no fixes, no model override, no custom focus text; use
+  `/codex:adversarial-review` for custom framing. **Gotcha:** `/codex:setup`
+  verifies install + auth but **not** reviewer-model support — if a review 400s
+  with "model … requires a newer version of Codex," upgrade the Codex CLI or
+  switch its default model (the reviewer picks the model, and the run through
+  `codex:rescue` is *not* tracked by `/codex:status`).
 
 ## Conventions
 
