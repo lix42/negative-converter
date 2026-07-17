@@ -1226,12 +1226,252 @@ Both are tracked in `TASKS.md` as dependents of this task.
   wire `convert_reported`'s `ConvertReport.dmax` into the JSON report.
 
 ## algo-sigmoid
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-14
 
 - Goal: third converter — S-curve (H&D / paper response) tone mapping in density
   space with toe/shoulder control (design-spec §12 roadmap; NLP comparison
   priority 2).
+- **Done.** New `Converter` impl in `src/algo/sigmoid.rs`, selected via
+  `--algorithm sigmoid`. Reuses `to_density` (stages 1–2), the resolved `Dmax`
+  anchor (`resolve_dmax`), and the film-base guard (`check_base`) from
+  `density`; stage 4 was factored out of `density::render` into a shared
+  `render_print` and is reused unchanged. Full CI gate clean (see the final gate
+  run at the end of this section for the current suite total).
+- **Exact formula (the concrete, documented curve — spec §7.3):** per channel,
+  in log₁₀-output space, with `A = Dmax` (resolved anchor) and `c = contrast`:
+  ```text
+  t = c·(D' − A)                                 the density algorithm's straight line
+  F = −c·A                                       paper-black floor (the line's value at D' = 0)
+  p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skipped if toe = 0)
+  v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skipped if shoulder = 0)
+  lin = 10^v
+  ```
+  Chosen over a closed-form logistic because the task requires **reduction to
+  the straight line as toe/shoulder → 0** — with both `0` the knee branches are
+  skipped and the expression is *bit-identical* to density's stage 3
+  (`10^(c·(D'−A))`), pinned by an `assert_eq!` end-to-end test. Properties (all
+  test-pinned): strictly monotonic; **white asymptote `1.0` reached from strictly
+  below with the guarantee `lin ≤ 1.0` for every finite density when
+  `shoulder > 0`** (so the default u16 encode cannot clip highlights — verified on
+  the real-scan fixture: density default clips 3 429 samples / 0.49 %, sigmoid
+  clips **0**, same resolved anchor 1.6281); black asymptote `≈ 10^(−c·A)` (exact
+  when `shoulder = 0`). `shoulder = 0` gives no highlight roll-off — highlights
+  follow the toe-shaped line and can exceed `1.0` like `density`.
+- **Knee order is load-bearing (PR-review fix, 2026-07-14).** Two independent
+  reviews (Codex P2 + pr-review comment-analyzer) caught that the original order —
+  shoulder first, **toe last** — let the toe soft-max lift the white asymptote to
+  `(1 + 10^(−c·A/toe))^toe > 1`, which *overshoots and clips* for a small anchor
+  (e.g. `--d-max 0.1`, default `toe 0.2`, `c 1` → ≈ `1.056`), defeating the headline
+  "shoulder ⇒ no highlight clip" guarantee. **Fix: reorder to toe-first,
+  shoulder-last**, so the soft-min-with-white is the final op and nothing can lift
+  it. This trades a raised white asymptote for an *imperceptibly* lowered black
+  floor (the shoulder now nudges the floor a hair below `10^(−c·A)` — negligible).
+  The shoulder is written in the **manifestly-bounded** form
+  `−shoulder·log10(1 + 10^(−p/shoulder))` (algebraically equal to
+  `p − shoulder·log10(1 + 10^(p/shoulder))` but a negative × non-negative, so
+  `v ≤ 0` in *f32 by construction* — the subtraction form rounded a hair above 0,
+  `10^v = 1.0000006`, which would clip). Regression tests: a curve-level sweep over
+  small-anchor / low-contrast / toe≫shoulder param sets asserting `lin ≤ 1.0`, and
+  an e2e `--d-max 0.1` asserting `clipped_high == 0`. Bit-exact `toe=shoulder=0`
+  reduction preserved (both branches still skipped).
+- **Numerical gotchas (recorded for future density-domain curves):**
+  - `log10(1 + 10^y)` must be the stable `max(y,0) + log10(1 + 10^(−|y|))` —
+    the naive form overflows `10^y` at `y ≳ 38` (e.g. any tiny-but-nonzero knee
+    width) and would send the knee to `−inf` instead of its asymptote.
+  - Rust's `f32::max(NaN, 0.0)` returns `0.0` (NaN-launder trap!) — the stable
+    form still propagates NaN via its second term; pinned by a test. NaN
+    density → NaN output for `io::encode`'s non-finite counter, per the
+    `SCAN_EPSILON` convention in `density.rs`.
+- **Refactor first (pure, bit-exact):** `density::render` used to fuse stage 3
+  (`10^(γ·(D'−Dmax))`) with stage 4 (WB → `2^exposure` → black point →
+  soft-clip). Stage 4 is now `render_print(density, tone, print)` with the
+  stage-3 curve injected as a per-sample closure — same arithmetic order, so
+  the existing value-pinning render tests (incl.
+  `none_anchor_is_bit_exact_with_pre_anchor_render`) double as the bit-exact
+  regression suite; all pass unchanged. The two sub-stages stay separately
+  parameterized (core fidelity rule).
+- **Param/knob shape (four coupled spots wired, each with a test):**
+  - `SigmoidParams { contrast (>0, default 1.0), toe (≥0, default 0.2),
+    shoulder (≥0, default 0.2) }` in `types.rs`; recipe section `sigmoid.*`
+    (`sigmoid.contrast` / `sigmoid.toe` / `sigmoid.shoulder`).
+  - CLI flags `--sigmoid-contrast` / `--sigmoid-toe` / `--sigmoid-shoulder`
+    (`SigmoidOverrides` in `cli.rs`) — prefixed for namespacing; recipe keys
+    drop the prefix (like `--d-max` ⇒ `density.dmax`).
+  - `merge` arms + merge test; `validate`: contrast finite `>0`, knee widths
+    finite `≥0` (a negative width would silently read as "knee off").
+  - `ResolvedConfig` gained the `sigmoid` section; `AlgoParams::Sigmoid
+    { density, sigmoid, print }`; `stages::algo_params` takes `&SigmoidParams`.
+- **Anchor decision:** the S-curve is anchored on `[0, Dmax]` (white knee and
+  black floor both derive from it), so it **requires** an anchor — reused via
+  the same `DmaxSource`/`resolve_dmax`/`convert_reported` path as `density`
+  (one measurement, reported as `report.dmax` identically). `sigmoid` +
+  `dmax = none` is rejected: `validate` (Usage, exit 2) for the CLI/recipe
+  path, plus a fail-loud backstop inside `convert_reported` (exit 1) for
+  programmatic construction. The `None`-is-bit-exact HDR escape hatch stays a
+  `density`-algorithm feature (documented in §9).
+- **`density_gamma` is ignored under sigmoid** (it parameterizes the straight
+  line the S-curve replaces; `sigmoid.contrast` is the analogue). Because the
+  rest of the `density.*` section *is* consumed (scale/offset/dmax), a
+  customized-but-ignored gamma is the silent-no-op trap — `run_convert` emits a
+  report warning (which `--strict` promotes) when `algorithm = sigmoid` and
+  `density_gamma != 1.0`. Fully inert sections (e.g. `simple.*` under density)
+  stay silent as before — the warning is only for the partial-consumption case.
+- **`--highlight-compress` interaction (documented, not disabled):** the
+  shoulder compresses in density space before exposure/WB; the print soft-clip
+  compresses in linear space after them. They compose; with the shoulder on and
+  neutral print params nothing exceeds `1.0`, so the (default-off) soft-clip
+  simply never engages.
+- **Real-scan spot check** (committed fixture, throwaway `#[ignore]` probe,
+  removed): contrast sweep 0.7 / 1.0 / 1.5 → p50 0.373 / 0.245 / 0.121 and
+  mid-separation (p75−p25) 0.235 / 0.227 / 0.176 — midtone contrast visibly
+  adjustable; max sample 0.926 / 0.944 / 0.965 — highlights roll off smoothly,
+  never reaching 1.0 (no hard clip); shadow separation (p05−p01) stays positive
+  at every contrast.
+- **Docs:** design-spec **md + html together** — new §7.3 (curve, anchors,
+  reduction, anchor requirement, gamma/soft-clip interactions), §6 diagram and
+  §2/§12 algorithm lists, §8 recipe-section list, §9: `--algorithm` gains
+  `sigmoid`, density-stage header notes the sharing, `--no-d-max` marked
+  density-only, new "Sigmoid stage" section with the three knobs.
+- **Notes for dependents:** `render_print` is the shared stage-4 entry point
+  for any future density-domain curve (power-law roadmap item) — inject the
+  curve as the `tone` closure, keep `resolve_dmax` as the single anchor source.
+  `auto-neutral-wb` / `regional-color-balance` operate on `density.*`/`print.*`
+  and therefore apply to `sigmoid` runs unchanged.
+- **Review (pr-review-toolkit, parallel panel):** code-reviewer, comment,
+  test-coverage, type-design, silent-failure. Two findings fixed:
+  - **(type-design/silent-failure, correctness):** the `Auto`-resolved anchor was
+    only checked `Some(_)`, not positive. `auto_dmax` can return `0.0`
+    (empty/all-non-finite) or a *negative* percentile when a wrong film base
+    pushes most corrected densities below zero; with `anchor ≤ 0` the toe floor
+    `10^(−contrast·anchor) ≥ 1`, so every sample renders above display white — a
+    quietly-wrong all-white image. Fixed: `convert_reported` now guards
+    `resolved.filter(|a| a.is_finite() && *a > 0.0)` and errors loudly (exit 1),
+    covering the `none` programmatic path *and* the degenerate-`Auto` case (the
+    CLAUDE.md film-base gotcha, mirroring `simple.rs`). Tests added
+    (`convert_rejects_a_non_positive_auto_anchor`: scan>base → negative percentile,
+    plus a smuggled negative `Explicit`).
+  - **(test-coverage, sev-6):** the `density_gamma`-ignored-under-sigmoid warning
+    had no coverage. Added an e2e (`sigmoid_warns_when_density_gamma_is_ignored`)
+    asserting the warning fires for sigmoid+custom gamma, is absent for
+    sigmoid+default and density+custom, and `--strict` promotes it to exit 1.
+  - Re-ran code-review after the fixes: **clean, no findings** (bit-exact refactor,
+    four-spot wiring, exit codes, docs md+html sync all confirmed). Gates green:
+    fmt clean, clippy clean, build clean, **152 unit + 21 e2e** tests pass.
+- **Rebased onto `origin/main` 3c7f5bd** (post-#20/#21/#22). Conflicts resolved:
+  - `src/types.rs`, `src/cli.rs`: #20 renamed the output knob `--out-depth
+    u16|f32` → `--output-hdr` bool (`OutputParams.hdr`; `OutDepth` is now internal,
+    dropped from the cli import). Adjusted my sigmoid test in `pipeline/stages.rs`
+    (`out_depth: OutDepth::F32` → `hdr: true`) — the only code touch the rebase
+    needed. Kept `output_hdr_bool_drives_depth` (upstream) alongside my
+    `SigmoidParams` / `algorithm_serializes_sigmoid_lowercase` tests; dropped the
+    now-obsolete `out_depth_serializes_lowercase`.
+  - `docs/TASKS.md`: kept upstream's new `dmax-reference` task line and marked
+    `algo-sigmoid` `[x]`.
+  - `docs/design-spec.md`+`.html` §9/§12: combined upstream's `--output-hdr`
+    wording and the `bw-support` roadmap graduation with my §7.3/sigmoid-stage
+    additions.
+  - Confirmed no sibling-agent content leaked (initial bare `stash pop` grabbed a
+    sibling's stash off the **shared** worktree stash stack; recovered by
+    `reset --hard origin/main` then re-applying my own stash by immutable SHA).
+- **New-design review:** the new (unstarted) `dmax-reference` task will change the
+  *default acquisition* of `Dmax` (per-frame auto → roll-fixed reference) and
+  demote `--auto-d-max`, but explicitly **keeps the anchor a positive scalar in
+  density units and keeps the render machinery** — so the sigmoid anchor contract
+  (positive scalar via `DmaxSource`, `--no-d-max` rejected, degenerate-Auto guard)
+  is unaffected. No sigmoid change needed now; when `dmax-reference` lands the
+  sigmoid default path simply consumes the fixed reference anchor (still positive).
+- Post-rebase gates: fmt/clippy/build clean; **155 unit + 21 e2e** tests pass
+  (unit count rose from the new base's added tests).
+- **Second review round (2026-07-14, Codex + pr-review 5-agent).** Primary
+  correctness fix = the knee-order/white-overshoot bug (documented above). LOW
+  items folded in:
+  1. **Contrast upper bound** — `SIGMOID_CONTRAST_MAX = 50.0` (in `sigmoid.rs`),
+     enforced in `validate`. An extreme slope collapses the S-curve into a hard
+     threshold whose knees launder the blow-out into a finite two-level image that
+     trips *neither* the clip nor the non-finite counter (density surfaces `+inf`);
+     the cap closes that silent-destruction hole. Test + §9 docs (md+html) updated.
+  2. **`debug_assert!`** at the top of `s_curve` (`contrast > 0`, `toe/shoulder ≥ 0`)
+     — defense for the pure stage that otherwise trusts CLI-validated inputs.
+  3. **Contrast-backstop comment** in `convert_reported` explaining the asymmetry
+     (the anchor has a runtime guard; `contrast` is config-only, fully
+     CLI-validated, so no runtime re-check — the debug assert covers programmatic
+     callers).
+  4. **Anchor error now names the true cause** (`anchor_error` helper): `none` →
+     disabled-anchor message; `Some(≤0)` with no finite densities → corrupt/
+     non-finite input (not the base); `Some(≤0)` with finite densities → wrong
+     base. Test `anchor_error_distinguishes_corrupt_input_from_bad_base`.
+  5. **Sigmoid recipe round-trip e2e** with non-default toe/shoulder
+     (`sigmoid_sidecar_recipe_round_trips_through_recipe_in`) — guards the
+     four-spot serialization/merge for the sigmoid section.
+  Deferred (optional nice-to-haves): shoulder↔`--highlight-compress` composition
+  test and a sigmoid e2e determinism assertion — the shared `render_print`/anchor
+  paths are already determinism- and composition-tested via the density suite and
+  the existing sigmoid round-trip; judged low marginal value. Final gates green
+  (see the ship report).
+- **Third review round (2026-07-14, Codex + pr-review 5-agent).** Both reviewers
+  converged on one theme: the manifestly-bounded shoulder that fixed the white
+  overshoot also *silently launders extreme upstream inputs* into a clean in-range
+  sample, contradicting the fail-loud / non-finite-counter discipline. Two
+  complementary MUST-FIXes:
+  1. **Non-finite propagation in `s_curve`.** A non-finite corrected density
+     (`NaN`/`±inf`, e.g. an accepted-but-huge `--density-scale`/`--density-offset`
+     overflowing `to_density`) was mapped by the bounded knees to `10^v = 1.0`,
+     hiding the fault (`density` surfaces it as `+inf`). Fixed: `s_curve` now
+     returns the input `d` verbatim when `!d.is_finite()` **before** the knees, and
+     also surfaces a finite-`d`→non-finite-`p` knee-math overflow (capped contrast
+     × huge offset). So `10^v ≤ 1.0` is guaranteed only for *finite* stage-3
+     output; a non-finite sample rides through to `io::encode`'s counter. Bit-exact
+     `toe=shoulder=0` reduction preserved (finite path untouched). Tests:
+     `s_curve_propagates_non_finite` (NaN/±inf/overflow, knees on & off) and
+     `convert_propagates_non_finite_scan_to_output` (a non-finite scan rides
+     through the full converter). NB: a *CLI-driven* overflow e2e isn't
+     constructible on the committed fixture — its corrected densities are too small
+     to overflow f32 within validated param ranges (scale alone can't; a uniform
+     offset overflows *all* pixels → the anchor-guard's corrupt-input branch, exit
+     1) — so the converter-level test pins the path instead.
+  2. **Knee-width cap.** A huge *finite* `--sigmoid-toe`/`--sigmoid-shoulder`
+     (verified: `shoulder 10000` → all-black, `toe 10000` → all-white) flattens the
+     image with finite in-range samples that trip no counter — the same
+     silent-destruction class the contrast cap closed. Added
+     `SIGMOID_KNEE_MAX = 10.0` (shared for both; ~11× the ~0.05–0.9 photographic
+     range and ~5× a scan's full density range, so it rejects only degenerate
+     widths), enforced in `validate` with an actionable message; §9 docs (md+html)
+     updated; boundary tested (accept at cap, reject cap+1 / 10000 / +inf).
+  SHOULD/LOW also done: hardened the white-ceiling test with an FP-stressful corner
+  (`contrast 50, shoulder 0.001`) plus `s_curve_manifest_form_beats_the_naive_subtraction_form`
+  (asserts the naive subtraction form overshoots >1.0 where `s_curve` stays ≤1.0 —
+  guards against a revert); `convert_requires_a_dmax_anchor` now asserts the
+  `None`-specific "scene-referred" token; scoped the "clipping impossible" doc claim
+  to *stage-3 output under neutral print params* (the print stage can lift samples
+  back above 1.0); refreshed the stale headline test count; `anchor_error` now
+  distinguishes a programmatic non-positive `Explicit` anchor from the wrong-base
+  case; added a `shoulder = 0` complement test (highlights may exceed 1.0 like
+  density). Deferred: shoulder↔`--highlight-compress` composition e2e (low value;
+  both knobs' math is unit-tested and they compose additively in log/linear
+  space). Gates green: **159 unit + 23 e2e**.
+- **Final pass (2026-07-14).** Round-3 review converged (a Codex "won't compile"
+  P0 was a verified false positive — destructuring `self.sigmoid` copies the Copy
+  f32 fields; the crate builds). The one round-3 MEDIUM (within-cap extreme params
+  posterize with no warning) is an **accepted, documented tradeoff**: the caps
+  reject nonsense/degenerate-asymptote values, not aggression — no warning band, no
+  tighter caps (documented at the consts in `sigmoid.rs` and in §9, md+html). Also
+  added: a knees-off finite-overflow case to `s_curve_propagates_non_finite`; a
+  `debug_assert!(matches!(source, DmaxSource::None))` in `anchor_error`'s `None`
+  arm (pins `resolve_dmax` `None` ⟺ source `None`); a near-cap toe
+  (`SIGMOID_KNEE_MAX`) case in the white-ceiling sweep; and scoped the §7.3
+  "cannot clip" claim to stage-3-under-neutral-print (the print stage can lift
+  samples above 1.0). Gates green: **159 unit + 23 e2e**.
+- **Deferred (shared / general-robustness, NOT sigmoid-specific — do not fix under
+  this task):**
+  - A *tiny-positive* `Auto`/`Explicit` `Dmax` anchor passes the `> 0` guard yet is
+    degenerate (renders near-black or extreme). Pre-existing and shared with the
+    `density` render's anchor path (`dmax-white-anchor`); a general anchor-sanity
+    follow-up, not a regression here.
+  - Verifying a non-finite sample still reaches `io::encode`'s non-finite counter
+    *across the lcms2 color transform* (`pipeline::color::to_output`) — a gap
+    shared with `density` (both feed the same color→encode path); belongs to a
+    color/encode robustness pass, not this task.
 
 ## auto-neutral-wb
 **Status:** not started

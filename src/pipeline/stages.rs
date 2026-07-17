@@ -10,7 +10,7 @@ use crate::algo::{self, AlgoParams, ConvertReport};
 use crate::pipeline::color;
 use crate::types::{
     Algorithm, DensityParams, FilmBase, LinearImage, OutputParams, PrintParams, Result,
-    SimpleParams,
+    SigmoidParams, SimpleParams,
 };
 
 /// The in-memory pipeline result the orchestrator hands to the encoder: the
@@ -36,12 +36,20 @@ pub fn algo_params(
     algorithm: Algorithm,
     simple: &SimpleParams,
     density: &DensityParams,
+    sigmoid: &SigmoidParams,
     print: &PrintParams,
 ) -> AlgoParams {
     match algorithm {
         Algorithm::Simple => AlgoParams::Simple(simple.clone()),
         Algorithm::Density => AlgoParams::Density {
             density: density.clone(),
+            print: print.clone(),
+        },
+        // `sigmoid` shares the density (stages 1–2 + anchor) and print (stage 4)
+        // params with `density`; only stage 3 is its own.
+        Algorithm::Sigmoid => AlgoParams::Sigmoid {
+            density: density.clone(),
+            sigmoid: sigmoid.clone(),
             print: print.clone(),
         },
     }
@@ -108,24 +116,29 @@ mod tests {
         LinearImage::new(w, h, rgb, None).unwrap()
     }
 
-    fn density_params() -> (SimpleParams, DensityParams, PrintParams) {
+    fn density_params() -> (SimpleParams, DensityParams, SigmoidParams, PrintParams) {
         (
             SimpleParams::default(),
             DensityParams::default(),
+            SigmoidParams::default(),
             PrintParams::default(),
         )
     }
 
     #[test]
     fn algo_params_selects_the_requested_algorithm() {
-        let (s, d, p) = density_params();
+        let (s, d, g, p) = density_params();
         assert!(matches!(
-            algo_params(Algorithm::Simple, &s, &d, &p),
+            algo_params(Algorithm::Simple, &s, &d, &g, &p),
             AlgoParams::Simple(_)
         ));
         assert!(matches!(
-            algo_params(Algorithm::Density, &s, &d, &p),
+            algo_params(Algorithm::Density, &s, &d, &g, &p),
             AlgoParams::Density { .. }
+        ));
+        assert!(matches!(
+            algo_params(Algorithm::Sigmoid, &s, &d, &g, &p),
+            AlgoParams::Sigmoid { .. }
         ));
     }
 
@@ -140,14 +153,14 @@ mod tests {
     #[test]
     fn render_runs_the_full_simple_path_and_transforms_color() {
         let img = synthetic_negative(40, 40);
-        let (s, d, p) = density_params();
+        let (s, d, g, p) = density_params();
         // The auto estimate lands on the bright orange base (r > b).
         let base = resolve(&img, FilmBaseSource::Auto);
         assert!(base.r > base.b, "orange base: r > b");
         let out = render(
             &img,
             &base,
-            algo_params(Algorithm::Simple, &s, &d, &p),
+            algo_params(Algorithm::Simple, &s, &d, &g, &p),
             &OutputParams::default(),
         )
         .unwrap();
@@ -158,12 +171,12 @@ mod tests {
     #[test]
     fn render_runs_the_density_path_with_explicit_base() {
         let img = synthetic_negative(16, 16);
-        let (s, d, p) = density_params();
+        let (s, d, g, p) = density_params();
         let base = FilmBase::from([0.9, 0.55, 0.42]);
         let out = render(
             &img,
             &base,
-            algo_params(Algorithm::Density, &s, &d, &p),
+            algo_params(Algorithm::Density, &s, &d, &g, &p),
             &OutputParams {
                 hdr: true,
                 ..OutputParams::default()
@@ -174,17 +187,37 @@ mod tests {
     }
 
     #[test]
+    fn render_runs_the_sigmoid_path_and_reports_the_anchor() {
+        let img = synthetic_negative(16, 16);
+        let (s, d, g, p) = density_params();
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
+        let out = render(
+            &img,
+            &base,
+            algo_params(Algorithm::Sigmoid, &s, &d, &g, &p),
+            &OutputParams {
+                hdr: true,
+                ..OutputParams::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(out.image.rgb.len(), 16 * 16 * 3);
+        // The default Auto anchor rides back through ConvertReport.
+        assert!(out.convert.dmax.is_some_and(f32::is_finite));
+    }
+
+    #[test]
     fn render_rejects_a_degenerate_base() {
         // Defense-in-depth: even if a zero-channel base reached `render` (estimate
         // now rejects it at birth), the converter must reject it rather than
         // divide by zero — exit 1, never a silently-wrong image.
         let img = synthetic_negative(20, 20);
-        let (s, d, p) = density_params();
+        let (s, d, g, p) = density_params();
         let base = FilmBase::from([0.0, 0.55, 0.42]);
         match render(
             &img,
             &base,
-            algo_params(Algorithm::Density, &s, &d, &p),
+            algo_params(Algorithm::Density, &s, &d, &g, &p),
             &OutputParams::default(),
         ) {
             Err(e) => assert_eq!(e.exit_code(), 1),

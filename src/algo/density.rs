@@ -16,7 +16,9 @@
 //!                                      − black_point, then highlight soft-clip
 //! ```
 //!
-//! Stages 1–2 are [`to_density`]; 3–4 are [`render`].
+//! Stages 1–2 are [`to_density`]; 3–4 are [`render`], which composes this
+//! algorithm's stage-3 curve with the shared stage-4 print render
+//! [`render_print`] (also used by `sigmoid`, which swaps in an S-curve stage 3).
 //!
 //! **Display-white anchor (`Dmax`).** Stage 3 renders density *relative to* the
 //! scene-white density `Dmax`: scene white (`D' = Dmax`) maps to `1.0` and the base
@@ -180,6 +182,33 @@ pub(crate) fn render(
     // per-pixel arithmetic below is bit-identical to the pre-anchor render.
     let resolved = resolve_dmax(&density.density, dmax);
     let anchor = resolved.unwrap_or(0.0);
+    let image = render_print(
+        density,
+        // stage 3, anchored
+        |d| 10f32.powf(density_gamma * (d - anchor)),
+        print,
+    );
+    (image, resolved)
+}
+
+/// Stage 4 — the print render, shared by every density-domain algorithm
+/// (`density` and `sigmoid`), fused with a caller-supplied stage-3 `tone` map
+/// (corrected density → positive linear) so the buffer is traversed once.
+///
+/// The fusion is mechanical, not conceptual: `tone` *is* stage 3 (the algorithm's
+/// curve), this function owns only stage 4 — per-channel highlight/neutral white
+/// balance, an overall `2^print_exposure` gain (exposure in **stops**), the
+/// `black_point` floor subtraction, and the highlight soft-clip — so the two
+/// sub-stages stay separately parameterized (the core fidelity rule).
+///
+/// Consumes the `DensityImage` (a use-once intermediate): the density buffer is
+/// transformed into the output in place and the IR plane is moved, so no
+/// image-sized buffer is allocated or cloned here.
+pub(crate) fn render_print(
+    density: DensityImage,
+    tone: impl Fn(f32) -> f32 + Sync,
+    print: &PrintParams,
+) -> LinearImage {
     let exposure_gain = 2f32.powf(print.print_exposure);
     let wb = print.white_balance;
     let black = print.black_point;
@@ -188,7 +217,7 @@ pub(crate) fn render(
     let mut rgb = density.density;
     rgb.par_chunks_exact_mut(3).for_each(|d| {
         for c in 0..3 {
-            let paper = 10f32.powf(density_gamma * (d[c] - anchor)); // stage 3, anchored
+            let paper = tone(d[c]); // stage 3 (the algorithm's curve)
             let exposed = paper * wb[c] * exposure_gain; // stage 4
             d[c] = soft_clip(exposed - black, hc);
         }
@@ -199,9 +228,8 @@ pub(crate) fn render(
     // validated constructor anyway — its checks are O(1) (buffer lengths, not a
     // per-sample scan), so a future regression that breaks the invariant panics
     // loudly here instead of minting a silently-malformed image.
-    let image = LinearImage::new(density.width, density.height, rgb, density.ir)
-        .expect("render preserves the validated buffer-length invariants");
-    (image, resolved)
+    LinearImage::new(density.width, density.height, rgb, density.ir)
+        .expect("render preserves the validated buffer-length invariants")
 }
 
 /// Percentile of the corrected-density distribution taken as the `Auto` anchor.
@@ -217,7 +245,9 @@ const AUTO_DMAX_PERCENTILE: f32 = 0.995;
 /// across channels — a per-channel anchor would double as color correction, which
 /// is the future auto-WB task's job); `Explicit` returns the given value; `None`
 /// yields no anchor. Deterministic: same buffer + params ⇒ same value.
-fn resolve_dmax(densities: &[f32], source: DmaxSource) -> Option<f32> {
+/// `pub(crate)` because `sigmoid` anchors its S-curve on the same resolved `Dmax`
+/// rather than inventing a second measurement.
+pub(crate) fn resolve_dmax(densities: &[f32], source: DmaxSource) -> Option<f32> {
     match source {
         DmaxSource::None => None,
         DmaxSource::Explicit(d) => Some(d),
@@ -325,8 +355,9 @@ impl Converter for Density {
 /// per-channel value is a transmission in `(0, 1]`. Non-positive / non-finite
 /// values would divide into inf/NaN; values above `1.0` are impossible for a
 /// `[0, 1]`-normalized scan (a typo like `--film-base 90` for `0.90`) and would
-/// silently render every real sample above white.
-fn check_base(base: &FilmBase) -> Result<()> {
+/// silently render every real sample above white. Shared with `sigmoid`, whose
+/// [`to_density`] call has the same precondition.
+pub(crate) fn check_base(base: &FilmBase) -> Result<()> {
     for (name, v) in [("r", base.r), ("g", base.g), ("b", base.b)] {
         if !v.is_finite() || v <= 0.0 || v > 1.0 {
             return Err(NcError::Other(format!(

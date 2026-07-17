@@ -25,7 +25,7 @@ use crate::pipeline::{film_base, stages};
 use crate::types::{
     Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
     FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams, Result,
-    SimpleParams,
+    SigmoidParams, SimpleParams,
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +136,8 @@ pub struct ConvertArgs {
     #[command(flatten)]
     pub dmax: DmaxOverrides,
     #[command(flatten)]
+    pub sigmoid: SigmoidOverrides,
+    #[command(flatten)]
     pub print: PrintOverrides,
     #[command(flatten)]
     pub simple: SimpleOverrides,
@@ -233,6 +235,22 @@ pub struct DmaxOverrides {
     pub no_d_max: bool,
 }
 
+/// Sigmoid-algorithm overrides (design-spec §7.3/§9, `algorithm = sigmoid`).
+/// The flags are `--sigmoid-*`-prefixed for namespacing; the recipe keys drop
+/// the prefix (`sigmoid.contrast` etc.), like `--d-max` ⇒ `density.dmax`.
+#[derive(Args, Debug, Default)]
+pub struct SigmoidOverrides {
+    /// Mid-density slope of the S-curve (the `--density-gamma` analogue).
+    #[arg(long)]
+    pub sigmoid_contrast: Option<f32>,
+    /// Toe (shadow) knee width in log10 density units; 0 disables the toe.
+    #[arg(long)]
+    pub sigmoid_toe: Option<f32>,
+    /// Shoulder (highlight) knee width in log10 density units; 0 disables it.
+    #[arg(long)]
+    pub sigmoid_shoulder: Option<f32>,
+}
+
 /// Print / tone-render overrides (design-spec §9).
 #[derive(Args, Debug, Default)]
 pub struct PrintOverrides {
@@ -301,6 +319,7 @@ pub struct ResolvedConfig {
     pub input: InputParams,
     pub film_base: FilmBaseParams,
     pub density: DensityParams,
+    pub sigmoid: SigmoidParams,
     pub print: PrintParams,
     pub simple: SimpleParams,
     pub output: OutputParams,
@@ -482,6 +501,17 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.density.dmax = DmaxSource::None;
     }
 
+    // sigmoid
+    if let Some(v) = args.sigmoid.sigmoid_contrast {
+        cfg.sigmoid.contrast = v;
+    }
+    if let Some(v) = args.sigmoid.sigmoid_toe {
+        cfg.sigmoid.toe = v;
+    }
+    if let Some(v) = args.sigmoid.sigmoid_shoulder {
+        cfg.sigmoid.shoulder = v;
+    }
+
     // print
     if let Some(v) = args.print.print_exposure {
         cfg.print.print_exposure = v;
@@ -604,6 +634,56 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     // loudly; `Auto`/`None` need no value check.
     if let DmaxSource::Explicit(d) = cfg.density.dmax {
         positive("--d-max", &[d])?;
+    }
+
+    // Sigmoid: the S-curve is anchored on `[0, Dmax]` — both its white knee and
+    // its black floor derive from the anchor — so `dmax = none` (scene-referred,
+    // no anchor) cannot drive it (design-spec §7.3).
+    if cfg.algorithm == Algorithm::Sigmoid && cfg.density.dmax == DmaxSource::None {
+        return Err(usage(
+            "--algorithm sigmoid needs a display-white anchor (--auto-d-max or \
+             --d-max <d>); --no-d-max / `density.dmax = none` is only supported \
+             by --algorithm density"
+                .into(),
+        ));
+    }
+    // Contrast (mid-density slope) must be positive AND bounded above: an extreme
+    // slope collapses the S-curve into a hard black/white threshold whose knees
+    // silently launder the blow-out into a finite two-level image (highlights →
+    // exactly 1.0, shadows → the floor) that trips *neither* the clip nor the
+    // non-finite counter — a silent destruction the `density` algorithm avoids
+    // (it overflows to +inf, which is counted). Cap it; use `--algorithm density`
+    // for genuinely extreme contrast.
+    positive("--sigmoid-contrast", &[cfg.sigmoid.contrast])?;
+    if cfg.sigmoid.contrast > crate::algo::sigmoid::SIGMOID_CONTRAST_MAX {
+        return Err(usage(format!(
+            "--sigmoid-contrast ({}) must be <= {} (beyond this the S-curve is a hard \
+             threshold that silently destroys tonal detail; use --algorithm density)",
+            cfg.sigmoid.contrast,
+            crate::algo::sigmoid::SIGMOID_CONTRAST_MAX
+        )));
+    }
+    // Knee widths non-negative AND bounded above: 0 disables a knee, a negative
+    // width would silently be treated as "off" by the curve, and a huge *finite*
+    // width flattens the image into near-uniform tone (giant shoulder → all-black,
+    // giant toe → all-white) with samples that stay finite and in range — the same
+    // silent-destruction class the contrast cap closes. Reject both loudly.
+    finite(
+        "--sigmoid-toe/--sigmoid-shoulder",
+        &[cfg.sigmoid.toe, cfg.sigmoid.shoulder],
+    )?;
+    let knee_max = crate::algo::sigmoid::SIGMOID_KNEE_MAX;
+    if cfg.sigmoid.toe < 0.0
+        || cfg.sigmoid.shoulder < 0.0
+        || cfg.sigmoid.toe > knee_max
+        || cfg.sigmoid.shoulder > knee_max
+    {
+        return Err(usage(format!(
+            "--sigmoid-toe ({}) and --sigmoid-shoulder ({}) must be in [0, {knee_max}] \
+             (0 disables the knee; a larger width flattens the image into near-uniform \
+             tone without tripping the clip/non-finite counters)",
+            cfg.sigmoid.toe, cfg.sigmoid.shoulder
+        )));
     }
 
     // Print: exposure / black point finite; gains positive. Highlight roll-off is a
@@ -903,6 +983,25 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         ..Report::default()
     };
 
+    // `sigmoid` consumes the density section's scale/offset/dmax but replaces the
+    // stage-3 straight line that `density_gamma` parameterizes, so a customized
+    // gamma would be a silent no-op — the four-spot trap in disguise. Unlike a
+    // fully inert section (e.g. `simple.*` under `--algorithm density`), this is a
+    // *partially* consumed section, so warn loudly instead of staying silent.
+    if cfg.algorithm == Algorithm::Sigmoid
+        && cfg.density.density_gamma != DensityParams::default().density_gamma
+    {
+        push_warning(
+            &mut report,
+            &log,
+            format!(
+                "--algorithm sigmoid ignores --density-gamma (got {}); the S-curve's \
+                 mid-density slope is --sigmoid-contrast",
+                cfg.density.density_gamma
+            ),
+        );
+    }
+
     // Stage 1 — decode.
     let (image, info) = decode(&args.input)?;
     log.info(format_args!(
@@ -953,7 +1052,13 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let rendered = stages::render(
         &image,
         &base.base,
-        stages::algo_params(cfg.algorithm, &cfg.simple, &cfg.density, &cfg.print),
+        stages::algo_params(
+            cfg.algorithm,
+            &cfg.simple,
+            &cfg.density,
+            &cfg.sigmoid,
+            &cfg.print,
+        ),
         &cfg.output,
     )?;
     // lcms2 transform/profile failures reach us only through the global handler
@@ -1273,6 +1378,133 @@ mod tests {
             merge(recipe, &parse_convert(&["--no-d-max"])).density.dmax,
             DmaxSource::None
         );
+    }
+
+    #[test]
+    fn merge_sigmoid_flags_override_recipe_else_keep_recipe() {
+        // Each flag maps to its field; a forgotten merge arm would leave the
+        // default and silently make the flag a no-op (the four-spot-wiring trap).
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&[
+                "--algorithm",
+                "sigmoid",
+                "--sigmoid-contrast",
+                "1.6",
+                "--sigmoid-toe",
+                "0.1",
+                "--sigmoid-shoulder",
+                "0.35",
+            ]),
+        );
+        assert_eq!(cfg.algorithm, Algorithm::Sigmoid);
+        assert_eq!(cfg.sigmoid.contrast, 1.6);
+        assert_eq!(cfg.sigmoid.toe, 0.1);
+        assert_eq!(cfg.sigmoid.shoulder, 0.35);
+
+        // No flag keeps the recipe's values; a flag replaces only its own knob.
+        let recipe: ResolvedConfig =
+            serde_json::from_str(r#"{"sigmoid":{"contrast":2.0,"toe":0.05}}"#).unwrap();
+        let cfg = merge(recipe, &parse_convert(&["--sigmoid-shoulder", "0.4"]));
+        assert_eq!(cfg.sigmoid.contrast, 2.0);
+        assert_eq!(cfg.sigmoid.toe, 0.05);
+        assert_eq!(cfg.sigmoid.shoulder, 0.4);
+    }
+
+    #[test]
+    fn validate_rejects_bad_sigmoid_params() {
+        // Contrast must be finite, positive, AND bounded above (an extreme slope
+        // silently collapses the curve into a hard threshold — see the const doc).
+        for bad in [
+            0.0,
+            -1.0,
+            f32::NAN,
+            f32::INFINITY,
+            crate::algo::sigmoid::SIGMOID_CONTRAST_MAX + 1.0,
+            1e30,
+        ] {
+            let mut cfg = ResolvedConfig::default();
+            cfg.sigmoid.contrast = bad;
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "contrast {bad} should fail"
+            );
+        }
+        // The cap itself is accepted (boundary is inclusive).
+        let mut cfg = ResolvedConfig::default();
+        cfg.sigmoid.contrast = crate::algo::sigmoid::SIGMOID_CONTRAST_MAX;
+        validate(&cfg).unwrap();
+        // Knee widths must be finite, >= 0, AND <= the cap (a negative width would
+        // silently read as "knee off"; a huge finite width flattens the image
+        // without tripping any counter). Both ends fail loudly.
+        let knee_max = crate::algo::sigmoid::SIGMOID_KNEE_MAX;
+        for (toe, shoulder) in [
+            (-0.1, 0.2),
+            (0.2, f32::NAN),
+            (0.2, f32::INFINITY),
+            (knee_max + 1.0, 0.2),
+            (0.2, knee_max + 1.0),
+            (10_000.0, 0.2),
+            (0.2, 10_000.0),
+        ] {
+            let mut cfg = ResolvedConfig::default();
+            cfg.sigmoid.toe = toe;
+            cfg.sigmoid.shoulder = shoulder;
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "toe={toe} shoulder={shoulder} should fail"
+            );
+        }
+        // Zero widths (both knees off = the straight line) and the cap itself are
+        // valid (boundary inclusive).
+        let mut cfg = ResolvedConfig::default();
+        cfg.sigmoid.toe = 0.0;
+        cfg.sigmoid.shoulder = 0.0;
+        validate(&cfg).unwrap();
+        let mut cfg = ResolvedConfig::default();
+        cfg.sigmoid.toe = knee_max;
+        cfg.sigmoid.shoulder = knee_max;
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_sigmoid_without_a_dmax_anchor() {
+        // The S-curve is anchored on [0, Dmax]; `dmax = none` only works for
+        // the density algorithm's scene-referred output.
+        let mut cfg = ResolvedConfig {
+            algorithm: Algorithm::Sigmoid,
+            ..ResolvedConfig::default()
+        };
+        cfg.density.dmax = DmaxSource::None;
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+        // Auto and Explicit anchors are fine under sigmoid...
+        cfg.density.dmax = DmaxSource::Auto;
+        validate(&cfg).unwrap();
+        cfg.density.dmax = DmaxSource::Explicit(1.4);
+        validate(&cfg).unwrap();
+        // ...and `none` stays valid for the density algorithm.
+        cfg.algorithm = Algorithm::Density;
+        cfg.density.dmax = DmaxSource::None;
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn recipe_parses_nested_sigmoid_keys() {
+        // §9 places the sigmoid knobs under `sigmoid.*` (no flag prefix); with
+        // `deny_unknown_fields` a misplaced key would silently reject the recipe,
+        // so pin the documented nesting.
+        let cfg: ResolvedConfig = serde_json::from_str(
+            r#"{"algorithm":"sigmoid","sigmoid":{"contrast":1.4,"toe":0.15,"shoulder":0.3}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.algorithm, Algorithm::Sigmoid);
+        assert_eq!(cfg.sigmoid.contrast, 1.4);
+        assert_eq!(cfg.sigmoid.toe, 0.15);
+        assert_eq!(cfg.sigmoid.shoulder, 0.3);
+        // Partial section fills the remaining defaults.
+        let cfg: ResolvedConfig = serde_json::from_str(r#"{"sigmoid":{"toe":0.0}}"#).unwrap();
+        assert_eq!(cfg.sigmoid.toe, 0.0);
+        assert_eq!(cfg.sigmoid.contrast, SigmoidParams::default().contrast);
     }
 
     #[test]

@@ -53,8 +53,8 @@ The deterministic core owns the image science. Any future ML assistance (see
 ### Out of scope (Step 1) — see §12 Roadmap
 
 - IR-based dust/scratch removal (follow-up task).
-- Additional algorithms beyond the two above, e.g. sigmoid / explicit H&D curve
-  (follow-up task).
+- Additional algorithms beyond the two above (follow-up tasks; the sigmoid /
+  explicit H&D curve has since shipped post-MVP as `--algorithm sigmoid`, §7.3).
 - Black & white film support, incl. plain 16-bit RAW scans (follow-up task).
 - Camera RAW (Bayer/X-Trans) input, DNG processing.
 - ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).
@@ -155,7 +155,7 @@ own parameter struct and can be unit-tested in isolation.
                                      ▼
                  ┌──────────────────────────────────────────────┐
                  │ 3. Algorithm: negative → positive             │
-                 │    (simple | density)  — pluggable            │
+                 │    (simple | density | sigmoid) — pluggable   │
                  │    sub-stages: density convert, correct,      │
                  │    invert, tone/print render                  │
                  └──────────────────────────────────────────────┘
@@ -244,6 +244,54 @@ disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.
 Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as
 separate, independently parameterized sub-stages — the core fidelity rule from §3.
 
+### 7.3 `sigmoid` — density-domain S-curve (H&D / paper response)
+
+An S-shaped tone curve in density space, giving the shoulder/toe control of a
+photographic H&D / print-paper characteristic instead of the `density`
+algorithm's straight `10^(gamma·(D'−Dmax))` line. Shares steps 1–2 (and their
+parameters, §9) and step 4 (the print render, `print.*`) with `density`; only
+step 3 — the density → positive curve — is replaced:
+
+```
+t = contrast·(D' − Dmax)                       the straight line, in log10-output space
+F = −contrast·Dmax                             paper-black floor (the line's value at D' = 0)
+p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skipped if toe = 0)
+v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skipped if shoulder = 0)
+lin = 10^v
+```
+
+i.e. the straight line passed through two soft knees — a **toe** compressing the
+approach to paper black, then a **shoulder** compressing the approach to display
+white. **The knee order is deliberate:** the shoulder (soft-min with the
+log-output-`0` ceiling) is applied *last*, so nothing lifts the result back above
+white — for `shoulder > 0`, this **stage-3 output** is `≤ 1.0` for every finite
+density, for any valid params (including a small `Dmax` or low-contrast auto
+anchor), so under neutral print params the default u16 encode **cannot clip
+highlights** (the stage-4 print render — exposure/gains — can still lift samples
+above `1.0`). With `shoulder = 0` there is no roll-off and
+highlights follow the (toe-shaped) line, which can exceed `1.0` like `density`.
+The toe holds shadows to the paper-black floor `≈ 10^(−contrast·Dmax)` (exact
+when `shoulder = 0`; the shoulder nudges it imperceptibly lower otherwise).
+`toe`/`shoulder` are knee widths in log10 density units; `contrast` is the
+mid-density slope in log-output space. The curve is strictly monotonic; with
+`toe = shoulder = 0` both knees are skipped and it reproduces `density`'s step 3
+**bit-for-bit** (`contrast` standing in for `density_gamma`), so `density`
+remains the debuggable straight-line reference. `contrast` is capped (§9) — an
+extreme slope would collapse the curve into a hard threshold that silently
+destroys tonal detail.
+
+Because both the white knee and the black floor derive from the anchor, the
+S-curve is anchored on `[0, Dmax]` and **requires** one: `density.dmax = none`
+(`--no-d-max`) with `--algorithm sigmoid` is a usage error (exit 2) —
+scene-referred output stays a `density`-algorithm feature. The anchor is
+resolved by the same `density.dmax` machinery (`auto` percentile / explicit
+value) and reported the same way. `density.density_gamma` parameterizes the
+straight line the S-curve replaces and is **ignored** under `sigmoid` (a report
+warning fires when it was customized); `sigmoid.contrast` is the analogue.
+`--highlight-compress` (a linear-space soft-clip after exposure/WB) composes
+with the shoulder rather than being disabled — with the shoulder on and neutral
+print params it simply never engages, since nothing exceeds `1.0`.
+
 ### Pluggable interface (sketch)
 
 ```rust
@@ -285,7 +333,8 @@ no interactive prompts.
   so an agent can load a roll recipe and tweak one value per frame.
 
 The recipe JSON is **grouped into per-stage objects** (`input`, `film_base`,
-`density`, `print`, `simple`, `output`, plus the top-level `algorithm`) rather
+`density`, `sigmoid`, `print`, `simple`, `output`, plus the top-level
+`algorithm`) rather
 than one flat bag of keys. The grouping lets the tool **reject unknown/typo'd
 keys at every level** (a misspelled knob is a hard error, not a silently-ignored
 default → a quietly wrong image). A recipe may be **partial** — any omitted key or
@@ -454,9 +503,9 @@ downstream (`density_offset`, white balance) — never a shadow/highlight
 crossover.
 
 ### Algorithm select
-- `--algorithm simple|density`
+- `--algorithm simple|density|sigmoid`
 
-### Density stage (algorithm = density)
+### Density stage (algorithm = density, shared by sigmoid)
 - `--density-scale R,G,B` — per-channel density gain.
 - `--density-offset R,G,B` — per-channel density offset (orange-mask comp).
 - `--density-gamma <f>` — film/print curve gamma.
@@ -472,7 +521,36 @@ crossover.
     calibrate-once property like `Dmin`).
   - `--no-d-max` ⇒ `"none"` — disable the anchor; scene-referred output (base →
     `1.0`, detail above), reproducing the pre-anchor render bit-for-bit for HDR
-    (`--output-hdr`) workflows.
+    (`--output-hdr`) workflows. **Density algorithm only** — the sigmoid S-curve
+    is anchored on `[0, Dmax]`, so `sigmoid` + `none` is a usage error (§7.3).
+- The `sigmoid` algorithm shares this whole section **except `density_gamma`**,
+  which parameterizes the straight-line curve it replaces and is ignored under
+  `--algorithm sigmoid` (a report warning fires when it was customized;
+  `sigmoid.contrast` is the analogue).
+
+### Sigmoid stage (algorithm = sigmoid)
+The stage-3 S-curve knobs (§7.3); stages 1–2 and 4 use the `density.*` and
+`print.*` sections above. Recipe keys drop the flag prefix (`sigmoid.contrast`,
+`sigmoid.toe`, `sigmoid.shoulder`):
+- `--sigmoid-contrast <f>` — mid-density slope of the curve in log-output space
+  (the `--density-gamma` analogue). Finite and in `(0, 50]`; default `1.0`. The
+  upper cap guards against an extreme slope collapsing the S-curve into a hard
+  black/white threshold that silently destroys tonal detail (use `--algorithm
+  density` for genuinely extreme contrast).
+- `--sigmoid-toe <f>` — toe (shadow) knee width in log10 density units; `0`
+  disables the toe. In `[0, 10]`; default `0.2`. The upper cap is far beyond the
+  ~`0.05–0.9` photographic range and rejects a degenerate width that would
+  flatten the image into near-uniform tone without tripping the clip/non-finite
+  counters.
+- `--sigmoid-shoulder <f>` — shoulder (highlight) knee width in log10 density
+  units; `0` disables the shoulder. In `[0, 10]`; default `0.2` (same cap
+  rationale as `--sigmoid-toe`).
+
+These caps reject only *nonsense / degenerate-asymptote* values (a knee of `10000`
+that flattens the frame); within them, aggressive-but-valid contrast/knees produce
+faithful, deliberate output that may posterize or crush — that is the user's
+choice and is intentionally **not** warned (a degenerate-band warning would
+false-positive on legitimate high-contrast conversions).
 
 ### Print / tone render
 - `--print-exposure <f>` — overall positive exposure.
@@ -569,10 +647,11 @@ the NLP feature comparison, Phase 6).
    threshold, mask dilation/morphology, inpainting method/strength. Must handle
    the known limits — disable/guard for silver B&W film and Kodachrome. New
    stages: `defect_mask`, `inpaint`. New flags under an `--ir-*` namespace.
-2. **Additional algorithms.** At minimum a **sigmoid / explicit H&D-curve** model
-   (NegPy-style) for more photographically meaningful controls; possibly a
-   power-law/exponent model (RawTherapee-style) for camera-scanned negatives.
-   Added via the existing `Converter` trait, selectable with `--algorithm`.
+2. **Additional algorithms.** The **sigmoid / explicit H&D-curve** model has
+   since **shipped** as `--algorithm sigmoid` (§7.3, task `algo-sigmoid`);
+   still open: possibly a power-law/exponent model (RawTherapee-style) for
+   camera-scanned negatives. Added via the existing `Converter` trait,
+   selectable with `--algorithm`.
 3. **Black & white film support.** The *rendering* half has graduated into the
    tracked `bw-support` task (Phase 6): B&W film is still a density medium, so
    the `density` algorithm is the B&W renderer, plus a mono color model that

@@ -94,7 +94,8 @@ impl From<FilmBase> for [f32; 3] {
 ///
 /// A neutral selector that mirrors the CLI/recipe key, like the param structs —
 /// it does not depend on the `algo` implementations. Serializes lowercase
-/// (`"simple"` / `"density"`) and parses the same on the CLI via `ValueEnum`.
+/// (`"simple"` / `"density"` / `"sigmoid"`) and parses the same on the CLI via
+/// `ValueEnum`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Algorithm {
@@ -103,6 +104,8 @@ pub enum Algorithm {
     /// Density-domain inversion (Cineon / negadoctor) — the default.
     #[default]
     Density,
+    /// Density-domain S-curve (photographic H&D / paper-response) tone mapping.
+    Sigmoid,
 }
 
 /// Output bit depth — an **internal** selector the encoder and the depth-aware
@@ -329,6 +332,39 @@ impl Default for PrintParams {
     }
 }
 
+/// Sigmoid / H&D-curve algorithm knobs (design-spec §7.3/§9,
+/// `algorithm = sigmoid`).
+///
+/// The sigmoid algorithm shares stages 1–2 (and [`DensityParams`]'s
+/// `density_scale` / `density_offset` / `dmax`) and stage 4 ([`PrintParams`])
+/// with `density`; these knobs parameterize only its replacement stage 3, the
+/// S-curve mapping corrected density to positive linear. `density_gamma` is the
+/// straight-line curve's contrast and is **ignored** under `sigmoid` —
+/// `contrast` here is the analogous knob.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SigmoidParams {
+    /// Mid-density slope of the curve in log-output space (the `density_gamma`
+    /// analogue). Must be finite and > 0.
+    pub contrast: f32,
+    /// Toe (shadow) knee width in log10 density units: how softly the curve
+    /// approaches paper black. `0` disables the toe (hard straight-line black).
+    pub toe: f32,
+    /// Shoulder (highlight) knee width in log10 density units: how softly the
+    /// curve approaches display white. `0` disables the shoulder.
+    pub shoulder: f32,
+}
+
+impl Default for SigmoidParams {
+    fn default() -> Self {
+        Self {
+            contrast: 1.0,
+            toe: 0.2,
+            shoulder: 0.2,
+        }
+    }
+}
+
 /// Simple inversion-baseline knobs (design-spec §9, `algorithm = simple`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -543,6 +579,37 @@ mod tests {
             ..OutputParams::default()
         };
         assert_eq!(hdr.depth(), OutDepth::F32);
+    }
+
+    #[test]
+    fn sigmoid_params_json_round_trip_and_partial_defaults() {
+        let params = SigmoidParams {
+            contrast: 1.3,
+            toe: 0.1,
+            shoulder: 0.4,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SigmoidParams>(&json).unwrap(),
+            params
+        );
+        // A partial section fills the remaining defaults.
+        let p: SigmoidParams = serde_json::from_str(r#"{"contrast":2.0}"#).unwrap();
+        assert_eq!(p.contrast, 2.0);
+        assert_eq!(p.toe, SigmoidParams::default().toe);
+        assert_eq!(p.shoulder, SigmoidParams::default().shoulder);
+    }
+
+    #[test]
+    fn algorithm_serializes_sigmoid_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Algorithm::Sigmoid).unwrap(),
+            "\"sigmoid\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Algorithm>("\"sigmoid\"").unwrap(),
+            Algorithm::Sigmoid
+        );
     }
 
     #[test]
