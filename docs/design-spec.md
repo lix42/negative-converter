@@ -417,6 +417,15 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    loudly** (naming the recovery flags) rather than emit a silently-wrong base.
    Threshold tuning against full-size scans (`real-scan-verification`) and a
    `--holder white|black` control for light holders are roadmap items (§12).
+   **Known residual limit:** a flat, bright *scene* region sitting behind the
+   holder on a rebate-less / cropped scan (e.g. sky along one edge) can still
+   satisfy every RGB gate and, as the sole candidate, be taken as the base — a
+   wrong `Dmin`, which shows up as a correctable global per-channel cast (the §8
+   failure geometry), not a crossover. Distinguishing it needs signals this
+   single-frame RGB pass lacks — colour-independent corroboration
+   (`auto-base-neutral-stock`) and opacity-based film-boundary detection
+   (`ir-holder-detection`); until those land, pin the base with
+   `--base-region` / `--film-base` for work you're keeping.
 3. **Content-based estimation (last resort, opt-in).** When the scan is cropped
    to the image with no unexposed film visible, a per-channel high percentile of
    the *exposed content* approximates the base (the thinnest area of a negative

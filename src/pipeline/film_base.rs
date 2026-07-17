@@ -23,6 +23,22 @@
 //! so no genuine picture area can out-bright it. Gates stay deliberately strict
 //! — auto is a convenience tier (design-spec §9 ladder), so a refused detection
 //! is acceptable and a wrong one is not.
+//!
+//! **Known residual false positive.** One case the strict RGB gates still can't
+//! catch: a flat, bright *scene* region that happens to sit behind the holder on
+//! a rebate-less / cropped scan (e.g. sky along one edge) satisfies every gate
+//! (holder-backed, uniform, transitions to picture before the cap, brighter than
+//! the interior) and, as the sole surviving candidate, is taken as the base — a
+//! wrong `Dmin`. Telling it from a genuine thin rebate needs signals a
+//! single-frame RGB pass doesn't have: colour-independent corroboration
+//! (`auto-base-neutral-stock`) or opacity-based film-boundary detection
+//! (`ir-holder-detection`). Neither blunt remedy is acceptable here — rejecting
+//! all thin uniform holder-backed bands would drop genuine rebates, and requiring
+//! cross-edge corroboration would reject legitimate single-edge rebate (common,
+//! and tested). The failure is bounded: a wrong base is a *correctable global
+//! per-channel cast* (design-spec §8), never a crossover, and pinning via
+//! `--base-region` / `--film-base` avoids it — which is the recommended path for
+//! work you're keeping.
 
 use serde::Serialize;
 
