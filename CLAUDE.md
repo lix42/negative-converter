@@ -124,9 +124,11 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
     silently anywhere.
 - **Verify against real sample files.** There is no public spec for the SilverFast
   HDRi on-disk layout; the decoder must be validated against the user's actual
-  scans and degrade gracefully on unrecognized layouts. Sample scans live at
-  `../nc-assets/{48,64}bit-full/` and `~/Pictures/scan/` (50–160 MB each) — **never
-  read them into context**; inspect IFD structure with `tiffinfo`, and exercise the
+  scans and degrade gracefully on unrecognized layouts. Sample scans live in the
+  `nc-assets` Google Drive folder
+  (https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6) — the
+  canonical source — mirrored locally at `../nc-assets/{48,64}bit-full/` (and
+  `~/Pictures/scan/`; 50–160 MB each). **Never read them into context**; inspect IFD structure with `tiffinfo`, and exercise the
   pipeline on them with a throwaway `#[ignore]` test that calls `io::decode` and
   prints only derived numbers (remove it after). Note: real scans are laid out
   `dark holder → thin inset rebate → picture` (the rebate is not the outer margin),
