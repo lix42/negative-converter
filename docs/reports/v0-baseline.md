@@ -2,8 +2,7 @@
 
 **Version:** `v0` (pipeline_version 0) · **Date:** 2026-07-15 · `nc` 0.1.0
 **Assets:** Ektar 100 and Harman Phoenix rolls — full-size SilverFast HDRi scans
-from the `nc-assets` Google Drive folder
-(https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6), synced
+from the [nc-assets Google Drive folder](https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6), synced
 locally to `../nc-assets/{Ektar,phoenix}/` · **Outputs:** `../nc-assets/converted/`
 
 This is the reference point every future version is compared against. It records
