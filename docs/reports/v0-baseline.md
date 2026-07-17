@@ -1,8 +1,9 @@
 # Conversion baseline — v0
 
 **Version:** `v0` (pipeline_version 0) · **Date:** 2026-07-15 · `nc` 0.1.0
-**Assets:** Ektar 100 and Harman Phoenix rolls (`../nc-assets/{Ektar,phoenix}/`,
-full-size SilverFast HDRi scans) · **Outputs:** `../nc-assets/converted/`
+**Assets:** Ektar 100 and Harman Phoenix rolls — full-size SilverFast HDRi scans
+from the [nc-assets Google Drive folder](https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6), synced
+locally to `../nc-assets/{Ektar,phoenix}/` · **Outputs:** `../nc-assets/converted/`
 
 This is the reference point every future version is compared against. It records
 *what v0 does*, the numbers it produced on real scans, and where it falls short —
@@ -26,7 +27,8 @@ The shipped Step-1 default path, driven through the recommended §8 workflow:
 ## Method
 
 ```
-# Paths are relative to the repo root; the scans live in ../nc-assets/.
+# Paths are relative to the repo root; sync the nc-assets Google Drive folder
+# (https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6) to ../nc-assets/ first.
 # 1. Measure Dmin per roll from the unexposed reference frame.
 nc estimate ../nc-assets/Ektar/20260713-nikon-963.tif   --base-region 2000,1400,400,400
 nc estimate ../nc-assets/phoenix/20260712-nikon-933.tif --base-region 1500,1500,400,400

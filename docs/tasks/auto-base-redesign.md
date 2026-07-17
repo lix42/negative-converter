@@ -88,8 +88,11 @@ and a wrong one is not. Tune the confidence gates against the
   warning; a clean rebate rectangle does not.
 - Regression: the existing explicit/region paths and their tests are unchanged
   (the region uniformity check warns, never changes the value).
-- Validate against the real scans in `../nc-assets` and `~/Pictures/scan`
-  (uncommitted probe, as in the `film-base-estimation` verification).
+- Validate against the real scans in `../nc-assets` (synced from the `nc-assets`
+  Google Drive folder,
+  https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6) and
+  `~/Pictures/scan` (uncommitted probe, as in the `film-base-estimation`
+  verification).
 
 ## Dependencies
 
