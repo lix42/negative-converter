@@ -326,7 +326,7 @@ no interactive prompts.
 |---|---|
 | `nc convert` | The main pipeline: negative file → positive TIFF. |
 | `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
-| `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON. |
+| `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. |
 | `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). |
 
 ### Recipes (JSON in/out)
@@ -388,12 +388,39 @@ nc inspect in.tiff --report json
 # (Product tip: wind past the light-struck leader, shoot a lens-cap frame, and
 # scan it — a full frame of clean base beats sampling the thin rebate. Don't use
 # the auto-burned wind-on frames; they are fogged leader. See §9 film-base.)
-# `estimate` measures Dmin from the sampled rectangle and reports it in a form
-# ready to drop into --film-base or a recipe's film_base.source.
+# `estimate` measures Dmin from the sampled rectangle and reports it in
+# directly reusable forms: a paste-ready --film-base flag string and a
+# `film_base` recipe fragment (emitted only when the measurement is a valid
+# explicit base — each channel in (0, 1] — else a warning explains why not).
 nc estimate reference.tiff --base-region 200,0,300,3600 --report json
-# → { "film_base": [0.553, 0.271, 0.159], ... }
+# → { "film_base": { "r": 0.553, "g": 0.271, "b": 0.159 },
+#     "film_base_source": { "region": [200, 0, 300, 3600] },
+#     "film_base_flag": "--film-base 0.553,0.271,0.159",
+#     "film_base_recipe": { "source": { "explicit": [0.553, 0.271, 0.159] } }, … }
 nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
-# …or bake the value into roll-A.json (film_base.source = explicit) and batch it.
+# …or paste film_base_recipe into roll-A.json as its "film_base" section and batch it.
+
+# On a dedicated blank frame, `estimate --grid` samples a fixed 5-cell grid
+# (corners + center) over the frame (or over --base-region) instead of a single
+# measurement: the report gains a `grid` object (per-cell regions/values, the
+# per-channel relative spread, the tolerance, and the agreement verdict), the
+# combined base is the per-channel median across cells, and disagreement beyond
+# the tolerance is a loud warning (--strict promotes it to a failing exit) —
+# it diagnoses light leaks, scanner illumination falloff, or dust.
+# A cells-disagree *warning* does NOT suppress the reuse-ready output: when the
+# combined median base is in range it is still offered (film_base_flag /
+# film_base_recipe), because the median resists a single bad cell. A consumer
+# treating that base as authoritative should check `warnings`, or run --strict,
+# which promotes the disagreement to a hard failure. (A *degenerate* base — see
+# below — is different: it is a hard error, not a warning, and no reuse output.)
+# A degenerate combined base (non-finite or <= 0 on any channel — e.g. --grid
+# --base-region on the dark holder) is not a usable Dmin anchor, so --grid emits
+# the diagnostic report (with grid.cells) and then **fails loudly regardless of
+# --strict** (exit 1), matching the single-measurement path's finite-and-positive
+# guard.
+# --grid conflicts with --film-base (nothing to sample) and --auto-base (the
+# grid replaces border detection). Deterministic: fixed layout, fixed percentile.
+nc estimate blank.tiff --grid --report json
 ```
 
 ## 9. Parameter reference (grouped by stage)
@@ -448,8 +475,8 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    clean base — far more area than the rebate
    — measured with `nc estimate` and frozen into the roll recipe (§8 example).
    The large area also enables multi-region sampling with an agreement check
-   (roadmap §12), which doubles as a light-leak / illumination-falloff
-   diagnostic.
+   (`nc estimate --grid`, §8), which doubles as a light-leak /
+   illumination-falloff diagnostic.
 2. **The rebate (the unexposed strip around each frame).** Reliable form: point
    `--base-region` at a visible rebate patch manually — `nc inspect` reports the
    detector's candidate rectangles (edge, coordinates, value, spread) so you can
@@ -497,7 +524,11 @@ recovery flags — an agent can catch the exit code and re-run with an explicit
 choice. Estimator selection is never silent. **A degenerate resolved base** (a
 zero / negative / non-finite channel — e.g. a `--base-region` on the dark holder)
 is likewise rejected at the estimation stage rather than left to poison the
-density divide or be echoed back by `nc estimate` as a trustworthy `Dmin`. A
+density divide or be echoed back by `nc estimate` as a trustworthy `Dmin`. This
+holds for the `nc estimate --grid` combined base too: it emits the diagnostic
+report (with `grid.cells`) and then fails loudly on a degenerate combined base
+regardless of `--strict` (exit 1), the same code the single-measurement guard
+returns. A
 neutral base `[1,1,1]` is
 representable but not recommended: it forfeits the per-channel orange-mask
 neutralization (content estimation strictly dominates it). Note the failure
@@ -582,8 +613,8 @@ false-positive on legitimate high-contrast conversions).
 ### Global
 - `--params <json>`, `--dump-params <json>`
 - `--report json|none`, `--report-file <path>`
-- `--strict` — promote report warnings (clipping, non-finite samples, …) to a
-  failing exit (see §11)
+- `--strict` — promote report warnings (clipping, non-finite samples, grid
+  disagreement, …) to a failing exit (see §11); on `convert` and `estimate`
 - `-v/--verbose`, `--quiet`
 
 **Telemetry (operational, `convert` only — NOT recipe keys).** Opt-in
@@ -688,6 +719,14 @@ Warnings (e.g. clipped highlights/shadows, IR present but ignored, BigTIFF
 auto-promoted) are surfaced in the JSON report and on stderr, without failing the
 run unless `--strict` is set.
 
+A **degenerate resolved film base** (a zero / negative / non-finite channel)
+maps to exit 1 (generic error) on both estimate paths: the single-measurement
+path via `film_base::estimate`'s finite-and-positive guard, and `nc estimate
+--grid` via a post-report guard on the combined base — the latter emits the
+diagnostic report (with `grid.cells`) first, then fails regardless of `--strict`
+(see §8). This is unconditional, distinct from the `--strict`-only promotion of
+the grid *disagreement* warning.
+
 ## 12. Roadmap (follow-up tasks, explicitly out of Step 1)
 
 These are deliberately deferred and recorded here so they aren't lost. Items
@@ -737,13 +776,12 @@ the NLP feature comparison, Phase 6).
 9. **Light film holders.** Auto/border logic assumes a dark holder surround; some
    holders are white. Add a `--holder white|black` control (recipe key
    `film_base.holder`) so detection knows the surround polarity.
-10. **Reuse-ready `nc estimate` output.** Emit the measured base in a directly
-    reusable form — a `--film-base R,G,B` string and/or a `film_base` recipe
-    fragment — so the calibrate-once → reuse workflow (§8) is copy-paste smooth.
-    This includes **grid / multi-region sampling with an agreement check** for
-    unexposed-frame calibration (§9 ladder tier 1): sample center + corners,
-    require per-channel agreement within a tolerance, and report the spread —
-    disagreement diagnoses light leaks and scanner illumination falloff.
+10. **Reuse-ready `nc estimate` output — shipped** (`estimate-reuse-output`).
+    The estimate report now carries the measured base in directly reusable
+    forms (`film_base_flag`, `film_base_recipe`) and `--grid` provides the
+    5-cell agreement-checked sampling for unexposed-frame calibration (§9
+    ladder tier 1) with the spread reported and disagreement warned loudly.
+    See §8.
 11. **UI-assisted film-base picking.** Once a UI layer exists: visual region
     picking for the rebate/reference frame, highlighting auto-detected
     candidates, and feedback when a chosen region fails the uniformity check

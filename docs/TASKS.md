@@ -61,6 +61,8 @@ graph TD
   film-base-estimation --> auto-base-redesign
   auto-base-redesign --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
+  estimate-reuse-output --> grid-verdict-enum
+  film-base-estimation --> grid-verdict-enum
   pipeline-orchestration --> real-scan-verification
   pipeline-orchestration --> perf-instrumentation
   pipeline-orchestration --> perf-telemetry
@@ -105,6 +107,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `auto-base-redesign` (post-MVP): `film-base-estimation`
 - `white-holder-support` (post-MVP): `auto-base-redesign`
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
+- `grid-verdict-enum` (post-MVP): `estimate-reuse-output`, `film-base-estimation`
 - `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
 - `perf-instrumentation` (post-MVP, **parked**): `pipeline-orchestration` — LAB
   criterion benches; prototyped and parked on branch
@@ -168,7 +171,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 
 - [x] [Robust auto film-base detection](tasks/auto-base-redesign.md)
 - [ ] [Light film holder support](tasks/white-holder-support.md)
-- [ ] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
+- [x] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
+- [ ] [Grid agreement verdict enum](tasks/grid-verdict-enum.md)
 - [ ] [IR-assisted film-holder detection](tasks/ir-holder-detection.md)
 - [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base-content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `auto-base-redesign` (tell that task's owner)
 - [ ] [Neutral-base robustness for auto film-base detection](tasks/auto-base-neutral-stock.md)

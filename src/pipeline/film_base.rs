@@ -101,6 +101,17 @@ const RECOVERY_ADVICE: &str = "pass --film-base or --base-region (design-spec §
      --base-content flag is owned by the film-base-content-fallback task); until it \
      ships, use --film-base or --base-region";
 
+/// Fraction of the grid rectangle's width/height used for each grid cell, so the
+/// five cells cover the corners and center with clear gaps between them.
+const GRID_CELL_FRAC: f32 = 0.25;
+
+/// Max acceptable per-channel relative spread (`(max - min) / max`) across the
+/// grid cells for them to count as agreeing. An unexposed reference frame is
+/// physically uniform base, so cells should match to within a few percent;
+/// larger spread indicates light leaks, scanner illumination falloff, or dust —
+/// a diagnostic the caller must surface loudly, not average away.
+pub const GRID_MAX_RELATIVE_SPREAD: f32 = 0.05;
+
 /// A resolved film base plus any non-fatal quality warnings the estimation
 /// raised (e.g. a non-uniform `--base-region`, cross-edge disagreement). The
 /// orchestrator folds the warnings into the JSON report, where `--strict`
@@ -519,6 +530,131 @@ fn sample_region_at(image: &LinearImage, rect: [u32; 4], p: f32) -> Result<FilmB
     })
 }
 
+// ---------------------------------------------------------------------------
+// Grid / multi-region sampling (unexposed-frame calibration, design-spec §9
+// ladder tier 1)
+// ---------------------------------------------------------------------------
+
+/// One grid cell: the rectangle sampled and the base it measured. Serialized
+/// into the JSON report so a disagreement is diagnosable per cell.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct GridCell {
+    /// The sampled rectangle `[x, y, w, h]`.
+    pub region: [u32; 4],
+    /// Per-channel high-percentile transmission of this cell.
+    pub base: FilmBase,
+}
+
+/// Result of grid sampling: the combined base plus the per-cell values and
+/// their spread, so agreement failure can be reported *with* the evidence
+/// rather than averaged away. Serialize-only — it feeds the JSON report.
+///
+/// `base`, `spread`, `tolerance`, and `agreement` are all **derived from
+/// `cells`**; construct only via [`estimate_grid`] so they stay consistent.
+///
+/// **Known limitation — `agreement: bool` conflates two conditions.** A `false`
+/// verdict means either the cells genuinely *disagree* (light leak / scanner
+/// illumination falloff / dust) or the sample is *degenerate* (all-zero / dark,
+/// e.g. a region on the holder). It can't tell which, because the `spread`
+/// sentinel is overloaded: a degenerate all-zero channel and a genuine full-range
+/// disagreement both read ~`1.0`. The CLI (`cli::run_estimate`) therefore
+/// re-derives which case it is by re-inspecting the combined `base` (channel
+/// `<= 0` ⇒ degenerate ⇒ hard error; otherwise disagreement ⇒ warning). Replacing
+/// this bool + overloaded sentinel with a self-describing verdict enum
+/// (`Uniform | Disagree | Degenerate`) so the estimate reports its own verdict
+/// and the CLI stops re-deriving it is the `grid-verdict-enum` follow-up task.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GridEstimate {
+    /// Combined base: the per-channel **median** across cells (robust to one
+    /// bad cell — e.g. a dust patch — while staying deterministic).
+    pub base: FilmBase,
+    /// The five sampled cells, in fixed order: top-left, top-right,
+    /// bottom-left, bottom-right, center.
+    pub cells: [GridCell; 5],
+    /// Per-channel relative spread across cells, `(max - min) / max`
+    /// (`1.0` when the max is non-positive — a degenerate sample,
+    /// indistinguishable from a genuine full-range spread by this field
+    /// alone; the combined `base` disambiguates).
+    pub spread: [f32; 3],
+    /// The documented agreement tolerance ([`GRID_MAX_RELATIVE_SPREAD`]) the
+    /// spread was judged against, echoed so the report is self-contained.
+    pub tolerance: f32,
+    /// Whether every channel's spread is within the tolerance. `false` is
+    /// diagnostic — light leaks, illumination falloff, or dust.
+    pub agreement: bool,
+}
+
+/// Sample a fixed 5-cell grid (corners + center) over `rect` and combine the
+/// per-cell film-base measurements. For an unexposed reference frame the whole
+/// rectangle is clean base, so the cells double as an agreement check: their
+/// spread diagnoses light leaks and scanner illumination falloff (reported, and
+/// judged against [`GRID_MAX_RELATIVE_SPREAD`] — the caller surfaces failure
+/// loudly). Deterministic: fixed layout ([`GRID_CELL_FRAC`] of the rectangle
+/// per cell), fixed percentile ([`SAMPLE_PERCENTILE`]).
+pub fn estimate_grid(image: &LinearImage, rect: [u32; 4]) -> Result<GridEstimate> {
+    let [x, y, w, h] = rect;
+    // Validate the whole rectangle up front so a bad `--base-region` reports
+    // itself, not a derived cell. (Empty / out-of-bounds checks match
+    // `sample_region_at`; the u64 arithmetic prevents wrap near u32::MAX.)
+    if w == 0 || h == 0 {
+        return Err(NcError::Usage(format!(
+            "grid region must be non-empty (got {w}x{h})"
+        )));
+    }
+    if x as u64 + w as u64 > image.width as u64 || y as u64 + h as u64 > image.height as u64 {
+        return Err(NcError::Usage(format!(
+            "grid region [{x},{y},{w},{h}] is outside the {}x{} image",
+            image.width, image.height
+        )));
+    }
+
+    // Cell size: a fixed fraction of the rectangle, at least 1 px. On a tiny
+    // rectangle the cells overlap; that is harmless and still deterministic.
+    let cw = ((w as f32 * GRID_CELL_FRAC).round() as u32).clamp(1, w);
+    let ch = ((h as f32 * GRID_CELL_FRAC).round() as u32).clamp(1, h);
+    let origins = [
+        (x, y),                               // top-left
+        (x + w - cw, y),                      // top-right
+        (x, y + h - ch),                      // bottom-left
+        (x + w - cw, y + h - ch),             // bottom-right
+        (x + (w - cw) / 2, y + (h - ch) / 2), // center
+    ];
+
+    let mut sampled = Vec::with_capacity(origins.len());
+    for (cx, cy) in origins {
+        let region = [cx, cy, cw, ch];
+        sampled.push(GridCell {
+            region,
+            base: sample_region_at(image, region, SAMPLE_PERCENTILE)?,
+        });
+    }
+    // Infallible: one cell per origin, and `origins` is a 5-element array.
+    let cells: [GridCell; 5] = sampled.try_into().expect("one grid cell per origin");
+
+    // Per-channel median (combined value) and relative spread across cells.
+    let mut base = [0.0f32; 3];
+    let mut spread = [0.0f32; 3];
+    for c in 0..3 {
+        let mut vals: Vec<f32> = cells
+            .iter()
+            .map(|cell| <[f32; 3]>::from(cell.base)[c])
+            .collect();
+        vals.sort_by(f32::total_cmp);
+        base[c] = vals[vals.len() / 2];
+        let (lo, hi) = (vals[0], vals[vals.len() - 1]);
+        spread[c] = if hi > 0.0 { (hi - lo) / hi } else { 1.0 };
+    }
+    let agreement = spread.iter().all(|s| *s <= GRID_MAX_RELATIVE_SPREAD);
+
+    Ok(GridEstimate {
+        base: FilmBase::from(base),
+        cells,
+        spread,
+        tolerance: GRID_MAX_RELATIVE_SPREAD,
+        agreement,
+    })
+}
+
 /// The `p`-quantile (0.0–1.0) of `values` by rounded rank `round((n-1)·p)` over
 /// the finite values, no interpolation, in O(n). (Not the textbook nearest-rank
 /// `⌈p·n⌉`: for `[0.1,0.2,0.3,0.4]` at p=0.5 this returns `0.3`, not `0.2`.)
@@ -866,6 +1002,164 @@ mod tests {
             estimate(&img, &params(FilmBaseSource::Region([0, 0, 0, 4]))).unwrap_err(),
             NcError::Usage(_)
         ));
+    }
+
+    #[test]
+    fn grid_agrees_on_a_uniform_frame() {
+        // A flat unexposed-reference frame: five cells, tiny spread, agreement,
+        // combined value equal to the flat color.
+        let img = solid(40, 40, [0.9, 0.55, 0.42]);
+        let grid = estimate_grid(&img, [0, 0, 40, 40]).unwrap();
+        assert_eq!(grid.cells.len(), 5);
+        assert!(
+            grid.agreement,
+            "uniform frame must agree: {:?}",
+            grid.spread
+        );
+        assert!(grid.spread.iter().all(|s| *s < 1e-6));
+        assert_eq!(grid.tolerance, GRID_MAX_RELATIVE_SPREAD);
+        assert!((grid.base.r - 0.9).abs() < 1e-6);
+        assert!((grid.base.g - 0.55).abs() < 1e-6);
+        assert!((grid.base.b - 0.42).abs() < 1e-6);
+        // Fixed layout: 25% cells at the corners and center of the rectangle.
+        assert_eq!(grid.cells[0].region, [0, 0, 10, 10]);
+        assert_eq!(grid.cells[3].region, [30, 30, 10, 10]);
+        assert_eq!(grid.cells[4].region, [15, 15, 10, 10]);
+    }
+
+    #[test]
+    fn grid_disagreement_is_reported_not_averaged_away() {
+        // Darken one corner (a light leak / falloff): agreement must fail with
+        // the spread visible, while the median combined value resists the one
+        // bad cell.
+        let mut img = solid(40, 40, [0.8, 0.8, 0.8]);
+        for y in 0..10 {
+            for x in 0..10 {
+                set_px(&mut img, x, y, [0.4, 0.4, 0.4]);
+            }
+        }
+        let grid = estimate_grid(&img, [0, 0, 40, 40]).unwrap();
+        assert!(!grid.agreement, "a dark corner must break agreement");
+        assert!(grid.spread[0] > GRID_MAX_RELATIVE_SPREAD);
+        // Median of [0.4, 0.8, 0.8, 0.8, 0.8] stays on the true base.
+        assert!((grid.base.r - 0.8).abs() < 1e-6);
+        // The bad cell is identifiable in the per-cell report.
+        assert!((grid.cells[0].base.r - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grid_respects_the_given_rectangle() {
+        // Grid over a sub-rectangle must ignore pixels outside it.
+        let mut img = solid(40, 40, [0.1, 0.1, 0.1]);
+        for y in 10..30 {
+            for x in 10..30 {
+                set_px(&mut img, x, y, [0.7, 0.6, 0.5]);
+            }
+        }
+        let grid = estimate_grid(&img, [10, 10, 20, 20]).unwrap();
+        assert!(grid.agreement);
+        assert!((grid.base.r - 0.7).abs() < 1e-6);
+        assert!((grid.base.b - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn grid_cells_land_in_bounds_on_an_odd_non_square_rect() {
+        // An odd, non-square rectangle exercises the `round(w*GRID_CELL_FRAC)`
+        // cell sizing and the `(w-cw)/2` integer center origin (the square/even
+        // cases above hide the rounding). The five cells must land exactly where
+        // that arithmetic puts them and none may spill past the rect bounds.
+        let img = solid(83, 47, [0.5, 0.4, 0.3]);
+        let rect = [7, 5, 61, 29]; // odd width and height, non-square, offset
+        let grid = estimate_grid(&img, rect).unwrap();
+
+        let [x, y, w, h] = rect;
+        // round(61*0.25)=round(15.25)=15 ; round(29*0.25)=round(7.25)=7
+        let cw = 15u32;
+        let ch = 7u32;
+        let expect = [
+            [x, y, cw, ch],                               // top-left
+            [x + w - cw, y, cw, ch],                      // top-right
+            [x, y + h - ch, cw, ch],                      // bottom-left
+            [x + w - cw, y + h - ch, cw, ch],             // bottom-right
+            [x + (w - cw) / 2, y + (h - ch) / 2, cw, ch], // center
+        ];
+        for (cell, want) in grid.cells.iter().zip(expect) {
+            assert_eq!(cell.region, want, "cell region mismatch");
+            let [cx, cy, ccw, cch] = cell.region;
+            assert!(
+                cx + ccw <= x + w && cy + cch <= y + h,
+                "cell {:?} spills past rect {rect:?}",
+                cell.region
+            );
+        }
+        // Center origin is the floored midpoint: (61-15)/2=23, (29-7)/2=11.
+        assert_eq!(grid.cells[4].region, [7 + 23, 5 + 11, 15, 7]);
+    }
+
+    #[test]
+    fn grid_degenerate_base_is_reported_but_estimate_grid_does_not_error() {
+        // `estimate_grid` reports a degenerate combined base (all-dark cells) via
+        // its spread sentinel + failed agreement rather than erroring — the hard
+        // error is the *caller's* job (`cli::run_estimate`, after emitting the
+        // report). This pins that division of responsibility so the e2e test in
+        // `tests/` owns the exit-code assertion.
+        let img = solid(40, 40, [0.0, 0.0, 0.0]);
+        let grid = estimate_grid(&img, [0, 0, 40, 40]).unwrap();
+        assert!(!grid.agreement);
+        assert_eq!(<[f32; 3]>::from(grid.base), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn grid_single_channel_disagreement_drives_the_verdict() {
+        // Only ONE channel's cells disagree (a corner darkened on red only) while
+        // green and blue stay flat. Agreement must fail, driven solely by red —
+        // isolating the per-channel `spread.iter().all(...)` verdict from an
+        // all-channel disagreement.
+        let mut img = solid(40, 40, [0.8, 0.8, 0.8]);
+        for y in 0..10 {
+            for x in 0..10 {
+                set_px(&mut img, x, y, [0.4, 0.8, 0.8]); // red-only dip
+            }
+        }
+        let grid = estimate_grid(&img, [0, 0, 40, 40]).unwrap();
+        assert!(!grid.agreement, "a single-channel dip must break agreement");
+        assert!(
+            grid.spread[0] > GRID_MAX_RELATIVE_SPREAD,
+            "red must exceed tol"
+        );
+        assert!(grid.spread[1] <= GRID_MAX_RELATIVE_SPREAD, "green agrees");
+        assert!(grid.spread[2] <= GRID_MAX_RELATIVE_SPREAD, "blue agrees");
+    }
+
+    #[test]
+    fn grid_rejects_bad_rectangles() {
+        let img = solid(8, 8, [0.5, 0.5, 0.5]);
+        assert!(matches!(
+            estimate_grid(&img, [0, 0, 0, 8]).unwrap_err(),
+            NcError::Usage(_)
+        ));
+        assert!(matches!(
+            estimate_grid(&img, [4, 4, 8, 8]).unwrap_err(),
+            NcError::Usage(_)
+        ));
+        // A tiny rectangle still works (cells clamp to >= 1 px and may overlap).
+        assert!(estimate_grid(&img, [0, 0, 2, 2]).is_ok());
+    }
+
+    #[test]
+    fn grid_degenerate_all_black_frame_uses_the_spread_sentinel() {
+        // An all-black rectangle (e.g. a region on the dark holder reading 0):
+        // the spread guard must yield the 1.0 sentinel — not 0/0 = NaN, which
+        // would serialize as `null` and break the report schema — and the
+        // agreement verdict must fail closed.
+        let img = solid(40, 40, [0.0, 0.0, 0.0]);
+        let grid = estimate_grid(&img, [0, 0, 40, 40]).unwrap();
+        assert_eq!(grid.spread, [1.0, 1.0, 1.0]);
+        assert!(
+            !grid.agreement,
+            "degenerate sample must not count as agreeing"
+        );
+        assert_eq!(<[f32; 3]>::from(grid.base), [0.0, 0.0, 0.0]);
     }
 
     #[test]
