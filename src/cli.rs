@@ -25,9 +25,9 @@ use crate::io::encode;
 use crate::pipeline::{film_base, stages};
 use crate::telemetry;
 use crate::types::{
-    Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
-    FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams, Result,
-    SigmoidParams, SimpleParams, WbSource,
+    Algorithm, BalanceRange, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase,
+    FilmBaseParams, FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams,
+    Result, SigmoidParams, SimpleParams, WbSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -225,6 +225,10 @@ pub struct FilmBaseOverrides {
 }
 
 /// Density-stage overrides (design-spec §9, `algorithm = density`).
+///
+/// The two `balance_range` flags are mutually exclusive (clap rejects passing
+/// both), like the [`DmaxOverrides`] trio: whichever is given replaces the
+/// recipe's `density.balance_range` entirely.
 #[derive(Args, Debug, Default)]
 pub struct DensityOverrides {
     /// Per-channel density gain.
@@ -236,6 +240,23 @@ pub struct DensityOverrides {
     /// Film / print curve gamma.
     #[arg(long)]
     pub density_gamma: Option<f32>,
+    /// Regional balance: per-channel density offset for the positive's shadows.
+    /// Negative values are typical, so a leading `-` is accepted
+    /// (`allow_hyphen_values`); the comma-list parser still rejects non-numbers.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb, allow_hyphen_values = true)]
+    pub shadow_balance: Option<[f32; 3]>,
+    /// Regional balance: per-channel density offset for the positive's highlights.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb, allow_hyphen_values = true)]
+    pub highlight_balance: Option<[f32; 3]>,
+    /// Explicit tone-ramp anchors for the regional balance (corrected density;
+    /// reuse a frame's reported range across a roll). A negative `LO` is legal
+    /// (`density_offset` can shift densities below zero).
+    #[arg(long, value_name = "LO,HI", value_parser = parse_lo_hi, allow_hyphen_values = true,
+          conflicts_with = "auto_balance_range")]
+    pub balance_range: Option<[f32; 2]>,
+    /// Measure the regional-balance tone range per frame (the default behavior).
+    #[arg(long)]
+    pub auto_balance_range: bool,
 }
 
 /// Display-white anchor (`Dmax`) overrides (design-spec §9, `density.dmax`).
@@ -446,6 +467,13 @@ pub struct Report {
     /// (design-spec §8/§9).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub white_balance: Option<[f32; 3]>,
+    /// Resolved regional-balance tone-ramp range `[lo, hi]` (corrected density)
+    /// the density conversion used (`convert`): the auto-measured or explicit
+    /// anchors, absent when both balances are neutral or for the `simple`
+    /// algorithm. Reported so a roll can reuse one frame's measured range via
+    /// `--balance-range` (design-spec §9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_range: Option<[f32; 2]>,
     /// How the film base was chosen, as the structured [`FilmBaseSource`]
     /// (`"auto"` / `{"region":[…]}` / `{"explicit":[…]}`) so an agent gets the
     /// sampled rectangle / explicit values without string-parsing a label.
@@ -498,6 +526,11 @@ pub struct Report {
 fn parse_rgb(s: &str) -> std::result::Result<[f32; 3], String> {
     let v = parse_floats::<3>(s)?;
     Ok(v)
+}
+
+/// Parse `LO,HI` into two `f32`s.
+fn parse_lo_hi(s: &str) -> std::result::Result<[f32; 2], String> {
+    parse_floats::<2>(s)
 }
 
 /// Parse `X,Y,W,H` into four `u32`s.
@@ -591,6 +624,19 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     }
     if let Some(v) = args.density.density_gamma {
         cfg.density.density_gamma = v;
+    }
+    if let Some(v) = args.density.shadow_balance {
+        cfg.density.shadow_balance = v;
+    }
+    if let Some(v) = args.density.highlight_balance {
+        cfg.density.highlight_balance = v;
+    }
+    // balance range: the two flags are mutually exclusive (clap-enforced);
+    // whichever is given replaces the recipe's `density.balance_range` entirely.
+    if let Some(v) = args.density.balance_range {
+        cfg.density.balance_range = BalanceRange::Explicit(v);
+    } else if args.density.auto_balance_range {
+        cfg.density.balance_range = BalanceRange::Auto;
     }
 
     // dmax anchor: the three flags are mutually exclusive (clap-enforced);
@@ -735,6 +781,32 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     positive("--density-gamma", &[cfg.density.density_gamma])?;
     positive("--density-scale", &cfg.density.density_scale)?;
     finite("--density-offset", &cfg.density.density_offset)?;
+
+    // Regional balance: the offsets are density deltas — any finite value
+    // (including negative) is meaningful. An explicit ramp range must be finite
+    // and ordered `lo < hi`: equal anchors would make the ramp divide by zero,
+    // and a recipe can smuggle values the CLI parser never saw.
+    finite("--shadow-balance", &cfg.density.shadow_balance)?;
+    finite("--highlight-balance", &cfg.density.highlight_balance)?;
+    if let BalanceRange::Explicit([lo, hi]) = cfg.density.balance_range {
+        finite("--balance-range", &[lo, hi])?;
+        if lo >= hi {
+            return Err(usage(format!(
+                "--balance-range low ({lo}) must be < high ({hi})"
+            )));
+        }
+        // The span `hi - lo` divides the ramp; two individually-finite anchors
+        // can still overflow it to `+inf` (e.g. `-3e38,3e38`), which silently
+        // collapses `w_hi` to 0 for every pixel — the highlight balance would
+        // then never apply while the report claims the range was honored. A
+        // representable span is a hard requirement, not just `lo < hi`.
+        if !(hi - lo).is_finite() {
+            return Err(usage(format!(
+                "--balance-range span (high {hi} − low {lo}) overflows f32; \
+                 use anchors whose difference is representable"
+            )));
+        }
+    }
 
     // Dmax anchor: an explicit anchor is a corrected density — scene white sits at
     // a positive density above the base's `D = 0`, so a non-positive / non-finite
@@ -1257,6 +1329,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     }
     report.dmax = rendered.convert.dmax;
     report.white_balance = rendered.convert.white_balance;
+    report.balance_range = rendered.convert.balance_range;
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).
@@ -2117,6 +2190,124 @@ mod tests {
         let cfg: ResolvedConfig = serde_json::from_str(r#"{"sigmoid":{"toe":0.0}}"#).unwrap();
         assert_eq!(cfg.sigmoid.toe, 0.0);
         assert_eq!(cfg.sigmoid.contrast, SigmoidParams::default().contrast);
+    }
+
+    #[test]
+    fn merge_regional_balance_flags() {
+        // Each new knob maps through merge; a forgotten arm would silently make
+        // the flag a no-op (the four-spot-wiring trap).
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&[
+                "--shadow-balance",
+                "0.1,0,-0.05",
+                "--highlight-balance",
+                "-0.1,0.02,0",
+                "--balance-range",
+                "0.25,1.75",
+            ]),
+        );
+        assert_eq!(cfg.density.shadow_balance, [0.1, 0.0, -0.05]);
+        assert_eq!(cfg.density.highlight_balance, [-0.1, 0.02, 0.0]);
+        assert_eq!(
+            cfg.density.balance_range,
+            BalanceRange::Explicit([0.25, 1.75])
+        );
+
+        // No flag keeps the recipe's values; a flag replaces them (flags win),
+        // and `--auto-balance-range` overrides a recipe's explicit range.
+        let recipe: ResolvedConfig = serde_json::from_str(
+            r#"{"density":{"shadow_balance":[0.2,0.0,0.0],
+                           "balance_range":{"explicit":[0.5,2.5]}}}"#,
+        )
+        .unwrap();
+        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        assert_eq!(cfg.density.shadow_balance, [0.2, 0.0, 0.0]);
+        assert_eq!(
+            cfg.density.balance_range,
+            BalanceRange::Explicit([0.5, 2.5])
+        );
+        let cfg = merge(
+            recipe,
+            &parse_convert(&["--shadow-balance", "0,0,0", "--auto-balance-range"]),
+        );
+        assert_eq!(cfg.density.shadow_balance, [0.0, 0.0, 0.0]);
+        assert_eq!(cfg.density.balance_range, BalanceRange::Auto);
+    }
+
+    #[test]
+    fn mutually_exclusive_balance_range_flags_are_rejected() {
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "i",
+                "-o",
+                "o",
+                "--balance-range",
+                "0.2,1.8",
+                "--auto-balance-range"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_regional_balance() {
+        // Non-finite balance offsets (recipe-smuggleable) fail loudly.
+        let mut cfg = ResolvedConfig::default();
+        cfg.density.shadow_balance = [0.1, f32::NAN, 0.0];
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+        let mut cfg = ResolvedConfig::default();
+        cfg.density.highlight_balance = [f32::INFINITY, 0.0, 0.0];
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
+        // An explicit range must be finite, ordered lo < hi (equal anchors would
+        // make the ramp divide by zero), and have a *representable* span — two
+        // individually-finite anchors can still overflow `hi - lo` to +inf,
+        // which would silently flatten the ramp.
+        for bad in [
+            [1.0, 1.0],
+            [2.0, 1.0],
+            [f32::NAN, 1.0],
+            [0.0, f32::INFINITY],
+            [-3.0e38, 3.0e38], // finite anchors, span overflows to +inf
+        ] {
+            let mut cfg = ResolvedConfig::default();
+            cfg.density.balance_range = BalanceRange::Explicit(bad);
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "balance range {bad:?} should fail"
+            );
+        }
+
+        // Negative-density anchors are legal (density_offset can shift D' below
+        // zero), and Auto plus finite balances validate.
+        let mut cfg = ResolvedConfig::default();
+        cfg.density.shadow_balance = [0.1, -0.1, 0.0];
+        cfg.density.balance_range = BalanceRange::Explicit([-0.5, 1.5]);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn recipe_parses_regional_balance_keys() {
+        // The keys live under `density` (§9); `deny_unknown_fields` would
+        // silently reject a docs-shaped recipe if the structs drifted.
+        let cfg: ResolvedConfig = serde_json::from_str(
+            r#"{"density":{"shadow_balance":[0.1,0.0,-0.05],
+                           "highlight_balance":[-0.1,0.0,0.05],
+                           "balance_range":{"explicit":[0.25,1.75]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.density.shadow_balance, [0.1, 0.0, -0.05]);
+        assert_eq!(cfg.density.highlight_balance, [-0.1, 0.0, 0.05]);
+        assert_eq!(
+            cfg.density.balance_range,
+            BalanceRange::Explicit([0.25, 1.75])
+        );
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"density":{"balance_range":"auto"}}"#).unwrap();
+        assert_eq!(cfg.density.balance_range, BalanceRange::Auto);
     }
 
     #[test]

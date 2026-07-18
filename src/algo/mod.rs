@@ -64,6 +64,12 @@ pub struct ConvertReport {
     /// freeze one frame's estimate into a recipe / `--white-balance` (measure
     /// once, reuse). `None` for algorithms without the print stage (`simple`).
     pub white_balance: Option<[f32; 3]>,
+    /// The resolved regional-balance tone-ramp range `[lo, hi]` (corrected
+    /// density), when the density algorithm applied a shadow/highlight balance.
+    /// `None` for `simple` or when both balances are the neutral `[0, 0, 0]`.
+    /// Reported so a roll can reuse one frame's measured range via
+    /// `--balance-range` (design-spec §9).
+    pub balance_range: Option<[f32; 2]>,
 }
 
 /// The shipped Step-1 algorithms. `density` is the default.

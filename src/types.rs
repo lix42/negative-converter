@@ -280,6 +280,29 @@ pub enum DmaxSource {
     None,
 }
 
+/// Where the regional (shadow/highlight) balance's tone-ramp anchors come from
+/// (design-spec §7.2/§9, `density.balance_range`).
+///
+/// A single mutually-exclusive choice, like [`DmaxSource`] — not independent
+/// flags. The ramps span the corrected-density range `[lo, hi]`: `lo` is the
+/// positive's deepest shadow tone, `hi` its brightest highlight tone. `Auto`
+/// (default) measures the range per frame from the pre-regional corrected
+/// densities (robust percentiles of the per-pixel scalar tone) and reports the
+/// measured `[lo, hi]`; `Explicit` fixes it. Roll reuse is measure-once-replay:
+/// run one frame under `Auto`, read its reported range, then pass it as
+/// `Explicit` on the rest for deterministic, frame-independent toning.
+/// Serializes as `"auto"` / `{ "explicit": [lo, hi] }`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BalanceRange {
+    /// Measure `[lo, hi]` per frame from the corrected-density distribution.
+    #[default]
+    Auto,
+    /// Explicit `[lo, hi]` corrected-density anchors (e.g. a reused measured
+    /// range for roll consistency). Requires `lo < hi`, both finite.
+    Explicit([f32; 2]),
+}
+
 /// Density-domain algorithm knobs (design-spec §9, `algorithm = density`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -293,6 +316,19 @@ pub struct DensityParams {
     /// Display-white anchor source (default `auto`). Applied in the render
     /// sub-stage at the density→linear boundary, beside `density_gamma`.
     pub dmax: DmaxSource,
+    /// Per-channel density offset `[r, g, b]` applied to the **positive's
+    /// shadows** (low scalar tone density; the region near the film base).
+    /// A positive value brightens that channel there — pushes the region toward
+    /// that channel's color. `[0, 0, 0]` (default) is identity/off.
+    pub shadow_balance: [f32; 3],
+    /// Per-channel density offset `[r, g, b]` applied to the **positive's
+    /// highlights** (high scalar tone density; the dense negative areas).
+    /// Same sign convention as `shadow_balance`. `[0, 0, 0]` (default) is off.
+    pub highlight_balance: [f32; 3],
+    /// Tone-ramp anchor source for the regional balance (default `auto`).
+    /// Only consulted when a balance is non-zero — the neutral default skips
+    /// the regional pass entirely (bit-exact with the unbalanced output).
+    pub balance_range: BalanceRange,
 }
 
 impl Default for DensityParams {
@@ -302,6 +338,9 @@ impl Default for DensityParams {
             density_offset: [0.0, 0.0, 0.0],
             density_gamma: 1.0,
             dmax: DmaxSource::Auto,
+            shadow_balance: [0.0, 0.0, 0.0],
+            highlight_balance: [0.0, 0.0, 0.0],
+            balance_range: BalanceRange::Auto,
         }
     }
 }
@@ -594,6 +633,9 @@ mod tests {
             density_offset: [0.1, 0.0, -0.05],
             density_gamma: 0.6,
             dmax: DmaxSource::Explicit(1.8),
+            shadow_balance: [0.05, 0.0, -0.02],
+            highlight_balance: [-0.05, 0.01, 0.0],
+            balance_range: BalanceRange::Explicit([0.25, 1.75]),
         };
         let json = serde_json::to_string(&params).unwrap();
         let back: DensityParams = serde_json::from_str(&json).unwrap();
@@ -688,6 +730,33 @@ mod tests {
             serde_json::from_str::<Algorithm>("\"sigmoid\"").unwrap(),
             Algorithm::Sigmoid
         );
+    }
+
+    #[test]
+    fn density_params_default_regional_balance_is_neutral() {
+        // The identity defaults the bit-exact-default guarantee rests on.
+        let d = DensityParams::default();
+        assert_eq!(d.shadow_balance, [0.0, 0.0, 0.0]);
+        assert_eq!(d.highlight_balance, [0.0, 0.0, 0.0]);
+        assert_eq!(d.balance_range, BalanceRange::Auto);
+    }
+
+    #[test]
+    fn balance_range_serializes_like_dmax_source() {
+        // Unit variant is a bare lowercase string; the newtype variant is a
+        // tagged object — the same shape convention as `DmaxSource`.
+        assert_eq!(
+            serde_json::to_string(&BalanceRange::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BalanceRange::Explicit([0.25, 2.5])).unwrap(),
+            r#"{"explicit":[0.25,2.5]}"#
+        );
+        for src in [BalanceRange::Auto, BalanceRange::Explicit([0.1, 1.9])] {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(serde_json::from_str::<BalanceRange>(&json).unwrap(), src);
+        }
     }
 
     #[test]

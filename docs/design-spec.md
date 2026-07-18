@@ -211,7 +211,9 @@ The credible baseline for color negatives, following Kodak Cineon / darktable
 
 ```
 1. transmission → density:   D  = -log10(scan / Dmin_transmission)   (per channel)
-2. density correction:       D' = per-channel scale·D + offset (orange-mask comp)
+2. density correction:       B  = per-channel scale·D + offset (orange-mask comp)
+   regional balance:         D̄  = mean(B_r, B_g, B_b)   (scalar tone value)
+                             D' = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)
 3. map density → positive:   lin = 10^(gamma · (D' − Dmax))          (per channel)
 4. print render controls:    exposure, black point, white balance, highlight compression
 ```
@@ -244,6 +246,31 @@ disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.
 > per-frame `--auto-d-max` demoted to an opt-in exposure-normalizing mode. See §12
 > item 14 (`dmax-reference`). The frame-local `auto` behavior described above is
 > what currently ships.
+
+**Regional (shadow/highlight) color balance.** A color *crossover* — a cast that
+differs between shadows and highlights (expired film, misprocessing, mixed
+lighting) — cannot be fixed by any single global per-channel gain/offset; in
+density space it is a per-channel offset that varies with tone. Step 2 therefore
+adds density-weighted offsets: `w_lo`/`w_hi` are complementary smoothstep ramps
+over the corrected-density range `[lo, hi]` (`w_lo = 1` at `lo` fading smoothly
+to `0` at `hi`, `w_hi = 1 − w_lo`, both saturating outside the range), so equal
+shadow and highlight balances degenerate to a uniform `density_offset`. The
+ramps take the **scalar** per-pixel tone `D̄` (the mean of the pre-regional
+corrected channels), never each channel's own density — per-channel weighting
+would let one channel of a crossover pixel receive the shadow correction while
+another receives the highlight one, misfiring on exactly the pixels this control
+exists to fix. Naming is from the **positive's** point of view: low density
+(near base) is a *shadow*, high density a *highlight*, and (by the polarity
+above) a positive balance value brightens that channel in its region. The range
+anchors come from `density.balance_range`: `auto` (default) measures robust
+percentiles (0.5 % / 99.5 %, nearest-rank over a deterministic sample) of the
+per-pixel tone in a two-pass within step 2 — it cannot anchor on the `auto`
+`Dmax`, which is measured *after* step 2 (circular) — while an explicit
+`[lo, hi]` (e.g. a frame's reported range reused across a roll) short-circuits
+the measuring pass. Neutral `[0,0,0]` balances (the default) skip the regional
+pass entirely: the output is bit-exact with the unbalanced render. This runs
+*before* the print render's white balance: stage 2 fixes the tone-dependent
+crossover, print WB the remaining global cast. See §9.
 
 **Auto neutral white balance (`print.white_balance`).** The step-4 white-balance
 gains are a single mutually-exclusive source: explicit `[r, g, b]` gains (the
@@ -584,10 +611,32 @@ crossover.
     `1.0`, detail above), reproducing the pre-anchor render bit-for-bit for HDR
     (`--output-hdr`) workflows. **Density algorithm only** — the sigmoid S-curve
     is anchored on `[0, Dmax]`, so `sigmoid` + `none` is a usage error (§7.3).
-- The `sigmoid` algorithm shares this whole section **except `density_gamma`**,
-  which parameterizes the straight-line curve it replaces and is ignored under
-  `--algorithm sigmoid` (a report warning fires when it was customized;
-  `sigmoid.contrast` is the analogue).
+- Regional (shadow/highlight) color balance (see §7.2). "Shadow"/"highlight"
+  name the **positive's** tone regions (low/high corrected density); a positive
+  value brightens that channel in its region. Defaults `[0, 0, 0]` are identity
+  — the default output is bit-exact with the unbalanced render:
+  - `--shadow-balance R,G,B` ⇒ `density.shadow_balance` — per-channel density
+    offset applied in the positive's shadows.
+  - `--highlight-balance R,G,B` ⇒ `density.highlight_balance` — per-channel
+    density offset applied in the positive's highlights.
+  - Tone-ramp anchors — a single mutually-exclusive choice, recipe key
+    `density.balance_range` (default `"auto"`); the two flags conflict, and
+    whichever is given replaces a recipe's `balance_range`. Only consulted when
+    a balance is non-zero:
+    - `--auto-balance-range` (default) ⇒ `"auto"` — measure `[lo, hi]` per frame
+      from the corrected-density tone distribution (the 0.5th / 99.5th
+      percentiles, nearest-rank). The `auto` run echoes the measured `[lo, hi]`
+      in its JSON report, so a roll can capture one frame's range and replay it
+      on the rest via `--balance-range` for consistent toning. Fails loudly when
+      a balance is requested on a frame with no measurable range (uniform
+      densities) — pass an explicit range instead.
+    - `--balance-range LO,HI` ⇒ `{ "explicit": [lo, hi] }` — fix the ramp anchors
+      (`lo < hi`, both finite, and their difference representable in `f32`).
+- The `sigmoid` algorithm shares this whole section (including the regional
+  balance above) **except `density_gamma`**, which parameterizes the
+  straight-line curve it replaces and is ignored under `--algorithm sigmoid` (a
+  report warning fires when it was customized; `sigmoid.contrast` is the
+  analogue).
 
 ### Sigmoid stage (algorithm = sigmoid)
 The stage-3 S-curve knobs (§7.3); stages 1–2 and 4 use the `density.*` and

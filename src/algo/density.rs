@@ -10,15 +10,42 @@
 //!
 //! ```text
 //! 1. transmission → density:   D_c  = -log10(max(scan_c, EPS) / base_c)
-//! 2. density correction:       D'_c = density_scale_c · D_c + density_offset_c
+//! 2. density correction:       B_c  = density_scale_c · D_c + density_offset_c
+//!    regional balance:         D̄    = mean(B_r, B_g, B_b)   (scalar tone)
+//!                              D'_c = B_c + shadow_balance_c · w_lo(D̄)
+//!                                         + highlight_balance_c · w_hi(D̄)
 //! 3. density → positive:       lin_c = 10^(density_gamma · (D'_c − Dmax))
 //! 4. print render:             lin_c = white_balance_c · 2^print_exposure · lin_c
 //!                                      − black_point, then highlight soft-clip
 //! ```
 //!
-//! Stages 1–2 are [`to_density`]; 3–4 are [`render`], which composes this
-//! algorithm's stage-3 curve with the shared stage-4 print render
-//! [`render_print`] (also used by `sigmoid`, which swaps in an S-curve stage 3).
+//! Stages 1–2 are [`to_density`] + [`regional_balance`]; 3–4 are [`render`],
+//! which composes this algorithm's stage-3 curve with the shared stage-4 print
+//! render [`render_print`] (also used by `sigmoid`, which swaps in an S-curve
+//! stage 3).
+//!
+//! **Regional (shadow/highlight) color balance.** A color *crossover* — a cast
+//! that differs between shadows and highlights — is, in density space, a
+//! per-channel offset that varies with tone. `regional_balance` adds
+//! density-weighted per-channel offsets inside stage 2: `w_lo`/`w_hi` are
+//! complementary smoothstep ramps over the corrected-density range `[lo, hi]`
+//! (`w_lo = 1` at `lo` fading to `0` at `hi`; `w_hi = 1 − w_lo`), so equal
+//! shadow and highlight balances degenerate to a uniform `density_offset`. The
+//! ramps take the **scalar** per-pixel tone `D̄` (the mean of the pre-regional
+//! corrected channels), never each channel's own density — per-channel
+//! weighting would let one channel of a crossover pixel receive the shadow
+//! correction while another receives the highlight one, misfiring on exactly
+//! the pixels this control exists to fix. Naming is from the **positive's**
+//! point of view: low density (near base) is a scene/positive *shadow*, high
+//! density a *highlight* — and positive polarity (below) means a positive
+//! balance value brightens that channel in its region. The range anchors come
+//! from [`BalanceRange`]: `Auto` measures robust percentiles of the per-pixel
+//! tone in a deterministic two-pass within stage 2 (it cannot anchor on the
+//! `Auto` `Dmax`, which is measured *after* stage 2 — that would be circular);
+//! `Explicit` short-circuits the measuring pass for roll reuse. The neutral
+//! `[0,0,0]` defaults skip the pass entirely — bit-exact with the unbalanced
+//! output. `Dmax` (`Auto`) is then measured from the *post-balance* densities,
+//! keeping the display-white anchor consistent with what is rendered.
 //!
 //! **Display-white anchor (`Dmax`).** Stage 3 renders density *relative to* the
 //! scene-white density `Dmax`: scene white (`D' = Dmax`) maps to `1.0` and the base
@@ -64,7 +91,8 @@ use rayon::prelude::*;
 
 use crate::algo::{ConvertReport, Converter};
 use crate::types::{
-    DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result, WbSource,
+    BalanceRange, DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result,
+    WbSource,
 };
 
 /// Floor applied to the scan transmission before the `log10`, so a zero / negative
@@ -75,9 +103,9 @@ use crate::types::{
 const SCAN_EPSILON: f32 = 1e-6;
 
 /// Corrected per-pixel film density `D'` (interleaved RGB), the boundary between
-/// the two sub-stages: the output of [`to_density`] (stages 1–2) and the input to
-/// [`render`] (stages 3–4). The IR plane is carried through untouched (Step-1 rule:
-/// preserve, don't consume).
+/// the two sub-stages: the output of [`to_density`] + [`regional_balance`]
+/// (stages 1–2) and the input to [`render`] (stages 3–4). The IR plane is carried
+/// through untouched (Step-1 rule: preserve, don't consume).
 ///
 /// Algo-internal (`pub(crate)`), not a cross-stage contract type — the neutral
 /// contract lives in `types.rs`. It has no validated constructor; its length
@@ -105,7 +133,8 @@ pub struct Density {
     pub print: PrintParams,
 }
 
-/// Stages 1–2 — transmission → corrected density (pure).
+/// Stage 1 + stage 2's per-channel correction — transmission → corrected
+/// density (pure). [`regional_balance`] then completes stage 2.
 ///
 /// `D_c = -log10(max(scan_c, EPS) / base_c)` then `D'_c = scale_c·D_c + offset_c`.
 /// Dividing by the *per-channel* base is what neutralizes the orange mask: at the
@@ -152,6 +181,180 @@ pub(crate) fn to_density(
         density,
         ir: image.ir.clone(),
     }
+}
+
+/// Percentiles of the per-pixel scalar tone (`D̄`) distribution taken as the
+/// `Auto` ramp anchors `[lo, hi]`. Symmetric and deliberately robust: the bottom
+/// and top half-percent (dust shadows, specular sparkle, hot pixels) are ignored
+/// so an outlier can't stretch the ramp and flatten the weights over the real
+/// tonal range. `hi` mirrors [`AUTO_DMAX_PERCENTILE`]'s robustness intent.
+const BALANCE_LO_PERCENTILE: f32 = 0.005;
+const BALANCE_HI_PERCENTILE: f32 = 0.995;
+
+/// Cap on how many per-pixel tones the `Auto` range measurement examines — the
+/// same bound (and rationale) as [`AUTO_DMAX_MAX_SAMPLES`]: percentiles over ~1M
+/// samples are statistically indistinguishable from the full population, and the
+/// cap keeps the measuring pass to a small transient buffer. The stride walks
+/// whole RGB pixels (chunks of 3), so no channel-bias adjustment is needed.
+const BALANCE_MAX_SAMPLES: usize = 1 << 20;
+
+/// Clamped cubic smoothstep: `0` at `t <= 0`, `1` at `t >= 1`, `t²(3 − 2t)`
+/// between — smooth (zero slope at both ends) and strictly monotonic inside.
+/// The highlight weight `w_hi`; the shadow weight is its complement `1 − w_hi`.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The scalar tone value `D̄` of one interleaved-RGB pixel: the mean of its
+/// *finite* corrected densities. A non-finite channel (NaN from corrupt input)
+/// is excluded so the two healthy channels still get the right regional
+/// correction — the NaN channel itself stays NaN through any offset, so the
+/// encoder's non-finite counter still surfaces it. All-non-finite ⇒ `None`.
+///
+/// The mean itself is also required finite: finite channels of very large
+/// magnitude (only reachable via pathological recipe `density_scale`/`offset`
+/// values) can overflow the sum to `±inf`, and an infinite tone would corrupt
+/// *both* consumers — as a measured anchor it would make `hi`/`lo` infinite (a
+/// flat, silently-wrong ramp for the whole frame), and in the apply pass an
+/// `inf/inf` weight ratio would turn into NaN that poisons the pixel's finite
+/// channels. Such a pixel is skipped instead. Note the encoder is a reliable
+/// backstop only in the positive direction: a hugely *positive* density blows up
+/// to non-finite in the render's `10^(γ·D')` (counted), but a hugely *negative*
+/// one underflows to a finite `+0.0` — a quietly black pixel the counters won't
+/// flag. Both require absurd (validation-passing but physically-impossible)
+/// recipe params to reach, so the skip is a defensive floor, not a routine path.
+fn pixel_tone(px: &[f32]) -> Option<f32> {
+    let mut sum = 0.0f32;
+    let mut n = 0u32;
+    for &v in px {
+        if v.is_finite() {
+            sum += v;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let mean = sum / n as f32;
+    mean.is_finite().then_some(mean)
+}
+
+/// Measure the `Auto` ramp anchors `[lo, hi]` from the per-pixel scalar tone
+/// distribution: `lo` is the [`BALANCE_LO_PERCENTILE`] and `hi` the
+/// [`BALANCE_HI_PERCENTILE`] taken by **nearest-rank** — index
+/// `round((n − 1) · p)` into the sorted finite tones (not the textbook
+/// `ceil(n · p)`; the `n − 1` form pins the endpoints so `p = 0`/`1` map to the
+/// min/max). The sample is a deterministic stride over whole RGB pixels, capped
+/// at [`BALANCE_MAX_SAMPLES`]. Measuring the *same* `D̄` the ramps consume keeps
+/// anchors and inputs in one domain, so non-default `density_scale`/`offset`
+/// can't make them drift apart. Returns `None` when the distribution can't
+/// define a usable ramp: no finite tones, `lo == hi` (a uniform frame has no
+/// shadow/highlight distinction), or a span `hi − lo` that overflows `f32` (only
+/// reachable via pathological anchors — an infinite span would flatten the ramp).
+fn measure_balance_range(density: &[f32]) -> Option<[f32; 2]> {
+    let pixels = density.len() / 3;
+    let stride = pixels.div_ceil(BALANCE_MAX_SAMPLES).max(1);
+    let mut tones: Vec<f32> = Vec::with_capacity(pixels.div_ceil(stride));
+    tones.extend(
+        density
+            .chunks_exact(3)
+            .step_by(stride)
+            .filter_map(pixel_tone),
+    );
+    if tones.is_empty() {
+        return None;
+    }
+    let last = tones.len() - 1;
+    let rank = |p: f32| (last as f32 * p).round() as usize;
+    // Two independent O(n) selections; `select_nth_unstable`'s returned order
+    // statistic is independent of tie ordering, so this stays deterministic.
+    let (_, lo, _) = tones.select_nth_unstable_by(rank(BALANCE_LO_PERCENTILE), f32::total_cmp);
+    let lo = *lo;
+    let (_, hi, _) = tones.select_nth_unstable_by(rank(BALANCE_HI_PERCENTILE), f32::total_cmp);
+    let hi = *hi;
+    (lo < hi && (hi - lo).is_finite()).then_some([lo, hi])
+}
+
+/// Stage 2 (second half) — regional (shadow/highlight) color balance (pure).
+///
+/// Adds the density-weighted per-channel offsets of the module-doc model in
+/// place: `D'_c = B_c + shadow_balance_c·w_lo(D̄) + highlight_balance_c·w_hi(D̄)`
+/// with `w_hi = smoothstep((D̄ − lo) / (hi − lo))`, `w_lo = 1 − w_hi`, and `D̄`
+/// the pixel's scalar tone (see [`pixel_tone`]). Outside `[lo, hi]` the weights
+/// saturate (0/1), so an explicit roll range still corrects frames whose tones
+/// slightly exceed it.
+///
+/// Returns the resolved `[lo, hi]` for the JSON report (roll reuse), or `None`
+/// when no range was consulted: both balances neutral `[0, 0, 0]` (buffer
+/// untouched, measuring pass skipped, output **bit-exact** with the unbalanced
+/// render — even `+0.0` would flip `-0.0`), or `shadow == highlight` (equal but
+/// non-neutral), which collapses to a tone-independent per-channel offset (see
+/// below) and likewise needs no range.
+///
+/// Fails loudly ([`NcError::Other`]) when a balance was requested but the
+/// `Auto` range is degenerate (uniform or all-non-finite frame) — a silently
+/// skipped correction would be a quietly wrong image; the error names
+/// `--balance-range` as the recovery flag.
+pub(crate) fn regional_balance(
+    image: &mut DensityImage,
+    params: &DensityParams,
+) -> Result<Option<[f32; 2]>> {
+    let shadow = params.shadow_balance;
+    let highlight = params.highlight_balance;
+    if shadow == [0.0; 3] && highlight == [0.0; 3] {
+        return Ok(None);
+    }
+
+    // Equal (but non-neutral) balances collapse to a tone-independent per-channel
+    // offset: the ramp weights are complementary (`w_lo + w_hi == 1`), so the
+    // per-pixel correction `shadow_c·w_lo + highlight_c·w_hi` reduces to
+    // `shadow_c` at every tone and never consults the range (design-spec §7.2:
+    // "equal shadow and highlight balances degenerate to a uniform
+    // density_offset"). Apply the constant offset directly and report no range —
+    // measuring one here would only let a uniform/degenerate frame fail
+    // spuriously under `Auto`. An unconditional add is safe: a non-finite density
+    // plus a finite offset stays non-finite, so the encoder's counter still fires.
+    if shadow == highlight {
+        image.density.par_chunks_exact_mut(3).for_each(|px| {
+            for c in 0..3 {
+                px[c] += shadow[c];
+            }
+        });
+        return Ok(None);
+    }
+
+    let [lo, hi] = match params.balance_range {
+        BalanceRange::Explicit(range) => range,
+        BalanceRange::Auto => measure_balance_range(&image.density).ok_or_else(|| {
+            NcError::Other(
+                "regional balance: cannot measure a density range on this frame \
+                 (uniform or non-finite densities); pass an explicit --balance-range LO,HI"
+                    .into(),
+            )
+        })?,
+    };
+    // `span` is finite and `> 0`: explicit ranges are CLI/recipe-validated
+    // (finite, lo < hi, representable span), and `measure_balance_range` rejects
+    // any range whose span isn't finite-and-positive.
+    let span = hi - lo;
+    debug_assert!(
+        span.is_finite() && span > 0.0,
+        "ramp span must be finite > 0"
+    );
+
+    image.density.par_chunks_exact_mut(3).for_each(|px| {
+        // A pixel with no finite tone (all-non-finite, or a mean that overflows
+        // f32) is left alone — the encoder's non-finite counter surfaces the
+        // underlying fault; see `pixel_tone`.
+        let Some(tone) = pixel_tone(px) else { return };
+        let w_hi = smoothstep((tone - lo) / span);
+        let w_lo = 1.0 - w_hi;
+        for c in 0..3 {
+            px[c] += shadow[c] * w_lo + highlight[c] * w_hi;
+        }
+    });
+    Ok(Some([lo, hi]))
 }
 
 /// Stages 3–4 — corrected density → positive linear (pure print render).
@@ -534,12 +737,18 @@ impl Converter for Density {
         // validates an *explicit* base, but an auto/region-estimated one is only
         // guarded here — the base's consumption point. Fail loudly instead.
         check_base(base)?;
-        let density = to_density(image, base, &self.density);
+        let mut density = to_density(image, base, &self.density);
 
-        // Resolve the display-white anchor once, from the corrected densities:
-        // the WB analysis pass and the final render must share the exact same
-        // anchor (re-measuring would be wasted work; a different anchor would
-        // break the reuse-the-reported-gains bit-exactness).
+        // Regional (shadow/highlight) balance completes stage 2 *before* we
+        // resolve an Auto `Dmax` or estimate white balance, so both are measured
+        // from the post-balance densities (see the module doc for why the Auto
+        // anchor cannot precede the balance).
+        let balance_range = regional_balance(&mut density, &self.density)?;
+
+        // Resolve the display-white anchor once, from the (post-balance)
+        // corrected densities: the WB analysis pass and the final render must
+        // share the exact same anchor (re-measuring would be wasted work; a
+        // different anchor would break the reuse-the-reported-gains bit-exactness).
         let dmax = resolve_dmax(&density.density, self.density.dmax);
 
         // Resolve the white-balance gains. Explicit gains skip the analysis
@@ -577,6 +786,7 @@ impl Converter for Density {
             ConvertReport {
                 dmax,
                 white_balance: Some(wb),
+                balance_range,
             },
         ))
     }
@@ -650,6 +860,7 @@ mod tests {
             density_offset: [0.5, -0.25, 0.0],
             density_gamma: 1.0,
             dmax: DmaxSource::None, // unused by to_density
+            ..DensityParams::default()
         };
         let d = to_density(&img, &base, &params);
         assert!(approx(d.density[0], 2.5, 1e-5));
@@ -788,6 +999,7 @@ mod tests {
                 density_offset: [0.05, 0.0, -0.05],
                 density_gamma: 1.4,
                 dmax: DmaxSource::Auto,
+                ..DensityParams::default()
             },
             print: PrintParams {
                 print_exposure: -1.0,
@@ -973,6 +1185,336 @@ mod tests {
         };
         let out = conv.convert(&img, &base).unwrap();
         assert_eq!(out.ir.as_deref(), Some(&[0.33_f32][..]));
+    }
+
+    // --- regional (shadow/highlight) balance ------------------------------------
+
+    /// A `DensityImage` straight from interleaved corrected densities.
+    fn density_image(width: u32, height: u32, density: Vec<f32>) -> DensityImage {
+        DensityImage {
+            width,
+            height,
+            density,
+            ir: None,
+        }
+    }
+
+    #[test]
+    fn regional_balance_neutral_default_is_bit_exact_noop() {
+        // Zero balances must not touch the buffer at all — not even `+0.0`
+        // (which would flip a `-0.0`) or NaN arithmetic — and report no range.
+        let src = vec![0.7f32, -0.0, f32::NAN, 0.0, 2.0, -1.1];
+        let mut img = density_image(2, 1, src.clone());
+        let resolved = regional_balance(&mut img, &DensityParams::default()).unwrap();
+        assert_eq!(resolved, None);
+        for (a, b) in img.density.iter().zip(&src) {
+            assert_eq!(a.to_bits(), b.to_bits(), "buffer must be bit-identical");
+        }
+    }
+
+    #[test]
+    fn regional_balance_neutralizes_a_synthetic_crossover() {
+        // Opposite casts injected at low/high density: shadows too red (+0.2 red
+        // density), highlights too cyan (−0.2 red density). Matching balance
+        // params neutralize both — the definition of the control. The explicit
+        // range [0.5, 2.5] keeps both pixels in the saturated weight zones
+        // (tones ≈ 0.07 and ≈ 2.93), so the correction is exact.
+        let mut img = density_image(2, 1, vec![0.2, 0.0, 0.0, 2.8, 3.0, 3.0]);
+        let params = DensityParams {
+            shadow_balance: [-0.2, 0.0, 0.0],
+            highlight_balance: [0.2, 0.0, 0.0],
+            balance_range: BalanceRange::Explicit([0.5, 2.5]),
+            ..DensityParams::default()
+        };
+        let resolved = regional_balance(&mut img, &params).unwrap();
+        assert_eq!(resolved, Some([0.5, 2.5]));
+        for c in 0..3 {
+            assert!(approx(img.density[c], 0.0, 1e-6), "shadow chan {c}");
+            assert!(approx(img.density[3 + c], 3.0, 1e-6), "highlight chan {c}");
+        }
+    }
+
+    #[test]
+    fn smoothstep_is_clamped_smooth_and_monotonic() {
+        // Endpoints and saturation outside the range.
+        assert_eq!(smoothstep(-1.0), 0.0);
+        assert_eq!(smoothstep(0.0), 0.0);
+        assert_eq!(smoothstep(1.0), 1.0);
+        assert_eq!(smoothstep(2.0), 1.0);
+        // Midpoint is the 50/50 blend; monotonic non-decreasing across the range.
+        assert!(approx(smoothstep(0.5), 0.5, 1e-6));
+        let mut prev = 0.0f32;
+        for i in 0..=100 {
+            let w = smoothstep(i as f32 / 100.0);
+            assert!(w >= prev, "not monotonic at {i}");
+            prev = w;
+        }
+        // Smooth at the ends: near-zero slope (first-order flat).
+        assert!(smoothstep(0.01) < 0.001);
+        assert!(smoothstep(0.99) > 0.999);
+    }
+
+    #[test]
+    fn regional_balance_uses_one_scalar_tone_for_all_channels() {
+        // A crossover pixel whose channels straddle the range: per-channel
+        // weighting would give channel 0 the full shadow correction and channel
+        // 1 the full highlight one — exactly the misfire the scalar tone
+        // prevents. Tone = mean(0, 3, 1.5) = 1.5 = range midpoint ⇒ every
+        // channel gets the same 0.5/0.5 blend.
+        let mut img = density_image(1, 1, vec![0.0, 3.0, 1.5]);
+        let params = DensityParams {
+            shadow_balance: [1.0, 1.0, 1.0],
+            highlight_balance: [0.0, 0.0, 0.0],
+            balance_range: BalanceRange::Explicit([0.0, 3.0]),
+            ..DensityParams::default()
+        };
+        regional_balance(&mut img, &params).unwrap();
+        assert!(approx(img.density[0], 0.5, 1e-6));
+        assert!(approx(img.density[1], 3.5, 1e-6));
+        assert!(approx(img.density[2], 2.0, 1e-6));
+    }
+
+    #[test]
+    fn regional_balance_equal_balances_reduce_to_a_uniform_offset() {
+        // w_lo + w_hi = 1 (complementary ramps), so equal shadow and highlight
+        // balances act as one tone-independent per-channel offset.
+        let offs = [0.1f32, -0.05, 0.02];
+        let src = vec![0.0f32, 0.5, 1.0, 2.0, 2.5, 3.0];
+        let mut img = density_image(2, 1, src.clone());
+        let params = DensityParams {
+            shadow_balance: offs,
+            highlight_balance: offs,
+            balance_range: BalanceRange::Explicit([0.0, 3.0]),
+            ..DensityParams::default()
+        };
+        regional_balance(&mut img, &params).unwrap();
+        for (i, (&got, &was)) in img.density.iter().zip(&src).enumerate() {
+            assert!(approx(got, was + offs[i % 3], 1e-6), "sample {i}");
+        }
+    }
+
+    #[test]
+    fn regional_balance_equal_balances_need_no_range_on_a_uniform_frame() {
+        // Equal (non-neutral) balances reduce to a per-channel offset that never
+        // uses the range (w_lo + w_hi = 1), so `Auto` must NOT try to measure a
+        // range: on a uniform frame the measurement is degenerate and would error.
+        // The equal-balances short-circuit applies the constant offset and reports
+        // no range (design-spec §7.2). Regression guard for the Codex P2.
+        let offs = [0.1f32, 0.0, -0.1];
+        let src = vec![1.5f32; 12]; // uniform ⇒ measure_balance_range → None
+        let mut img = density_image(4, 1, src.clone());
+        let params = DensityParams {
+            shadow_balance: offs,
+            highlight_balance: offs,
+            balance_range: BalanceRange::Auto, // must not be consulted
+            ..DensityParams::default()
+        };
+        // Succeeds (no "cannot measure a density range" error) and reports None.
+        let resolved = regional_balance(&mut img, &params).unwrap();
+        assert_eq!(resolved, None, "equal balances consult no range");
+        // Output == neutral frame + the constant per-channel offset.
+        for (i, (&got, &was)) in img.density.iter().zip(&src).enumerate() {
+            assert!(approx(got, was + offs[i % 3], 1e-6), "sample {i}");
+        }
+    }
+
+    #[test]
+    fn measure_balance_range_takes_nearest_rank_percentiles() {
+        // 1000 pixels with distinct tones 0..=999: lo = round(999·0.005) = 5,
+        // hi = round(999·0.995) = 994 — pins both nearest-rank indices.
+        let density: Vec<f32> = (0..1000).flat_map(|t| [t as f32; 3]).collect();
+        assert_eq!(measure_balance_range(&density), Some([5.0, 994.0]));
+    }
+
+    #[test]
+    fn measure_balance_range_rejects_degenerate_distributions() {
+        // Uniform (lo == hi), all-non-finite, and empty all yield None.
+        assert_eq!(measure_balance_range(&[1.0; 30]), None);
+        assert_eq!(measure_balance_range(&[f32::NAN; 30]), None);
+        assert_eq!(measure_balance_range(&[]), None);
+        // Individually-finite tones whose span overflows f32 → None (a flat,
+        // silently-wrong ramp otherwise). Two pixels at ∓f32::MAX tones.
+        let m = f32::MAX;
+        assert_eq!(measure_balance_range(&[-m, -m, -m, m, m, m]), None);
+        // Non-finite tones are excluded, not ranked: the finite pixels alone
+        // define the range.
+        let mut density: Vec<f32> = (0..200).flat_map(|t| [t as f32; 3]).collect();
+        density.extend([f32::NAN; 3]);
+        let [lo, hi] = measure_balance_range(&density).unwrap();
+        assert!(lo.is_finite() && hi.is_finite() && lo < hi);
+    }
+
+    #[test]
+    fn regional_balance_auto_fails_loudly_on_a_uniform_frame() {
+        // A requested balance with no measurable range must error (a silently
+        // skipped correction is a quietly wrong image), naming the recovery flag.
+        let mut img = density_image(2, 1, vec![1.0; 6]);
+        let params = DensityParams {
+            shadow_balance: [0.1, 0.0, 0.0],
+            ..DensityParams::default()
+        };
+        let err = regional_balance(&mut img, &params).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("--balance-range"));
+        // An explicit range short-circuits the measuring pass and succeeds on
+        // the same frame (the documented roll-reuse escape hatch).
+        let params = DensityParams {
+            balance_range: BalanceRange::Explicit([0.0, 2.0]),
+            ..params
+        };
+        assert_eq!(
+            regional_balance(&mut img, &params).unwrap(),
+            Some([0.0, 2.0])
+        );
+    }
+
+    #[test]
+    fn regional_balance_keeps_non_finite_channels_confined() {
+        // One NaN channel: the tone comes from the finite channels, which still
+        // receive their correction; the NaN channel stays NaN (the encoder's
+        // non-finite counter must still see it). An all-NaN pixel is untouched.
+        let mut img = density_image(2, 1, vec![f32::NAN, 1.0, 2.0, f32::NAN, f32::NAN, f32::NAN]);
+        let params = DensityParams {
+            shadow_balance: [0.5, 0.5, 0.5],
+            highlight_balance: [0.5, 0.5, 0.5], // uniform +0.5 (tone-independent)
+            balance_range: BalanceRange::Explicit([0.0, 3.0]),
+            ..DensityParams::default()
+        };
+        regional_balance(&mut img, &params).unwrap();
+        assert!(img.density[0].is_nan());
+        assert!(approx(img.density[1], 1.5, 1e-6));
+        assert!(approx(img.density[2], 2.5, 1e-6));
+        for c in 3..6 {
+            assert!(img.density[c].is_nan(), "all-NaN pixel must stay NaN");
+        }
+    }
+
+    #[test]
+    fn pixel_tone_rejects_an_overflowing_mean() {
+        // Finite channels near f32::MAX can overflow the sum to +inf. An
+        // infinite tone must not leak out: as a measured anchor it would make
+        // `hi = inf` (a flat, silently-wrong ramp), and in the apply pass it
+        // would become NaN weights poisoning the pixel's finite channels.
+        let huge = f32::MAX;
+        assert_eq!(pixel_tone(&[huge, huge, huge]), None);
+        // A normal pixel and a partially-finite pixel still produce a tone.
+        assert_eq!(pixel_tone(&[1.0, 2.0, 3.0]), Some(2.0));
+        assert_eq!(pixel_tone(&[f32::NAN, 1.0, 3.0]), Some(2.0));
+        assert_eq!(pixel_tone(&[f32::NAN; 3]), None);
+
+        // End to end: the overflow pixel neither anchors the measured range
+        // nor receives a correction; the well-behaved pixels still do. Uses
+        // *unequal* shadow/highlight balances so the `Auto` range-measuring path
+        // actually runs (equal balances short-circuit to a constant offset before
+        // any measurement — see `regional_balance`). Finite tones are 0.0 and 2.0,
+        // so the measured range is [0.0, 2.0]: the tone-0 pixel sits at w_lo = 1
+        // (gets +0.1) and the tone-2 pixel at w_hi = 1 (gets +0.3).
+        let mut img = density_image(3, 1, vec![huge, huge, huge, 0.0, 0.0, 0.0, 2.0, 2.0, 2.0]);
+        let params = DensityParams {
+            shadow_balance: [0.1, 0.1, 0.1],
+            highlight_balance: [0.3, 0.3, 0.3],
+            ..DensityParams::default()
+        };
+        let resolved = regional_balance(&mut img, &params).unwrap().unwrap();
+        assert!(resolved[1].is_finite(), "hi anchor must not be inf");
+        for c in 0..3 {
+            assert_eq!(img.density[c], huge, "overflow pixel untouched");
+            assert!(approx(img.density[3 + c], 0.1, 1e-6));
+            assert!(approx(img.density[6 + c], 2.3, 1e-6));
+        }
+    }
+
+    #[test]
+    fn auto_dmax_is_measured_after_the_regional_balance() {
+        // Ordering contract (module doc): with `dmax = auto` the display-white
+        // anchor is resolved from the *post-balance* densities, so it tracks
+        // what is actually rendered. A uniform balance (+0.5 on every channel
+        // at every tone) shifts every density by +0.5, so the reported Auto
+        // anchor must shift by the same amount versus the neutral run.
+        let base = FilmBase::from([0.6, 0.6, 0.6]);
+        let img = LinearImage::new(2, 1, vec![0.5, 0.5, 0.5, 0.05, 0.05, 0.05], None).unwrap();
+        let neutral = Density {
+            density: DensityParams::default(),
+            print: PrintParams::default(),
+        };
+        let (_, rep_neutral) = neutral.convert_reported(&img, &base).unwrap();
+        let balanced = Density {
+            density: DensityParams {
+                shadow_balance: [0.5, 0.5, 0.5],
+                highlight_balance: [0.5, 0.5, 0.5], // tone-independent +0.5
+                ..DensityParams::default()
+            },
+            print: PrintParams::default(),
+        };
+        let (_, rep_balanced) = balanced.convert_reported(&img, &base).unwrap();
+        let (a, b) = (rep_neutral.dmax.unwrap(), rep_balanced.dmax.unwrap());
+        assert!(
+            approx(b - a, 0.5, 1e-5),
+            "auto dmax must be measured post-balance: neutral {a}, balanced {b}"
+        );
+    }
+
+    #[test]
+    fn convert_reported_surfaces_the_balance_range() {
+        let base = FilmBase::from([0.6, 0.6, 0.6]);
+        // Two-tone image so an Auto range is measurable.
+        let img = LinearImage::new(2, 1, vec![0.5, 0.5, 0.5, 0.05, 0.05, 0.05], None).unwrap();
+
+        // Neutral balances → no range reported (and no measuring pass).
+        let conv = Density {
+            density: DensityParams::default(),
+            print: PrintParams::default(),
+        };
+        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        assert_eq!(rep.balance_range, None);
+
+        // Auto → the measured [lo, hi], finite and ordered.
+        let conv = Density {
+            density: DensityParams {
+                shadow_balance: [0.05, 0.0, 0.0],
+                ..DensityParams::default()
+            },
+            print: PrintParams::default(),
+        };
+        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        let [lo, hi] = rep.balance_range.expect("range reported");
+        assert!(lo.is_finite() && hi.is_finite() && lo < hi);
+
+        // Explicit → echoed back exactly.
+        let conv = Density {
+            density: DensityParams {
+                shadow_balance: [0.05, 0.0, 0.0],
+                balance_range: BalanceRange::Explicit([0.25, 1.75]),
+                ..DensityParams::default()
+            },
+            print: PrintParams::default(),
+        };
+        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        assert_eq!(rep.balance_range, Some([0.25, 1.75]));
+    }
+
+    #[test]
+    fn regional_balance_is_deterministic_and_preserves_ir() {
+        let base = FilmBase::from([0.6, 0.3, 0.18]);
+        let img = LinearImage::new(
+            3,
+            1,
+            vec![0.5, 0.25, 0.15, 0.3, 0.15, 0.09, 0.1, 0.05, 0.03],
+            Some(vec![0.1, 0.2, 0.3]),
+        )
+        .unwrap();
+        let conv = Density {
+            density: DensityParams {
+                shadow_balance: [0.1, 0.0, -0.05],
+                highlight_balance: [-0.1, 0.02, 0.0],
+                ..DensityParams::default()
+            },
+            print: PrintParams::default(),
+        };
+        let a = conv.convert(&img, &base).unwrap();
+        let b = conv.convert(&img, &base).unwrap();
+        assert_eq!(a.rgb, b.rgb);
+        assert_eq!(a.ir.as_deref(), Some(&[0.1f32, 0.2, 0.3][..]));
     }
 
     // --- Dmax white anchor -----------------------------------------------------
@@ -1492,5 +2034,73 @@ mod tests {
         let (b, rb) = conv.convert_reported(&img, &base).unwrap();
         assert_eq!(ra.white_balance, rb.white_balance);
         assert_eq!(a.rgb, b.rgb);
+    }
+
+    #[test]
+    fn auto_wb_measures_post_regional_balance_density() {
+        // The two features active together: `convert_reported` runs
+        // `regional_balance` FIRST (mutating the density), then estimates the
+        // auto-WB gains on the *post-balance* density. Every other test isolates
+        // one feature (regional-balance tests use explicit unit WB; auto-WB tests
+        // use neutral balance), so nothing pins the ordering — a refactor that
+        // estimated WB on the *pre*-balance density would leave every test green
+        // while silently changing this combined output. This closes that gap.
+        let base = FilmBase::from([0.6, 0.35, 0.2]);
+        let img = LinearImage::new(
+            3,
+            2,
+            vec![
+                0.5, 0.3, 0.15, 0.3, 0.2, 0.1, 0.2, 0.1, 0.05, //
+                0.45, 0.25, 0.12, 0.1, 0.06, 0.03, 0.55, 0.32, 0.18,
+            ],
+            None,
+        )
+        .unwrap();
+        // A tone-dependent crossover cast (shadows warm, highlights cool) so the
+        // regional pass reshapes the per-channel density ratios the WB estimator
+        // then reads — green untouched so it stays the WB anchor.
+        let balance = DensityParams {
+            shadow_balance: [-0.15, 0.0, 0.08],
+            highlight_balance: [0.15, 0.0, -0.08],
+            ..DensityParams::default()
+        };
+
+        let neutral = Density {
+            density: DensityParams::default(),
+            print: PrintParams {
+                white_balance: WbSource::Percentile,
+                ..PrintParams::default()
+            },
+        };
+        let balanced = Density {
+            density: balance,
+            print: PrintParams {
+                white_balance: WbSource::Percentile,
+                ..PrintParams::default()
+            },
+        };
+        let (_, rep_neutral) = neutral.convert_reported(&img, &base).unwrap();
+        let (_, rep_balanced) = balanced.convert_reported(&img, &base).unwrap();
+
+        // (a) The ordering guard: WB estimated on the post-balance density must
+        // differ from WB estimated with no balance applied.
+        let wb_neutral = rep_neutral.white_balance.expect("neutral gains reported");
+        let wb_balanced = rep_balanced.white_balance.expect("balanced gains reported");
+        assert_ne!(
+            wb_neutral, wb_balanced,
+            "auto-WB must be measured on the post-balance density"
+        );
+
+        // (b) Both fields present and internally consistent in the one report.
+        let [lo, hi] = rep_balanced.balance_range.expect("range reported");
+        assert!(
+            lo.is_finite() && hi.is_finite() && lo < hi,
+            "range [{lo}, {hi}]"
+        );
+        assert_eq!(wb_balanced[1], 1.0, "green-anchored");
+        assert!(
+            wb_balanced.iter().all(|g| g.is_finite() && *g > 0.0),
+            "usable gains {wb_balanced:?}"
+        );
     }
 }
