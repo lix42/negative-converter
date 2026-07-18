@@ -136,7 +136,7 @@ plane is a separate single channel, carried but not consumed (§6.1).
 |---|---|---|---|---|
 | **transmission** (raw scan value) | fraction of light the film passes | more transparent film, thinner negative, brighter pixel *in the raw scan* — a **darker** scene | `[0, 1]` (= `u16`/65535) | `io::decode`, `LinearImage.rgb` |
 | **film base / `Dmin`** | the unexposed rebate's transmission — the per-channel *relative* maximum transmission | (the ceiling of transmission) | `(0, 1]` | `FilmBase`, `film_base::estimate` |
-| **density `D` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `D′ = density_scale·D + density_offset` (corrected) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `D′` shifted by the offset | `density::to_density`, `DensityImage.density` |
+| **density `D` / `B` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `B = density_scale·D + density_offset` (per-channel corrected density); `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)` (after regional balance, §7.2) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `B`/`D′` shifted by the offset (and, for `D′`, the regional balance) | `density::to_density`, `density::regional_balance`, `DensityImage.density` |
 | **positive** (scene-referred linear) | the rendered positive: `10^(γ·(D′ − Dmax))` then print controls | **brighter** positive — a **brighter** scene | `[0, ∞)`, nominally `~[0, 1]`, **unclamped** (HDR); may dip `< 0` after black-point | `density::render`, `stages::render` |
 | **output sample** (terminal) | the written TIFF value | brighter | `u16 [0, 65535]` (clamped to `[0,1]` first) or `f32` (unclamped) | `io::encode` |
 
@@ -147,16 +147,22 @@ axis that falls.
 **"bright" / "dark" / "highlight" / "shadow" always mean the *scene's*
 luminance** — never a raw pixel value. A scene highlight is the **densest**
 negative and the **lowest** transmission; a scene shadow (including the unexposed
-base) is the **thinnest** negative and the **highest** transmission. So never call
-a high-transmission value "bright" — say "high-transmission". When naming a numeric
-value, name its space: "high density", "high transmission", "bright positive".
+base) is the **thinnest** negative and the **highest** transmission. So in any
+mixed or ambiguous context never call a high-transmission value "bright" — say
+"high-transmission". (A module working *purely* in the raw-scan transmission
+domain may adopt a local "'bright' = raw-scan transmission" convention, stated
+with an explicit §4 cross-reference — as the auto-base detector does, §8.) When
+naming a numeric value, name its space: "high density", "high transmission",
+"bright positive".
 
 **The film-base paradox.** The unexposed base is at once the **highest
 transmission**, **zero density** (`D = 0`), and renders to **near-black positive** —
 it depicts scene black. *Brightest in the scan = darkest in the positive.*
 
 **`Dmin`** is the film base **transmission** — the divisor the conversion anchors
-on. It is the per-channel *relative* maximum (no image pixel out-transmits it),
+on. It is the per-channel *relative* maximum (no **genuine picture** pixel
+out-transmits it — dust, specular highlights, hot pixels, or noise can, which is
+why `D` can dip `< 0` and why the `SCAN_EPSILON` floor exists),
 **not** a value near 1: the orange mask and scanner gain pull channels down (real
 Ektar base ≈ `[0.53, 0.26, 0.16]`, blue near the bottom). Named for minimum
 *density* but stored as a transmission.
