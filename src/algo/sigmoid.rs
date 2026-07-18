@@ -88,7 +88,7 @@
 //! sample rides through to the counter instead.
 
 use crate::algo::density::{
-    DensityImage, check_base, estimate_wb_gains, render_print, resolve_dmax, to_density,
+    check_base, estimate_wb_gains, render_print, resolve_dmax, sample_toned_positive, to_density,
 };
 use crate::algo::{ConvertReport, Converter};
 use crate::types::{
@@ -297,27 +297,21 @@ impl Converter for Sigmoid {
         let tone = move |d: f32| s_curve(d, contrast, toe, shoulder, anchor);
 
         // White balance: explicit gains apply directly; an auto mode is estimated
-        // from a neutral analysis render (unit gains, default print — no exposure /
-        // black point / soft-clip) through the *same* stage-4 slot, so reusing the
-        // reported gains via `--white-balance` is bit-identical (measure once,
-        // reuse for the roll). Shared with `density` via `estimate_wb_gains`; the
-        // neutral pass runs on a clone so the final render below still consumes the
-        // cached density buffer. The analysis pass reads only `rgb`, so it drops
-        // the IR plane (`ir: None`) rather than cloning an image-sized buffer for
-        // nothing; the final render still consumes the original `density` with IR
-        // intact.
+        // from a neutral positive (unit gains, default print — no exposure / black
+        // point / soft-clip), which with those neutral params reduces stage 4 to
+        // the identity, so the neutral positive is just the stage-3 `tone`. We
+        // apply `tone` to only the strided sample of the density buffer (no
+        // full-image render, no clone) and hand that small buffer to the estimator,
+        // which no longer strides — bit-identical to rendering the whole neutral
+        // positive and striding it. The gains still apply through the *same*
+        // stage-4 slot in the final render, so reusing the reported gains via
+        // `--white-balance` is bit-identical (measure once, reuse for the roll).
+        // Shared with `density` via `sample_toned_positive` / `estimate_wb_gains`.
         let wb = match self.print.white_balance {
             WbSource::Explicit(gains) => gains,
             auto_mode => {
-                let analysis = DensityImage {
-                    width: density.width,
-                    height: density.height,
-                    density: density.density.clone(),
-                    ir: None,
-                };
-                let neutral =
-                    render_print(analysis, tone, [1.0, 1.0, 1.0], &PrintParams::default());
-                estimate_wb_gains(&neutral.rgb, auto_mode)?
+                let sampled = sample_toned_positive(&density.density, tone);
+                estimate_wb_gains(&sampled, auto_mode)?
             }
         };
         let image = render_print(density, tone, wb, &self.print);

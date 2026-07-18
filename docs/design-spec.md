@@ -623,7 +623,10 @@ false-positive on legitimate high-contrast conversions).
   auto mode **by source** — `--white-balance 1,1,1` over an auto recipe means
   neutral gains, not re-estimation:
   - `--white-balance R,G,B` ⇒ `{ "explicit": [r, g, b] }` — fixed
-    highlight/neutral gains.
+    highlight/neutral gains. For backward compatibility the recipe key also
+    accepts a **bare `[r, g, b]` array** (the pre-auto-WB on-disk form, when
+    `white_balance` was a plain array) as explicit gains, so older recipes /
+    sidecars still parse; new output always writes the tagged form.
   - `--auto-wb gray-world` ⇒ `"gray-world"` — equalize the trimmed per-channel
     means (≈ Auto-AVG). Assumes the frame averages to neutral, so a dominant
     scene color biases it.

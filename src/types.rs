@@ -322,7 +322,13 @@ impl Default for DensityParams {
 /// (no ML, per the project's "AI-friendly ≠ ML" rule): same input + params ⇒
 /// identical gains. The resolved gains ride into the convert JSON report so a
 /// roll can freeze one frame's estimate into a recipe (measure once, reuse).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// **Wire compatibility:** it *writes* the tagged form above, but its custom
+/// [`Deserialize`] also accepts a legacy **bare `[r, g, b]` array**
+/// (`"white_balance": [1, 1, 1]`) as `Explicit` gains — before this feature
+/// `print.white_balance` was a plain `[f32; 3]`, so recipes/sidecars written by
+/// older `nc` must still parse (reproducibility). See design-spec §9.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WbSource {
     /// Fixed per-channel gains `[r, g, b]`. The default (`[1, 1, 1]` = neutral,
@@ -341,6 +347,39 @@ pub enum WbSource {
 impl Default for WbSource {
     fn default() -> Self {
         WbSource::Explicit([1.0, 1.0, 1.0])
+    }
+}
+
+impl<'de> Deserialize<'de> for WbSource {
+    /// Accepts both the current tagged form (`{ "explicit": [r, g, b] }` /
+    /// `"gray-world"` / `"percentile"`) and the legacy **bare `[r, g, b]`** array
+    /// that pre-`WbSource` recipes/sidecars wrote (when `print.white_balance` was
+    /// a plain `[f32; 3]`), mapping the bare array to `Explicit`. Keeps old
+    /// recipes reproducible; `Serialize` still emits only the tagged form.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A tagged copy of the variants (the derived shape), plus an untagged
+        // wrapper that tries the bare array first, then the tagged form.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum Tagged {
+            Explicit([f32; 3]),
+            GrayWorld,
+            Percentile,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare([f32; 3]),
+            Tagged(Tagged),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Bare(gains) | Repr::Tagged(Tagged::Explicit(gains)) => WbSource::Explicit(gains),
+            Repr::Tagged(Tagged::GrayWorld) => WbSource::GrayWorld,
+            Repr::Tagged(Tagged::Percentile) => WbSource::Percentile,
+        })
     }
 }
 
@@ -684,6 +723,31 @@ mod tests {
             let json = serde_json::to_string(&src).unwrap();
             assert_eq!(serde_json::from_str::<WbSource>(&json).unwrap(), src);
         }
+    }
+
+    #[test]
+    fn wb_source_deserializes_legacy_bare_array_as_explicit() {
+        // Before `WbSource`, `print.white_balance` was a plain `[f32; 3]`, so
+        // existing recipes/sidecars serialize the bare array. The custom
+        // `Deserialize` must still accept it (→ `Explicit`) for reproducibility,
+        // alongside the tagged forms.
+        assert_eq!(
+            serde_json::from_str::<WbSource>("[1.1,1.0,0.9]").unwrap(),
+            WbSource::Explicit([1.1, 1.0, 0.9])
+        );
+        // The same, nested in a recipe's `print` section (defaults fill the rest).
+        let print: PrintParams =
+            serde_json::from_str(r#"{"white_balance":[1.1,1.0,0.9]}"#).unwrap();
+        assert_eq!(print.white_balance, WbSource::Explicit([1.1, 1.0, 0.9]));
+        // The tagged forms still parse (the bare array is an *addition*).
+        assert_eq!(
+            serde_json::from_str::<WbSource>(r#"{"explicit":[1.1,1.0,0.9]}"#).unwrap(),
+            WbSource::Explicit([1.1, 1.0, 0.9])
+        );
+        assert_eq!(
+            serde_json::from_str::<WbSource>("\"gray-world\"").unwrap(),
+            WbSource::GrayWorld
+        );
     }
 
     #[test]

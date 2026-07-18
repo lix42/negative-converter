@@ -436,7 +436,7 @@ nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941</cod
   <li><code>--black-point &lt;f&gt;</code> — paper black / shadow floor.</li>
   <li>White balance — a single mutually-exclusive choice, recipe key <code>print.white_balance</code> (default <code>{ "explicit": [1, 1, 1] }</code> = neutral; see §7.2). The two flags conflict (passing both is a usage error); whichever is given replaces a recipe's <code>white_balance</code> entirely. Explicit gains beat an auto mode <strong>by source</strong> — <code>--white-balance 1,1,1</code> over an auto recipe means neutral gains, not re-estimation:
     <ul>
-      <li><code>--white-balance R,G,B</code> ⇒ <code>{ "explicit": [r, g, b] }</code> — fixed highlight/neutral gains.</li>
+      <li><code>--white-balance R,G,B</code> ⇒ <code>{ "explicit": [r, g, b] }</code> — fixed highlight/neutral gains. For backward compatibility the recipe key also accepts a <strong>bare <code>[r, g, b]</code> array</strong> (the pre-auto-WB on-disk form, when <code>white_balance</code> was a plain array) as explicit gains, so older recipes / sidecars still parse; new output always writes the tagged form.</li>
       <li><code>--auto-wb gray-world</code> ⇒ <code>"gray-world"</code> — equalize the trimmed per-channel means (≈ Auto-AVG). Assumes the frame averages to neutral, so a dominant scene color biases it.</li>
       <li><code>--auto-wb percentile</code> ⇒ <code>"percentile"</code> — equalize the channels at a matched near-white percentile (≈ Auto-Neutral); more robust to dominant colors. The resolved gains land in the convert report (<code>white_balance</code>, green-anchored) ready to freeze into <code>--white-balance</code> / a roll recipe (§8).</li>
     </ul>

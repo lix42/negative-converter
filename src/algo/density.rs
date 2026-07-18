@@ -354,24 +354,51 @@ const AUTO_WB_TRIM: f32 = 0.01;
 /// keeps the examined pixel count under [`AUTO_WB_MAX_PIXELS`]. Strides whole
 /// pixels (interleaved RGB triples), so unlike [`auto_dmax_stride`] there is no
 /// channel-bias concern — every sampled pixel contributes all three channels.
-fn auto_wb_stride(pixels: usize) -> usize {
+///
+/// `pub(crate)` because the stride is applied by the *caller* (the algorithms'
+/// `convert_reported`, which strides the density buffer and tones only the
+/// sampled pixels — see [`sample_toned_positive`]) rather than inside the
+/// estimator; `sigmoid` shares the same helper, so both must agree on the stride.
+pub(crate) fn auto_wb_stride(pixels: usize) -> usize {
     pixels.div_ceil(AUTO_WB_MAX_PIXELS).max(1)
 }
 
-/// Per-channel *finite* samples from a deterministic strided pixel walk, each
-/// channel sorted ascending (`total_cmp`). Non-finite samples (`NaN`/`±inf`
+/// Sample the corrected-density buffer on the deterministic [`auto_wb_stride`]
+/// and apply the caller's **neutral** stage-3 `tone` to only the sampled pixels,
+/// yielding the small interleaved-RGB positive the estimator consumes.
+///
+/// This is bit-exact with the previous approach — render the *whole* neutral
+/// positive (unit gains, 0 EV, no black-point/soft-clip, so stage 4 is the
+/// identity `paper·1·1 − 0`) and then stride it in the estimator — but without
+/// the full-image render or the density-buffer clone: on the opt-in `--auto-wb`
+/// path it touches only the (≤ [`AUTO_WB_MAX_PIXELS`]) sampled pixels instead of
+/// the tens of millions in a full scan. The estimator must therefore *not* stride
+/// again (see [`estimate_wb_gains`] / [`wb_channel_samples`]): it examines exactly
+/// this pre-sampled set.
+pub(crate) fn sample_toned_positive(density: &[f32], tone: impl Fn(f32) -> f32) -> Vec<f32> {
+    let pixels = density.len() / 3;
+    let stride = auto_wb_stride(pixels);
+    let mut sampled = Vec::with_capacity(pixels.div_ceil(stride) * 3);
+    for px in density.chunks_exact(3).step_by(stride) {
+        sampled.extend_from_slice(&[tone(px[0]), tone(px[1]), tone(px[2])]);
+    }
+    sampled
+}
+
+/// Per-channel *finite* samples of an already-sampled positive `rgb` (see
+/// [`sample_toned_positive`] — the stride is applied by the caller, not here),
+/// each channel sorted ascending (`total_cmp`). Non-finite samples (`NaN`/`±inf`
 /// from corrupt input) are excluded per sample, so a bad pixel can't poison a
 /// statistic. The full sort makes every downstream statistic order-defined,
 /// hence deterministic: same buffer ⇒ same samples ⇒ same gains.
 fn wb_channel_samples(rgb: &[f32]) -> [Vec<f32>; 3] {
-    let stride = auto_wb_stride(rgb.len() / 3);
-    let cap = (rgb.len() / 3).div_ceil(stride);
+    let cap = rgb.len() / 3;
     let mut channels = [
         Vec::with_capacity(cap),
         Vec::with_capacity(cap),
         Vec::with_capacity(cap),
     ];
-    for px in rgb.chunks_exact(3).step_by(stride) {
+    for px in rgb.chunks_exact(3) {
         for (c, channel) in channels.iter_mut().enumerate() {
             if px[c].is_finite() {
                 channel.push(px[c]);
@@ -406,11 +433,14 @@ fn trimmed_mean(sorted: &[f32], trim: f32) -> f32 {
 /// with unit gains and no exposure/black/soft-clip applied).
 ///
 /// `Explicit` gains pass through untouched, keeping the function total (callers
-/// shortcut that case to skip the analysis render). The auto modes are pure,
-/// deterministic statistics over the finite samples of a strided pixel walk
-/// (see [`wb_channel_samples`]); distribution extremes are excluded by
-/// construction (the percentile's top tail / the trimmed mean), so clipped
-/// speculars and dead pixels don't skew the estimate:
+/// shortcut that case to skip the analysis pass entirely). Otherwise `rgb`
+/// arrives **already sampled** — the caller strides the density buffer and tones
+/// only the sampled pixels (see [`sample_toned_positive`]), so this function
+/// examines every pixel it is given and does *not* stride again. The auto modes
+/// are pure, deterministic statistics over the finite samples (see
+/// [`wb_channel_samples`]); distribution extremes are excluded by construction
+/// (the percentile's top tail / the trimmed mean), so clipped speculars and dead
+/// pixels don't skew the estimate:
 ///
 /// - [`WbSource::GrayWorld`]: equalize the per-channel trimmed means — a cast
 ///   shows up as unequal channel averages (assumes the frame averages neutral).
@@ -518,32 +548,22 @@ impl Converter for Density {
         let wb = match self.print.white_balance {
             WbSource::Explicit(gains) => gains,
             auto_mode => {
-                // Estimation: render the positive with a fully *neutral* print
-                // (unit gains, 0 EV, no black point, no soft-clip) so the
-                // statistics measure exactly the quantity the white-balance
-                // slot multiplies. The user's `print_exposure` would cancel in
-                // the channel ratios anyway, while `black_point` /
-                // `highlight_compress` apply *after* the gains and would
-                // distort them. The density buffer is cloned because it is the
-                // cached stage-3 input the final render below consumes —
-                // measure on the copy, render the original. The analysis pass
-                // reads only `rgb`, so it drops the IR plane (`ir: None`) rather
-                // than cloning an image-sized buffer for nothing; the final
-                // render still consumes the original `density` with IR intact.
-                let analysis = DensityImage {
-                    width: density.width,
-                    height: density.height,
-                    density: density.density.clone(),
-                    ir: None,
-                };
-                let neutral = render(
-                    analysis,
-                    self.density.density_gamma,
-                    dmax,
-                    [1.0, 1.0, 1.0],
-                    &PrintParams::default(),
-                );
-                estimate_wb_gains(&neutral.rgb, auto_mode)?
+                // Estimation: measure the gains on the positive rendered with a
+                // fully *neutral* print (unit gains, 0 EV, no black point, no
+                // soft-clip) so the statistics measure exactly the quantity the
+                // white-balance slot multiplies. The user's `print_exposure`
+                // would cancel in the channel ratios anyway, while `black_point`
+                // / `highlight_compress` apply *after* the gains and would
+                // distort them. With those neutral params stage 4 collapses to
+                // the identity (`paper·1·1 − 0`), so the neutral positive is just
+                // the stage-3 tone — we apply it to only the strided sample of
+                // the density buffer (no full-image render, no clone) and hand
+                // that small buffer to the estimator, which no longer strides.
+                let anchor = dmax.unwrap_or(0.0);
+                let gamma = self.density.density_gamma;
+                let sampled =
+                    sample_toned_positive(&density.density, |d| 10f32.powf(gamma * (d - anchor)));
+                estimate_wb_gains(&sampled, auto_mode)?
             }
         };
 
