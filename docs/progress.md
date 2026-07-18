@@ -1817,12 +1817,77 @@ Three further items the user decided after the review:
     *computation* dropped), not a regression from this task.
 
 ## regional-color-balance
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-17
 
 - Goal: shadow/highlight per-channel balance (density-weighted offsets in stage
   2) to correct color crossover a global gain can't fix (NLP comparison
   priority 3b).
+- 2026-07-14 — **implemented.** New pure sub-stage `regional_balance`
+  (`algo/density.rs`) completing stage 2 between `to_density` and `render`:
+  `D'_c = B_c + shadow_balance_c·w_lo(D̄) + highlight_balance_c·w_hi(D̄)` with
+  `w_hi = smoothstep((D̄ − lo)/(hi − lo))`, `w_lo = 1 − w_hi` (complementary, so
+  equal balances degenerate to a uniform `density_offset`), and `D̄` the
+  per-pixel **scalar** tone = mean of the *finite* pre-regional corrected
+  channels (per-channel weighting would misfire on exactly the crossover pixels;
+  a NaN channel is excluded from the tone but stays NaN itself, so the encode
+  non-finite counter still sees it).
+- **Decisions:**
+  - *Naming convention (§9):* "shadow"/"highlight" are the **positive's** tone
+    regions — low corrected density (near base) = shadow, high = highlight — and
+    with the positive polarity a **positive balance value brightens that channel
+    in its region**. Documented in §7.2/§9.
+  - *Range anchors:* new enum `BalanceRange` (`types.rs`), `Auto` (default) |
+    `Explicit([lo, hi])` — one enum field, not parallel knobs. `Auto` measures
+    nearest-rank percentiles **0.5 % / 99.5 %** of the per-pixel tone `D̄` over a
+    deterministic strided pixel sample (cap 2^20 pixels, mirrors the `auto_dmax`
+    approach; strides whole RGB triples so no channel-bias bump is needed). The
+    measurement uses the same `D̄` domain the ramps consume, so non-default
+    `density_scale`/`offset` can't make anchors and inputs drift. It deliberately
+    does **not** anchor on the Auto `Dmax` (measured *after* stage 2 — circular).
+  - *Ordering:* regional balance runs **before** `render`, so an `Auto` `Dmax`
+    is resolved from the *post-balance* densities (display-white anchor stays
+    consistent with what is rendered), and before print WB (stage 2 fixes the
+    tone-dependent crossover; print WB the residual global cast).
+  - *Neutral default is bit-exact:* `[0,0,0]` balances return before touching
+    the buffer (even `+0.0` would flip `-0.0`) and skip the measuring pass;
+    pinned by a bit-level test.
+  - *Fail loudly:* a requested balance with an unmeasurable `Auto` range
+    (uniform / all-non-finite frame) is an `NcError::Other` naming
+    `--balance-range` as the recovery — never a silently skipped correction.
+    Explicit ranges are CLI-validated (finite, `lo < hi`; exit 2).
+  - *CLI:* `--shadow-balance R,G,B`, `--highlight-balance R,G,B` (both with
+    `allow_hyphen_values` — negative offsets are the common case),
+    `--balance-range LO,HI` ⊕ `--auto-balance-range` (clap-conflicting pair).
+    All four coupled spots wired (overrides, `DensityParams` fields, merge arms,
+    validate) + merge/recipe-nesting/conflict tests.
+  - *Report:* `ConvertReport.balance_range` → report key `balance_range`
+    (`[lo, hi]`, omitted when `None`) so a roll can reuse one frame's measured
+    range via `--balance-range` — same reuse pattern as `dmax`.
+- **Notes for dependents:** `auto-neutral-wb` — regional balance composes with
+  (and precedes) print WB; if auto-WB ever wants tone context, reuse the
+  measured `balance_range` from the report rather than re-measuring inside
+  stage 2. `algo-sigmoid` — the sub-stage boundary is unchanged: sigmoid replaces
+  the `render` tone map, not stage 2, so regional balance carries over as-is.
+- 2026-07-17 — **rebased onto `algo-sigmoid` (#27) + `auto-base-redesign` +
+  #24/#25/#26** (commit-WIP method). algo-sigmoid refactored `density::render`
+  into a shared `render_print(density, tone, print)` and added a `sigmoid`
+  converter that reuses stages 1–2 (`to_density`) and stage 4 (`render_print`).
+  My `render(density, gamma, dmax, print)` wrapper kept its signature (now
+  delegates to `render_print`), so `density::convert_reported` was unaffected.
+  **Decision — regional balance now applies under `sigmoid` too:** the
+  `shadow_balance`/`highlight_balance`/`balance_range` knobs live in the shared
+  `DensityParams` and regional balance is a stage-2 op, which sigmoid shares —
+  so `sigmoid::convert_reported` now calls `regional_balance` after `to_density`
+  (before its anchor resolve, same post-balance-`Dmax` ordering as `density`) and
+  surfaces `balance_range` in its `ConvertReport`. Without this, `--shadow-balance`
+  would have been a silent no-op under `--algorithm sigmoid` (violating the
+  fail-loud / no-silent-no-op rule). Pinned by three sigmoid tests
+  (applies-not-noop, reports the range, and bit-exact match to `density` with
+  knees off + a balance). `ConvertReport` gained `balance_range`, so sigmoid's
+  `ConvertReport { dmax }` construction was updated to include it. §7.2/§9
+  (both .md and .html) reconciled: the "sigmoid shares this whole section" note
+  now explicitly includes the regional balance.
 
 ## real-scan-verification
 **Status:** not started

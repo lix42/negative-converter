@@ -1783,3 +1783,147 @@ fn auto_wb_reports_gains_that_reproduce_the_output_when_reused() {
     // The explicit run reports the same resolved gains.
     assert_eq!(json(&stdout)["white_balance"], report["white_balance"]);
 }
+
+#[test]
+fn density_report_carries_resolved_balance_range() {
+    // The roll-reuse workflow reads `balance_range` from the report and feeds it
+    // back via --balance-range, so the measured [lo, hi] must ride into the
+    // stdout JSON when a balance is requested — and stay absent for the neutral
+    // default (guards the `run_convert` wiring, not just `ConvertReport`).
+    let dir = TempDir::new("balreport");
+    let fix = fixture("hdr-48bit.tif");
+    let out = dir.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--shadow-balance",
+        "-0.05,0,0.02",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let range = report["balance_range"]
+        .as_array()
+        .unwrap_or_else(|| panic!("measured range must be reported: {report}"));
+    let (lo, hi) = (range[0].as_f64().unwrap(), range[1].as_f64().unwrap());
+    assert!(lo.is_finite() && hi.is_finite() && lo < hi, "{report}");
+
+    // Neutral balances → the field is omitted (no regional pass ran).
+    let out2 = dir.path("out2.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out2.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert!(
+        report.get("balance_range").is_none_or(|v| v.is_null()),
+        "no range must be reported for neutral balances: {report}"
+    );
+}
+
+#[test]
+fn auto_measured_balance_range_reproduces_the_output_when_reused() {
+    // THE measure-once-reuse workflow, end-to-end: measure a frame's tone range
+    // under Auto, freeze it, and replay it on the next frame of the roll. This
+    // closes the loop the report/recipe tests only cover in halves and crosses
+    // the report-field ↔ recipe-key boundary CLAUDE.md flags as bug-prone —
+    // `Report.balance_range` must ride out as JSON text and feed straight back
+    // in via `--balance-range` with no precision drift.
+    let dir = TempDir::new("balreuse");
+    let fix = fixture("hdr-48bit.tif");
+
+    // A real crossover cast (shadows warm, highlights cool), so the regional
+    // pass runs and Auto has a non-degenerate range to measure.
+    let balances = [
+        "--shadow-balance",
+        "-0.15,0,0.08",
+        "--highlight-balance",
+        "0.15,0,-0.08",
+    ];
+
+    // Frame 1: Auto measures the range and reports it.
+    let auto_out = dir.path("auto.tiff");
+    let mut auto_args = vec![
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        auto_out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--auto-balance-range",
+    ];
+    auto_args.extend_from_slice(&balances);
+    let (code, stdout, err) = run(&auto_args);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let range = report["balance_range"]
+        .as_array()
+        .unwrap_or_else(|| panic!("measured range must be reported: {report}"));
+    // Take the numbers' verbatim JSON text — exactly what an agent reading the
+    // report would paste back — so no reformatting can mask (or introduce) drift.
+    let lo_hi = format!("{},{}", range[0], range[1]);
+
+    // Frame 2: freeze the reported range via Explicit `--balance-range`, same
+    // balances. Byte-identical output proves the range survived the JSON text
+    // round-trip and that `Report.balance_range` feeds back cleanly as input.
+    let reuse_out = dir.path("reuse.tiff");
+    let mut reuse_args = vec![
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        reuse_out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--balance-range",
+        &lo_hi,
+    ];
+    reuse_args.extend_from_slice(&balances);
+    let (code, _stdout, err) = run(&reuse_args);
+    assert_eq!(code, 0, "{err}");
+
+    assert_eq!(
+        std::fs::read(&auto_out).unwrap(),
+        std::fs::read(&reuse_out).unwrap(),
+        "reusing the reported range via --balance-range must reproduce the \
+         auto-measured output byte-for-byte"
+    );
+}
+
+#[test]
+fn auto_measured_balance_range_is_deterministic_in_the_report() {
+    // The convert-determinism test proves the RGB output is stable, but the
+    // reported anchors are the roll-reuse contract — an agent freezes them and
+    // replays them, so the measured [lo, hi] must itself be exactly repeatable.
+    let dir = TempDir::new("baldet");
+    let fix = fixture("hdr-48bit.tif");
+    let range = |tag: &str| {
+        let out = dir.path(tag);
+        let (code, stdout, err) = run(&[
+            "convert",
+            fix.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--auto-balance-range",
+            "--shadow-balance",
+            "-0.05,0,0.02",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        json(&stdout)["balance_range"].clone()
+    };
+    let (a, b) = (range("a.tiff"), range("b.tiff"));
+    assert!(
+        a.as_array().is_some_and(|r| r.len() == 2),
+        "range must be reported: {a}"
+    );
+    assert_eq!(a, b, "auto-measured balance_range must be deterministic");
+}

@@ -1,11 +1,16 @@
 //! `sigmoid` — density-domain S-curve (photographic H&D / paper-response) tone
 //! mapping, the roadmap's third converter (design-spec §7.3).
 //!
-//! Shares stages 1–2 ([`to_density`]) and stage 4 (the [`render_print`] print
-//! render, [`PrintParams`]) with `density`; only stage 3 — the corrected-density
+//! Shares stages 1–2 ([`to_density`] + the [`regional_balance`] shadow/highlight
+//! color balance) and stage 4 (the [`render_print`] print render,
+//! [`PrintParams`]) with `density`; only stage 3 — the corrected-density
 //! → positive-linear curve — is replaced: the straight line `10^(γ·(D'−Dmax))`
 //! becomes an S-curve with toe/shoulder control. Density conversion and print
-//! rendering stay **separate** sub-stages (core fidelity rule).
+//! rendering stay **separate** sub-stages (core fidelity rule). Because regional
+//! balance is a stage-2 operation on the corrected density, the
+//! `density.shadow_balance`/`highlight_balance` knobs apply under `sigmoid`
+//! exactly as under `density` (its `Auto` `Dmax` anchor is likewise measured
+//! from the *post-balance* densities).
 //!
 //! ## Curve (per channel, in log₁₀-output space)
 //!
@@ -88,7 +93,8 @@
 //! sample rides through to the counter instead.
 
 use crate::algo::density::{
-    check_base, estimate_wb_gains, render_print, resolve_dmax, sample_toned_positive, to_density,
+    check_base, estimate_wb_gains, regional_balance, render_print, resolve_dmax,
+    sample_toned_positive, to_density,
 };
 use crate::algo::{ConvertReport, Converter};
 use crate::types::{
@@ -268,7 +274,11 @@ impl Converter for Sigmoid {
         // trusts its inputs needs no re-check — the `s_curve` debug assert catches
         // a programmatic caller that skipped `validate`.
         check_base(base)?;
-        let density = to_density(image, base, &self.density);
+        let mut density = to_density(image, base, &self.density);
+        // Regional balance completes stage 2 (shared with `density`) *before* the
+        // anchor is resolved, so an `Auto` `Dmax` is measured from the
+        // post-balance densities — the same ordering contract as `density`.
+        let balance_range = regional_balance(&mut density, &self.density)?;
         // One anchor measurement, shared with `density`'s semantics. The S-curve
         // is anchored on `[0, Dmax]` — its white knee and its black floor
         // (`F = −contrast·anchor`) both derive from a *positive* anchor — so an
@@ -292,8 +302,8 @@ impl Converter for Sigmoid {
             shoulder,
         } = self.sigmoid;
         // Stage-3 S-curve. A `move` closure over the `Copy` curve params, so it is
-        // itself `Copy` and can be passed by value to both `render_print` calls
-        // below (the neutral analysis pass and the final render).
+        // itself `Copy` and can be passed by value to both the WB sampling and the
+        // final render.
         let tone = move |d: f32| s_curve(d, contrast, toe, shoulder, anchor);
 
         // White balance: explicit gains apply directly; an auto mode is estimated
@@ -307,6 +317,7 @@ impl Converter for Sigmoid {
         // stage-4 slot in the final render, so reusing the reported gains via
         // `--white-balance` is bit-identical (measure once, reuse for the roll).
         // Shared with `density` via `sample_toned_positive` / `estimate_wb_gains`.
+        // (Regional balance already ran on `density` above, before the anchor.)
         let wb = match self.print.white_balance {
             WbSource::Explicit(gains) => gains,
             auto_mode => {
@@ -320,6 +331,7 @@ impl Converter for Sigmoid {
             ConvertReport {
                 dmax: resolved,
                 white_balance: Some(wb),
+                balance_range,
             },
         ))
     }
@@ -329,6 +341,7 @@ impl Converter for Sigmoid {
 mod tests {
     use super::*;
     use crate::algo::density::Density;
+    use crate::types::BalanceRange;
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps
@@ -589,6 +602,90 @@ mod tests {
             "reduced sigmoid must equal density bit-for-bit"
         );
         assert_eq!(a.ir, b.ir);
+    }
+
+    #[test]
+    fn regional_balance_applies_under_sigmoid() {
+        // Regional balance is a shared stage-2 operation, so `--shadow-balance`
+        // etc. must take effect under `sigmoid` (not be a silent no-op) and must
+        // be reported. A crossover-injected shadow gets a non-zero shadow
+        // balance; the output must differ from the neutral-balance sigmoid run,
+        // and the reported range must be present.
+        let base = FilmBase::from([0.6, 0.3, 0.18]);
+        let img = LinearImage::new(2, 1, vec![0.5, 0.25, 0.15, 0.06, 0.03, 0.02], None).unwrap();
+        let dmax = DmaxSource::Explicit(1.2);
+        let params = SigmoidParams {
+            contrast: 1.4,
+            toe: 0.1,
+            shoulder: 0.2,
+        };
+        let neutral = sigmoid(dmax, params.clone());
+        let balanced = Sigmoid {
+            density: DensityParams {
+                dmax,
+                shadow_balance: [0.2, 0.0, -0.1],
+                highlight_balance: [-0.1, 0.05, 0.0],
+                ..DensityParams::default()
+            },
+            sigmoid: params,
+            print: PrintParams::default(),
+        };
+        let (out_neutral, rep_neutral) = neutral.convert_reported(&img, &base).unwrap();
+        let (out_balanced, rep_balanced) = balanced.convert_reported(&img, &base).unwrap();
+        assert_eq!(
+            rep_neutral.balance_range, None,
+            "neutral: no range reported"
+        );
+        assert!(
+            rep_balanced.balance_range.is_some(),
+            "balanced: range must be reported under sigmoid"
+        );
+        assert_ne!(
+            out_neutral.rgb, out_balanced.rgb,
+            "regional balance must change sigmoid output, not no-op"
+        );
+    }
+
+    #[test]
+    fn regional_balance_composes_the_same_in_sigmoid_and_density() {
+        // With knees off, sigmoid reduces to density's straight line — and the
+        // shared regional-balance sub-stage must apply identically in both, so
+        // the two produce bit-identical output for the same balance params. Pins
+        // that sigmoid reuses `regional_balance` rather than a divergent copy.
+        let base = FilmBase::from([0.6, 0.3, 0.18]);
+        let img = LinearImage::new(2, 1, vec![0.5, 0.25, 0.15, 0.06, 0.03, 0.02], None).unwrap();
+        let gamma = 1.4;
+        let dmax = DmaxSource::Explicit(1.2);
+        let density = DensityParams {
+            density_gamma: gamma,
+            dmax,
+            shadow_balance: [0.15, 0.0, -0.05],
+            highlight_balance: [-0.05, 0.02, 0.0],
+            balance_range: BalanceRange::Explicit([0.2, 1.8]),
+            ..DensityParams::default()
+        };
+        let sig = Sigmoid {
+            density: DensityParams {
+                density_gamma: 99.0, // ignored — contrast drives the curve
+                ..density.clone()
+            },
+            sigmoid: SigmoidParams {
+                contrast: gamma,
+                toe: 0.0,
+                shoulder: 0.0,
+            },
+            print: PrintParams::default(),
+        };
+        let den = Density {
+            density,
+            print: PrintParams::default(),
+        };
+        let a = sig.convert(&img, &base).unwrap();
+        let b = den.convert(&img, &base).unwrap();
+        assert_eq!(
+            a.rgb, b.rgb,
+            "shared regional balance must match bit-for-bit"
+        );
     }
 
     #[test]
@@ -865,5 +962,77 @@ mod tests {
         for (i, v) in out.rgb.iter().enumerate() {
             assert!(v.is_finite() && *v > 0.0 && *v <= 1.0, "sample {i}: {v}");
         }
+    }
+
+    #[test]
+    fn auto_wb_measures_post_regional_balance_density() {
+        // Sigmoid analogue of the density ordering guard: its own
+        // `convert_reported` also runs `regional_balance` before estimating the
+        // auto-WB gains, so the gains must reflect the post-balance density. No
+        // other sigmoid test runs both features at once, so a refactor moving the
+        // WB estimate ahead of the balance would go unnoticed here too. Knees off
+        // (toe = shoulder = 0) so the analysis positive stays the straight-line
+        // power form, matching the other sigmoid auto-WB tests.
+        let base = FilmBase::from([0.6, 0.35, 0.2]);
+        let img = LinearImage::new(
+            3,
+            2,
+            vec![
+                0.5, 0.3, 0.15, 0.3, 0.2, 0.1, 0.2, 0.1, 0.05, //
+                0.45, 0.25, 0.12, 0.1, 0.06, 0.03, 0.55, 0.32, 0.18,
+            ],
+            None,
+        )
+        .unwrap();
+        let straight = SigmoidParams {
+            toe: 0.0,
+            shoulder: 0.0,
+            ..SigmoidParams::default()
+        };
+        // Tone-dependent crossover cast; green untouched so it stays the anchor.
+        let balance = DensityParams {
+            shadow_balance: [-0.15, 0.0, 0.08],
+            highlight_balance: [0.15, 0.0, -0.08],
+            ..DensityParams::default()
+        };
+
+        let neutral = Sigmoid {
+            density: DensityParams::default(),
+            sigmoid: straight.clone(),
+            print: PrintParams {
+                white_balance: WbSource::Percentile,
+                ..PrintParams::default()
+            },
+        };
+        let balanced = Sigmoid {
+            density: balance,
+            sigmoid: straight,
+            print: PrintParams {
+                white_balance: WbSource::Percentile,
+                ..PrintParams::default()
+            },
+        };
+        let (_, rep_neutral) = neutral.convert_reported(&img, &base).unwrap();
+        let (_, rep_balanced) = balanced.convert_reported(&img, &base).unwrap();
+
+        // (a) WB measured post-balance differs from WB with no balance applied.
+        let wb_neutral = rep_neutral.white_balance.expect("neutral gains reported");
+        let wb_balanced = rep_balanced.white_balance.expect("balanced gains reported");
+        assert_ne!(
+            wb_neutral, wb_balanced,
+            "auto-WB must be measured on the post-balance density under sigmoid"
+        );
+
+        // (b) Both fields present and internally consistent in the one report.
+        let [lo, hi] = rep_balanced.balance_range.expect("range reported");
+        assert!(
+            lo.is_finite() && hi.is_finite() && lo < hi,
+            "range [{lo}, {hi}]"
+        );
+        assert_eq!(wb_balanced[1], 1.0, "green-anchored");
+        assert!(
+            wb_balanced.iter().all(|g| g.is_finite() && *g > 0.0),
+            "usable gains {wb_balanced:?}"
+        );
     }
 }
