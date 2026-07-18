@@ -1109,11 +1109,214 @@ Both are tracked in `TASKS.md` as dependents of this task.
   darker-than-interior assumptions of base estimation don't hold.
 
 ## estimate-reuse-output
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-14
 
 - Goal: `nc estimate` output shaped for direct reuse (drop-in recipe fragment /
   flag values), closing the measure-once-reuse-for-the-roll loop.
+- **Done.** Full CI gate clean (`fmt --check`, `clippy --all-targets -D
+  warnings`, `build`, `test`); suite is **208 tests** (182 unit + 26 E2E; the
+  counts include tests other tasks added under the same base).
+- **Rebased onto `origin/main` 94fdc12 (2026-07-16).** Post-merge of #23
+  (`auto-base-redesign`: inward-scan rebate detector — `estimate` now returns
+  `BaseEstimate { base, warnings }`, plus `RebateCandidate`/`Edge`/`guard_base`)
+  and #27 (`algo-sigmoid`). Conflicts in film_base.rs, cli.rs, tests/pipeline.rs,
+  and both design-spec files, all reconciled keeping BOTH sides:
+  - **film_base.rs:** my `estimate_grid`/`GridEstimate`/`GridCell` now sit on the
+    new detector. Grid cells switched from the old `sample_region` (which now
+    returns `BaseEstimate`) to `sample_region_at(_, SAMPLE_PERCENTILE)` (still
+    `FilmBase`). Dropped the two obsolete `auto_fails_*` unit tests that #23
+    deleted; kept all grid tests.
+  - **cli.rs:** `run_estimate`'s non-grid branch adopts the `BaseEstimate` API
+    (`est.base` + folds `est.warnings`); grid branch and reuse-ready output
+    unchanged. `Report` keeps both #23's `base_candidates` and my
+    `film_base_flag`/`film_base_recipe`/`grid`. Deduped a doubly-added
+    `EstimateArgs.strict` (both #23 and I added `--strict` to estimate) into one
+    field with a merged doc.
+  - **tests:** kept #23's `mixed_base_region_warns_and_strict_refuses_it` plus my
+    two estimate tests. Dropped the `--strict` from the reuse round-trip test:
+    the new inward-scan uniformity gate warns on any `--base-region` of this
+    real-photo fixture (no region-uniform patch exists), so a clean-strict-exit-0
+    assertion isn't expressible here — `estimate --strict` is covered by #23's
+    mixed-region test instead.
+  - **docs:** subcommand table keeps #23's richer `inspect` row + my `estimate`
+    row; the §8 ladder Tier-1 keeps #23's inward-scan detail with my
+    `nc estimate --grid` reference.
+- **Rebased onto `origin/main` 3c7f5bd (2026-07-15).** Post-merge of #20
+  (`--out-depth u16|f32` → the boolean `--output-hdr`), #21 (bw-support docs),
+  and #22 (roll-workflow/versioning follow-up tasks + acquisition ladder). Only
+  code change from the rebase: the two `convert` round-trip invocations in the
+  reuse E2E test switched `--out-depth f32` → `--output-hdr` (both still set
+  `output.hdr = true`, so the byte-identical A/B comparison holds). My
+  estimate/grid/reuse surface does not touch `OutDepth`, so cli.rs merged
+  cleanly. Design check against the new tasks: my Tier-1 `estimate`
+  reader + `film_base_flag`/`film_base_recipe` are exactly what
+  `base-acquisition-planner` (Tier 1) consumes and `roll-conversion` applies —
+  complementary, no overlap; I use only `Explicit`/`Region`/`Auto` sources, not
+  the `--base-content`/`FilmBaseSource::Content` owned by
+  `film-base-content-fallback`; and I touch no `Dmax` surface (owned by
+  `dmax-reference`). §8/§9 grid + reuse wording sits inside the existing
+  acquisition ladder without duplicating the new task specs.
+
+### What was built
+- **Reuse-ready report fields (`cli.rs`).** The `estimate` report now carries,
+  beside the raw `film_base` measurement:
+  - `film_base_flag` — a paste-ready `"--film-base R,G,B"` string. Values are
+    formatted with `f32`'s `Display` (shortest round-tripping decimal), so
+    parsing them back yields the **bit-identical** measured `f32`s.
+  - `film_base_recipe` — the same measurement as a `FilmBaseParams` fragment,
+    serializing to the documented `{"source":{"explicit":[r,g,b]}}` shape; it
+    parses back both standalone and as a recipe's `film_base` section
+    (unit-tested against `deny_unknown_fields`).
+  - Both are attached **only when the measurement passes the same
+    explicit-base validation `convert` applies** (each channel in `(0, 1]`).
+    A degenerate measurement (e.g. a region on the dark holder sampling ~0)
+    is still reported as `film_base`, but a warning explains why no
+    reuse-ready output was emitted — "reuse-ready" therefore implies "will be
+    accepted by convert".
+- **Grid calibration mode (`estimate --grid`, `pipeline/film_base.rs`).**
+  `estimate_grid(image, rect)` samples a fixed 5-cell grid (top-left,
+  top-right, bottom-left, bottom-right, center; each cell 25% × 25% of the
+  rectangle, ≥1 px, same 97th percentile as single-region sampling) over the
+  full frame or `--base-region`. Returns `GridEstimate { base, cells, spread,
+  tolerance, agreement }`:
+  - combined `base` = per-channel **median** across cells (robust to one bad
+    cell, deterministic);
+  - `spread` = per-channel `(max − min) / max` across cells, judged against
+    the documented `GRID_MAX_RELATIVE_SPREAD = 0.05`;
+  - disagreement is **diagnostic, not fatal**: the CLI pushes a report warning
+    naming the spread/tolerance and pointing at the per-cell evidence in
+    `grid.cells` (never averaged away silently).
+- **`--strict` on `estimate`.** Promotes any estimate warning (grid
+  disagreement, decode notes, unusable-base) to exit 1 *after* the report is
+  emitted — same contract as `convert`.
+
+### Key decisions / notes for dependents
+- **`--grid` is an estimate-only CLI mode, not a recipe key.** It configures a
+  *measurement/diagnostic* of the `estimate` command (like `--report`), not a
+  conversion knob: `convert` never grid-samples — the workflow is measure once
+  with `estimate`, then freeze the explicit value via the emitted flag/fragment.
+  So the four-spot knob wiring (Overrides/Params/merge/validate) deliberately
+  does not apply; the recipe surface is unchanged. clap-conflicts with
+  `--film-base` (nothing to sample) and `--auto-base` (grid replaces border
+  detection); compatible with `--base-region` (grid within the rectangle).
+- **Report `film_base_source` under `--grid`** is the overall rectangle sampled
+  (`{"region":[x,y,w,h]}`, full frame when no `--base-region`); the new `grid`
+  report object documents the per-cell method. No new `FilmBaseSource` variant —
+  grid never enters the convert/recipe surface.
+- `GridEstimate`/`GridCell` live in `pipeline/film_base.rs` (Serialize-only,
+  embedded in `Report` like `DecodeInfo`), keeping report-shape types beside
+  the stage that produces them.
+- Verified on the committed real fixtures: `estimate --base-region 0,0,60,60`
+  emits flag + fragment; full-frame `--grid` on a real (non-blank) frame
+  disagrees as expected (spread ≈ 0.42–0.56 ≫ 0.05) → warning, exit 0, and
+  exit 1 under `--strict`. E2E round-trip test feeds both the flag string and
+  the fragment (as `--params` recipe) back into `convert` and asserts the same
+  base and **byte-identical outputs** between the two reuse forms.
+- Docs: design-spec §8 (estimate example now shows the real report shape and
+  the grid mode), §9 ladder tier 1 + Global `--strict`, roadmap item 10 marked
+  shipped — `.md` and `.html` edited together.
+
+### Review
+- Ran `pr-review-toolkit:review-pr` (code / tests / silent-failure / type-design
+  / comments) — 1 full round + 1 confirmation round; confirmation came back
+  clean.
+  - **Fixed from round 1:** extracted the reuse-output computation into the
+    pure `reuse_ready(rgb) -> Option<(String, FilmBaseParams)>` so the
+    degenerate-suppression branch is unit-testable (and tested);
+    `GridEstimate.cells` tightened from `Vec<GridCell>` to `[GridCell; 5]`
+    (expresses the fixed layout at compile time, identical JSON, removes a
+    latent wrong-median hazard if the count ever changed); the grid warning
+    now distinguishes a *degenerate sample* (combined base channel ≤ 0) from
+    genuine *disagreement* (light leak/falloff/dust) so the diagnostic names
+    the actual problem; doc qualifiers (reuse fields are conditional; derived
+    grid fields; spread-sentinel ambiguity); added tests — all-black-frame
+    spread sentinel (guards against `0/0 = NaN` → `null` in the report),
+    clean `estimate --strict` exits 0, grid runs emit the reuse fields.
+  - **Deliberate, not fixed:** reuse fields are still emitted when a grid
+    *disagrees* but the combined base is valid — the median is designed to
+    resist one bad cell, the disagreement warning is loud, and `--strict`
+    fails the run; scripted consumers that want hard safety use `--strict`.
+  - **Disputed/deferred:** a plausibility floor for tiny-but-positive bases
+    (e.g. `0.002` from a region on the dark holder) was suggested (silent-
+    failure review, MEDIUM). Deferred: any threshold is arbitrary (a dense
+    orange mask legitimately scans B ≈ 0.03 on real fixtures), the emitted
+    value *is* accepted and correctly processed by `convert`, and design-spec
+    roadmap item 8 (`auto-base-redesign`) already owns `--base-region`
+    plausibility/uniformity warnings — recorded there rather than inventing a
+    magic constant here.
+
+### Post-merge review fix (2026-07-17) — grid degenerate base now hard-errors
+Six-reviewer pass (Codex + 5 lenses) on the reuse-output change found one
+warranted correctness gap: the `--grid` path only *warned* on a degenerate
+combined base (any channel non-finite or ≤ 0 — e.g. `--grid --base-region` on the
+dark holder) and exited 0 unless `--strict`, while the single-measurement path
+hard-errors on the identical condition at birth via `film_base::estimate`'s
+finite-and-positive guard. That asymmetry violated the CLAUDE.md film-base gotcha
+and design-spec §11 fail-loudly.
+- **Fix:** `cli::run_estimate` now, in the `--grid` branch, hard-errors after
+  `emit_report(...)` when the combined base has any non-finite or ≤ 0 channel —
+  **regardless of `--strict`** — using the same `NcError::Other` (exit 1) the
+  single-path guard returns, so both estimate paths map a degenerate base to one
+  exit code. The per-cell "grid measured non-positive transmission…" warning
+  still rides the emitted report as diagnostics; the diagnostic report (with
+  `grid.cells`) lands on stdout *before* the gate, same emit-before-gate contract
+  as the `--strict` check.
+- **Docs:** design-spec §8 (grid behavior) and §11 (exit code) updated in both
+  `.md` and `.html` to state `--grid` errors (exit 1) on a degenerate combined
+  base regardless of `--strict`.
+- **Tests added:** `film_base.rs` — odd, non-square grid rect (cell sizing /
+  center-origin arithmetic + in-bounds), single-channel disagreement drives the
+  agreement verdict, and a note-pinning test that `estimate_grid` itself reports
+  (not errors) a degenerate base (the hard error is the caller's job).
+  `tests/pipeline.rs` — e2e `estimate --grid` on an all-black frame exits 1
+  without `--strict`, matching the single-path degenerate exit, with the report
+  emitted first. New committed fixture `tests/fixtures/black-48bit.tif` (64×64
+  all-zero 16-bit RGB) supplies the all-black input (generated once via a
+  throwaway in-crate generator, since integration tests can't reach the `tiff`
+  crate).
+
+### Post-merge follow-ups (2026-07-17) — type-design + doc from the same review
+Three further items the user decided after the review:
+- **(doc, no behavior change) Reuse output survives grid disagreement.** Made
+  explicit that a cells-disagree *warning* does NOT suppress the reuse-ready
+  output — the combined median resists a single bad cell, so the base is still
+  offered; consumers check `warnings` or run `--strict`. Documented in
+  design-spec §8 (md+html) and at the `reuse_ready` emission site in
+  `run_estimate`. Only a *degenerate* base withholds the reuse forms (and it is a
+  hard error).
+- **(Type #1, done) Collapsed the parallel reuse `Option`s.** `Report`'s
+  `film_base_flag: Option<String>` + `film_base_recipe: Option<FilmBaseParams>`
+  (illegal flag-without-recipe was representable) became one
+  `reuse: Option<ReuseReady>` where `struct ReuseReady { flag, recipe }` — both-or-
+  neither is now unrepresentable (the CLAUDE.md parallel-`Option` anti-pattern).
+  Wire shape is **byte-identical**: `#[serde(flatten)]` on the `Option` plus
+  `#[serde(rename = "film_base_flag" / "film_base_recipe")]` on the struct fields
+  keeps the two flat top-level keys (present together / both absent); the `reuse`
+  wrapper name never appears on the wire. Safe because `Report` is serialize-only
+  (no `Deserialize`/`deny_unknown_fields`, so no flatten conflict). Added a
+  snapshot unit test (`report_reuse_flattens_to_flat_keys_or_nothing`) locking the
+  shape; existing round-trip/e2e tests pass unchanged.
+- **(Type #2, deferred to a task) `GridEstimate.agreement: bool` limitation.**
+  Documented on the type that `agreement=false` conflates *disagree* vs
+  *degenerate* and that the `spread` `1.0` value is an overloaded sentinel, so the
+  CLI re-derives the case from the base. Kept as-is for now; created
+  `docs/tasks/grid-verdict-enum.md` (replace the bool + sentinel with a
+  `GridVerdict { Uniform | Disagree | Degenerate }` enum; deps
+  `estimate-reuse-output`, `film-base-estimation`; post-MVP) and wired it into
+  `TASKS.md` (Mermaid graph, dependency list, Phase 5 checklist as `[ ]`).
+
+### Follow-ups / deferred (with reasons)
+- Grid tolerance (0.05) is a documented constant, not a flag — make it a knob
+  only if real blank-frame scans show legitimate falloff above 5%
+  (`real-scan-verification` can inform this).
+- `inspect`'s suggested-Dmin output does not carry the reuse fields (kept
+  estimate-only per the task scope; trivial to add later if wanted).
+- `--base-region` plausibility (dark-holder detection / uniformity warning)
+  stays with `auto-base-redesign` (roadmap item 8), which owns that diagnostic.
+- If grid sampling ever becomes a `convert`-usable source, it must join
+  `FilmBaseSource` as a variant (one enum per the conventions), not a bool
+  beside it.
 
 ## dmax-white-anchor
 **Status:** done

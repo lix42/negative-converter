@@ -293,6 +293,181 @@ fn mixed_base_region_warns_and_strict_refuses_it() {
 }
 
 #[test]
+fn estimate_emits_reuse_ready_output_that_round_trips() {
+    // The calibrate-once → reuse workflow (design-spec §8): `estimate` must emit
+    // the measured base as a paste-ready `--film-base` flag and a `film_base`
+    // recipe fragment, and feeding either back to `convert` must reproduce the
+    // exact same base (and thus a byte-identical output).
+    let tmp = TempDir::new("reuse");
+    let fix = fixture("hdr-48bit.tif");
+    // Focus: the reuse round-trip. (This real-photo fixture has no
+    // region-uniform patch, so the inward-scan uniformity check warns on any
+    // `--base-region` here — `--strict` estimate behavior is covered separately
+    // by `mixed_base_region_warns_and_strict_refuses_it`.)
+    let (code, stdout, err) = run(&[
+        "estimate",
+        fix.to_str().unwrap(),
+        "--base-region",
+        "0,0,60,60",
+    ]);
+    assert_eq!(code, 0, "estimate should succeed: {err}");
+    let report = json(&stdout);
+    let base = report["film_base"].clone();
+
+    // The flag string is `--film-base R,G,B` with the measured values.
+    let flag = report["film_base_flag"].as_str().expect("flag emitted");
+    let value = flag.strip_prefix("--film-base ").expect("flag prefix");
+    // The recipe fragment is the documented `{"source":{"explicit":[…]}}` shape,
+    // carrying exactly the same numbers as the measurement.
+    let fragment = &report["film_base_recipe"];
+    assert_eq!(
+        fragment["source"]["explicit"],
+        serde_json::json!([base["r"], base["g"], base["b"]]),
+        "fragment must carry the measured base: {report}"
+    );
+
+    // Round-trip A: the flag value fed to `convert` reproduces the base.
+    let out_flag = tmp.path("flag.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out_flag.to_str().unwrap(),
+        "--output-hdr",
+        "--film-base",
+        value,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let convert_report = json(&stdout);
+    assert_eq!(
+        convert_report["film_base"], base,
+        "--film-base from the flag string must reproduce the measured base"
+    );
+
+    // Round-trip B: the fragment pasted into a recipe reproduces the base and
+    // a byte-identical output (determinism across the two reuse forms).
+    let recipe = tmp.path("roll.json");
+    std::fs::write(
+        &recipe,
+        serde_json::json!({ "film_base": fragment }).to_string(),
+    )
+    .unwrap();
+    let out_recipe = tmp.path("recipe.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out_recipe.to_str().unwrap(),
+        "--output-hdr",
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "fragment must load as a valid recipe: {err}");
+    assert_eq!(json(&stdout)["film_base"], base);
+    assert_eq!(
+        std::fs::read(&out_flag).unwrap(),
+        std::fs::read(&out_recipe).unwrap(),
+        "flag and fragment reuse must produce byte-identical outputs"
+    );
+}
+
+#[test]
+fn estimate_grid_reports_spread_and_strict_promotes_disagreement() {
+    // `--grid` samples 5 fixed cells; on a real (non-blank) frame the cells
+    // disagree, which must be reported loudly — per-cell evidence in the
+    // report, a warning, and a failing exit under `--strict` — never averaged
+    // away silently.
+    let fix = fixture("hdr-48bit.tif");
+    let (code, stdout, err) = run(&["estimate", fix.to_str().unwrap(), "--grid"]);
+    assert_eq!(
+        code, 0,
+        "non-strict disagreement is a warning, not fatal: {err}"
+    );
+    let report = json(&stdout);
+    let grid = &report["grid"];
+    assert_eq!(grid["cells"].as_array().unwrap().len(), 5);
+    assert_eq!(grid["agreement"], false, "picture content must disagree");
+    assert!(grid["spread"][0].as_f64().unwrap() > grid["tolerance"].as_f64().unwrap());
+    assert!(
+        grid["cells"][0]["region"].is_array() && grid["cells"][0]["base"]["r"].is_number(),
+        "per-cell evidence must be reported: {report}"
+    );
+    // The sampled rectangle (the fixture's full 502x462 frame) is recorded as
+    // the structured source.
+    assert_eq!(
+        report["film_base_source"]["region"],
+        serde_json::json!([0, 0, 502, 462])
+    );
+    // The grid path feeds the same reuse-ready output as a single measurement
+    // (the combined median base here is valid, so the flag must be present).
+    assert!(
+        report["film_base_flag"].is_string(),
+        "grid runs emit reuse-ready output too: {report}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("grid cells disagree")),
+        "disagreement must be a report warning: {report}"
+    );
+
+    // `--strict` promotes the disagreement warning to exit 1 after the report.
+    let (code, stdout, err) = run(&["estimate", fix.to_str().unwrap(), "--grid", "--strict"]);
+    assert_eq!(code, 1, "--strict must fail on grid disagreement");
+    let _ = json(&stdout); // the report still lands on stdout before the gate
+    assert!(err.contains("strict"), "stderr should explain: {err}");
+}
+
+#[test]
+fn estimate_grid_degenerate_base_hard_errors_without_strict() {
+    // A degenerate combined grid base (an all-black frame — the same condition a
+    // `--grid --base-region` on the dark holder produces) is not a usable Dmin
+    // anchor. The grid path must hard-error on it **without** `--strict`, mapping
+    // to the same exit code the single-measurement path's finite-and-positive
+    // guard returns for a degenerate base (`NcError::Other` → exit 1) — and the
+    // diagnostic report (with `grid.cells`) must still land on stdout first.
+    let fix = fixture("black-48bit.tif");
+
+    // The single-measurement degenerate exit code, established on the same input:
+    // a `--base-region` on the all-black frame fails `estimate`'s birth guard.
+    let (single_code, _stdout, single_err) = run(&[
+        "estimate",
+        fix.to_str().unwrap(),
+        "--base-region",
+        "0,0,32,32",
+    ]);
+    assert_eq!(single_code, 1, "single-path degenerate base is exit 1");
+    assert!(
+        single_err.contains("finite and positive"),
+        "single-path error names the degenerate condition: {single_err}"
+    );
+
+    // The grid path on the same frame — no `--strict` — must match that exit code.
+    let (code, stdout, err) = run(&["estimate", fix.to_str().unwrap(), "--grid"]);
+    assert_eq!(
+        code, single_code,
+        "grid degenerate base must map to the single-path exit code without --strict: {err}"
+    );
+    // The report is emitted before the gate: stdout is clean JSON carrying the
+    // five grid cells that diagnose the degenerate sample.
+    let report = json(&stdout);
+    assert_eq!(report["command"], "estimate");
+    assert_eq!(report["grid"]["cells"].as_array().unwrap().len(), 5);
+    assert_eq!(report["grid"]["agreement"], false);
+    // No reuse-ready output for a degenerate base.
+    assert!(
+        report["film_base_flag"].is_null(),
+        "a degenerate base must not be advertised as reusable: {report}"
+    );
+    assert!(
+        err.contains("finite and positive"),
+        "the hard error names the degenerate condition: {err}"
+    );
+}
+
+#[test]
 fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
     let tmp = TempDir::new("ir");
     // HDRi: the IR plane is written.

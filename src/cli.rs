@@ -95,18 +95,28 @@ pub struct IoArgs {
 }
 
 /// `estimate`: an input scan, the film-base source flags (so the
-/// calibrate-once-from-a-reference workflow works, design-spec §8), and
-/// reporting controls.
+/// calibrate-once-from-a-reference workflow works, design-spec §8), the grid
+/// calibration mode, and reporting controls.
 #[derive(Args, Debug)]
 pub struct EstimateArgs {
     /// Input negative scan (SilverFast HDR/HDRi TIFF).
     pub input: PathBuf,
+    /// Sample a fixed 5-cell grid (corners + center) over the frame — or over
+    /// `--base-region` — instead of a single measurement. For unexposed
+    /// reference frames (design-spec §9 ladder tier 1): the per-cell spread is
+    /// reported and disagreement warns loudly (it diagnoses light leaks,
+    /// illumination falloff, or dust). Incompatible with an explicit
+    /// `--film-base` (nothing to sample) and with `--auto-base` (grid replaces
+    /// border detection).
+    #[arg(long, conflicts_with_all = ["film_base", "auto_base"])]
+    pub grid: bool,
     #[command(flatten)]
     pub film_base: FilmBaseOverrides,
-    /// Treat estimation warnings (e.g. a non-uniform `--base-region`) as a hard
-    /// error. `estimate` produces the `Dmin` a roll is calibrated on, so a
-    /// script baking the result into a recipe wants a plausible-looking-but-bad
-    /// base to fail loudly rather than be echoed back.
+    /// Treat estimation warnings (a non-uniform `--base-region`, grid
+    /// disagreement, decode notes, …) as a hard error. `estimate` produces the
+    /// `Dmin` a roll is calibrated on, so a script baking the result into a
+    /// recipe wants a plausible-looking-but-bad base to fail loudly rather than
+    /// be echoed back.
     #[arg(long)]
     pub strict: bool,
     #[command(flatten)]
@@ -342,6 +352,26 @@ pub struct ResolvedConfig {
 // Report
 // ---------------------------------------------------------------------------
 
+/// The reuse-ready forms of a measured film base, kept as one unit so the flag
+/// and the recipe fragment are both-present-or-both-absent — the illegal
+/// flag-without-recipe (or recipe-without-flag) state two parallel `Option`s
+/// would permit is unrepresentable (the parallel-`Option` anti-pattern in
+/// `CLAUDE.md`). Serialize-only; the field renames keep the two forms as the
+/// flat top-level report keys `film_base_flag` / `film_base_recipe` when this is
+/// `#[serde(flatten)]`ed into [`Report`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ReuseReady {
+    /// Ready-to-paste `--film-base R,G,B` flag for the measured base; the values
+    /// round-trip to the exact measured `f32`s.
+    #[serde(rename = "film_base_flag")]
+    pub flag: String,
+    /// The same measurement as a minimal recipe fragment for the `film_base`
+    /// section — `{"source":{"explicit":[r,g,b]}}` — ready to merge into a roll
+    /// recipe.
+    #[serde(rename = "film_base_recipe")]
+    pub recipe: FilmBaseParams,
+}
+
 /// Machine-readable result emitted on stdout (or `--report-file`). One shape
 /// serves all three commands; irrelevant fields are `None`/empty and omitted
 /// from the JSON (`skip_serializing_if`), so an agent gets a clean object per
@@ -378,6 +408,8 @@ pub struct Report {
     /// How the film base was chosen, as the structured [`FilmBaseSource`]
     /// (`"auto"` / `{"region":[…]}` / `{"explicit":[…]}`) so an agent gets the
     /// sampled rectangle / explicit values without string-parsing a label.
+    /// For `estimate --grid` this is the overall rectangle the grid sampled
+    /// (`{"region":[…]}`); the `grid` field documents the per-cell method.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base_source: Option<FilmBaseSource>,
     /// Candidate unexposed-rebate bands from the inward-scan detector
@@ -387,6 +419,22 @@ pub struct Report {
     /// and a future UI draws its highlight rectangles from the same data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_candidates: Option<Vec<film_base::RebateCandidate>>,
+    /// Reuse-ready forms of the measured base (`estimate`): a ready-to-paste
+    /// `--film-base R,G,B` flag and the matching `film_base` recipe fragment, so
+    /// the calibrate-once → reuse workflow (design-spec §8) is copy-paste smooth.
+    /// Both forms are present together or both absent — the pair only exists when
+    /// the measurement is usable as an explicit base (each channel in `(0, 1]`),
+    /// so a single [`ReuseReady`] (both-or-neither) replaces two parallel
+    /// `Option`s that could encode the illegal flag-without-recipe state. Flattened
+    /// so the two forms stay flat top-level keys (`film_base_flag` /
+    /// `film_base_recipe`) on the wire; `None` emits neither.
+    #[serde(flatten)]
+    pub reuse: Option<ReuseReady>,
+    /// Grid-sampling result (`estimate --grid`): the per-cell values, their
+    /// per-channel spread, the agreement tolerance and verdict. Disagreement
+    /// additionally lands in `warnings` (and fails under `--strict`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid: Option<film_base::GridEstimate>,
     /// Path the IR plane was exported to, when `--export-ir` was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ir_exported: Option<PathBuf>,
@@ -1336,10 +1384,33 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     )
 }
 
+/// Reuse-ready forms of a measured base: a paste-ready `--film-base R,G,B`
+/// flag string and the matching `film_base` recipe fragment — or `None` when
+/// the measurement fails the explicit-base validation `convert` applies (each
+/// channel in `(0, 1]`), so a degenerate base is never advertised as reusable.
+/// `f32`'s `Display` prints the shortest round-tripping decimal, so both forms
+/// reproduce the exact measured value when fed back to `convert`.
+fn reuse_ready(rgb: [f32; 3]) -> Option<(String, FilmBaseParams)> {
+    validate_explicit_film_base(&rgb).ok()?;
+    Some((
+        format!("--film-base {},{},{}", rgb[0], rgb[1], rgb[2]),
+        FilmBaseParams {
+            source: FilmBaseSource::Explicit(rgb),
+        },
+    ))
+}
+
 /// `nc estimate` — run only film-base / `Dmin` estimation from the selected
-/// source (default `auto`, or `--base-region`/`--film-base`) and emit the
-/// resolved [`FilmBase`] as JSON. Auto detection may fail loudly on real scans;
-/// that propagates as an error (the user asked for an estimate we can't give).
+/// source (default `auto`, or `--base-region`/`--film-base`; `--grid` samples
+/// a 5-cell grid for unexposed-frame calibration) and emit the resolved
+/// [`FilmBase`] as JSON — together with reuse-ready forms of it (a
+/// `--film-base` flag string and a `film_base` recipe fragment) when the
+/// measurement is usable as an explicit base (each channel in `(0, 1]`;
+/// otherwise a warning explains why not) — so the measured value drops
+/// straight into a `convert` call or a roll recipe (design-spec §8). Auto
+/// detection may fail loudly on real scans; that propagates as an error (the
+/// user asked for an estimate we can't give). `--strict` promotes warnings
+/// (e.g. grid disagreement) to a failing exit after the report is emitted.
 fn run_estimate(args: EstimateArgs) -> Result<()> {
     let started = Instant::now();
     let log = Log::new(&args.report);
@@ -1361,34 +1432,131 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         info.format, info.width, info.height, info.ir_present
     ));
 
-    let est = film_base::estimate(
-        &image,
-        &FilmBaseParams {
-            source: source.clone(),
-        },
-    )?;
-
     let mut report = Report {
         command: Some("estimate"),
         input: Some(args.input.clone()),
-        film_base: Some(est.base),
-        film_base_source: Some(source),
         ..Report::default()
     };
     for w in &info.warnings {
         push_warning(&mut report, &log, w.clone());
     }
-    for w in est.warnings {
-        push_warning(&mut report, &log, w);
+
+    let base = if args.grid {
+        // Grid calibration: clap rejects `--grid` with `--film-base` /
+        // `--auto-base`, so the rectangle is `--base-region` or the full frame.
+        let rect = args
+            .film_base
+            .base_region
+            .unwrap_or([0, 0, image.width, image.height]);
+        let grid = film_base::estimate_grid(&image, rect)?;
+        if !grid.agreement {
+            // The 1.0 spread sentinel also fires when a channel's cells all
+            // measure ~0 (a degenerate sample, not a light leak); diagnose by
+            // the combined base so the warning names the actual problem.
+            let msg = if <[f32; 3]>::from(grid.base).iter().any(|v| *v <= 0.0) {
+                format!(
+                    "grid measured non-positive transmission (combined base \
+                     [{}, {}, {}]) — degenerate sample, not film base; was the \
+                     sampled area unexposed film? See the report's grid.cells",
+                    grid.base.r, grid.base.g, grid.base.b
+                )
+            } else {
+                format!(
+                    "grid cells disagree: per-channel relative spread \
+                     [{:.4}, {:.4}, {:.4}] exceeds tolerance {} — possible light \
+                     leak, scanner illumination falloff, or dust; see the \
+                     report's grid.cells for the per-region values",
+                    grid.spread[0], grid.spread[1], grid.spread[2], grid.tolerance
+                )
+            };
+            push_warning(&mut report, &log, msg);
+        }
+        // The source records the overall rectangle the grid sampled; the
+        // `grid` report field documents the per-cell method.
+        report.film_base_source = Some(FilmBaseSource::Region(rect));
+        let base = grid.base;
+        report.grid = Some(grid);
+        base
+    } else {
+        // Single-measurement path: `film_base::estimate` guards the base
+        // finite-and-positive at birth (auto-base-redesign) and may attach
+        // quality warnings (non-uniform region, cross-edge disagreement).
+        let est = film_base::estimate(
+            &image,
+            &FilmBaseParams {
+                source: source.clone(),
+            },
+        )?;
+        report.film_base_source = Some(source);
+        for w in est.warnings {
+            push_warning(&mut report, &log, w);
+        }
+        est.base
+    };
+    report.film_base = Some(base);
+
+    // Reuse-ready forms — attached only when the measurement passes the
+    // explicit-base validation `convert` applies: a base outside `(0, 1]` on any
+    // channel is still reported as the measurement, but never as "reuse-ready".
+    // The single-measurement path already errors on a degenerate base via
+    // `estimate`'s guard; the grid path's degenerate (`<= 0` / non-finite)
+    // combined base is hard-errored below, *after* the report is emitted — so
+    // this suppression keeps that emitted report from advertising the degenerate
+    // value as reusable, and still stands alone for a non-degenerate but
+    // out-of-range base (a channel `> 1`).
+    //
+    // Deliberately independent of grid *agreement*: a `--grid` run whose cells
+    // disagree (light leak / falloff / dust) still emits reuse-ready output when
+    // the combined median base is in range — the median resists a single bad
+    // cell, and the disagreement already rides `warnings`. A consumer treating
+    // the base as authoritative must check `warnings` (or run `--strict`, which
+    // promotes the disagreement to a hard failure); only a *degenerate* base
+    // withholds the reuse forms. (Design-spec §8.)
+    match reuse_ready(<[f32; 3]>::from(base)) {
+        Some((flag, recipe)) => {
+            report.reuse = Some(ReuseReady { flag, recipe });
+        }
+        None => push_warning(
+            &mut report,
+            &log,
+            format!(
+                "measured base {:?} is not usable as an explicit --film-base \
+                 (channels must be in (0, 1]) — was the sampled area unexposed \
+                 film base? No reuse-ready output emitted",
+                <[f32; 3]>::from(base)
+            ),
+        ),
     }
+
     report.elapsed_ms = Some(elapsed_ms(started));
     // Emit the report before the `--strict` gate so the machine-readable record
-    // (the measured base) lands even when a warning then fails the run.
+    // (the measured base) lands even when a warning then fails the run (same
+    // contract as `convert`).
     emit_report(
         &report,
         args.report.report,
         args.report.report_file.as_deref(),
     )?;
+    // A degenerate grid combined base (non-finite or <= 0 on any channel — e.g.
+    // `--grid --base-region` on the dark holder) cannot anchor the density
+    // divide, so hard-error **regardless of `--strict`**, mirroring the
+    // single-measurement path where `film_base::estimate`'s finite-and-positive
+    // guard rejects the same condition at birth. Same `NcError::Other` (exit 1)
+    // as that guard, so both estimate paths map a degenerate base to one exit
+    // code. The diagnostic report (with `grid.cells` and the per-cell warning) is
+    // emitted above first, so the evidence lands before this gate.
+    if args.grid
+        && <[f32; 3]>::from(base)
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0)
+    {
+        return Err(NcError::Other(format!(
+            "grid combined film base {:?} is not finite and positive on every \
+             channel; it cannot anchor the density divide — was the sampled area \
+             unexposed film base? See the report's grid.cells",
+            <[f32; 3]>::from(base)
+        )));
+    }
     if args.strict && !report.warnings.is_empty() {
         return Err(NcError::Other(format!(
             "--strict: {} warning(s) present (see report)",
@@ -2006,6 +2174,122 @@ mod tests {
                 "0.9,0.5,0.4"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn estimate_grid_conflicts_with_explicit_and_auto_base() {
+        // Grid replaces sampling/detection, so an explicit base or auto-base
+        // alongside it is contradictory — clap must reject, not silently pick.
+        for bad in [
+            ["--grid", "--film-base", "0.9,0.5,0.4"].as_slice(),
+            ["--grid", "--auto-base"].as_slice(),
+        ] {
+            let mut argv = vec!["nc", "estimate", "in.tiff"];
+            argv.extend_from_slice(bad);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{bad:?} should conflict"
+            );
+        }
+        // `--grid` with `--base-region` is the documented sub-rectangle mode.
+        let cli = Cli::try_parse_from([
+            "nc",
+            "estimate",
+            "in.tiff",
+            "--grid",
+            "--base-region",
+            "0,0,9,9",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Estimate(a) => {
+                assert!(a.grid);
+                assert_eq!(a.film_base.base_region, Some([0, 0, 9, 9]));
+            }
+            _ => unreachable!("expected estimate"),
+        }
+    }
+
+    #[test]
+    fn reuse_ready_fragment_round_trips_as_a_recipe() {
+        // The `film_base_recipe` report fragment must parse back both as the
+        // `film_base` section value and inside a full recipe — otherwise the
+        // advertised paste-into-a-roll-recipe workflow is broken.
+        let fragment = FilmBaseParams {
+            source: FilmBaseSource::Explicit([0.553, 0.271, 0.159]),
+        };
+        let json = serde_json::to_string(&fragment).unwrap();
+        assert_eq!(json, r#"{"source":{"explicit":[0.553,0.271,0.159]}}"#);
+        let back: FilmBaseParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, fragment);
+        let recipe: ResolvedConfig =
+            serde_json::from_str(&format!(r#"{{"film_base":{json}}}"#)).unwrap();
+        assert_eq!(recipe.film_base, fragment);
+        validate(&recipe).unwrap();
+    }
+
+    #[test]
+    fn film_base_flag_string_round_trips_exact_f32s() {
+        // `Display` for f32 prints the shortest decimal that parses back to the
+        // same bits, so the emitted `--film-base` string reproduces the exact
+        // measured base — including awkward values with no short decimal form.
+        let rgb = [0.553_712_3_f32, 1.0 / 3.0, f32::MIN_POSITIVE];
+        let (flag, fragment) = reuse_ready(rgb).expect("a valid base is reuse-ready");
+        let value = flag.strip_prefix("--film-base ").unwrap();
+        assert_eq!(parse_rgb(value).unwrap(), rgb);
+        // The two forms carry the same value — never allowed to drift.
+        assert_eq!(fragment.source, FilmBaseSource::Explicit(rgb));
+    }
+
+    #[test]
+    fn report_reuse_flattens_to_flat_keys_or_nothing() {
+        // The wire contract: the reuse pair serializes as two flat top-level keys
+        // (`film_base_flag` / `film_base_recipe`), both present together, and the
+        // `ReuseReady` wrapper / `reuse` field name never leaks. `None` emits
+        // neither key. Locks the `#[serde(flatten)]` + rename shape so a refactor
+        // can't silently change the agent-facing JSON.
+        // Values exactly representable in f32 (halves/quarters/eighths) so the
+        // JSON literals match without precision noise — the shape is the point.
+        let with = Report {
+            reuse: Some(ReuseReady {
+                flag: "--film-base 0.5,0.25,0.125".to_string(),
+                recipe: FilmBaseParams {
+                    source: FilmBaseSource::Explicit([0.5, 0.25, 0.125]),
+                },
+            }),
+            ..Report::default()
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["film_base_flag"], "--film-base 0.5,0.25,0.125");
+        assert_eq!(
+            v["film_base_recipe"],
+            serde_json::json!({ "source": { "explicit": [0.5, 0.25, 0.125] } })
+        );
+        assert!(v.get("reuse").is_none(), "the wrapper name must not leak");
+
+        let without = Report::default();
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(v.get("film_base_flag").is_none());
+        assert!(v.get("film_base_recipe").is_none());
+        assert!(v.get("reuse").is_none());
+    }
+
+    #[test]
+    fn reuse_ready_suppresses_degenerate_bases() {
+        // The safety contract of the reuse output: a measurement `convert`
+        // would reject (dark-holder zero, non-finite, >1 typo-scale) must never
+        // be advertised as a paste-ready --film-base.
+        assert!(reuse_ready([0.0, 0.5, 0.5]).is_none()); // dark holder channel
+        assert!(reuse_ready([f32::NAN, 0.5, 0.5]).is_none()); // numerical fault
+        assert!(reuse_ready([0.9, 90.0, 0.4]).is_none()); // "90" typo for "0.90"
+        assert!(reuse_ready([-0.1, 0.5, 0.5]).is_none()); // negative
+        // A valid base produces the exact flag string and matching fragment.
+        let (flag, fragment) = reuse_ready([0.553, 0.271, 0.159]).unwrap();
+        assert_eq!(flag, "--film-base 0.553,0.271,0.159");
+        assert_eq!(
+            fragment.source,
+            FilmBaseSource::Explicit([0.553, 0.271, 0.159])
         );
     }
 
