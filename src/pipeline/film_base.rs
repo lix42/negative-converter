@@ -635,10 +635,11 @@ pub fn estimate_grid(image: &LinearImage, rect: [u32; 4]) -> Result<GridEstimate
     let mut base = [0.0f32; 3];
     let mut spread = [0.0f32; 3];
     for c in 0..3 {
-        let mut vals: Vec<f32> = cells
-            .iter()
-            .map(|cell| <[f32; 3]>::from(cell.base)[c])
-            .collect();
+        // Exactly `cells.len()` (== 5) values — a fixed-size stack array, no heap.
+        let mut vals = [0.0f32; 5];
+        for (i, cell) in cells.iter().enumerate() {
+            vals[i] = <[f32; 3]>::from(cell.base)[c];
+        }
         vals.sort_by(f32::total_cmp);
         base[c] = vals[vals.len() / 2];
         let (lo, hi) = (vals[0], vals[vals.len() - 1]);
