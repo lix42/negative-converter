@@ -68,8 +68,10 @@ the version (the cache dir is `~/.claude/plugins/cache/openai-codex/codex/<ver>/
 and the plugin auto-updates):
 
 ```
-# Resolve the installed companion script (any version), then review the worktree.
-codex_mjs=$(ls -t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs | head -1)
+# Resolve the installed companion script (highest version), then review the worktree.
+# Use /bin/ls (not bare `ls`) — a `ls` aliased to eza/lsd/uutils reads `-t` as
+# "--time <FIELD>" and errors; /bin/ls is the real coreutils binary.
+codex_mjs=$(/bin/ls -1 ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs 2>/dev/null | sort -V | tail -1)
 node "$codex_mjs" review --wait --scope working-tree
 ```
 
