@@ -258,6 +258,7 @@
 <blockquote>
   <p><strong>Under reconsideration (2026-07).</strong> Treating <code>Dmax</code> as frame-local <code>auto</code> effectively <em>normalizes exposure per frame</em> — it brightens underexposed frames and forces an overcast scene's grey to display white — which conflicts with NC's "convert, don't grade" purpose (exposure belongs in Lightroom). The planned direction makes <code>Dmax</code> a <strong>roll-fixed calibration</strong> measured once from a fully-exposed reference frame (the light-struck leader), reused like <code>Dmin</code>, with per-frame <code>--auto-d-max</code> demoted to an opt-in exposure-normalizing mode. See §12 item 14 (<code>dmax-reference</code>). The frame-local <code>auto</code> behavior described above is what currently ships.</p>
 </blockquote>
+<p><strong>Auto neutral white balance (<code>print.white_balance</code>).</strong> The step-4 white-balance gains are a single mutually-exclusive source: explicit <code>[r, g, b]</code> gains (the default, <code>[1, 1, 1]</code> = neutral), or one of two deterministic per-frame estimators — <code>"gray-world"</code> (equalize the trimmed per-channel means, ≈ NLP Auto-AVG) or <code>"percentile"</code> (equalize the channels at a matched near-white percentile, ≈ NLP Auto-Neutral; more robust to a dominant scene color). The estimators are pure statistics over a neutrally-rendered positive — finite samples only, distribution extremes excluded (trim / the percentile's top tail) so clipped speculars and dead pixels can't skew the estimate; no ML. Gains are <strong>green-anchored</strong> (<code>g = 1</code>): auto WB corrects color, not overall brightness (that is <code>print_exposure</code>'s job). The estimated gains are applied through the <strong>same step-4 slot</strong> as explicit gains — before <code>black_point</code> and the highlight soft-clip, never a post-hoc multiply — and the resolved gains land in the convert JSON report, so a run that reuses them via <code>--white-balance</code> reproduces the output bit-for-bit (measure once, reuse for the roll; §8). Explicit gains beat an auto mode <strong>by source</strong>, not value: <code>--white-balance 1,1,1</code> over a recipe's auto mode means neutral gains, not re-estimation. See §9.</p>
 <p>Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as separate, independently parameterized sub-stages — the core fidelity rule.</p>
 
 <h3>7.3 <code>sigmoid</code> — density-domain S-curve (H&amp;D / paper response)</h3>
@@ -373,7 +374,15 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # guard.
 # --grid conflicts with --film-base (nothing to sample) and --auto-base (the
 # grid replaces border detection). Deterministic: fixed layout, fixed percentile.
-nc estimate blank.tiff --grid --report json</code></pre>
+nc estimate blank.tiff --grid --report json
+
+# Auto neutral white balance: estimate per-frame gains (percentile ≈ NLP
+# Auto-Neutral; gray-world ≈ Auto-AVG), read the resolved gains back from the
+# report, and freeze them into --white-balance / the roll recipe
+# (print.white_balance = {"explicit": [...]}) — the reuse run is bit-identical.
+nc convert frame01.tiff -o frame01_pos.tiff --auto-wb percentile --report json
+# → { "white_balance": [1.083, 1.0, 0.941], ... }
+nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941</code></pre>
 
 <h2 id="params">9. Parameter reference (grouped by stage)</h2>
 <p>Every flag is also a recipe key, nested under the stage object shown in each heading below (e.g. <code>--density-gamma</code> ⇒ <code>density.density_gamma</code>, <code>--output-hdr</code> ⇒ <code>output.hdr</code>, <code>--algorithm</code> ⇒ top-level <code>algorithm</code>). Names are binding — the recipe structs and this section are kept in sync (<code>deny_unknown_fields</code>). Unknown keys are rejected (see the Recipes section).</p>
@@ -425,7 +434,14 @@ nc estimate blank.tiff --grid --report json</code></pre>
 <ul>
   <li><code>--print-exposure &lt;f&gt;</code> — overall positive exposure.</li>
   <li><code>--black-point &lt;f&gt;</code> — paper black / shadow floor.</li>
-  <li><code>--white-balance R,G,B</code> — highlight/neutral white balance gains.</li>
+  <li>White balance — a single mutually-exclusive choice, recipe key <code>print.white_balance</code> (default <code>{ "explicit": [1, 1, 1] }</code> = neutral; see §7.2). The two flags conflict (passing both is a usage error); whichever is given replaces a recipe's <code>white_balance</code> entirely. Explicit gains beat an auto mode <strong>by source</strong> — <code>--white-balance 1,1,1</code> over an auto recipe means neutral gains, not re-estimation:
+    <ul>
+      <li><code>--white-balance R,G,B</code> ⇒ <code>{ "explicit": [r, g, b] }</code> — fixed highlight/neutral gains. For backward compatibility the recipe key also accepts a <strong>bare <code>[r, g, b]</code> array</strong> (the pre-auto-WB on-disk form, when <code>white_balance</code> was a plain array) as explicit gains, so older recipes / sidecars still parse; new output always writes the tagged form.</li>
+      <li><code>--auto-wb gray-world</code> ⇒ <code>"gray-world"</code> — equalize the trimmed per-channel means (≈ Auto-AVG). Assumes the frame averages to neutral, so a dominant scene color biases it.</li>
+      <li><code>--auto-wb percentile</code> ⇒ <code>"percentile"</code> — equalize the channels at a matched near-white percentile (≈ Auto-Neutral); more robust to dominant colors. The resolved gains land in the convert report (<code>white_balance</code>, green-anchored) ready to freeze into <code>--white-balance</code> / a roll recipe (§8).</li>
+    </ul>
+    An auto mode requires <code>--algorithm density</code> or <code>--algorithm sigmoid</code> — the <code>simple</code> algorithm is the only one with no print white-balance stage, so <code>--auto-wb</code> with <code>simple</code> is a usage error (exit 2) rather than a silently dropped request (§3 fail-loudly).
+  </li>
   <li><code>--highlight-compress &lt;f&gt;</code> — highlight roll-off amount.</li>
 </ul>
 <h4>Simple algorithm</h4>

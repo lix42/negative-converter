@@ -69,3 +69,8 @@ convert:  decode → film base → algorithm → [auto-wb analysis → re-render
 
 - [Density-domain algorithm](algo-density.md)
 - [Pipeline orchestration](pipeline-orchestration.md)
+
+## See also
+
+- [White balance & roll consistency](../white-balance.md) — why auto-WB varies
+  per frame, and how to freeze one correction across a roll.

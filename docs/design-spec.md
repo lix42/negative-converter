@@ -245,6 +245,24 @@ disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.
 > item 14 (`dmax-reference`). The frame-local `auto` behavior described above is
 > what currently ships.
 
+**Auto neutral white balance (`print.white_balance`).** The step-4 white-balance
+gains are a single mutually-exclusive source: explicit `[r, g, b]` gains (the
+default, `[1, 1, 1]` = neutral), or one of two deterministic per-frame
+estimators — `"gray-world"` (equalize the trimmed per-channel means, ≈ NLP
+Auto-AVG) or `"percentile"` (equalize the channels at a matched near-white
+percentile, ≈ NLP Auto-Neutral; more robust to a dominant scene color). The
+estimators are pure statistics over a neutrally-rendered positive — finite
+samples only, distribution extremes excluded (trim / the percentile's top tail)
+so clipped speculars and dead pixels can't skew the estimate; no ML. Gains are
+**green-anchored** (`g = 1`): auto WB corrects color, not overall brightness
+(that is `print_exposure`'s job). The estimated gains are applied through the
+**same step-4 slot** as explicit gains — before `black_point` and the highlight
+soft-clip, never a post-hoc multiply — and the resolved gains land in the
+convert JSON report, so a run that reuses them via `--white-balance` reproduces
+the output bit-for-bit (measure once, reuse for the roll; §8). Explicit gains
+beat an auto mode **by source**, not value: `--white-balance 1,1,1` over a
+recipe's auto mode means neutral gains, not re-estimation. See §9.
+
 Density conversion (steps 1–2) and print rendering (steps 3–4) are kept as
 separate, independently parameterized sub-stages — the core fidelity rule from §3.
 
@@ -421,6 +439,14 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # --grid conflicts with --film-base (nothing to sample) and --auto-base (the
 # grid replaces border detection). Deterministic: fixed layout, fixed percentile.
 nc estimate blank.tiff --grid --report json
+
+# Auto neutral white balance: estimate per-frame gains (percentile ≈ NLP
+# Auto-Neutral; gray-world ≈ Auto-AVG), read the resolved gains back from the
+# report, and freeze them into --white-balance / the roll recipe
+# (print.white_balance = {"explicit": [...]}) — the reuse run is bit-identical.
+nc convert frame01.tiff -o frame01_pos.tiff --auto-wb percentile --report json
+# → { "white_balance": [1.083, 1.0, 0.941], ... }
+nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941
 ```
 
 ## 9. Parameter reference (grouped by stage)
@@ -590,7 +616,29 @@ false-positive on legitimate high-contrast conversions).
 ### Print / tone render
 - `--print-exposure <f>` — overall positive exposure.
 - `--black-point <f>` — paper black / shadow floor.
-- `--white-balance R,G,B` — highlight/neutral white balance gains.
+- White balance — a single mutually-exclusive choice, recipe key
+  `print.white_balance` (default `{ "explicit": [1, 1, 1] }` = neutral; see
+  §7.2). The two flags conflict (passing both is a usage error); whichever is
+  given replaces a recipe's `white_balance` entirely. Explicit gains beat an
+  auto mode **by source** — `--white-balance 1,1,1` over an auto recipe means
+  neutral gains, not re-estimation:
+  - `--white-balance R,G,B` ⇒ `{ "explicit": [r, g, b] }` — fixed
+    highlight/neutral gains. For backward compatibility the recipe key also
+    accepts a **bare `[r, g, b]` array** (the pre-auto-WB on-disk form, when
+    `white_balance` was a plain array) as explicit gains, so older recipes /
+    sidecars still parse; new output always writes the tagged form.
+  - `--auto-wb gray-world` ⇒ `"gray-world"` — equalize the trimmed per-channel
+    means (≈ Auto-AVG). Assumes the frame averages to neutral, so a dominant
+    scene color biases it.
+  - `--auto-wb percentile` ⇒ `"percentile"` — equalize the channels at a
+    matched near-white percentile (≈ Auto-Neutral); more robust to dominant
+    colors. The resolved gains land in the convert report (`white_balance`,
+    green-anchored) ready to freeze into `--white-balance` / a roll recipe (§8).
+
+  An auto mode requires `--algorithm density` or `--algorithm sigmoid` — the
+  `simple` algorithm is the only one with no print white-balance stage, so
+  `--auto-wb` with `simple` is a usage error (exit 2) rather than a silently
+  dropped request (§3 fail-loudly).
 - `--highlight-compress <f>` — highlight roll-off amount.
 
 ### Simple algorithm

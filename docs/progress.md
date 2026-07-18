@@ -1677,12 +1677,144 @@ Three further items the user decided after the review:
     color/encode robustness pass, not this task.
 
 ## auto-neutral-wb
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-14
 
 - Goal: deterministic auto white-balance estimation (gray-world / neutral-
   percentile) feeding `print.white_balance`, reported for roll reuse (NLP
   comparison priority 3a).
+- **Done.** Two per-frame estimators behind the existing stage-4 slot; full CI
+  gate clean (fmt / clippy `-D warnings` / build / test), suite **216 tests**
+  (191 unit + 25 E2E). Rebased onto post-#27 main (the `--out-depth` → boolean
+  `--output-hdr` rename #20, bw-support docs #21, roll/versioning follow-ups
+  #22, auto-base inward-scan redesign #23, sigmoid tone algorithm #27). The
+  auto-WB E2E test uses `--output-hdr` (the removed `--out-depth f32`).
+- **Rebased onto the sigmoid refactor (#27): stage 4 is now the shared
+  `render_print(density, tone, white_balance, print)`** — sigmoid fuses its
+  S-curve as the `tone` map. Reconciliation: my WB change made `render_print`
+  take the **resolved** `white_balance: [f32;3]` (it no longer reads
+  `print.white_balance`, now a `WbSource`); the density `render` wrapper is kept
+  (resolved args → `render_print`) for density + its tests. **Auto-WB now works
+  for `sigmoid` too**, not just `density`: both share `render_print` and the
+  print WB stage, so `estimate_wb_gains` is `pub(crate)` and `Sigmoid::
+  convert_reported` runs the same two-pass (neutral analysis render → estimate →
+  re-render through the slot) and reports the gains. The `validate` guard now
+  whitelists `density | sigmoid` (rejects only `simple`, which has no print WB
+  stage) — supporting sigmoid was *less* special-casing than restricting it.
+  Also reconciled: `stages::render` now takes a resolved `&FilmBase`
+  (auto-base #23 moved estimation to the orchestrator) and `stages::algo_params`
+  takes 5 args (sigmoid) — both auto-merged; my WB wiring sits on top unchanged.
+- Design checked against the new `roll-conversion` (auto-WB is a frame-local
+  `--auto-*` mode; reported gains are the value to freeze into a roll recipe's
+  `print.white_balance = {"explicit": […]}`) and `dmax-reference` (Dmax stays a
+  scalar and the render machinery is unchanged, so resolving the anchor once and
+  sharing it across the analysis + final passes still holds) — no code change
+  needed.
+- **Knob shape (the task's core decision): `print.white_balance` is now one
+  source enum, `WbSource { Explicit([f32;3]) | GrayWorld | Percentile }`**
+  (`types.rs`), default `Explicit([1,1,1])` (= neutral, auto off). This is a
+  deliberate **recipe wire-format change**: the key serializes as
+  `{ "explicit": [r,g,b] }` / `"gray-world"` / `"percentile"` (kebab-case,
+  mirroring `FilmBaseSource`/`DmaxSource`), no longer a bare `[r,g,b]` array.
+  Rationale: explicit-beats-auto **by source** falls out of the type — after the
+  merge the variant records provenance, so `--white-balance 1,1,1` over a recipe
+  auto mode means "neutral gains", never re-estimation (a value-based or
+  parallel-field encoding cannot express that). Pre-release, so old sidecars
+  weren't grandfathered; §9 (md + html) updated. CLI: `--white-balance R,G,B`
+  vs `--auto-wb gray-world|percentile` (clap `conflicts_with`; `AutoWb`
+  ValueEnum in `cli.rs`). All four coupled spots wired with tests: override
+  fields, merge arm (source-precedence test included), `validate` (explicit
+  gains positive; auto modes carry no value), recipe nesting test.
+- **An auto mode without `--algorithm density` is a loud usage error (exit 2),
+  not a silent no-op** (review finding, fail-loudly rule): only `density` reads
+  `print.white_balance`, so an auto mode elsewhere would drop the requested
+  estimation silently. `validate` **whitelists `density`** (`!= Density`
+  errors), not blacklists `simple`, so a future third algorithm that also
+  ignores the print stage fails loudly by default — the "forgotten coupled
+  spot" trap (silent-failure review, MEDIUM). §9 (md + html) documents it; test
+  `validate_rejects_auto_wb_with_the_simple_algorithm`. Explicit
+  `print.white_balance` under `simple` stays allowed (inert, not an action
+  dropped — `simple` has its own `invert_white_balance`).
+- **CLI-flag coverage guard:** `every_auto_wb_source_has_a_cli_flag`
+  (`cli.rs`) uses an exhaustive `match` so a future `WbSource` auto mode fails
+  to compile until it is given an `--auto-wb` value — closes the type-design
+  review's "recipe-only mode could ship silently" drift risk.
+- **Estimators (`algo/density.rs::estimate_wb_gains`), deterministic statistics
+  only:** samples come from a strided pixel walk (`AUTO_WB_MAX_PIXELS = 2^20`,
+  whole-pixel stride so no channel bias), non-finite samples dropped per sample,
+  each channel fully sorted (`total_cmp`) so every statistic is order-defined.
+  - `GrayWorld` (≈ NLP Auto-AVG): per-channel mean of the central 98%
+    (`AUTO_WB_TRIM = 0.01` per end) — the trim is frame-relative, so clipped
+    speculars/dead pixels are excluded in both display-anchored and
+    scene-referred (`--no-d-max`) renders. Documented weakness: a dominant
+    scene color biases it (test pins this vs percentile).
+  - `Percentile` (≈ NLP Auto-Neutral): per-channel nearest-rank 95th percentile
+    (`AUTO_WB_PERCENTILE = 0.95`) — equalizes near-white, robust to dominant
+    colors; the top 5% never enters the statistic.
+  - Gains are **green-anchored** (`g = 1.0` exactly): WB corrects color, not
+    exposure. Degenerate channels (all non-finite / non-positive level /
+    non-finite gain) **fail loudly** (`NcError::Other`, exit 1) — never
+    silently-neutral gains.
+- **Estimation reads, application re-renders (the task's hard requirement).**
+  `Density::convert_reported` resolves the Dmax anchor **once**, renders an
+  analysis positive from a *clone* of the density buffer with a fully neutral
+  print (unit gains, 0 EV, no black point, no soft-clip — so the statistics
+  measure exactly the quantity the WB slot multiplies; the user's exposure
+  would cancel in the ratios, black/soft-clip would distort them), estimates,
+  then runs the real `render` with the resolved gains through the standard
+  stage-4 slot. `render`'s signature changed to take the **resolved** anchor
+  (`Option<f32>`) and **resolved** gains (`[f32;3]`) instead of the source
+  enums — both passes must share one anchor without re-measuring; it returns
+  just the image now (resolution moved to the caller). Explicit gains skip the
+  analysis pass entirely, so the default path's per-pixel arithmetic (and
+  output) is unchanged.
+- **Reuse contract pinned bit-exactly:** unit test
+  `auto_wb_output_is_bit_exact_with_explicit_rerun_of_reported_gains` plus E2E
+  `auto_wb_reports_gains_that_reproduce_the_output_when_reused` (report gains →
+  `--white-balance` → byte-identical f32 TIFF; JSON's shortest-round-trip f64
+  parses back to the identical f32). Determinism test (same input ⇒ same gains
+  and rgb) included.
+- **Report:** `ConvertReport` and the convert JSON `Report` gained
+  `white_balance: Option<[f32;3]>` — the *resolved* gains (auto-estimated or
+  explicit; `None` for `simple`). Per the task decision, `nc estimate` was NOT
+  extended (its contract is Dmin-only; it can't render the positive these
+  statistics need — `estimate-reuse-output` territory). Note: the **sidecar**
+  recipe records the auto *mode* (the run's parameters — rerunning it
+  re-estimates); the frozen gains live in the *report*, by design.
+- **Real-scan spot check** (committed fixtures, CLI runs, derived numbers only):
+  with the guessed base `0.9,0.55,0.42` — gray-world `[1.458, 1.0, 0.542]`
+  (hdr-48bit) / `[1.347, 1.0, 0.621]` (hdri-64bit); percentile
+  `[1.583, 1.0, 0.494]` / `[1.543, 1.0, 0.521]`. I.e. the typical blue-heavy
+  post-inversion cast is pulled down toward neutral; dmax unchanged (≈1.63 /
+  ≈1.62), 0% clipping at u16.
+- **Notes for dependents:**
+  - `regional-color-balance`: the global gains here are a single multiplier per
+    channel — they cannot fix shadow/highlight crossover; that task's
+    density-weighted offsets slot into stage 2. Reuse the sampling helpers
+    (`wb_channel_samples` / `trimmed_mean` / `nearest_rank`) if useful, and keep
+    its knob a single source enum like `WbSource`.
+  - Rebate/border pixels are *not* excluded from the statistics (no crop knob
+    exists yet). They render neutral by construction (base → `D=0` in all
+    channels), so they dilute gains toward 1 rather than casting them —
+    deterministic and mild; revisit if a crop/region knob lands.
+  - `estimate-reuse-output`: if `estimate` ever grows a WB story, the report's
+    `white_balance` array is the value to make drop-in reusable.
+- **Review (pr-review-toolkit, 5 dimensions):** code-reviewer clean (all four
+  hard requirements verified); comments clean; tests → the auto-wb+simple
+  no-op + the `--no-d-max` robustness gap (both fixed, above); type-design →
+  the CLI-flag exhaustiveness guard (fixed, above) plus a *recommended*
+  extraction of `render`'s three read `PrintParams` scalars out of the
+  `&PrintParams` arg; silent-failure → the whitelist-vs-blacklist polarity
+  (fixed) plus a LOW note that explicit `--white-balance` under `simple` is
+  silently inert.
+  - **Deliberately not changed (reported with reasoning):** (1) `render` keeps
+    `print: &PrintParams` with `white_balance` documented-as-ignored rather than
+    expanding to a 7-argument signature across ~13 call sites — one `pub(crate)`
+    caller, the ignored field is documented at the signature, and the
+    bit-exact-reuse contract is test-pinned; the code-reviewer did not flag it.
+    (2) explicit `--white-balance` under `simple` staying inert is pre-existing,
+    documented cross-algorithm-knob behavior (a *value* left unused, not a
+    *computation* dropped), not a regression from this task.
 
 ## regional-color-balance
 **Status:** not started

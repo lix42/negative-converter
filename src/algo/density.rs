@@ -32,6 +32,17 @@
 //! scene-referred output bit-for-bit. `Dmax` is **frame-local** (scene white),
 //! unlike the roll-level `Dmin` base.
 //!
+//! **Auto neutral white balance (`WbSource`).** The stage-4 white-balance gains
+//! come from [`WbSource`]: `Explicit` gains (the default, `[1,1,1]`) are applied
+//! directly; the `GrayWorld` / `Percentile` auto modes first *estimate* the gains
+//! from a neutrally-rendered positive (deterministic statistics — trimmed channel
+//! means / matched near-white percentiles — over finite samples only), then apply
+//! them through the **same stage-4 slot**. Because application is the standard
+//! slot (not a post-hoc multiply after `black_point` / the soft-clip), a later
+//! run reusing the reported gains via `--white-balance` reproduces the output
+//! bit-for-bit — the measure-once-reuse-for-the-roll contract. Gains are
+//! green-anchored (`g = 1`): auto WB corrects color, not overall exposure.
+//!
 //! **Polarity (deliberate correction to the task-file sketch).** With
 //! `D = -log10(scan/base)` the density is `≥ 0` and *grows* with the film's
 //! optical density: the unexposed base (scene black) sits at `D = 0`, and a dense
@@ -53,7 +64,7 @@ use rayon::prelude::*;
 
 use crate::algo::{ConvertReport, Converter};
 use crate::types::{
-    DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result,
+    DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result, WbSource,
 };
 
 /// Floor applied to the scan transmission before the `log10`, so a zero / negative
@@ -159,13 +170,20 @@ pub(crate) fn to_density(
 /// separate `10^(−γ·Dmax)` gain: mathematically equivalent, but the factored form
 /// overflows `f32` when `γ·D'` alone exceeds the pow10 range even though the
 /// anchored exponent is small (e.g. `γ = 5`, EPS-clamped `D' ≈ 8`), turning scene
-/// white into `inf` instead of `1.0`. With [`DmaxSource::None`] the anchor term is
-/// exactly `0.0`, so this reproduces the pre-anchor render bit-for-bit
-/// (`d − 0.0 == d` for every `f32`).
+/// white into `inf` instead of `1.0`. A `None` anchor is applied as exactly
+/// `0.0`, so it reproduces the pre-anchor render bit-for-bit (`d − 0.0 == d` for
+/// every `f32`).
 ///
-/// Returns the rendered image and the **resolved anchor density** — `Some(Dmax)`
-/// for `Auto`/`Explicit`, `None` for `DmaxSource::None` — so the orchestrator can
-/// report it (it does not clamp; values may land outside `[0, 1]`).
+/// The anchor arrives **resolved** (see [`resolve_dmax`]) and the white-balance
+/// gains **resolved** (explicit, or auto-estimated by [`estimate_wb_gains`]) —
+/// not as their source enums — because [`Density::convert_reported`] may run this
+/// render twice (a neutral analysis pass, then the real one) and both passes must
+/// share the exact same anchor without re-measuring. `print` supplies only the
+/// remaining stage-4 controls (`print_exposure`, `black_point`,
+/// `highlight_compress`); its `white_balance` *source* field is deliberately not
+/// read here.
+///
+/// Does not clamp; values may land outside `[0, 1]`.
 ///
 /// Consumes the `DensityImage` (it is a use-once intermediate): the density buffer
 /// is transformed into the output in place and the IR plane is moved, so no
@@ -173,22 +191,21 @@ pub(crate) fn to_density(
 pub(crate) fn render(
     density: DensityImage,
     density_gamma: f32,
-    dmax: DmaxSource,
+    dmax: Option<f32>,
+    white_balance: [f32; 3],
     print: &PrintParams,
-) -> (LinearImage, Option<f32>) {
-    // Resolve the anchor from the corrected-density buffer *before* the in-place
-    // transform overwrites it. The anchor is subtracted in the exponent (see the
-    // doc above); `None` ⇒ anchor 0.0 ⇒ `d − 0.0 == d` bit-exactly, so the
-    // per-pixel arithmetic below is bit-identical to the pre-anchor render.
-    let resolved = resolve_dmax(&density.density, dmax);
-    let anchor = resolved.unwrap_or(0.0);
-    let image = render_print(
+) -> LinearImage {
+    // The anchor is subtracted in the exponent (see the doc above); `None` ⇒
+    // anchor 0.0 ⇒ `d − 0.0 == d` bit-exactly, so the per-pixel arithmetic is
+    // bit-identical to the pre-anchor render. Stage 4 is delegated to the shared
+    // `render_print`, with the density stage-3 curve fused in as its `tone` map.
+    let anchor = dmax.unwrap_or(0.0);
+    render_print(
         density,
-        // stage 3, anchored
-        |d| 10f32.powf(density_gamma * (d - anchor)),
+        |d| 10f32.powf(density_gamma * (d - anchor)), // stage 3, anchored
+        white_balance,
         print,
-    );
-    (image, resolved)
+    )
 }
 
 /// Stage 4 — the print render, shared by every density-domain algorithm
@@ -196,10 +213,17 @@ pub(crate) fn render(
 /// (corrected density → positive linear) so the buffer is traversed once.
 ///
 /// The fusion is mechanical, not conceptual: `tone` *is* stage 3 (the algorithm's
-/// curve), this function owns only stage 4 — per-channel highlight/neutral white
-/// balance, an overall `2^print_exposure` gain (exposure in **stops**), the
-/// `black_point` floor subtraction, and the highlight soft-clip — so the two
-/// sub-stages stay separately parameterized (the core fidelity rule).
+/// curve), this function owns only stage 4 — the per-channel white-balance gains,
+/// an overall `2^print_exposure` gain (exposure in **stops**), the `black_point`
+/// floor subtraction, and the highlight soft-clip — so the two sub-stages stay
+/// separately parameterized (the core fidelity rule).
+///
+/// The white-balance gains arrive **resolved** (`[f32; 3]`), not as the
+/// `print.white_balance` [`WbSource`]: an auto mode is estimated from a neutral
+/// analysis render *before* this call (the algorithms' `convert_reported`, via
+/// [`estimate_wb_gains`]) and applied here through the standard slot, so a later
+/// run reusing the reported gains via explicit `--white-balance` is bit-identical.
+/// `print.white_balance` itself is deliberately not read here.
 ///
 /// Consumes the `DensityImage` (a use-once intermediate): the density buffer is
 /// transformed into the output in place and the IR plane is moved, so no
@@ -207,10 +231,11 @@ pub(crate) fn render(
 pub(crate) fn render_print(
     density: DensityImage,
     tone: impl Fn(f32) -> f32 + Sync,
+    white_balance: [f32; 3],
     print: &PrintParams,
 ) -> LinearImage {
     let exposure_gain = 2f32.powf(print.print_exposure);
-    let wb = print.white_balance;
+    let wb = white_balance;
     let black = print.black_point;
     let hc = print.highlight_compress;
 
@@ -243,10 +268,10 @@ const AUTO_DMAX_PERCENTILE: f32 = 0.995;
 /// Resolve the display-white anchor density for a corrected-density buffer.
 /// `Auto` measures a high percentile of the *finite* densities (scalar, pooled
 /// across channels — a per-channel anchor would double as color correction, which
-/// is the future auto-WB task's job); `Explicit` returns the given value; `None`
-/// yields no anchor. Deterministic: same buffer + params ⇒ same value.
-/// `pub(crate)` because `sigmoid` anchors its S-curve on the same resolved `Dmax`
-/// rather than inventing a second measurement.
+/// is the auto-WB modes' job, see [`estimate_wb_gains`]); `Explicit` returns the
+/// given value; `None` yields no anchor. Deterministic: same buffer + params ⇒
+/// same value. `pub(crate)` because `sigmoid` anchors its S-curve on the same
+/// resolved `Dmax` rather than inventing a second measurement.
 pub(crate) fn resolve_dmax(densities: &[f32], source: DmaxSource) -> Option<f32> {
     match source {
         DmaxSource::None => None,
@@ -303,6 +328,175 @@ fn auto_dmax(densities: &[f32]) -> f32 {
     *nth
 }
 
+// ---------------------------------------------------------------------------
+// Auto white balance (stage-4 gain estimation)
+// ---------------------------------------------------------------------------
+
+/// Cap on how many *pixels* the auto-WB statistics examine. Like
+/// [`AUTO_DMAX_MAX_SAMPLES`], ~1M pixels are statistically indistinguishable
+/// from the full population for a mean/percentile, and the cap bounds the
+/// analysis to a small transient buffer per channel on large scans.
+const AUTO_WB_MAX_PIXELS: usize = 1 << 20;
+
+/// Percentile equalized by [`WbSource::Percentile`] (per channel, nearest rank).
+/// High enough to sit on near-white content — where a neutral rendition matters
+/// most — while the top 5% (specular sparkle, dust, would-be-clipped extremes)
+/// never enters the statistic.
+const AUTO_WB_PERCENTILE: f32 = 0.95;
+
+/// Fraction trimmed from *each* end of a channel's distribution before the
+/// [`WbSource::GrayWorld`] mean, so dead blacks and clipped/specular extremes
+/// can't skew it. Frame-relative (a quantile, not an absolute level), so it
+/// works for display-anchored and scene-referred (`--no-d-max`) renders alike.
+const AUTO_WB_TRIM: f32 = 0.01;
+
+/// Deterministic pixel stride for the WB statistics: the smallest stride that
+/// keeps the examined pixel count under [`AUTO_WB_MAX_PIXELS`]. Strides whole
+/// pixels (interleaved RGB triples), so unlike [`auto_dmax_stride`] there is no
+/// channel-bias concern — every sampled pixel contributes all three channels.
+///
+/// `pub(crate)` because the stride is applied by the *caller* (the algorithms'
+/// `convert_reported`, which strides the density buffer and tones only the
+/// sampled pixels — see [`sample_toned_positive`]) rather than inside the
+/// estimator; `sigmoid` shares the same helper, so both must agree on the stride.
+pub(crate) fn auto_wb_stride(pixels: usize) -> usize {
+    pixels.div_ceil(AUTO_WB_MAX_PIXELS).max(1)
+}
+
+/// Sample the corrected-density buffer on the deterministic [`auto_wb_stride`]
+/// and apply the caller's **neutral** stage-3 `tone` to only the sampled pixels,
+/// yielding the small interleaved-RGB positive the estimator consumes.
+///
+/// This is bit-exact with the previous approach — render the *whole* neutral
+/// positive (unit gains, 0 EV, no black-point/soft-clip, so stage 4 is the
+/// identity `paper·1·1 − 0`) and then stride it in the estimator — but without
+/// the full-image render or the density-buffer clone: on the opt-in `--auto-wb`
+/// path it touches only the (≤ [`AUTO_WB_MAX_PIXELS`]) sampled pixels instead of
+/// the tens of millions in a full scan. The estimator must therefore *not* stride
+/// again (see [`estimate_wb_gains`] / [`wb_channel_samples`]): it examines exactly
+/// this pre-sampled set.
+pub(crate) fn sample_toned_positive(density: &[f32], tone: impl Fn(f32) -> f32) -> Vec<f32> {
+    let pixels = density.len() / 3;
+    let stride = auto_wb_stride(pixels);
+    let mut sampled = Vec::with_capacity(pixels.div_ceil(stride) * 3);
+    for px in density.chunks_exact(3).step_by(stride) {
+        sampled.extend_from_slice(&[tone(px[0]), tone(px[1]), tone(px[2])]);
+    }
+    sampled
+}
+
+/// Per-channel *finite* samples of an already-sampled positive `rgb` (see
+/// [`sample_toned_positive`] — the stride is applied by the caller, not here),
+/// each channel sorted ascending (`total_cmp`). Non-finite samples (`NaN`/`±inf`
+/// from corrupt input) are excluded per sample, so a bad pixel can't poison a
+/// statistic. The full sort makes every downstream statistic order-defined,
+/// hence deterministic: same buffer ⇒ same samples ⇒ same gains.
+fn wb_channel_samples(rgb: &[f32]) -> [Vec<f32>; 3] {
+    let cap = rgb.len() / 3;
+    let mut channels = [
+        Vec::with_capacity(cap),
+        Vec::with_capacity(cap),
+        Vec::with_capacity(cap),
+    ];
+    for px in rgb.chunks_exact(3) {
+        for (c, channel) in channels.iter_mut().enumerate() {
+            if px[c].is_finite() {
+                channel.push(px[c]);
+            }
+        }
+    }
+    for channel in &mut channels {
+        channel.sort_unstable_by(f32::total_cmp);
+    }
+    channels
+}
+
+/// Nearest-rank percentile of a sorted, non-empty slice (`round((n−1)·p)`, the
+/// same convention as [`auto_dmax`]).
+fn nearest_rank(sorted: &[f32], p: f32) -> f32 {
+    sorted[(((sorted.len() - 1) as f32) * p).round() as usize]
+}
+
+/// Mean of the central `[trim, 1 − trim]` quantile span of a sorted, non-empty
+/// slice. Accumulates in `f64` sequentially over the sorted order — a fully
+/// order-defined sum, so the result is deterministic (a parallel float
+/// reduction would not be).
+fn trimmed_mean(sorted: &[f32], trim: f32) -> f32 {
+    let lo = (((sorted.len() - 1) as f32) * trim).round() as usize;
+    let hi = (((sorted.len() - 1) as f32) * (1.0 - trim)).round() as usize;
+    let span = &sorted[lo..=hi];
+    (span.iter().map(|&v| f64::from(v)).sum::<f64>() / span.len() as f64) as f32
+}
+
+/// Resolve the stage-4 white-balance gains `[r, g, b]` from a **neutrally
+/// rendered** positive (`rgb`: stage 3 output — anchored `10^(γ·(D'−Dmax))`
+/// with unit gains and no exposure/black/soft-clip applied).
+///
+/// `Explicit` gains pass through untouched, keeping the function total (callers
+/// shortcut that case to skip the analysis pass entirely). Otherwise `rgb`
+/// arrives **already sampled** — the caller strides the density buffer and tones
+/// only the sampled pixels (see [`sample_toned_positive`]), so this function
+/// examines every pixel it is given and does *not* stride again. The auto modes
+/// are pure, deterministic statistics over the finite samples (see
+/// [`wb_channel_samples`]); distribution extremes are excluded by construction
+/// (the percentile's top tail / the trimmed mean), so clipped speculars and dead
+/// pixels don't skew the estimate:
+///
+/// - [`WbSource::GrayWorld`]: equalize the per-channel trimmed means — a cast
+///   shows up as unequal channel averages (assumes the frame averages neutral).
+/// - [`WbSource::Percentile`]: equalize the per-channel [`AUTO_WB_PERCENTILE`]
+///   levels — a cast shows up as unequal near-white levels; robust to a
+///   dominant scene color that would bias the means.
+///
+/// Gains are **green-anchored** (`g = 1`): auto WB corrects *color*, not
+/// overall brightness — exposure is `print_exposure`'s job. Fails loudly
+/// ([`NcError::Other`], exit 1) when a channel yields no usable level (all
+/// samples non-finite, or a non-positive level no multiplicative gain can
+/// correct) — never silently-neutral or garbage gains.
+pub(crate) fn estimate_wb_gains(rgb: &[f32], source: WbSource) -> Result<[f32; 3]> {
+    let mode = match source {
+        WbSource::Explicit(gains) => return Ok(gains),
+        WbSource::GrayWorld => "gray-world",
+        WbSource::Percentile => "percentile",
+    };
+    let level_of = |sorted: &[f32]| match source {
+        WbSource::GrayWorld => trimmed_mean(sorted, AUTO_WB_TRIM),
+        // `Explicit` returned above; only `Percentile` reaches here.
+        _ => nearest_rank(sorted, AUTO_WB_PERCENTILE),
+    };
+
+    let channels = wb_channel_samples(rgb);
+    let mut level = [0.0f32; 3];
+    for (c, name) in ["red", "green", "blue"].into_iter().enumerate() {
+        let l = if channels[c].is_empty() {
+            f32::NAN // no usable sample in this channel
+        } else {
+            level_of(&channels[c])
+        };
+        if !l.is_finite() || l <= 0.0 {
+            return Err(NcError::Other(format!(
+                "auto white balance ({mode}): the {name} channel has no usable \
+                 level (got {l}); pass explicit --white-balance gains instead"
+            )));
+        }
+        level[c] = l;
+    }
+
+    let gains = [level[1] / level[0], 1.0, level[1] / level[2]];
+    for (g, name) in gains.into_iter().zip(["red", "green", "blue"]) {
+        // Positive finite levels can still divide into inf/0 across an extreme
+        // dynamic range (subnormal denominators); guard the gains themselves.
+        if !g.is_finite() || g <= 0.0 {
+            return Err(NcError::Other(format!(
+                "auto white balance ({mode}): estimated {name} gain is not a \
+                 positive finite value (got {g}); pass explicit --white-balance \
+                 gains instead"
+            )));
+        }
+    }
+    Ok(gains)
+}
+
 /// Highlight soft-clip: a smooth roll-off of values above the nominal display
 /// white (`1.0`). Below white the value passes through unchanged; above it the
 /// excess is compressed with an exponential knee of width `amount`, so the output
@@ -341,13 +535,50 @@ impl Converter for Density {
         // guarded here — the base's consumption point. Fail loudly instead.
         check_base(base)?;
         let density = to_density(image, base, &self.density);
-        let (image, dmax) = render(
-            density,
-            self.density.density_gamma,
-            self.density.dmax,
-            &self.print,
-        );
-        Ok((image, ConvertReport { dmax }))
+
+        // Resolve the display-white anchor once, from the corrected densities:
+        // the WB analysis pass and the final render must share the exact same
+        // anchor (re-measuring would be wasted work; a different anchor would
+        // break the reuse-the-reported-gains bit-exactness).
+        let dmax = resolve_dmax(&density.density, self.density.dmax);
+
+        // Resolve the white-balance gains. Explicit gains skip the analysis
+        // pass entirely — the default path costs nothing and its per-pixel
+        // arithmetic is unchanged.
+        let wb = match self.print.white_balance {
+            WbSource::Explicit(gains) => gains,
+            auto_mode => {
+                // Estimation: measure the gains on the positive rendered with a
+                // fully *neutral* print (unit gains, 0 EV, no black point, no
+                // soft-clip) so the statistics measure exactly the quantity the
+                // white-balance slot multiplies. The user's `print_exposure`
+                // would cancel in the channel ratios anyway, while `black_point`
+                // / `highlight_compress` apply *after* the gains and would
+                // distort them. With those neutral params stage 4 collapses to
+                // the identity (`paper·1·1 − 0`), so the neutral positive is just
+                // the stage-3 tone — we apply it to only the strided sample of
+                // the density buffer (no full-image render, no clone) and hand
+                // that small buffer to the estimator, which no longer strides.
+                let anchor = dmax.unwrap_or(0.0);
+                let gamma = self.density.density_gamma;
+                let sampled =
+                    sample_toned_positive(&density.density, |d| 10f32.powf(gamma * (d - anchor)));
+                estimate_wb_gains(&sampled, auto_mode)?
+            }
+        };
+
+        // Application: always the standard stage-4 white-balance slot (before
+        // `black_point` and the soft-clip), never a post-hoc multiply — so a
+        // later run reusing the reported gains via `--white-balance` is
+        // bit-identical (measure once, reuse for the roll).
+        let image = render(density, self.density.density_gamma, dmax, wb, &self.print);
+        Ok((
+            image,
+            ConvertReport {
+                dmax,
+                white_balance: Some(wb),
+            },
+        ))
     }
 }
 
@@ -461,7 +692,7 @@ mod tests {
             density: vec![1.0, 0.0, 2.0],
             ir: None,
         };
-        let (out, _) = render(d, 1.0, DmaxSource::None, &PrintParams::default());
+        let out = render(d, 1.0, None, [1.0; 3], &PrintParams::default());
         assert!(approx(out.rgb[0], 10.0, 1e-3));
         assert!(approx(out.rgb[1], 1.0, 1e-5));
         assert!(approx(out.rgb[2], 100.0, 1e-2));
@@ -476,7 +707,7 @@ mod tests {
             density: vec![1.0, 1.0, 1.0],
             ir: None,
         };
-        let (out, _) = render(d, 0.5, DmaxSource::None, &PrintParams::default());
+        let out = render(d, 0.5, None, [1.0; 3], &PrintParams::default());
         for c in 0..3 {
             assert!(approx(out.rgb[c], 10f32.powf(0.5), 1e-3), "channel {c}");
         }
@@ -494,10 +725,9 @@ mod tests {
         let print = PrintParams {
             print_exposure: 1.0, // 2^1 = 2
             black_point: 0.5,
-            white_balance: [2.0, 1.0, 0.5],
-            highlight_compress: 0.0,
+            ..PrintParams::default()
         };
-        let (out, _) = render(d, 1.0, DmaxSource::None, &print);
+        let out = render(d, 1.0, None, [2.0, 1.0, 0.5], &print);
         assert!(approx(out.rgb[0], 3.5, 1e-4)); // 1·2·2 − 0.5
         assert!(approx(out.rgb[1], 1.5, 1e-4)); // 1·1·2 − 0.5
         assert!(approx(out.rgb[2], 0.5, 1e-4)); // 1·0.5·2 − 0.5
@@ -511,7 +741,7 @@ mod tests {
             density: vec![0.3, 0.3, 0.3],
             ir: Some(vec![0.7]),
         };
-        let (out, _) = render(d, 1.0, DmaxSource::None, &PrintParams::default());
+        let out = render(d, 1.0, None, [1.0; 3], &PrintParams::default());
         assert_eq!(out.ir.as_deref(), Some(&[0.7_f32][..]));
     }
 
@@ -549,6 +779,7 @@ mod tests {
     // share the same `render` — so `render`'s math is pinned by the `render_*` tests.
     #[test]
     fn convert_equals_render_of_to_density() {
+        let wb = [1.0, 1.05, 1.1];
         let img = pixel([0.3, 0.15, 0.08], Some(0.5));
         let base = FilmBase::from([0.6, 0.3, 0.18]);
         let conv = Density {
@@ -561,17 +792,14 @@ mod tests {
             print: PrintParams {
                 print_exposure: -1.0,
                 black_point: 0.01,
-                white_balance: [1.0, 1.05, 1.1],
+                white_balance: WbSource::Explicit(wb),
                 highlight_compress: 0.2,
             },
         };
         let via_convert = conv.convert(&img, &base).unwrap();
-        let (via_parts, _) = render(
-            to_density(&img, &base, &conv.density),
-            conv.density.density_gamma,
-            conv.density.dmax,
-            &conv.print,
-        );
+        let dimg = to_density(&img, &base, &conv.density);
+        let anchor = resolve_dmax(&dimg.density, conv.density.dmax);
+        let via_parts = render(dimg, conv.density.density_gamma, anchor, wb, &conv.print);
         assert_eq!(via_convert.rgb, via_parts.rgb);
         assert_eq!(via_convert.ir, via_parts.ir);
     }
@@ -644,7 +872,7 @@ mod tests {
             highlight_compress: 0.5,
             ..PrintParams::default()
         };
-        let (out, _) = render(d, 1.0, DmaxSource::None, &print);
+        let out = render(d, 1.0, None, [1.0; 3], &print);
         let expected_r = 1.0 + 0.5 * (1.0 - (-2.0f32).exp());
         assert!(approx(out.rgb[0], expected_r, 1e-4), "got {}", out.rgb[0]);
         assert!(approx(out.rgb[1], 1.0, 1e-5));
@@ -703,13 +931,7 @@ mod tests {
             density: vec![dmax, dmax, dmax],
             ir: None,
         };
-        let (out, resolved) = render(
-            dimg,
-            gamma,
-            DmaxSource::Explicit(dmax),
-            &PrintParams::default(),
-        );
-        assert_eq!(resolved, Some(dmax));
+        let out = render(dimg, gamma, Some(dmax), [1.0; 3], &PrintParams::default());
         for v in &out.rgb {
             assert!(v.is_finite(), "overflowed: {v}");
             assert!(approx(*v, 1.0, 1e-5), "scene white should be 1.0, got {v}");
@@ -757,7 +979,7 @@ mod tests {
 
     #[test]
     fn none_anchor_is_bit_exact_with_pre_anchor_render() {
-        // `DmaxSource::None` must reproduce the pre-anchor render bit-for-bit: the
+        // A `None` anchor must reproduce the pre-anchor render bit-for-bit: the
         // anchor term is exactly 0.0 and `d − 0.0 == d` for every f32, so every
         // output sample must equal the direct pre-anchor arithmetic to the bit
         // (HDR f32 workflows depend on this). Uses `assert_eq!`, not an epsilon.
@@ -768,21 +990,26 @@ mod tests {
             density: density.clone(),
             ir: None,
         };
+        let wb = [1.0, 1.05, 0.9];
         let print = PrintParams {
             print_exposure: -0.6,
             black_point: 0.01,
-            white_balance: [1.0, 1.05, 0.9],
+            white_balance: WbSource::Explicit(wb),
             highlight_compress: 0.3,
         };
         let gamma = 1.3;
-        let (out, resolved) = render(dimg, gamma, DmaxSource::None, &print);
-        assert_eq!(resolved, None, "no anchor reported for None");
+        assert_eq!(
+            resolve_dmax(&density, DmaxSource::None),
+            None,
+            "no anchor resolved for None"
+        );
+        let out = render(dimg, gamma, None, wb, &print);
         let exposure_gain = 2f32.powf(print.print_exposure);
         for (i, &d) in density.iter().enumerate() {
             let c = i % 3;
             let paper = 10f32.powf(gamma * d);
             let expected = soft_clip(
-                paper * print.white_balance[c] * exposure_gain - print.black_point,
+                paper * wb[c] * exposure_gain - print.black_point,
                 print.highlight_compress,
             );
             assert_eq!(out.rgb[i], expected, "sample {i} not bit-exact");
@@ -801,13 +1028,11 @@ mod tests {
             density: vec![dmax, dmax, dmax, 0.0, 0.0, 0.0],
             ir: None,
         };
-        let (out, resolved) = render(
-            dimg,
-            gamma,
-            DmaxSource::Explicit(dmax),
-            &PrintParams::default(),
+        assert_eq!(
+            resolve_dmax(&dimg.density, DmaxSource::Explicit(dmax)),
+            Some(dmax)
         );
-        assert_eq!(resolved, Some(dmax));
+        let out = render(dimg, gamma, Some(dmax), [1.0; 3], &PrintParams::default());
         for c in 0..3 {
             assert!(
                 approx(out.rgb[c], 1.0, 1e-5),
@@ -881,6 +1106,8 @@ mod tests {
         };
         let (_, rep) = conv.convert_reported(&img, &base).unwrap();
         assert_eq!(rep.dmax, Some(1.25));
+        // The (explicit, default-neutral) gains are surfaced too.
+        assert_eq!(rep.white_balance, Some([1.0, 1.0, 1.0]));
 
         // None → no anchor reported.
         let conv = Density {
@@ -919,7 +1146,8 @@ mod tests {
                 ..DensityParams::default()
             },
         );
-        let (out, resolved) = render(dimg, gamma, DmaxSource::Auto, &PrintParams::default());
+        let resolved = resolve_dmax(&dimg.density, DmaxSource::Auto);
+        let out = render(dimg, gamma, resolved, [1.0; 3], &PrintParams::default());
         let dmax = resolved.unwrap();
         assert!(
             dmax > 0.0,
@@ -949,7 +1177,7 @@ mod tests {
             print_exposure: 2.0,
             ..PrintParams::default()
         };
-        let (out, _) = render(dimg, 1.5, DmaxSource::Explicit(dmax), &print);
+        let out = render(dimg, 1.5, Some(dmax), [1.0; 3], &print);
         for c in 0..3 {
             assert!(approx(out.rgb[c], 4.0, 1e-4), "chan {c}: {}", out.rgb[c]); // 2^2
         }
@@ -959,7 +1187,7 @@ mod tests {
     fn auto_anchor_is_a_scalar_pooled_across_channels() {
         // Channel-asymmetric densities (R high, B low): the anchor is a single
         // pooled scalar — the *same* gain on every channel — so it can't double as
-        // color correction (that's the future auto-WB task). Prove the per-channel
+        // color correction (that's the auto-WB modes' job). Prove the per-channel
         // ratio `out_c / 10^(γ·D'_c)` is identical across channels (== anchor gain).
         let dimg = DensityImage {
             width: 2,
@@ -968,10 +1196,12 @@ mod tests {
             ir: None,
         };
         let gamma = 1.0f32;
-        let (out, resolved) = render(
+        let resolved = resolve_dmax(&dimg.density, DmaxSource::Auto);
+        let out = render(
             dimg.clone(),
             gamma,
-            DmaxSource::Auto,
+            resolved,
+            [1.0; 3],
             &PrintParams::default(),
         );
         let dmax = resolved.unwrap();
@@ -984,5 +1214,283 @@ mod tests {
                 out.rgb[c]
             );
         }
+    }
+
+    // --- auto white balance ------------------------------------------------
+
+    /// An interleaved RGB buffer of `n` copies of `px` (a rendered positive for
+    /// the estimator tests).
+    fn uniform_positive(px: [f32; 3], n: usize) -> Vec<f32> {
+        px.iter().copied().cycle().take(3 * n).collect()
+    }
+
+    #[test]
+    fn estimate_wb_explicit_gains_pass_through() {
+        // Explicit is a pass-through: no statistics run, the image is ignored.
+        let gains = [1.3, 1.0, 0.7];
+        let got = estimate_wb_gains(&[], WbSource::Explicit(gains)).unwrap();
+        assert_eq!(got, gains);
+    }
+
+    #[test]
+    fn gray_world_gains_neutralize_a_uniform_cast() {
+        // Every pixel carries the same cast, so the trimmed means are exactly the
+        // cast and the gains are the green-anchored inverse: applying them
+        // equalizes the channels.
+        let rgb = uniform_positive([0.4, 0.5, 0.8], 200);
+        let gains = estimate_wb_gains(&rgb, WbSource::GrayWorld).unwrap();
+        assert!(approx(gains[0], 0.5 / 0.4, 1e-5), "r gain {}", gains[0]);
+        assert_eq!(gains[1], 1.0, "green-anchored");
+        assert!(approx(gains[2], 0.5 / 0.8, 1e-5), "b gain {}", gains[2]);
+        for px in rgb.chunks_exact(3) {
+            let balanced = [px[0] * gains[0], px[1] * gains[1], px[2] * gains[2]];
+            assert!(approx(balanced[0], balanced[1], 1e-5));
+            assert!(approx(balanced[1], balanced[2], 1e-5));
+        }
+    }
+
+    #[test]
+    fn percentile_gains_equalize_near_white_levels() {
+        // Channels are the same ramp scaled per channel, so every per-channel
+        // statistic scales with it and both modes recover the inverse scale.
+        let scale = [0.8f32, 1.0, 1.2];
+        let mut rgb = Vec::new();
+        for i in 0..100 {
+            let t = (i + 1) as f32 / 100.0;
+            rgb.extend_from_slice(&[scale[0] * t, scale[1] * t, scale[2] * t]);
+        }
+        for mode in [WbSource::Percentile, WbSource::GrayWorld] {
+            let gains = estimate_wb_gains(&rgb, mode).unwrap();
+            assert!(approx(gains[0], 1.0 / 0.8, 1e-4), "{mode:?} r {}", gains[0]);
+            assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
+            assert!(approx(gains[2], 1.0 / 1.2, 1e-4), "{mode:?} b {}", gains[2]);
+        }
+    }
+
+    #[test]
+    fn percentile_mode_resists_a_dominant_color_gray_world_does_not() {
+        // 90% of the frame is a strong green subject; 10% is genuinely neutral
+        // near-white. The near-white percentile lands on the neutral highlights
+        // (gains ≈ 1), while the gray-world means are dragged by the subject —
+        // the documented tradeoff between the two modes.
+        let mut rgb = uniform_positive([0.2, 0.6, 0.2], 90);
+        rgb.extend(uniform_positive([0.9, 0.9, 0.9], 10));
+        let p = estimate_wb_gains(&rgb, WbSource::Percentile).unwrap();
+        for (c, gain) in p.into_iter().enumerate() {
+            assert!(approx(gain, 1.0, 1e-5), "percentile chan {c}: {gain}");
+        }
+        let gw = estimate_wb_gains(&rgb, WbSource::GrayWorld).unwrap();
+        assert!(
+            gw[0] > 2.0,
+            "gray-world red gain dragged by cast: {}",
+            gw[0]
+        );
+    }
+
+    #[test]
+    fn estimate_wb_ignores_non_finite_and_extreme_samples() {
+        // A NaN sample, an inf sample, and a huge finite outlier (< 1% of the
+        // data) must not move either statistic off the bulk values.
+        let mut rgb = uniform_positive([0.4, 0.5, 0.6], 200);
+        rgb.extend_from_slice(&[1000.0, f32::NAN, f32::INFINITY]);
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            let gains = estimate_wb_gains(&rgb, mode).unwrap();
+            assert!(approx(gains[0], 0.5 / 0.4, 1e-3), "{mode:?} r {}", gains[0]);
+            assert!(approx(gains[2], 0.5 / 0.6, 1e-3), "{mode:?} b {}", gains[2]);
+        }
+    }
+
+    #[test]
+    fn estimate_wb_fails_loudly_on_an_unusable_channel() {
+        // An all-non-finite channel has no usable level — that must be a loud
+        // error (exit 1), never silently-neutral or garbage gains.
+        let rgb = uniform_positive([f32::NAN, 0.5, 0.5], 8);
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            let err = estimate_wb_gains(&rgb, mode).unwrap_err();
+            assert_eq!(err.exit_code(), 1, "{mode:?}");
+        }
+        // A non-positive level (possible only for degenerate input — the neutral
+        // analysis render itself produces 10^x > 0) is rejected the same way.
+        let rgb = uniform_positive([0.0, 0.5, 0.5], 8);
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            assert!(estimate_wb_gains(&rgb, mode).is_err(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn auto_wb_stride_is_bounded() {
+        assert_eq!(auto_wb_stride(0), 1);
+        assert_eq!(auto_wb_stride(AUTO_WB_MAX_PIXELS), 1);
+        let big = 7 * AUTO_WB_MAX_PIXELS + 3;
+        let stride = auto_wb_stride(big);
+        assert!(big.div_ceil(stride) <= AUTO_WB_MAX_PIXELS);
+    }
+
+    #[test]
+    fn auto_wb_convert_neutralizes_a_cast_end_to_end() {
+        // A wrong (neutral) base under an orange-mask scan leaves a constant
+        // per-channel cast in the positive; both auto modes must estimate gains
+        // that equalize the channels of this two-tone frame.
+        let base = FilmBase::from([0.8, 0.8, 0.8]); // deliberately ignores the mask
+        let cast = [0.5f32, 0.3, 0.2]; // orange-ish transmissions
+        let mut rgb = Vec::new();
+        for i in 0..64 {
+            let t = if i % 2 == 0 { 1.0 } else { 0.5 }; // two-tone content
+            rgb.extend_from_slice(&[cast[0] * t, cast[1] * t, cast[2] * t]);
+        }
+        let img = LinearImage::new(64, 1, rgb, None).unwrap();
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            let conv = Density {
+                density: DensityParams::default(),
+                print: PrintParams {
+                    white_balance: mode,
+                    ..PrintParams::default()
+                },
+            };
+            let (out, rep) = conv.convert_reported(&img, &base).unwrap();
+            let gains = rep.white_balance.expect("gains reported");
+            assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
+            for px in out.rgb.chunks_exact(3) {
+                assert!(approx(px[0], px[1], 1e-4), "{mode:?}: {px:?}");
+                assert!(approx(px[1], px[2], 1e-4), "{mode:?}: {px:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn auto_wb_carries_ir_through_the_final_output() {
+        // The auto-WB analysis pass renders on an IR-dropped copy (perf: no
+        // image-sized IR clone), but the *final* render must still consume the
+        // original density with its IR plane intact — assert the IR rides through.
+        let base = FilmBase::from([0.6, 0.6, 0.6]);
+        let img = pixel([0.2, 0.2, 0.2], Some(0.42));
+        let conv = Density {
+            density: DensityParams::default(),
+            print: PrintParams {
+                white_balance: WbSource::Percentile,
+                ..PrintParams::default()
+            },
+        };
+        let out = conv.convert(&img, &base).unwrap();
+        assert_eq!(out.ir.as_deref(), Some(&[0.42_f32][..]));
+    }
+
+    #[test]
+    fn auto_wb_output_is_bit_exact_with_explicit_rerun_of_reported_gains() {
+        // The measure-once-reuse-for-the-roll contract: a run that reuses the
+        // reported gains via explicit `--white-balance` must reproduce the auto
+        // run bit-for-bit — this is why application goes through the standard
+        // stage-4 slot and shares the resolved anchor, never a post-hoc multiply.
+        // Non-default print params prove the equality holds with black_point and
+        // the soft-clip in play.
+        let base = FilmBase::from([0.6, 0.35, 0.2]);
+        let img = LinearImage::new(
+            3,
+            2,
+            vec![
+                0.5, 0.3, 0.15, 0.3, 0.2, 0.1, 0.2, 0.1, 0.05, //
+                0.45, 0.25, 0.12, 0.1, 0.06, 0.03, 0.55, 0.32, 0.18,
+            ],
+            None,
+        )
+        .unwrap();
+        let print = PrintParams {
+            print_exposure: 0.3,
+            black_point: 0.02,
+            white_balance: WbSource::Percentile,
+            highlight_compress: 0.4,
+        };
+        let auto = Density {
+            density: DensityParams::default(),
+            print: print.clone(),
+        };
+        let (out_auto, rep) = auto.convert_reported(&img, &base).unwrap();
+        let gains = rep.white_balance.expect("auto gains reported");
+
+        let explicit = Density {
+            density: DensityParams::default(),
+            print: PrintParams {
+                white_balance: WbSource::Explicit(gains),
+                ..print
+            },
+        };
+        let (out_explicit, rep2) = explicit.convert_reported(&img, &base).unwrap();
+        assert_eq!(out_auto.rgb, out_explicit.rgb, "reuse must be bit-exact");
+        assert_eq!(rep2.white_balance, Some(gains));
+        assert_eq!(rep.dmax, rep2.dmax, "shared anchor");
+    }
+
+    #[test]
+    fn auto_wb_survives_scene_referred_no_dmax_render() {
+        // Pins the AUTO_WB_TRIM / percentile robustness claim for scene-referred
+        // output: with `DmaxSource::None` the render is unanchored (base → 1.0,
+        // detail far above — a wide dynamic range), so the analysis positive spans
+        // orders of magnitude. The extremes-excluding statistics must still yield
+        // finite, channel-equalizing, green-anchored gains rather than being
+        // dragged to inf by the brightest samples.
+        let base = FilmBase::from([0.9, 0.9, 0.9]); // neutral base ⇒ leaves a cast
+        // A wide density spread per pixel (thin → very dense), same per-channel
+        // cast ratio throughout, so correct gains equalize every pixel.
+        let cast = [0.6f32, 0.4, 0.25];
+        let mut rgb = Vec::new();
+        for i in 0..128 {
+            let t = 0.9f32.powi(i % 32); // transmissions from ~1 down to ~0.03
+            rgb.extend_from_slice(&[cast[0] * t, cast[1] * t, cast[2] * t]);
+        }
+        let img = LinearImage::new(128, 1, rgb, None).unwrap();
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            let conv = Density {
+                density: DensityParams {
+                    dmax: DmaxSource::None,
+                    ..DensityParams::default()
+                },
+                print: PrintParams {
+                    white_balance: mode,
+                    ..PrintParams::default()
+                },
+            };
+            let (out, rep) = conv.convert_reported(&img, &base).unwrap();
+            assert_eq!(rep.dmax, None, "{mode:?}: no anchor for --no-d-max");
+            let gains = rep.white_balance.expect("gains reported");
+            assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
+            for g in gains {
+                assert!(g.is_finite() && g > 0.0, "{mode:?}: gain {g} not usable");
+            }
+            for px in out.rgb.chunks_exact(3) {
+                assert!(
+                    px.iter().all(|v| v.is_finite()),
+                    "{mode:?}: non-finite output {px:?}"
+                );
+                assert!(approx(px[0], px[1], 1e-3), "{mode:?}: {px:?}");
+                assert!(approx(px[1], px[2], 1e-3), "{mode:?}: {px:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn auto_wb_is_deterministic() {
+        // Same input + params ⇒ identical gains and identical output.
+        let base = FilmBase::from([0.7, 0.5, 0.3]);
+        let img = LinearImage::new(
+            2,
+            2,
+            vec![
+                0.4, 0.3, 0.2, 0.35, 0.22, 0.11, //
+                0.5, 0.4, 0.25, 0.1, 0.07, 0.04,
+            ],
+            None,
+        )
+        .unwrap();
+        let conv = Density {
+            density: DensityParams::default(),
+            print: PrintParams {
+                white_balance: WbSource::GrayWorld,
+                ..PrintParams::default()
+            },
+        };
+        let (a, ra) = conv.convert_reported(&img, &base).unwrap();
+        let (b, rb) = conv.convert_reported(&img, &base).unwrap();
+        assert_eq!(ra.white_balance, rb.white_balance);
+        assert_eq!(a.rgb, b.rgb);
     }
 }

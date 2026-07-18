@@ -306,6 +306,83 @@ impl Default for DensityParams {
     }
 }
 
+/// Where the print white-balance gains come from (design-spec §9,
+/// `print.white_balance`).
+///
+/// A single mutually-exclusive choice, like [`FilmBaseSource`] / [`DmaxSource`] —
+/// not parallel fields. Modeling the source as **one enum** is what makes the
+/// precedence rule sound: an explicit `--white-balance 1,1,1` replaces a recipe's
+/// auto mode *by source*, because the variant itself records where the gains came
+/// from (explicit vs auto *provenance*), so precedence is decided by source, not
+/// by value — a separate bool/Option pair would carry the value but not that
+/// provenance. Serializes as
+/// `{ "explicit": [r, g, b] }` / `"gray-world"` / `"percentile"`.
+///
+/// The auto modes are **deterministic statistics** over the rendered positive
+/// (no ML, per the project's "AI-friendly ≠ ML" rule): same input + params ⇒
+/// identical gains. The resolved gains ride into the convert JSON report so a
+/// roll can freeze one frame's estimate into a recipe (measure once, reuse).
+///
+/// **Wire compatibility:** it *writes* the tagged form above, but its custom
+/// [`Deserialize`] also accepts a legacy **bare `[r, g, b]` array**
+/// (`"white_balance": [1, 1, 1]`) as `Explicit` gains — before this feature
+/// `print.white_balance` was a plain `[f32; 3]`, so recipes/sidecars written by
+/// older `nc` must still parse (reproducibility). See design-spec §9.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WbSource {
+    /// Fixed per-channel gains `[r, g, b]`. The default (`[1, 1, 1]` = neutral,
+    /// i.e. auto white balance off).
+    Explicit([f32; 3]),
+    /// Gray-world estimate (≈ NLP Auto-AVG): equalize the trimmed per-channel
+    /// means. Simple, but a dominant scene color (a green lawn, a red wall)
+    /// biases it — the whole frame is assumed to average to neutral.
+    GrayWorld,
+    /// Neutral-percentile estimate (≈ NLP Auto-Neutral): equalize the channels
+    /// at a matched high percentile (near-white). More robust to dominant
+    /// colors than gray-world — highlights are where neutrality matters most.
+    Percentile,
+}
+
+impl Default for WbSource {
+    fn default() -> Self {
+        WbSource::Explicit([1.0, 1.0, 1.0])
+    }
+}
+
+impl<'de> Deserialize<'de> for WbSource {
+    /// Accepts both the current tagged form (`{ "explicit": [r, g, b] }` /
+    /// `"gray-world"` / `"percentile"`) and the legacy **bare `[r, g, b]`** array
+    /// that pre-`WbSource` recipes/sidecars wrote (when `print.white_balance` was
+    /// a plain `[f32; 3]`), mapping the bare array to `Explicit`. Keeps old
+    /// recipes reproducible; `Serialize` still emits only the tagged form.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // A tagged copy of the variants (the derived shape), plus an untagged
+        // wrapper that tries the bare array first, then the tagged form.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum Tagged {
+            Explicit([f32; 3]),
+            GrayWorld,
+            Percentile,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare([f32; 3]),
+            Tagged(Tagged),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Bare(gains) | Repr::Tagged(Tagged::Explicit(gains)) => WbSource::Explicit(gains),
+            Repr::Tagged(Tagged::GrayWorld) => WbSource::GrayWorld,
+            Repr::Tagged(Tagged::Percentile) => WbSource::Percentile,
+        })
+    }
+}
+
 /// Print / tone-render knobs (design-spec §9). A **separate** sub-stage from
 /// density conversion — the core fidelity rule; don't collapse the two.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -315,8 +392,9 @@ pub struct PrintParams {
     pub print_exposure: f32,
     /// Paper black / shadow floor.
     pub black_point: f32,
-    /// Highlight/neutral white-balance gains `[r, g, b]`.
-    pub white_balance: [f32; 3],
+    /// Highlight/neutral white-balance gain source (default explicit `[1, 1, 1]`
+    /// = neutral). Auto modes estimate the gains per frame; see [`WbSource`].
+    pub white_balance: WbSource,
     /// Highlight roll-off amount.
     pub highlight_compress: f32,
 }
@@ -326,7 +404,7 @@ impl Default for PrintParams {
         Self {
             print_exposure: 0.0,
             black_point: 0.0,
-            white_balance: [1.0, 1.0, 1.0],
+            white_balance: WbSource::default(),
             highlight_compress: 0.0,
         }
     }
@@ -617,6 +695,67 @@ mod tests {
         // A recipe that sets only one knob should leave the rest at defaults.
         let params: PrintParams = serde_json::from_str(r#"{"print_exposure": 2.0}"#).unwrap();
         assert_eq!(params.print_exposure, 2.0);
-        assert_eq!(params.white_balance, [1.0, 1.0, 1.0]);
+        assert_eq!(params.white_balance, WbSource::Explicit([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn wb_source_serializes_like_the_other_source_enums() {
+        // Unit variants are bare kebab-case strings; the payload variant is a
+        // tagged object — the same shape convention as `FilmBaseSource` /
+        // `DmaxSource`.
+        assert_eq!(
+            serde_json::to_string(&WbSource::GrayWorld).unwrap(),
+            "\"gray-world\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WbSource::Percentile).unwrap(),
+            "\"percentile\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WbSource::Explicit([1.1, 1.0, 0.9])).unwrap(),
+            r#"{"explicit":[1.1,1.0,0.9]}"#
+        );
+        for src in [
+            WbSource::GrayWorld,
+            WbSource::Percentile,
+            WbSource::Explicit([2.0, 1.0, 0.5]),
+        ] {
+            let json = serde_json::to_string(&src).unwrap();
+            assert_eq!(serde_json::from_str::<WbSource>(&json).unwrap(), src);
+        }
+    }
+
+    #[test]
+    fn wb_source_deserializes_legacy_bare_array_as_explicit() {
+        // Before `WbSource`, `print.white_balance` was a plain `[f32; 3]`, so
+        // existing recipes/sidecars serialize the bare array. The custom
+        // `Deserialize` must still accept it (→ `Explicit`) for reproducibility,
+        // alongside the tagged forms.
+        assert_eq!(
+            serde_json::from_str::<WbSource>("[1.1,1.0,0.9]").unwrap(),
+            WbSource::Explicit([1.1, 1.0, 0.9])
+        );
+        // The same, nested in a recipe's `print` section (defaults fill the rest).
+        let print: PrintParams =
+            serde_json::from_str(r#"{"white_balance":[1.1,1.0,0.9]}"#).unwrap();
+        assert_eq!(print.white_balance, WbSource::Explicit([1.1, 1.0, 0.9]));
+        // The tagged forms still parse (the bare array is an *addition*).
+        assert_eq!(
+            serde_json::from_str::<WbSource>(r#"{"explicit":[1.1,1.0,0.9]}"#).unwrap(),
+            WbSource::Explicit([1.1, 1.0, 0.9])
+        );
+        assert_eq!(
+            serde_json::from_str::<WbSource>("\"gray-world\"").unwrap(),
+            WbSource::GrayWorld
+        );
+    }
+
+    #[test]
+    fn wb_source_default_is_neutral_explicit_gains() {
+        // The default must be *explicit* neutral gains, not an auto mode — auto
+        // white balance is opt-in, and the default output stays bit-identical to
+        // the pre-auto-WB render.
+        assert_eq!(WbSource::default(), WbSource::Explicit([1.0, 1.0, 1.0]));
+        assert_eq!(PrintParams::default().white_balance, WbSource::default());
     }
 }
