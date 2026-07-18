@@ -27,7 +27,7 @@ use crate::telemetry;
 use crate::types::{
     Algorithm, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase, FilmBaseParams,
     FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams, Result,
-    SigmoidParams, SimpleParams,
+    SigmoidParams, SimpleParams, WbSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -274,7 +274,36 @@ pub struct SigmoidOverrides {
     pub sigmoid_shoulder: Option<f32>,
 }
 
+/// Auto white-balance modes for `--auto-wb` — the CLI face of the two
+/// estimating [`WbSource`] variants (the explicit variant is `--white-balance`).
+/// clap's `ValueEnum` derives the kebab-case values `gray-world` / `percentile`,
+/// matching the recipe wire form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum AutoWb {
+    /// Equalize the trimmed per-channel means (≈ NLP Auto-AVG). Simple; a
+    /// dominant scene color biases it.
+    GrayWorld,
+    /// Equalize the channels at a matched near-white percentile (≈ NLP
+    /// Auto-Neutral). More robust to dominant colors.
+    Percentile,
+}
+
+impl From<AutoWb> for WbSource {
+    fn from(mode: AutoWb) -> Self {
+        match mode {
+            AutoWb::GrayWorld => WbSource::GrayWorld,
+            AutoWb::Percentile => WbSource::Percentile,
+        }
+    }
+}
+
 /// Print / tone-render overrides (design-spec §9).
+///
+/// `--white-balance` and `--auto-wb` are the two faces of the single
+/// `print.white_balance` source (mutually exclusive; clap rejects passing both);
+/// whichever is given replaces the recipe's choice entirely. Precedence is by
+/// **source**, not value: an explicit `--white-balance 1,1,1` over a recipe's
+/// auto mode means neutral gains, not re-estimation.
 #[derive(Args, Debug, Default)]
 pub struct PrintOverrides {
     /// Overall positive exposure.
@@ -283,9 +312,13 @@ pub struct PrintOverrides {
     /// Paper black / shadow floor.
     #[arg(long)]
     pub black_point: Option<f32>,
-    /// Highlight / neutral white-balance gains.
-    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb)]
+    /// Explicit highlight / neutral white-balance gains.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb,
+          conflicts_with = "auto_wb")]
     pub white_balance: Option<[f32; 3]>,
+    /// Estimate the white-balance gains per frame from image statistics.
+    #[arg(long = "auto-wb", value_enum, value_name = "MODE")]
+    pub auto_wb: Option<AutoWb>,
     /// Highlight roll-off amount.
     #[arg(long)]
     pub highlight_compress: Option<f32>,
@@ -405,6 +438,14 @@ pub struct Report {
     /// not calibrate-once (design-spec §9).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dmax: Option<f32>,
+    /// Resolved stage-4 white-balance gains `[r, g, b]` the density print render
+    /// applied (`convert`): the auto-estimated (`--auto-wb`) or explicit value,
+    /// absent for the `simple` algorithm. Reported so a roll can freeze one
+    /// frame's estimate into `--white-balance R,G,B` / a recipe's
+    /// `print.white_balance = {"explicit": […]}` — measure once, reuse
+    /// (design-spec §8/§9).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub white_balance: Option<[f32; 3]>,
     /// How the film base was chosen, as the structured [`FilmBaseSource`]
     /// (`"auto"` / `{"region":[…]}` / `{"explicit":[…]}`) so an agent gets the
     /// sampled rectangle / explicit values without string-parsing a label.
@@ -580,8 +621,14 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     if let Some(v) = args.print.black_point {
         cfg.print.black_point = v;
     }
+    // white balance: `--white-balance` / `--auto-wb` are mutually exclusive
+    // (clap-enforced); whichever is given replaces the recipe's source entirely.
+    // Precedence is by *source*: explicit `--white-balance 1,1,1` still beats a
+    // recipe's auto mode (the variant records where the gains came from).
     if let Some(v) = args.print.white_balance {
-        cfg.print.white_balance = v;
+        cfg.print.white_balance = WbSource::Explicit(v);
+    } else if let Some(mode) = args.print.auto_wb {
+        cfg.print.white_balance = mode.into();
     }
     if let Some(v) = args.print.highlight_compress {
         cfg.print.highlight_compress = v;
@@ -759,7 +806,29 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
             cfg.print.highlight_compress
         )));
     }
-    positive("--white-balance", &cfg.print.white_balance)?;
+    // Explicit gains must be positive; the auto modes carry no value to check
+    // here (estimated gains are guarded at the estimation point, exit 1). An auto
+    // mode only has an effect through a print white-balance stage — the density
+    // and sigmoid algorithms have one (both apply `print.white_balance` via
+    // `render_print`); `simple` does not (`stages::algo_params` never wires
+    // `print` into it). Whitelist the algorithms that consume the gains rather
+    // than blacklist `simple`: a future algorithm that also ignores the print
+    // stage must fail loudly here by default, not silently drop the requested
+    // estimation (exit 0, no gains) — the "forgotten coupled spot" trap.
+    match cfg.print.white_balance {
+        WbSource::Explicit(gains) => positive("--white-balance", &gains)?,
+        WbSource::GrayWorld | WbSource::Percentile
+            if !matches!(cfg.algorithm, Algorithm::Density | Algorithm::Sigmoid) =>
+        {
+            return Err(usage(
+                "--auto-wb needs --algorithm density or sigmoid (the simple \
+                 algorithm has no print white-balance stage); pass explicit \
+                 --white-balance gains instead, or switch algorithm"
+                    .into(),
+            ));
+        }
+        WbSource::GrayWorld | WbSource::Percentile => {}
+    }
 
     // Simple: gains positive; clip range finite and ordered.
     positive("--invert-white-balance", &cfg.simple.invert_white_balance)?;
@@ -1187,6 +1256,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         ));
     }
     report.dmax = rendered.convert.dmax;
+    report.white_balance = rendered.convert.white_balance;
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).
@@ -1749,7 +1819,150 @@ mod tests {
             &parse_convert(&["--algorithm", "simple", "--white-balance", "1.1,1.0,0.9"]),
         );
         assert_eq!(cfg.algorithm, Algorithm::Simple);
-        assert_eq!(cfg.print.white_balance, [1.1, 1.0, 0.9]);
+        assert_eq!(cfg.print.white_balance, WbSource::Explicit([1.1, 1.0, 0.9]));
+    }
+
+    #[test]
+    fn merge_wb_flags_map_to_the_source_enum() {
+        // Each flag maps to its variant; a forgotten merge arm would leave the
+        // default and silently make the flag a no-op (the four-spot-wiring trap).
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--auto-wb", "gray-world"]),
+        );
+        assert_eq!(cfg.print.white_balance, WbSource::GrayWorld);
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--auto-wb", "percentile"]),
+        );
+        assert_eq!(cfg.print.white_balance, WbSource::Percentile);
+
+        // No flag keeps the recipe's auto mode; a flag replaces it (flags win).
+        let mut recipe = ResolvedConfig::default();
+        recipe.print.white_balance = WbSource::GrayWorld;
+        assert_eq!(
+            merge(recipe.clone(), &parse_convert(&[]))
+                .print
+                .white_balance,
+            WbSource::GrayWorld
+        );
+        assert_eq!(
+            merge(recipe.clone(), &parse_convert(&["--auto-wb", "percentile"]))
+                .print
+                .white_balance,
+            WbSource::Percentile
+        );
+        // Explicit beats auto BY SOURCE: `--white-balance 1,1,1` over a recipe
+        // auto mode means neutral gains, not re-estimation — even though the
+        // value equals the default (the variant carries the provenance).
+        assert_eq!(
+            merge(recipe, &parse_convert(&["--white-balance", "1,1,1"]))
+                .print
+                .white_balance,
+            WbSource::Explicit([1.0, 1.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn mutually_exclusive_wb_flags_are_rejected() {
+        let argv = [
+            "nc",
+            "convert",
+            "i",
+            "-o",
+            "o",
+            "--white-balance",
+            "1,1,1",
+            "--auto-wb",
+            "percentile",
+        ];
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "--white-balance and --auto-wb should conflict"
+        );
+    }
+
+    #[test]
+    fn recipe_parses_nested_print_white_balance_key() {
+        // The recipe key lives under `print.white_balance`; pin the documented
+        // (§9) nesting and all three variant wire-forms through `ResolvedConfig`.
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"print":{"white_balance":"gray-world"}}"#).unwrap();
+        assert_eq!(cfg.print.white_balance, WbSource::GrayWorld);
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"print":{"white_balance":"percentile"}}"#).unwrap();
+        assert_eq!(cfg.print.white_balance, WbSource::Percentile);
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"print":{"white_balance":{"explicit":[1.2,1.0,0.8]}}}"#)
+                .unwrap();
+        assert_eq!(cfg.print.white_balance, WbSource::Explicit([1.2, 1.0, 0.8]));
+        // The auto modes validate under the density algorithm (no value to
+        // range-check).
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            let mut cfg = ResolvedConfig::default();
+            cfg.print.white_balance = mode;
+            validate(&cfg).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_rejects_auto_wb_with_the_simple_algorithm() {
+        // `simple` never reads `print.white_balance`, so an auto mode would be a
+        // silent no-op (exit 0, no estimation, no gains). A requested action must
+        // fail loudly instead — exit 2 (usage).
+        let mut cfg = ResolvedConfig {
+            algorithm: Algorithm::Simple,
+            ..ResolvedConfig::default()
+        };
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            cfg.print.white_balance = mode;
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "{mode:?} with simple must be rejected"
+            );
+        }
+        // Explicit gains under simple are fine (simple has its own
+        // `invert_white_balance`; `print.white_balance` is inert but not an
+        // action silently dropped).
+        cfg.print.white_balance = WbSource::Explicit([1.1, 1.0, 0.9]);
+        validate(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_auto_wb_with_density_and_sigmoid() {
+        // The whitelist's two arms: both algorithms with a print white-balance
+        // stage must accept an auto mode (the counterpart to the simple
+        // rejection above). Sigmoid needs a Dmax anchor, so set one.
+        for algorithm in [Algorithm::Density, Algorithm::Sigmoid] {
+            let mut cfg = ResolvedConfig {
+                algorithm,
+                ..ResolvedConfig::default()
+            };
+            cfg.density.dmax = DmaxSource::Auto;
+            for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+                cfg.print.white_balance = mode;
+                validate(&cfg)
+                    .unwrap_or_else(|e| panic!("{algorithm:?} + {mode:?} must validate: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn every_auto_wb_source_has_a_cli_flag() {
+        // Guard against a future `WbSource` auto mode shipping recipe-only (it
+        // must be reachable from `--auto-wb`, per "every knob is a CLI flag").
+        // `WbSource::Explicit` is `--white-balance`; every other variant must map
+        // back from an `AutoWb`. Uses an exhaustive match so adding a variant
+        // fails to compile until it is wired here (and thus to the flag).
+        for mode in [AutoWb::GrayWorld, AutoWb::Percentile] {
+            let src: WbSource = mode.into();
+            let round_trip = match src {
+                WbSource::Explicit(_) => panic!("an AutoWb must not map to Explicit"),
+                WbSource::GrayWorld => AutoWb::GrayWorld,
+                WbSource::Percentile => AutoWb::Percentile,
+            };
+            assert_eq!(round_trip, mode);
+        }
     }
 
     #[test]
@@ -2054,7 +2267,13 @@ mod tests {
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         let mut cfg = ResolvedConfig::default();
-        cfg.print.white_balance = [1.0, f32::NAN, 1.0];
+        cfg.print.white_balance = WbSource::Explicit([1.0, f32::NAN, 1.0]);
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
+        // Non-positive explicit gains are rejected too (a recipe can smuggle
+        // them past the CLI value parser).
+        let mut cfg = ResolvedConfig::default();
+        cfg.print.white_balance = WbSource::Explicit([1.0, 0.0, 1.0]);
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         // Negative highlight compression is rejected (the density render silently

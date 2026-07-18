@@ -87,10 +87,13 @@
 //! `10^v ≤ 1.0` is guaranteed only for *finite* stage-3 output — a non-finite
 //! sample rides through to the counter instead.
 
-use crate::algo::density::{check_base, render_print, resolve_dmax, to_density};
+use crate::algo::density::{
+    DensityImage, check_base, estimate_wb_gains, render_print, resolve_dmax, to_density,
+};
 use crate::algo::{ConvertReport, Converter};
 use crate::types::{
     DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result, SigmoidParams,
+    WbSource,
 };
 
 /// Sigmoid / H&D-curve converter.
@@ -288,12 +291,43 @@ impl Converter for Sigmoid {
             toe,
             shoulder,
         } = self.sigmoid;
-        let image = render_print(
-            density,
-            |d| s_curve(d, contrast, toe, shoulder, anchor),
-            &self.print,
-        );
-        Ok((image, ConvertReport { dmax: resolved }))
+        // Stage-3 S-curve. A `move` closure over the `Copy` curve params, so it is
+        // itself `Copy` and can be passed by value to both `render_print` calls
+        // below (the neutral analysis pass and the final render).
+        let tone = move |d: f32| s_curve(d, contrast, toe, shoulder, anchor);
+
+        // White balance: explicit gains apply directly; an auto mode is estimated
+        // from a neutral analysis render (unit gains, default print — no exposure /
+        // black point / soft-clip) through the *same* stage-4 slot, so reusing the
+        // reported gains via `--white-balance` is bit-identical (measure once,
+        // reuse for the roll). Shared with `density` via `estimate_wb_gains`; the
+        // neutral pass runs on a clone so the final render below still consumes the
+        // cached density buffer. The analysis pass reads only `rgb`, so it drops
+        // the IR plane (`ir: None`) rather than cloning an image-sized buffer for
+        // nothing; the final render still consumes the original `density` with IR
+        // intact.
+        let wb = match self.print.white_balance {
+            WbSource::Explicit(gains) => gains,
+            auto_mode => {
+                let analysis = DensityImage {
+                    width: density.width,
+                    height: density.height,
+                    density: density.density.clone(),
+                    ir: None,
+                };
+                let neutral =
+                    render_print(analysis, tone, [1.0, 1.0, 1.0], &PrintParams::default());
+                estimate_wb_gains(&neutral.rgb, auto_mode)?
+            }
+        };
+        let image = render_print(density, tone, wb, &self.print);
+        Ok((
+            image,
+            ConvertReport {
+                dmax: resolved,
+                white_balance: Some(wb),
+            },
+        ))
     }
 }
 
@@ -667,10 +701,125 @@ mod tests {
         let conv = sigmoid(DmaxSource::Explicit(1.25), SigmoidParams::default());
         let (_, rep) = conv.convert_reported(&img, &base).unwrap();
         assert_eq!(rep.dmax, Some(1.25));
+        // The default (neutral) print reports its resolved gains too.
+        assert_eq!(rep.white_balance, Some([1.0, 1.0, 1.0]));
 
         let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
         let (_, rep) = conv.convert_reported(&img, &base).unwrap();
         assert!(rep.dmax.is_some_and(f32::is_finite));
+    }
+
+    #[test]
+    fn auto_wb_convert_neutralizes_a_cast_end_to_end() {
+        // Mirror of the density end-to-end test for the sigmoid path: a wrong
+        // (neutral) base leaves a constant per-channel cast in the positive, and
+        // both auto modes must estimate gains that equalize the channels. Exercises
+        // the sigmoid-owned estimate→apply orchestration (its own analysis pass).
+        // Knees off (toe = shoulder = 0) so stage 3 is the straight-line power form
+        // (which preserves the constant per-channel density offset across both
+        // tones); with the S-curve's non-linear knees on, the two tones would map
+        // by different channel ratios and per-pixel equalization wouldn't hold —
+        // the bit-exact reuse test below covers the knees-on path.
+        let base = FilmBase::from([0.8, 0.8, 0.8]); // deliberately ignores the mask
+        let cast = [0.5f32, 0.3, 0.2]; // orange-ish transmissions
+        let mut rgb = Vec::new();
+        for i in 0..64 {
+            let t = if i % 2 == 0 { 1.0 } else { 0.5 }; // two-tone content
+            rgb.extend_from_slice(&[cast[0] * t, cast[1] * t, cast[2] * t]);
+        }
+        let img = LinearImage::new(64, 1, rgb, None).unwrap();
+        let straight = SigmoidParams {
+            toe: 0.0,
+            shoulder: 0.0,
+            ..SigmoidParams::default()
+        };
+        for mode in [WbSource::GrayWorld, WbSource::Percentile] {
+            let conv = Sigmoid {
+                density: DensityParams::default(),
+                sigmoid: straight.clone(),
+                print: PrintParams {
+                    white_balance: mode,
+                    ..PrintParams::default()
+                },
+            };
+            let (out, rep) = conv.convert_reported(&img, &base).unwrap();
+            let gains = rep.white_balance.expect("gains reported");
+            assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
+            for px in out.rgb.chunks_exact(3) {
+                assert!(approx(px[0], px[1], 1e-4), "{mode:?}: {px:?}");
+                assert!(approx(px[1], px[2], 1e-4), "{mode:?}: {px:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn auto_wb_output_is_bit_exact_with_explicit_rerun_of_reported_gains() {
+        // The sigmoid measure-once-reuse contract: reusing the reported gains via
+        // explicit `--white-balance` reproduces the auto run bit-for-bit, because
+        // application goes through the same stage-4 slot sharing the resolved
+        // anchor. Non-default print + curve params prove it holds with black_point,
+        // the soft-clip, and the S-curve knees in play.
+        let base = FilmBase::from([0.6, 0.35, 0.2]);
+        let img = LinearImage::new(
+            3,
+            2,
+            vec![
+                0.5, 0.3, 0.15, 0.3, 0.2, 0.1, 0.2, 0.1, 0.05, //
+                0.45, 0.25, 0.12, 0.1, 0.06, 0.03, 0.55, 0.32, 0.18,
+            ],
+            None,
+        )
+        .unwrap();
+        let print = PrintParams {
+            print_exposure: 0.3,
+            black_point: 0.02,
+            white_balance: WbSource::Percentile,
+            highlight_compress: 0.4,
+        };
+        let curve = SigmoidParams {
+            contrast: 1.4,
+            toe: 0.15,
+            shoulder: 0.3,
+        };
+        let auto = Sigmoid {
+            density: DensityParams::default(),
+            sigmoid: curve.clone(),
+            print: print.clone(),
+        };
+        let (out_auto, rep) = auto.convert_reported(&img, &base).unwrap();
+        let gains = rep.white_balance.expect("auto gains reported");
+
+        let explicit = Sigmoid {
+            density: DensityParams::default(),
+            sigmoid: curve,
+            print: PrintParams {
+                white_balance: WbSource::Explicit(gains),
+                ..print
+            },
+        };
+        let (out_explicit, rep2) = explicit.convert_reported(&img, &base).unwrap();
+        assert_eq!(out_auto.rgb, out_explicit.rgb, "reuse must be bit-exact");
+        assert_eq!(rep2.white_balance, Some(gains));
+        assert_eq!(rep.dmax, rep2.dmax, "shared anchor");
+    }
+
+    #[test]
+    fn auto_wb_carries_ir_through_the_final_output() {
+        // The auto-WB analysis pass renders on an IR-dropped copy (perf: no
+        // image-sized IR clone), but the *final* render must still consume the
+        // original density with its IR plane intact — assert the IR rides through.
+        let base = FilmBase::from([0.6, 0.6, 0.6]);
+        let img = pixel([0.2, 0.2, 0.2], Some(0.42));
+        let conv = Sigmoid {
+            density: DensityParams::default(),
+            sigmoid: SigmoidParams::default(),
+            print: PrintParams {
+                white_balance: WbSource::Percentile,
+                ..PrintParams::default()
+            },
+        };
+        let out = conv.convert(&img, &base).unwrap();
+        assert_eq!(out.ir.as_deref(), Some(&[0.42_f32][..]));
     }
 
     #[test]

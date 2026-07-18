@@ -185,7 +185,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md)
 - [ ] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md)
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
-- [ ] [Auto neutral white balance](tasks/auto-neutral-wb.md)
+- [x] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [ ] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
 - [ ] [Black & white negative support (mono color model)](tasks/bw-support.md)
 

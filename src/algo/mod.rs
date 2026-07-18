@@ -58,6 +58,12 @@ pub struct ConvertReport {
     /// when one was applied. `None` for algorithms/config that don't anchor
     /// (`simple`, or `density` with `dmax = none`).
     pub dmax: Option<f32>,
+    /// The resolved stage-4 white-balance gains `[r, g, b]` the density print
+    /// render applied — the explicit gains, or the auto-estimated ones
+    /// (`print.white_balance = gray-world | percentile`). Reported so a roll can
+    /// freeze one frame's estimate into a recipe / `--white-balance` (measure
+    /// once, reuse). `None` for algorithms without the print stage (`simple`).
+    pub white_balance: Option<[f32; 3]>,
 }
 
 /// The shipped Step-1 algorithms. `density` is the default.

@@ -1720,3 +1720,66 @@ fn density_report_carries_resolved_dmax() {
         "no anchor must be reported for --no-d-max: {report}"
     );
 }
+
+#[test]
+fn auto_wb_reports_gains_that_reproduce_the_output_when_reused() {
+    // The measure-once-reuse-for-the-roll contract, end to end: an `--auto-wb`
+    // run reports the resolved gains, and a second run feeding them back through
+    // the ordinary `--white-balance` flag must produce a byte-identical TIFF —
+    // proving the auto gains are applied through the standard stage-4 slot, not
+    // a post-hoc multiply. f32 output so the comparison covers full precision.
+    let dir = TempDir::new("autowb");
+    let fix = fixture("hdr-48bit.tif");
+    let base_args = |out: &Path, wb: &[&str]| {
+        let mut v = vec![
+            "convert".to_string(),
+            fix.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--film-base".to_string(),
+            "0.9,0.55,0.42".to_string(),
+            "--output-hdr".to_string(),
+        ];
+        v.extend(wb.iter().map(|s| s.to_string()));
+        v
+    };
+
+    // Auto run: gains land in the report, green-anchored.
+    let out_auto = dir.path("auto.tiff");
+    let argv = base_args(&out_auto, &["--auto-wb", "percentile"]);
+    let (code, stdout, err) = run(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let gains = report["white_balance"]
+        .as_array()
+        .unwrap_or_else(|| panic!("resolved gains must be reported: {report}"));
+    assert_eq!(gains.len(), 3);
+    assert_eq!(gains[1].as_f64().unwrap(), 1.0, "green-anchored");
+    // The sidecar recipe records the *auto mode* (the run's parameters), so
+    // re-running the sidecar re-estimates; the report carries the frozen gains.
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{}.json", out_auto.display())).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecar["print"]["white_balance"], "percentile");
+
+    // Reuse run: the reported gains via the explicit flag ⇒ byte-identical TIFF.
+    // (JSON prints the f32 gains as shortest-round-trip f64, which parses back
+    // to the identical f32.)
+    let wb_arg = gains
+        .iter()
+        .map(|g| g.as_f64().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let out_reuse = dir.path("reuse.tiff");
+    let argv = base_args(&out_reuse, &["--white-balance", &wb_arg]);
+    let (code, stdout, err) = run(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        std::fs::read(&out_auto).unwrap(),
+        std::fs::read(&out_reuse).unwrap(),
+        "reusing the reported gains must reproduce the auto output byte-for-byte"
+    );
+    // The explicit run reports the same resolved gains.
+    assert_eq!(json(&stdout)["white_balance"], report["white_balance"]);
+}
