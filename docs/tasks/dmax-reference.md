@@ -8,6 +8,14 @@ exactly like `Dmin` — acquired from a **fully-exposed reference frame** (the
 light-struck roll lead, always available). Demote per-frame `--auto-d-max` from
 the default to an explicit, lower-priority "exposure-normalizing" mode.
 
+> **Terminology.** `Dmax` here is nc's *display-white density anchor* — a **scalar**
+> in corrected-density (`D′`) space, **distinct** from classic photographic film
+> Dmax (the negative's physical maximum optical density). This task changes only how
+> that anchor is *acquired* (roll-fixed reference vs per-frame auto), never its
+> meaning or units. See design-spec §4 "Terminology & value domains" for the
+> canonical definition and the transmission-vs-density distinction this design
+> leans on.
+
 ## Background
 
 `dmax-white-anchor` (shipped) defined `Dmax` as **frame-local**, measured per

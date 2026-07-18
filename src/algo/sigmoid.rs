@@ -711,7 +711,7 @@ mod tests {
     #[test]
     fn convert_rejects_a_non_positive_auto_anchor() {
         // A degenerate Auto anchor (≤ 0) must fail loudly, not render an all-white
-        // image: here every pixel is *brighter* than the base (scan > base), so
+        // image: here every pixel has higher transmission than the base (scan > base), so
         // every corrected density is negative and the measured percentile is < 0.
         // Guards the CLAUDE.md film-base gotcha for the anchor path.
         let base = FilmBase::from([0.2, 0.2, 0.2]);
