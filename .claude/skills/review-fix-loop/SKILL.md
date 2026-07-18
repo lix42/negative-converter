@@ -68,8 +68,13 @@ the version (the cache dir is `~/.claude/plugins/cache/openai-codex/codex/<ver>/
 and the plugin auto-updates):
 
 ```
-# Resolve the installed companion script (any version), then review the worktree.
-codex_mjs=$(ls -t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs | head -1)
+# Resolve the newest installed companion script, then review the worktree.
+# `command ls` bypasses any `ls` alias (eza/lsd/uutils read `-t` as "--time
+# <FIELD>" and error) while still invoking the real `ls`, which handles `-1t`.
+# `-t` (sort by mtime, newest first) + `head -1` picks the most-recently-installed
+# version — a lexical sort would mis-rank (0.10 < 0.9). No GNU-only `sort -V`, no
+# hard-coded path. `/codex:review` resolves the path itself and is preferred.
+codex_mjs=$(command ls -1t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs 2>/dev/null | head -1)
 node "$codex_mjs" review --wait --scope working-tree
 ```
 
