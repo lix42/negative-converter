@@ -49,7 +49,7 @@ use crate::types::{FilmBase, FilmBaseParams, FilmBaseSource, LinearImage, NcErro
 
 /// Percentile used to summarize a region per channel. A high percentile (rather
 /// than the raw max) resists hot pixels / dust sparkles while still landing on
-/// the bright film base. Design task suggests 95th–99th; 97th is the middle.
+/// the high-transmission film base. Design task suggests 95th–99th; 97th is the middle.
 const SAMPLE_PERCENTILE: f32 = 0.97;
 
 /// Low percentile paired with [`SAMPLE_PERCENTILE`] for the uniformity check.
@@ -81,10 +81,11 @@ const MIN_BAND_STRIPS: u32 = 2;
 /// boundary.
 const STRIP_CONTINUITY_TOL: f32 = 0.10;
 
-/// A candidate must be brighter than the frame-interior median by this factor on
-/// **every** channel (the rebate is per-channel minimum density ⇒ per-channel
-/// maximum transmission). All-channel with a 5% margin replaces the Step-1
-/// heuristic's lenient any-channel 2% gate, which a bright surround could pass.
+/// A candidate must have higher transmission than the frame-interior median by this
+/// factor on **every** channel (the rebate is per-channel minimum density ⇒
+/// per-channel maximum transmission). All-channel with a 5% margin replaces the
+/// Step-1 heuristic's lenient any-channel 2% gate, which a high-transmission
+/// surround could pass.
 const INTERIOR_BRIGHTNESS_MARGIN: f32 = 1.05;
 
 /// Cross-edge agreement tolerance: per-channel relative difference above which
@@ -249,7 +250,7 @@ fn sample_region(image: &LinearImage, rect: [u32; 4]) -> Result<BaseEstimate> {
 /// contiguous dark-holder run. Strips are trimmed by the scan depth at both
 /// ends so the perpendicular edges' holder margins can't contaminate them.
 /// Returns one candidate per edge at most; an empty result means no confident
-/// band exists anywhere. Candidates are **not** brightness-gated here — that is
+/// band exists anywhere. Candidates are **not** transmission-gated here — that is
 /// [`select_auto_base`]'s job, which must be called on the **same image** these
 /// candidates came from (it recomputes the scan depth and interior median from
 /// it). Errors only when the image is too small to scan.
@@ -414,7 +415,7 @@ fn classify_strip(image: &LinearImage, edge: Edge, depth: u32, cap: u32) -> Resu
 /// the very edge, then a run of uniform, value-continuous strips at least
 /// [`MIN_BAND_STRIPS`] thick. The whole band is then re-measured as one region
 /// and must itself pass the uniformity gate (defense against a slow drift the
-/// per-strip checks can't see). A bright band **at** the edge (no holder
+/// per-strip checks can't see). A high-transmission band **at** the edge (no holder
 /// outside it) is rejected — that is the bright-surround false positive, or a
 /// crop with no holder, and both belong to `--base-region`, not auto.
 fn edge_candidate(image: &LinearImage, edge: Edge, cap: u32) -> Result<Option<RebateCandidate>> {
@@ -916,13 +917,13 @@ mod tests {
 
     #[test]
     fn auto_warns_on_disagreeing_edges() {
-        // Two holder-backed bands, both brighter than the interior but with
-        // clearly different values: the brightest wins, and the ambiguity is
+        // Two holder-backed bands, both higher-transmission than the interior but with
+        // clearly different values: the highest-transmission wins, and the ambiguity is
         // surfaced as a warning (--strict can then refuse it).
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         fill_rect(&mut img, [0, 3, 100, 4], [0.30, 0.20, 0.12]); // top: bright but different
         let est = estimate(&img, &params(FilmBaseSource::Auto)).unwrap();
-        assert_close(est.base, REBATE, 0.02); // brightest (the rebate) still wins
+        assert_close(est.base, REBATE, 0.02); // highest-transmission (the rebate) still wins
         assert!(
             est.warnings.iter().any(|w| w.contains("disagree")),
             "expected a cross-edge disagreement warning: {:?}",
