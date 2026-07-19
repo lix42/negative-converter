@@ -2073,3 +2073,78 @@ Three further items the user decided after the review:
   design-spec §12 item 17 emit_report consumer list now reads "convert/inspect/
   estimate" (md+html); design-spec §9 collision parenthetical now reads
   "(`NC_TELEMETRY_LOG` or the default path)" (md+html).
+
+## External review triage — 7 findings → 7 tasks (2026-07-18, docs-only, uncommitted)
+
+An external code review of the Step-1 codebase produced seven findings. Each was
+**verified against the actual code** before acting (several claims were checked
+with `tiffinfo`/`exiftool` on the real `../nc-assets` scans, `cargo build`, and
+direct source reads); all seven held up. Per the user's direction the pass stayed
+**docs-only** — every finding was turned into a tracked task rather than fixed in
+place, since the working tree already held documentation edits and code changes
+were to be scheduled, not mixed in. Result: `docs/TASKS.md` updated (Mermaid graph
++ dependency list + phase checklists) and seven new `docs/tasks/*.md` files. No
+source, `Cargo.toml`, or `Cargo.lock` touched.
+
+The tasks (all deps `[x]` ⇒ executable now, except where noted):
+
+- `input-color-management` (Phase 6) — **input ICC → working space.** `InputColor::Auto`
+  promises embedded/default-profile decoding but `Auto` ≡ `Linear` today (decode
+  normalizes integers, every stage assumes linear Rec.709/D65; only `Profile` is
+  rejected). Investigated with `exiftool`/`tiffinfo`: **all 26 real scans carry no
+  embedded ICC profile and no colorimetry tags** (raw `Gamma=1` Plustek/SilverFast),
+  while our own `converted/` outputs embed "sRGB built-in" — so this is a
+  forward-looking fidelity feature (enabled once the user makes an IT8 scanner
+  profile), not a fix for current output. One profile per scanner (device
+  characterization), **not** per film roll; stock differences stay the density
+  stage's job. Task uses lcms2 to build a source→working transform applied after
+  decode; lifts the `--input-profile` rejection. Deliberately skipped the cheaper
+  "honest default / fail-loud on embedded profile" option (pre-release).
+- `density-safety-bounds` (Phase 6) — physical bounds on
+  `density_scale`/`offset`/`gamma` (the sigmoid-bounds analogue density lacks;
+  `validate` checks only finiteness/positivity) + a degenerate-output
+  (histogram/dynamic-range collapse) **warning** catching the finite-all-black
+  underflow the loss counters miss (`10^(γ·D')`: huge-negative density → finite
+  `+0.0`, uncounted — acknowledged at `algo/density.rs:221-226`). Offset stays
+  negative-capable (mask compensation) ⇒ magnitude cap. Warning needs a
+  false-positive guard validated on real (legitimately dark) scans.
+- `transactional-output-writes` (Phase 8) — artifacts written straight to final
+  paths via `File::create`, sequentially; reproduced sidecar-fails-after-primary
+  leaving an orphaned TIFF. Temp-write → fsync → rename. Framed as **honest
+  "no partial artifacts + minimized window," not literal multi-file atomicity**
+  (POSIX rename is per-file). Records the existing IR-before-primary mitigation.
+- `memory-preflight` (Phase 8, Phase A of the memory review) — the 4 GiB decode
+  limit guards only the u16 read buffer while derived peak is a multiple
+  (u16+f32 decode, full-image clone in `to_output` incl. the never-transformed IR,
+  quantize buffer; three full images can overlap — decoded `image` + algo
+  `positive` + `to_output` clone ⇒ ~24 GiB, ~6× the 4 GiB input ceiling, and still
+  ~16 GiB / two images after the in-place fix) unchecked. Adds a peak-memory preflight
+  (one shared sizing model, operational `--max-memory`-style knob, fail-loud) and
+  drops the `to_output` clone (transform in place, skip IR).
+- `streaming-tiled-io` (Phase 8, Phase B, **evaluate-first**, gated on
+  `memory-preflight` + `real-scan-verification`) — strip/tile decode + streaming
+  encode. Opens with a **STEP 0 gate**: evaluate from measured peak whether it's
+  needed at all; if data is insufficient, collect it first; proceed only if real
+  scans exceed the budget. Default expectation: not needed yet (~18 MP ⇒ ~600 MB).
+  Pushed back on committing to a full streaming architecture unmeasured.
+- `dependency-hygiene` (Phase 8) — drop three unused crates (`image`,
+  `kamadak-exif`, `palette`; **verified `cargo build --all-targets` succeeds
+  without them** — `image` pulls a large codec tree) and unify the two `Algorithm`
+  enums onto `types::Algorithm`, removing the dead `algo::mod::Algorithm` copy and
+  its `#[allow(dead_code)]`. Pure cleanup. (Noted: `cargo` doesn't warn on unused
+  *deps* by default, which is why CI missed them.)
+- `release-readiness` (Phase 8) — (1) **doc-accuracy corrections** (do-first,
+  independent): README still says "pre-implementation / coding hasn't started" +
+  "Planned usage" (false); `TASKS.md` says "two algorithms" omitting `sigmoid`
+  (three exist); obsolete `--out-depth f32` → `--output-hdr` in **two** task files
+  (`real-scan-verification.md:32`, `pipeline-orchestration.md:49`); the research
+  report's `citeturn…` tokens are **PUA-wrapped** (plain grep finds 0) and need
+  delimiter-aware cleanup. (2) **productization**: license (**user decision** —
+  none present), Cargo release metadata (all fields absent), supported platforms
+  (lcms2-sys C-FFI cross-compile constraint), binary packaging (sequence after
+  `real-scan-verification`).
+
+**Deferred / not created:** the cheaper Option-1 honest-default for input color
+(pre-release makes it moot — folded into `input-color-management` lifting the
+rejection). **Open:** pick a first task — the doc-accuracy half of
+`release-readiness` is the quickest, most user-visible win.
