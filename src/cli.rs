@@ -1363,35 +1363,11 @@ fn convert_frame(
         );
     }
 
-    // Domain guard for an explicit / reference-derived `Dmax`. An explicit anchor is
-    // a base-relative density `D` measured under the *default* density-scale/offset
-    // (`estimate --d-max-region`, or a hand-set `--d-max`), but the render subtracts
-    // it from the corrected density `D′ = scale·D + offset`. With non-default
-    // scale/offset the anchor lands in a different density domain than the render
-    // subtracts it from, uniformly mis-anchoring every frame — silently. Warn
-    // loudly (`--strict`-promotable) so the user re-measures the anchor under these
-    // density params (or resets them). `Fixed`/`Auto` are already in the corrected
-    // domain (the nominal is defined there; `Auto` measures the post-correction
-    // buffer), and `simple` consumes neither knob, so the guard is scoped to an
-    // explicit anchor on a density-domain algorithm. (Regional balance is spatial
-    // and cannot fold into any scalar anchor — documented on `reference_dmax`.)
-    if matches!(cfg.density.dmax, DmaxSource::Explicit(_))
-        && matches!(cfg.algorithm, Algorithm::Density | Algorithm::Sigmoid)
-        && (cfg.density.density_scale != DensityParams::default().density_scale
-            || cfg.density.density_offset != DensityParams::default().density_offset)
-    {
-        push_warning_buf(
-            warnings,
-            log,
-            format!(
-                "explicit --d-max is a base-relative density measured under default \
-                 density-scale/offset, but density-scale ({:?}) / density-offset ({:?}) \
-                 are non-default — the anchor is in a different density domain than the \
-                 render subtracts it from, uniformly mis-anchoring the frame; re-measure \
-                 --d-max under these density params or reset them to defaults",
-                cfg.density.density_scale, cfg.density.density_offset
-            ),
-        );
+    // Domain guard for an explicit / reference-derived `Dmax` — see
+    // `explicit_dmax_domain_warning`. Fires the (`--strict`-promotable) warning when
+    // the anchor's density domain no longer matches what the render subtracts it from.
+    if let Some(msg) = explicit_dmax_domain_warning(cfg) {
+        push_warning_buf(warnings, log, msg);
     }
 
     // Stage 1 — decode. Per-stage wall clocks feed the telemetry record only
@@ -1546,6 +1522,97 @@ fn convert_frame(
         },
         loss,
     })
+}
+
+/// Domain guard for an explicit / reference-derived `Dmax`: the warning message when
+/// the anchor's density domain no longer matches what the render subtracts it from,
+/// else `None`.
+///
+/// An explicit anchor is a base-relative density `D` measured under the *default*
+/// density correction (`estimate --d-max-region`, or a hand-set `--d-max`), but the
+/// render subtracts it from the corrected density
+/// `D′ = scale·D + offset + regional-balance ramps`. Anything that moves `D′` off that
+/// default domain lands the anchor in a different density domain than the render
+/// subtracts it from, uniformly mis-anchoring every frame — silently. Two such knobs:
+/// non-default density-scale/offset, and a non-neutral regional (shadow/highlight)
+/// balance — the balance ramps add into `D′`
+/// (`D′_c = B_c + shadow_c·w_lo + highlight_c·w_hi`) before the `− Dmax`. The caller
+/// warns loudly (`--strict`-promotable) so the user re-measures the anchor under these
+/// density params (or resets them).
+///
+/// `Fixed`/`Auto` are already in the corrected domain (the nominal is defined there;
+/// `Auto` measures the post-correction, post-balance buffer), and `simple` consumes
+/// none of these knobs, so the guard is scoped to an explicit anchor on a
+/// density-domain algorithm. (Regional balance varies per-tone, so it cannot be
+/// *folded into* a scalar anchor — but a non-neutral balance still shifts `D′`, so a
+/// fixed anchor still mis-anchors; hence it belongs in this guard.)
+fn explicit_dmax_domain_warning(cfg: &ResolvedConfig) -> Option<String> {
+    let default_density = DensityParams::default();
+    let nondefault_correction = cfg.density.density_scale != default_density.density_scale
+        || cfg.density.density_offset != default_density.density_offset;
+    let nonneutral_balance = cfg.density.shadow_balance != default_density.shadow_balance
+        || cfg.density.highlight_balance != default_density.highlight_balance;
+    if matches!(cfg.density.dmax, DmaxSource::Explicit(_))
+        && matches!(cfg.algorithm, Algorithm::Density | Algorithm::Sigmoid)
+        && (nondefault_correction || nonneutral_balance)
+    {
+        Some(format!(
+            "explicit --d-max is a base-relative density measured under default \
+             density correction, but density-scale ({:?}) / density-offset ({:?}) / \
+             regional balance (shadow {:?}, highlight {:?}) are non-default — the \
+             anchor is in a different density domain than the render subtracts it \
+             from, uniformly mis-anchoring the frame; re-measure --d-max under these \
+             density params or reset them to defaults",
+            cfg.density.density_scale,
+            cfg.density.density_offset,
+            cfg.density.shadow_balance,
+            cfg.density.highlight_balance
+        ))
+    } else {
+        None
+    }
+}
+
+/// Plausibility warning for a measured reference `Dmax` (`estimate --d-max-region`), or
+/// `None` when it is a credible fully-exposed leader. Never a hard error (thin/unusual
+/// stock varies) — a `--strict`-promotable warning for the user's manual review, since
+/// a too-low anchor silently blows the roll too bright. Two distinct failure shapes, so
+/// at most one fires:
+///
+/// - (a) the gray mean itself is below the leader floor — the whole frame is thin (the
+///   weakest channel is necessarily low too, so this subsumes shape (b); report it as
+///   the frame-wide diagnosis);
+/// - (b) the gray mean is plausible, but the weakest channel sits barely above the base
+///   (essentially unexposed) — a colored / wrong region, which the scalar mean alone
+///   hides. A genuine leader is near-opaque in *every* channel, so the check is
+///   per-channel on the minimum, not just the average.
+fn reference_dmax_plausibility_warning(measured: &density::ReferenceDmax) -> Option<String> {
+    let dmax = measured.scalar;
+    let min_channel = measured
+        .per_channel
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    if dmax < density::MIN_PLAUSIBLE_REFERENCE_DMAX {
+        Some(format!(
+            "measured reference Dmax {dmax} is implausibly low for a fully-exposed \
+             leader (expected ≳ {:.1} density) — the region may not be a fully-exposed \
+             leader; verify --d-max-region before freezing this anchor",
+            density::MIN_PLAUSIBLE_REFERENCE_DMAX
+        ))
+    } else if min_channel < density::MIN_PLAUSIBLE_REFERENCE_DMAX {
+        Some(format!(
+            "measured reference Dmax {dmax} is plausible on the gray average, but its \
+             weakest channel density ({min_channel}, per-channel {:?}) is implausibly \
+             low (expected ≳ {:.1}) — the region is colored or not a fully-exposed \
+             leader (a genuine leader is near-opaque in every channel); verify \
+             --d-max-region before freezing this anchor",
+            measured.per_channel,
+            density::MIN_PLAUSIBLE_REFERENCE_DMAX
+        ))
+    } else {
+        None
+    }
 }
 
 /// `nc convert` — the full pipeline: decode → film-base → algorithm → output
@@ -2471,28 +2538,18 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
             // density-scale/offset). A degenerate / non-opaque region errors loudly
             // inside `reference_dmax`.
             let reference = film_base::sample_region_at(&image, region, 0.5)?;
-            let dmax = density::reference_dmax(<[f32; 3]>::from(reference), &base)?;
+            let measured = density::reference_dmax(<[f32; 3]>::from(reference), &base)?;
+            let dmax = measured.scalar;
             report.dmax = Some(dmax);
             report.dmax_region = Some(region);
             log.info(format_args!(
                 "measured roll-fixed Dmax {dmax} from {region:?}"
             ));
-            // Implausibly-low anchor for a fully-exposed leader: not a hard error
-            // (thin/unusual stock varies), but a loud, `--strict`-promotable warning
-            // for the user's manual review — a too-low anchor silently blows the
-            // roll too bright.
-            if dmax < density::MIN_PLAUSIBLE_REFERENCE_DMAX {
-                push_warning(
-                    &mut report,
-                    &log,
-                    format!(
-                        "measured reference Dmax {dmax} is implausibly low for a \
-                         fully-exposed leader (expected ≳ {:.1} density) — the region may \
-                         not be a fully-exposed leader; verify --d-max-region before \
-                         freezing this anchor",
-                        density::MIN_PLAUSIBLE_REFERENCE_DMAX
-                    ),
-                );
+            // Plausibility for a fully-exposed leader — a loud, `--strict`-promotable
+            // warning (never a hard error: thin/unusual stock varies). See
+            // `reference_dmax_plausibility_warning`.
+            if let Some(msg) = reference_dmax_plausibility_warning(&measured) {
+                push_warning(&mut report, &log, msg);
             }
             // Reuse-ready `--d-max` / `density.dmax` forms are gated on the SAME
             // base-usability check the film-base reuse uses (each channel in
@@ -3592,6 +3649,80 @@ mod tests {
             }
             _ => unreachable!("expected estimate"),
         }
+    }
+
+    #[test]
+    fn explicit_dmax_domain_warning_fires_on_nonneutral_regional_balance() {
+        // Baseline: an explicit anchor with default density correction and neutral
+        // balance is already in the render's domain — no warning.
+        let mut cfg = ResolvedConfig::default();
+        assert_eq!(cfg.algorithm, Algorithm::Density);
+        cfg.density.dmax = DmaxSource::Explicit(2.0);
+        assert!(explicit_dmax_domain_warning(&cfg).is_none());
+
+        // B1: a non-neutral regional balance shifts D′ (the corrected density the
+        // render subtracts the anchor from: D′_c = B_c + shadow·w_lo + highlight·w_hi),
+        // so a reused explicit anchor mis-anchors even with default scale/offset. Warn,
+        // and name regional balance in the message.
+        cfg.density.shadow_balance = [0.05, 0.0, -0.02];
+        let msg = explicit_dmax_domain_warning(&cfg).expect("non-neutral shadow balance must warn");
+        assert!(
+            msg.contains("regional balance"),
+            "message must name regional balance: {msg}"
+        );
+
+        // A non-neutral highlight balance alone (scale/offset default) also warns.
+        let mut cfg = ResolvedConfig::default();
+        cfg.density.dmax = DmaxSource::Explicit(2.0);
+        cfg.density.highlight_balance = [0.0, 0.01, 0.0];
+        assert!(explicit_dmax_domain_warning(&cfg).is_some());
+
+        // `simple` consumes none of these knobs — no warning despite the non-neutral
+        // balance and explicit anchor.
+        cfg.algorithm = Algorithm::Simple;
+        assert!(explicit_dmax_domain_warning(&cfg).is_none());
+
+        // A `Fixed`/`Auto` anchor is already in the corrected domain — no warning even
+        // with a non-neutral balance on a density algorithm.
+        let mut cfg = ResolvedConfig::default();
+        cfg.density.shadow_balance = [0.05, 0.0, -0.02];
+        assert!(matches!(cfg.density.dmax, DmaxSource::Fixed));
+        assert!(explicit_dmax_domain_warning(&cfg).is_none());
+    }
+
+    #[test]
+    fn reference_dmax_plausibility_warns_on_a_weak_channel_a_plausible_scalar_hides() {
+        // B2, colored-region example: base [1,1,1], transmissions ≈ [0.001,0.99,0.99]
+        // → per-channel densities ≈ [3.0, 0.004, 0.004]. The gray mean ≈ 1.0 clears
+        // MIN_PLAUSIBLE_REFERENCE_DMAX, so the scalar-only check passes, yet green and
+        // blue are essentially unexposed base — not a leader. The per-channel minimum
+        // check must fire the (weak-channel) warning.
+        let base = FilmBase::from([1.0, 1.0, 1.0]);
+        let measured = density::reference_dmax([0.001, 0.99, 0.99], &base).unwrap();
+        assert!(
+            measured.scalar >= density::MIN_PLAUSIBLE_REFERENCE_DMAX,
+            "the gray average alone must pass the scalar check ({})",
+            measured.scalar
+        );
+        let msg = reference_dmax_plausibility_warning(&measured)
+            .expect("a plausible scalar hiding a weak channel must warn");
+        assert!(
+            msg.contains("weakest channel"),
+            "the weak-channel warning must fire, not the thin-frame one: {msg}"
+        );
+
+        // A genuine near-opaque leader (dense in every channel) → no warning.
+        let measured = density::reference_dmax([0.01, 0.01, 0.01], &base).unwrap();
+        assert!(reference_dmax_plausibility_warning(&measured).is_none());
+
+        // A uniformly-thin frame (scalar below the floor) → the frame-wide warning.
+        let measured = density::reference_dmax([0.3, 0.3, 0.3], &base).unwrap();
+        let msg = reference_dmax_plausibility_warning(&measured)
+            .expect("a sub-floor gray mean must warn");
+        assert!(
+            msg.contains("implausibly low for a fully-exposed leader"),
+            "the thin-frame warning must fire: {msg}"
+        );
     }
 
     #[test]

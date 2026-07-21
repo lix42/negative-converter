@@ -2477,3 +2477,40 @@ the verified findings were applied (still uncommitted). What changed:
   reference → strict-promotable warning (e2e); degenerate grid base → `--d-max-region`
   skipped, still hard-errors (e2e); `sample_region_at` median (`p = 0.5`) on a
   non-uniform region differs from the high/low percentiles (`film_base.rs`).
+
+### Review-fix loop (2026-07-21)
+
+A second review pass (Codex P2 findings) over the still-uncommitted changes. Two
+verified findings applied:
+
+- **B1 — regional balance folded into the Dmax domain guard** (`cli.rs`). The
+  explicit-`Dmax` domain-mismatch warning previously fired only on non-default
+  `density_scale`/`density_offset`. But the render subtracts `Dmax` from
+  `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)`, so a **non-neutral
+  regional balance** also shifts that domain — a reference/explicit `--d-max` reused
+  with a non-neutral shadow/highlight balance silently mis-anchored with no warning.
+  This supersedes the prior "spatial balance can't fold into any scalar anchor,
+  documentation-only" stance (2026-07-19 note): it can't be *folded into* the anchor,
+  but a non-neutral balance still shifts `D′`, so the fixed anchor still mis-anchors —
+  hence it now belongs in the guard. The guard decision was extracted into a pure,
+  testable `explicit_dmax_domain_warning(&ResolvedConfig) -> Option<String>`; the
+  message now names regional balance alongside scale/offset. Test:
+  `explicit_dmax_domain_warning_fires_on_nonneutral_regional_balance`.
+- **B2 — per-channel reference plausibility** (`density.rs` + `cli.rs`). The
+  implausibly-low warning checked only the averaged scalar `dmax`, so a colored region
+  with one dense channel and others barely above base cleared it (base `[1,1,1]`,
+  transmissions ≈ `[0.001, 0.99, 0.99]` → per-channel densities ≈ `[3.0, 0.004, 0.004]`,
+  avg ≈ 1.0 > threshold; the `d ≤ 0` hard error doesn't catch positives). `reference_dmax`
+  now returns a `ReferenceDmax { scalar, per_channel }` (the scalar value is unchanged —
+  still the gray mean); the `d ≤ 0` per-channel hard error is kept. The estimate-side
+  plausibility decision was extracted into a pure
+  `reference_dmax_plausibility_warning(&ReferenceDmax) -> Option<String>` with two
+  distinct, mutually-exclusive shapes: (a) sub-floor gray mean → the existing frame-thin
+  warning; (b) plausible mean but weakest channel below `MIN_PLAUSIBLE_REFERENCE_DMAX` →
+  a new colored/wrong-region warning. Tests: `reference_dmax_exposes_a_weak_channel_a_plausible_scalar_hides`
+  (`density.rs`, the data) and `reference_dmax_plausibility_warns_on_a_weak_channel_a_plausible_scalar_hides`
+  (`cli.rs`, the wiring, covering all three branches).
+- Determinism, `None` bit-exactness, four-flag mutual exclusivity, and the
+  four-coupled-spots invariant are untouched — both fixes only add/route report
+  warnings (no image-output change). CI gate (`fmt` / `clippy -D warnings` / `build` /
+  `test`): clean.

@@ -518,6 +518,20 @@ pub(crate) fn resolve_dmax(densities: &[f32], source: DmaxSource) -> Option<f32>
 /// but real leader.
 pub(crate) const MIN_PLAUSIBLE_REFERENCE_DMAX: f32 = 1.0;
 
+/// A measured reference `Dmax`: the roll-fixed scalar anchor plus the per-channel
+/// base-relative densities it was reduced from. The `scalar` is the value frozen
+/// into a recipe / passed via `--d-max`; `per_channel` exists so the caller's
+/// plausibility check can look at the *weakest* channel — a colored/wrong region
+/// can average to a plausible gray density while one channel is essentially
+/// unexposed base, which the scalar alone hides (see [`reference_dmax`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReferenceDmax {
+    /// The gray-mean anchor (mean of `per_channel`) — the scalar `Dmax`.
+    pub scalar: f32,
+    /// Per-channel base-relative densities `[r, g, b]` (`D_c = -log10(t_c/base_c)`).
+    pub per_channel: [f32; 3],
+}
+
 /// Measure the roll-fixed display-white anchor `Dmax` (a scalar density) from a
 /// **fully-exposed reference frame** (the light-struck roll leader — near-opaque
 /// in every channel, always present, the film's max-density endpoint). This is the
@@ -566,10 +580,15 @@ pub(crate) const MIN_PLAUSIBLE_REFERENCE_DMAX: f32 = 1.0;
 ///
 /// A measured `Dmax` that is positive-but-implausibly-low for a leader is *not*
 /// rejected here (stock/development vary); the caller warns via
-/// [`MIN_PLAUSIBLE_REFERENCE_DMAX`].
-pub(crate) fn reference_dmax(reference: [f32; 3], base: &FilmBase) -> Result<f32> {
+/// [`MIN_PLAUSIBLE_REFERENCE_DMAX`]. The plausibility check is **per-channel**: a
+/// colored/wrong region can average to a plausible gray density while one channel
+/// sits barely above the base (essentially unexposed), so [`ReferenceDmax`] carries
+/// the per-channel densities alongside the scalar for the caller to test the
+/// weakest channel — a genuine leader is dense in *every* channel, not just on the
+/// gray average.
+pub(crate) fn reference_dmax(reference: [f32; 3], base: &FilmBase) -> Result<ReferenceDmax> {
     let base = [base.r, base.g, base.b];
-    let mut sum = 0.0f32;
+    let mut per_channel = [0.0f32; 3];
     for (c, name) in ["red", "green", "blue"].into_iter().enumerate() {
         let t = reference[c];
         // (a) An effectively-zero / non-finite reference channel is a degenerate
@@ -597,17 +616,20 @@ pub(crate) fn reference_dmax(reference: [f32; 3], base: &FilmBase) -> Result<f32
                  explicit --d-max"
             )));
         }
-        sum += d;
+        per_channel[c] = d;
     }
     // Each channel is finite and `> 0`, so the gray mean is finite and `> 0` too
     // (three finite positives, bounded well below overflow: `t > SCAN_EPSILON` and
     // `base ≤ 1` cap each `D` near `6`).
-    let dmax = sum / 3.0;
+    let scalar = (per_channel[0] + per_channel[1] + per_channel[2]) / 3.0;
     debug_assert!(
-        dmax.is_finite() && dmax > 0.0,
+        scalar.is_finite() && scalar > 0.0,
         "per-channel guards ensure this"
     );
-    Ok(dmax)
+    Ok(ReferenceDmax {
+        scalar,
+        per_channel,
+    })
 }
 
 /// Cap on how many density samples the `Auto` anchor examines. A 99.5th
@@ -1927,14 +1949,16 @@ mod tests {
         // channel D = -log10(t/b); the scalar Dmax is their mean. Base = 1 so
         // D = -log10(t): t = [0.01, 0.001, 0.1] → D = [2, 3, 1] → mean 2.0.
         let base = FilmBase::from([1.0, 1.0, 1.0]);
-        let d = reference_dmax([0.01, 0.001, 0.1], &base).unwrap();
+        let d = reference_dmax([0.01, 0.001, 0.1], &base).unwrap().scalar;
         assert!(approx(d, 2.0, 1e-5), "got {d}");
         // Orange base: a neutral (per-channel-equal fraction of base) reference
         // yields equal per-channel densities, so the mean equals that density —
         // the scalar carries no per-channel (white-balance) term.
         let base = FilmBase::from([0.5, 0.25, 0.15]);
         let frac = 0.05f32; // reference transmits 5% of each channel's base
-        let d = reference_dmax([0.5 * frac, 0.25 * frac, 0.15 * frac], &base).unwrap();
+        let d = reference_dmax([0.5 * frac, 0.25 * frac, 0.15 * frac], &base)
+            .unwrap()
+            .scalar;
         assert!(approx(d, -(frac.log10()), 1e-5), "got {d}");
     }
 
@@ -1991,13 +2015,45 @@ mod tests {
         // fully-exposed leader. `reference_dmax` returns it (thin stock varies); the
         // value sits below MIN_PLAUSIBLE_REFERENCE_DMAX so the CLI warns.
         let base = FilmBase::from([1.0, 1.0, 1.0]);
-        let d = reference_dmax([0.3, 0.3, 0.3], &base).unwrap();
+        let d = reference_dmax([0.3, 0.3, 0.3], &base).unwrap().scalar;
         assert!(d > 0.0 && d < MIN_PLAUSIBLE_REFERENCE_DMAX, "got {d}");
         // A genuine near-opaque leader clears the threshold.
-        let d = reference_dmax([0.01, 0.01, 0.01], &base).unwrap();
+        let d = reference_dmax([0.01, 0.01, 0.01], &base).unwrap().scalar;
         assert!(
             d >= MIN_PLAUSIBLE_REFERENCE_DMAX,
             "leader should clear: {d}"
+        );
+    }
+
+    #[test]
+    fn reference_dmax_exposes_a_weak_channel_a_plausible_scalar_hides() {
+        // Codex's colored-region example: base [1,1,1], transmissions
+        // ≈ [0.001, 0.99, 0.99] → per-channel densities ≈ [3.0, 0.004, 0.004].
+        // The gray mean ≈ 1.0 clears MIN_PLAUSIBLE_REFERENCE_DMAX, yet green and
+        // blue are essentially unexposed base — not a leader. The per-channel
+        // densities expose the weak channels so the caller can warn on the minimum.
+        let base = FilmBase::from([1.0, 1.0, 1.0]);
+        let measured = reference_dmax([0.001, 0.99, 0.99], &base).unwrap();
+        assert!(
+            measured.scalar >= MIN_PLAUSIBLE_REFERENCE_DMAX,
+            "the gray average alone would pass the plausibility check ({})",
+            measured.scalar
+        );
+        let min_channel = measured
+            .per_channel
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            min_channel < MIN_PLAUSIBLE_REFERENCE_DMAX,
+            "the weakest channel must be implausibly low ({min_channel})"
+        );
+        // The scalar is still the mean of the per-channel densities.
+        let mean = measured.per_channel.iter().sum::<f32>() / 3.0;
+        assert!(
+            approx(measured.scalar, mean, 1e-6),
+            "got {}",
+            measured.scalar
         );
     }
 
@@ -2012,7 +2068,7 @@ mod tests {
         let base = FilmBase::from([0.6, 0.35, 0.2]);
         // A near-opaque reference: a few % of each channel's base (dense/neutral).
         let refl = [0.6 * 0.03, 0.35 * 0.03, 0.2 * 0.03];
-        let d = reference_dmax(refl, &base).unwrap();
+        let d = reference_dmax(refl, &base).unwrap().scalar;
         assert!(
             d > 0.0,
             "reference Dmax should be a positive scalar, got {d}"
