@@ -2289,3 +2289,26 @@ findings verified and applied (still uncommitted):
   output, per-frame `film_base` override warns and `--strict`-promotes (frame still
   converts), a warn-then-fail frame keeping its warning, and a `frame_report_err`
   unit test.
+
+### Review-fix loop — P2 pass (2026-07-21)
+Rebased onto `origin/main` (now carries the merged #36 "7 tracked tasks" and #37);
+three verified Codex P2 findings applied (all `src/cli.rs`):
+- **`merge_json` replaces an externally-tagged enum variant switch instead of
+  unioning tags.** A per-frame override that flips a one-key enum map to a
+  different variant (real case: shared `film_base.source={"region":…}` + override
+  `{"film_base":{"source":{"explicit":…}}}`) was deep-merged key-by-key into a
+  two-tag `{"region":…,"explicit":…}` object that no enum deserializes, so a valid
+  override became a confusing `from_value` rejection. New `is_variant_switch` guard
+  (both sides single-key objects with *different* keys) replaces wholesale; same-tag
+  objects still deep-merge (a partial sub-field override keeps its siblings). Unit
+  test for the merge both ways + a `resolve_frames` test proving the region→explicit
+  override applies **and** still raises the roll-fixed-base warning.
+- **The `--frames` manifest is protected from roll write targets.** `run_roll` now
+  adds `args.frames` (the manifest path) to the read-input set passed to
+  `ensure_roll_targets_distinct`, so `--report-file` (or any output) equal to the
+  manifest is rejected (exit 2) before any write. Guard test added.
+- **Directory expansion fails loudly on an unreadable entry.** `expand_input`'s
+  `read_dir` iteration dropped per-entry `Err`s via `filter_map(Result::ok)` →
+  a silently short batch; it now propagates each entry error as a usage error
+  (exit 2, same class as failing to open the directory). Happy-path expansion test
+  added (a per-entry `read_dir` error is not portably reproducible in a unit test).

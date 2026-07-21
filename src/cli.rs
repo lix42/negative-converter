@@ -1727,16 +1727,28 @@ fn has_tiff_ext(p: &Path) -> bool {
 /// verbatim (a missing file surfaces later as a per-frame decode error).
 fn expand_input(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if path.is_dir() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-            .map_err(|e| {
+        let read_dir = std::fs::read_dir(path).map_err(|e| {
+            NcError::Usage(format!(
+                "cannot read input directory {}: {e}",
+                path.display()
+            ))
+        })?;
+        // Propagate a per-entry read error rather than dropping it: a silently
+        // skipped entry would shorten the batch without a word (fail-loud
+        // violation). Same usage-error class (exit 2) as failing to open the dir.
+        let mut entries: Vec<PathBuf> = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| {
                 NcError::Usage(format!(
-                    "cannot read input directory {}: {e}",
+                    "cannot read an entry in input directory {}: {e}",
                     path.display()
                 ))
-            })?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file() && has_tiff_ext(p))
-            .collect();
+            })?;
+            let p = entry.path();
+            if p.is_file() && has_tiff_ext(&p) {
+                entries.push(p);
+            }
+        }
         entries.sort();
         out.extend(entries);
     } else {
@@ -1774,12 +1786,19 @@ fn resolve_frame_output(explicit: Option<&Path>, input: &Path, out_dir: &Path) -
 /// Switching a multi-variant enum via an override is safe, not silent: the merged
 /// value must still deserialize as that enum. An externally-tagged enum such as
 /// [`FilmBaseSource`] serializes as a one-key map (`{"region":[…]}`), so an
-/// override that flips it to another variant (`{"explicit":[…]}`) *replaces* the
-/// whole map (this `(b, o) => *b = o` arm fires on the inner value, not a
-/// key-by-key merge that could leave two tags), and a malformed override is
-/// rejected loudly by the `from_value` in [`resolve_frames`], never applied
-/// half-merged.
+/// override that flips it to another variant (`{"explicit":[…]}`) must *replace*
+/// the whole map — a key-by-key merge would union the tags into `{"region":…,
+/// "explicit":…}`, which no externally-tagged enum can deserialize, turning an
+/// override that should apply into a confusing `from_value` rejection. The
+/// [`is_variant_switch`] guard catches exactly that signature (both sides are
+/// single-key objects with *different* keys) and replaces wholesale; a malformed
+/// override is still rejected loudly by the `from_value` in [`resolve_frames`],
+/// never applied half-merged.
 fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    if is_variant_switch(base, overlay) {
+        *base = overlay.clone();
+        return;
+    }
     match (base, overlay) {
         (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
             for (k, v) in o {
@@ -1787,6 +1806,21 @@ fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
             }
         }
         (b, o) => *b = o.clone(),
+    }
+}
+
+/// The externally-tagged-enum-variant-switch signature: `base` and `overlay` are
+/// both single-key objects with *different* keys (e.g. `{"region":[…]}` vs
+/// `{"explicit":[…]}`). Deep-merging such a pair would leave a two-tag object that
+/// no externally-tagged enum deserializes, so [`merge_json`] replaces it wholesale
+/// instead. A unit variant serializes as a bare string (`"auto"`), not an object,
+/// so switching to/from it never reaches here — the plain replace arm handles it.
+fn is_variant_switch(base: &serde_json::Value, overlay: &serde_json::Value) -> bool {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            b.len() == 1 && o.len() == 1 && b.keys().next() != o.keys().next()
+        }
+        _ => false,
     }
 }
 
@@ -2031,7 +2065,13 @@ fn run_roll(args: RollArgs) -> Result<()> {
 
     // Guard every write target (per-frame outputs + sidecars, and the report
     // file) against every input and against one another before writing anything.
-    let inputs: Vec<&Path> = planned.iter().map(|p| p.input.as_path()).collect();
+    // The `--frames` manifest is a read input too — a write target aimed at it
+    // (e.g. `--report-file` equal to the manifest path) must be rejected, not
+    // silently clobbered — so include it in the protected read set.
+    let mut inputs: Vec<&Path> = planned.iter().map(|p| p.input.as_path()).collect();
+    if let Some(frames) = args.frames.as_deref() {
+        inputs.push(frames);
+    }
     let mut targets: Vec<(String, PathBuf)> = Vec::new();
     for pf in &planned {
         targets.push((
@@ -3496,6 +3536,76 @@ mod tests {
     }
 
     #[test]
+    fn merge_json_replaces_enum_variant_switch_but_deep_merges_same_tag() {
+        // An externally-tagged enum variant switch (`region` → `explicit`) must
+        // REPLACE the one-key map, not union the tags — a `{"region":…,
+        // "explicit":…}` object deserializes as no enum variant. Regression guard
+        // for the per-frame `film_base.source` override path.
+        let mut base = serde_json::json!({"film_base": {"source": {"region": [1, 2, 3, 4]}}});
+        let overlay = serde_json::json!({"film_base": {"source": {"explicit": [0.9, 0.5, 0.4]}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"film_base": {"source": {"explicit": [0.9, 0.5, 0.4]}}})
+        );
+        // The SAME tag on both sides is not a variant switch: recurse into it so a
+        // partial override of one sub-field keeps its siblings.
+        let mut base = serde_json::json!({"density": {"dmax": {"auto": {"p": 0.5, "q": 1}}}});
+        let overlay = serde_json::json!({"density": {"dmax": {"auto": {"p": 0.9}}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"density": {"dmax": {"auto": {"p": 0.9, "q": 1}}}})
+        );
+    }
+
+    #[test]
+    fn per_frame_override_can_switch_film_base_variant_and_still_warns() {
+        // A per-frame `params` override that flips the roll-fixed `film_base.source`
+        // from `region` to `explicit` must APPLY (the merged JSON deserializes) and
+        // still raise the roll-level "base overridden" warning. Before the
+        // variant-switch fix the merge unioned the tags and `from_value` rejected
+        // it, turning a valid override into a confusing error.
+        let dir = std::env::temp_dir().join(format!("nc-roll-varswitch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("frames.json");
+        std::fs::write(
+            &manifest,
+            r#"{"frames":[{"input":"a.tif",
+                          "params":{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}}}}]}"#,
+        )
+        .unwrap();
+        let args = RollArgs {
+            inputs: vec![],
+            frames: Some(manifest.clone()),
+            out_dir: dir.clone(),
+            recipe_in: None,
+            strict: false,
+            report: ReportArgs::default(),
+        };
+        let shared = ResolvedConfig {
+            film_base: FilmBaseParams {
+                source: FilmBaseSource::Region([10, 10, 20, 20]),
+            },
+            ..ResolvedConfig::default()
+        };
+        let mut warnings = Vec::new();
+        let log = Log::new(&args.report);
+        let planned = resolve_frames(&args, &shared, &mut warnings, &log);
+        std::fs::remove_dir_all(&dir).ok();
+        let planned = planned.expect("region→explicit override should apply, not error");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].cfg.film_base.source,
+            FilmBaseSource::Explicit([0.9, 0.55, 0.42])
+        );
+        assert!(
+            !warnings.is_empty(),
+            "overriding the roll-fixed film base must still warn"
+        );
+    }
+
+    #[test]
     fn per_frame_override_keeps_shared_roll_fixed_params() {
         // The manifest per-frame merge path: a partial override changes only its
         // own knob and keeps the shared roll-fixed params (film base, Dmax) — the
@@ -3579,6 +3689,24 @@ mod tests {
     }
 
     #[test]
+    fn expand_input_lists_sorted_tiffs_and_skips_others() {
+        // Directory expansion after the fail-loud rewrite: `.tif`/`.tiff` files
+        // (case-insensitive) in sorted order, non-TIFF and extension-less entries
+        // skipped. (A per-entry `read_dir` error is not portably reproducible in a
+        // test, so only the happy path is exercised here.)
+        let dir = std::env::temp_dir().join(format!("nc-expand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.tif", "a.TIFF", "c.png", "d"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut out = Vec::new();
+        let got = expand_input(&dir, &mut out);
+        std::fs::remove_dir_all(&dir).ok();
+        got.expect("expanding a readable directory should succeed");
+        assert_eq!(out, vec![dir.join("a.TIFF"), dir.join("b.tif")]);
+    }
+
+    #[test]
     fn reject_roll_unsupported_rejects_export_ir() {
         let mut cfg = ResolvedConfig::default();
         assert!(reject_roll_unsupported(&cfg).is_ok());
@@ -3625,6 +3753,23 @@ mod tests {
             ),
         ];
         assert!(ensure_roll_targets_distinct(&inputs, &ok).is_ok());
+    }
+
+    #[test]
+    fn ensure_roll_targets_distinct_protects_the_frames_manifest() {
+        // `run_roll` adds the `--frames` manifest to the protected read set, so a
+        // write target aimed at it (e.g. `--report-file` equal to the manifest
+        // path) is rejected up front rather than clobbering the manifest.
+        let manifest = Path::new("/rolls/frames.json");
+        let inputs = [Path::new("/scans/a.tif"), manifest];
+        let clobber_manifest = vec![(
+            "--report-file".to_string(),
+            PathBuf::from("/rolls/frames.json"),
+        )];
+        assert!(matches!(
+            ensure_roll_targets_distinct(&inputs, &clobber_manifest),
+            Err(NcError::Usage(_))
+        ));
     }
 
     #[test]
