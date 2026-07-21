@@ -1027,6 +1027,16 @@ the NLP feature comparison, Phase 6).
     reusing the fail-soft `writeln!(stdout)` pattern the `--telemetry-file -` sink
     already uses. Pre-existing on `main`, independent of the telemetry work.
     Tracked: `stdout-broken-pipe-safety`.
+18. **Input-side color management & a global (scanner) config tier.** *Consume* an
+    input ICC profile — the scan's **embedded** profile or one supplied via
+    `--input-profile` / `input.color.profile` — converting the scan into the linear
+    working space before the pipeline, and lift the current exit-4 rejection. Beyond
+    the transform itself, this introduces the architectural notion of a **global
+    (cross-roll) tier**: a scanner IT8 profile is a property of the *device*,
+    constant across rolls, and layers *above* the per-roll recipe (global defaults →
+    roll recipe → per-frame override, extending items 6/13). Scope is *consuming* a
+    profile; **creating** one from an IT8/target (scanner profiling) remains a
+    non-goal (§2 out-of-scope). Tracked: `input-color-management`.
 
 ## 13. Open questions
 
