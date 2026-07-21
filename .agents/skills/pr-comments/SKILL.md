@@ -6,7 +6,7 @@ description: >-
   warranted, then reply to and resolve every thread — looping until the PR is
   green and quiet. Use when asked to "check PR comments", "address review
   feedback", "reply and resolve comments", or to drive a PR through its review
-  bots. Invoke as `/pr-comments <pr-number-or-url>`.
+  bots.
 ---
 
 # Address PR review comments
@@ -32,7 +32,7 @@ gh pr view <n> --json title,state,headRefName,mergeStateStatus,reviewDecision
 gh pr checks <n>                                    # CI + review-bot check states
 gh pr view <n> --json comments  -q '.comments[]'    # issue-level (conversation) comments
 gh pr view <n> --json reviews   -q '.reviews[]'     # review summaries (bodies)
-gh api repos/OWNER/REPO/pulls/<n>/comments          # INLINE review comments (has .id, .path, .line, .in_reply_to)
+gh api --paginate repos/OWNER/REPO/pulls/<n>/comments  # INLINE review comments (has .id, .path, .line, .in_reply_to); --paginate required — the default returns only the first 30
 ```
 
 For resolve state and thread node IDs, use GraphQL (REST doesn't expose either):
@@ -40,10 +40,15 @@ For resolve state and thread node IDs, use GraphQL (REST doesn't expose either):
 ```
 gh api graphql -f query='
 query($o:String!,$n:String!,$pr:Int!){ repository(owner:$o,name:$n){ pullRequest(number:$pr){
-  reviewThreads(first:100){ nodes { id isResolved isOutdated
+  reviewThreads(first:100){ pageInfo{ hasNextPage endCursor } nodes { id isResolved isOutdated
     comments(first:1){ nodes { databaseId author{login} body } } } } } } }' \
   -f o=OWNER -f n=REPO -F pr=NUMBER
 ```
+
+`first:100` caps the page: on PRs with more than 100 threads, follow the
+`pageInfo{ hasNextPage endCursor }` cursors (feed `endCursor` back as an `after:`
+argument) until `hasNextPage` is false — otherwise later threads are silently
+dropped and the "loop until quiet" guarantee breaks.
 
 Pass the PR number as the typed variable `$pr` (`-F pr=NUMBER`, capital `-F` for a
 number) — don't string-substitute it into the query; keeping it a variable avoids
@@ -136,10 +141,14 @@ won't iterate as separate args — loop with `for id in $(…)` / `while read -r
 and pass one ID per call. Verify at the end:
 
 ```
-gh api graphql -f query='query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){reviewThreads(first:100){nodes{isResolved}}}}}' \
+gh api graphql -f query='query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){reviewThreads(first:100){pageInfo{hasNextPage endCursor} nodes{isResolved}}}}}' \
   -f o=OWNER -f n=REPO -F pr=NUMBER \
   -q '[.data.repository.pullRequest.reviewThreads.nodes[].isResolved]|"resolved=\(map(select(.==true))|length)/\(length)"'
 ```
+
+This too caps at `first:100`: if `pageInfo.hasNextPage` is true, page through the
+`endCursor` cursors and count every page before declaring the PR quiet — a clean
+first page is not proof the later ones are resolved.
 
 ## Step 8 — Loop until quiet
 

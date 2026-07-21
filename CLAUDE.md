@@ -111,6 +111,11 @@ Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 
 ## Conventions
 
+- **Skill layout.** Agent skills live in `.agents/skills/` (the directory Codex
+  CLI scans; Codex invokes them as `$<name>`); `.claude/skills/` holds relative
+  symlinks into it for Claude Code. Exception: `review-fix-loop` ships as two
+  intentionally divergent variants — `.claude/skills/` (Claude Code two-engine
+  loop) and `.agents/skills/` (tool-agnostic) — never symlink one to the other.
 - **Value terms (high/low/bright/dark).** Before using these in code or docs, read
   design-spec §4 "Terminology & value domains". A pixel lives in several
   **per-channel** spaces; as scene luminance rises, `transmission ↓ · density ↑ ·
