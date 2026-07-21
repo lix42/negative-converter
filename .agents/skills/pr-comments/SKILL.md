@@ -39,16 +39,16 @@ For resolve state and thread node IDs, use GraphQL (REST doesn't expose either):
 
 ```
 gh api graphql -f query='
-query($o:String!,$n:String!,$pr:Int!){ repository(owner:$o,name:$n){ pullRequest(number:$pr){
-  reviewThreads(first:100){ pageInfo{ hasNextPage endCursor } nodes { id isResolved isOutdated
+query($o:String!,$n:String!,$pr:Int!,$after:String){ repository(owner:$o,name:$n){ pullRequest(number:$pr){
+  reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes { id isResolved isOutdated
     comments(first:1){ nodes { databaseId author{login} body } } } } } } }' \
   -f o=OWNER -f n=REPO -F pr=NUMBER
 ```
 
-`first:100` caps the page: on PRs with more than 100 threads, follow the
-`pageInfo{ hasNextPage endCursor }` cursors (feed `endCursor` back as an `after:`
-argument) until `hasNextPage` is false — otherwise later threads are silently
-dropped and the "loop until quiet" guarantee breaks.
+`first:100` caps the page: on PRs with more than 100 threads, page with the
+nullable `$after` variable — omit it for the first page, then re-run with
+`-f after=<endCursor>` until `hasNextPage` is false — otherwise later threads
+are silently dropped and the "loop until quiet" guarantee breaks.
 
 Pass the PR number as the typed variable `$pr` (`-F pr=NUMBER`, capital `-F` for a
 number) — don't string-substitute it into the query; keeping it a variable avoids
@@ -141,14 +141,15 @@ won't iterate as separate args — loop with `for id in $(…)` / `while read -r
 and pass one ID per call. Verify at the end:
 
 ```
-gh api graphql -f query='query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){reviewThreads(first:100){pageInfo{hasNextPage endCursor} nodes{isResolved}}}}}' \
+gh api graphql -f query='query($o:String!,$n:String!,$pr:Int!,$after:String){repository(owner:$o,name:$n){pullRequest(number:$pr){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{isResolved}}}}}' \
   -f o=OWNER -f n=REPO -F pr=NUMBER \
   -q '[.data.repository.pullRequest.reviewThreads.nodes[].isResolved]|"resolved=\(map(select(.==true))|length)/\(length)"'
 ```
 
-This too caps at `first:100`: if `pageInfo.hasNextPage` is true, page through the
-`endCursor` cursors and count every page before declaring the PR quiet — a clean
-first page is not proof the later ones are resolved.
+This too caps at `first:100`: if `pageInfo.hasNextPage` is true, re-run with
+`-f after=<endCursor>` (omit `after` for the first page) and count every page
+before declaring the PR quiet — a clean first page is not proof the later ones
+are resolved.
 
 ## Step 8 — Loop until quiet
 
