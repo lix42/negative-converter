@@ -22,8 +22,8 @@ more robust path). This task covers the cases IR can't: **HDR 48-bit scans with 
 IR plane**; **silver B&W film** (which blocks IR); and — because `ir-holder-detection`
 defaults **off** unless the film type is explicitly declared chromogenic — any
 **HDRi scan whose `--film-type` is unknown/undeclared** (the default C-41 workflow,
-until the user opts in). It is the RGB path `ir-holder-detection`'s dispatch falls
-back to, which is why it now builds on that task.
+until the user opts in). It is the RGB path that `ir-holder-detection`'s dispatch
+falls back to, which is why it now builds on that task.
 
 ## Design
 
@@ -50,7 +50,7 @@ is unavailable or off; the IR mask supersedes it when active. Only affects `auto
 
 ## Dependencies
 
-- [IR-assisted film-holder detection](ir-holder-detection.md) — this is the
-  RGB-only fallback for the no-IR path, so it builds on the holder-classification
-  dispatch that task establishes (which in turn builds on
+- [IR-assisted film-holder detection](ir-holder-detection.md) — `white-holder-support`
+  is the RGB-only fallback for the no-IR path, so it builds on the
+  holder-classification dispatch that task establishes (which in turn builds on
   [auto-base-redesign](auto-base-redesign.md), a transitive dependency).
