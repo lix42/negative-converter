@@ -58,6 +58,12 @@ graph TD
   algo-density --> pipeline-orchestration
   cli-framework --> pipeline-orchestration
   cli-framework --> stdout-broken-pipe-safety
+  pipeline-orchestration --> transactional-output-writes
+  pipeline-orchestration --> memory-preflight
+  pipeline-orchestration --> dependency-hygiene
+  pipeline-orchestration --> release-readiness
+  memory-preflight --> streaming-tiled-io
+  real-scan-verification --> streaming-tiled-io
   film-base-estimation --> auto-base-redesign
   auto-base-redesign --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
@@ -75,6 +81,8 @@ graph TD
   algo-density --> auto-neutral-wb
   pipeline-orchestration --> auto-neutral-wb
   algo-density --> regional-color-balance
+  algo-density --> density-safety-bounds
+  pipeline-orchestration --> density-safety-bounds
   algo-density --> bw-support
   pipeline-orchestration --> bw-support
   dmax-white-anchor --> bw-support
@@ -85,6 +93,8 @@ graph TD
   pipeline-orchestration --> roll-conversion
   dmax-white-anchor --> roll-conversion
   pipeline-orchestration --> conversion-versioning
+  color-management --> input-color-management
+  pipeline-orchestration --> input-color-management
   roll-conversion --> base-acquisition-planner
   auto-base-redesign --> base-acquisition-planner
   ir-holder-detection --> base-acquisition-planner
@@ -121,6 +131,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
 - `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
 - `regional-color-balance` (post-MVP): `algo-density`
+- `density-safety-bounds` (post-MVP): `algo-density`, `pipeline-orchestration`
 - `bw-support` (post-MVP): `algo-density`, `pipeline-orchestration`, `dmax-white-anchor`
 - `film-base-content-fallback` (post-MVP): `film-base-estimation`
 - `ir-holder-detection` (post-MVP): `auto-base-redesign`
@@ -129,6 +140,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `roll-conversion` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
 - `base-acquisition-planner` (post-MVP): `roll-conversion`, `auto-base-redesign`, `ir-holder-detection`, `film-base-content-fallback`, `dmax-reference`
 - `conversion-versioning` (post-MVP): `pipeline-orchestration`
+- `input-color-management` (post-MVP): `color-management`, `pipeline-orchestration`
+- `transactional-output-writes` (post-MVP, hardening): `pipeline-orchestration`
+- `memory-preflight` (post-MVP, hardening): `pipeline-orchestration`
+- `dependency-hygiene` (post-MVP, cleanup): `pipeline-orchestration` (dep removal is standalone)
+- `release-readiness` (post-MVP, productization): `pipeline-orchestration` (doc fixes now; packaging best after `real-scan-verification`)
+- `streaming-tiled-io` (post-MVP, **evaluate-first**): `memory-preflight`, `real-scan-verification`
 
 > **Post-MVP follow-ups** (Phases 5–6) are recorded for continuity and are **not**
 > blockers of `pipeline-orchestration` / the Step-1 MVP. Phase 5 came out of
@@ -188,6 +205,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [x] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
 - [ ] [Black & white negative support (mono color model)](tasks/bw-support.md)
+- [ ] [Density safety bounds](tasks/density-safety-bounds.md) — from the
+  density-safety review: physical bounds on `density_scale`/`offset`/`gamma` (the
+  sigmoid-bounds analogue density lacks) + a degenerate-output (histogram/dynamic-
+  range collapse) warning catching the finite-all-black underflow the loss counters
+  miss, with a false-positive guard validated on real scans.
+- [ ] [Input color management (apply input ICC → working space)](tasks/input-color-management.md) — from the color-profile review; makes `input.color` real (IT8 scanner profile / embedded ICC), lifts the `--input-profile` rejection
 
 ### Phase 7: Acceptance
 > The shipped defaults verified on the user's full-size real scans (assets
@@ -218,11 +241,36 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Background telemetry upload](tasks/telemetry-upload.md) — ship the local
   JSONL queue to a server; strictly opt-in. Scoped/informed by `telemetry-strategy`
   (design-spec §12).
+- [ ] [Transactional output writes](tasks/transactional-output-writes.md) — from
+  the output-atomicity review: write every artifact (primary TIFF, IR, sidecar,
+  report-file) to a same-directory temp, fsync, then rename, so a failed/interrupted
+  run never leaves a truncated final file. Honest guarantee: no partial files +
+  minimized inconsistency window, not literal multi-file atomicity (a crash between
+  renames can still mix old/new artifacts).
+- [ ] [Memory preflight & in-place transform](tasks/memory-preflight.md) — from the
+  memory-safety review (Phase A, cheap): predict peak allocation and fail loudly
+  over a budget before allocating (reconciling the dishonest 4 GiB input limit),
+  and drop the whole-image clone in `to_output` (transform in place, skip IR).
+- [ ] [Streaming / tiled I/O](tasks/streaming-tiled-io.md) — memory-safety review
+  Phase B (expensive, **evaluate-first**): strip/tile decode + streaming encode.
+  STEP 0 gate — evaluate from measured peak whether this is needed at all; if data
+  is insufficient, collect it first; proceed only if real scans exceed the budget.
+- [ ] [Dependency & module hygiene](tasks/dependency-hygiene.md) — from the
+  hygiene review: drop three unused crates (`image`, `kamadak-exif`, `palette` —
+  verified builds without them; `image` pulls a large codec tree) and unify the two
+  `Algorithm` enums onto `types::Algorithm`, removing the dead copy and its
+  `#[allow(dead_code)]`. Pure cleanup, byte-identical output.
 - [ ] [Stdout broken-pipe safety](tasks/stdout-broken-pipe-safety.md) — make every
   stdout JSON write (the report via `emit_report`, `nc params`) tolerate a closed
   pipe (e.g. `nc … | head`) without a panic/backtrace. Pre-existing on `main`, not
   caused by the telemetry work.
 - [ ] [Conversion versioning & baseline comparison](tasks/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
+- [ ] [Release readiness](tasks/release-readiness.md) — from the release-readiness
+  review: (1) correct public docs that misstate the product (README "pre-implementation"
+  + "planned", TASKS.md "two algorithms" omitting sigmoid, obsolete `--out-depth` in two
+  task files, PUA-wrapped `citeturn` tokens in the research report); (2) license (user
+  decision), Cargo release metadata, supported platforms (lcms2-sys C FFI constraint),
+  and binary packaging.
 
 ### Phase 9: Roll workflow (batch conversion)
 > Two conversion workflows established in the 2026-07 design discussion: **roll**
