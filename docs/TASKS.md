@@ -280,5 +280,5 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > roll conversion's default behavior on a batch. Roll-fixed `Dmin` / `Dmax`
 > depend on `dmax-reference`; the cascade depends on the detectors above.
 
-- [ ] [Roll conversion (batch + frozen recipe)](tasks/roll-conversion.md)
+- [x] [Roll conversion (batch + frozen recipe)](tasks/roll-conversion.md)
 - [ ] [Base-acquisition planner (the cascade)](tasks/base-acquisition-planner.md)

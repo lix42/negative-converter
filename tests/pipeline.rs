@@ -1927,3 +1927,626 @@ fn auto_measured_balance_range_is_deterministic_in_the_report() {
     );
     assert_eq!(a, b, "auto-measured balance_range must be deterministic");
 }
+
+// ---------------------------------------------------------------------------
+// roll (batch) — convert N frames from one shared, frozen recipe
+// ---------------------------------------------------------------------------
+
+/// Write `contents` to `path`, returning the path (for building recipes /
+/// manifests in a test's temp dir).
+fn write_file(path: &Path, contents: &str) -> PathBuf {
+    std::fs::write(path, contents).unwrap();
+    path.to_path_buf()
+}
+
+/// A hand-authored frozen roll recipe: explicit roll-fixed film base + Dmax, so
+/// every frame converts deterministically without auto-base (real scans are
+/// holder → rebate → picture, where auto-base fails loudly).
+const ROLL_RECIPE: &str = r#"{
+  "algorithm": "density",
+  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+  "density":   { "dmax": { "explicit": 1.6 } }
+}"#;
+
+#[test]
+fn roll_converts_a_batch_from_a_shared_frozen_recipe() {
+    let tmp = TempDir::new("roll-batch");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "roll should succeed:\n{stdout}\n{err}");
+
+    // Per-frame outputs (named <stem>_positive.tiff) + their sidecars.
+    let hdr_out = out_dir.join("hdr-48bit_positive.tiff");
+    let hdri_out = out_dir.join("hdri-64bit_positive.tiff");
+    assert!(is_tiff(&hdr_out), "first frame output must be a TIFF");
+    assert!(is_tiff(&hdri_out), "second frame output must be a TIFF");
+    assert!(out_dir.join("hdr-48bit_positive.tiff.json").exists());
+    assert!(out_dir.join("hdri-64bit_positive.tiff.json").exists());
+
+    let report = json(&stdout);
+    assert_eq!(report["command"], "roll");
+    // The shared frozen recipe (roll-fixed Dmin/Dmax) appears once, at the top.
+    // f32 round-trips through JSON as f64, so compare the anchors approximately.
+    let fb: Vec<f64> = report["recipe"]["film_base"]["source"]["explicit"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap())
+        .collect();
+    assert!(
+        (fb[0] - 0.9).abs() < 1e-6 && (fb[1] - 0.55).abs() < 1e-6 && (fb[2] - 0.42).abs() < 1e-6,
+        "recipe film base: {fb:?}"
+    );
+    assert!(
+        (report["recipe"]["density"]["dmax"]["explicit"]
+            .as_f64()
+            .unwrap()
+            - 1.6)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(report["summary"]["total"], 2);
+    assert_eq!(report["summary"]["succeeded"], 2);
+    assert_eq!(report["summary"]["failed"], 0);
+    let frames = report["frames"].as_array().unwrap();
+    assert_eq!(frames.len(), 2);
+    for f in frames {
+        assert_eq!(f["status"], "ok");
+        assert!(f["film_base"].is_object(), "per-frame film base reported");
+    }
+}
+
+#[test]
+fn roll_is_byte_identical_on_rerun() {
+    // Determinism: the same batch + same recipe ⇒ byte-identical output per frame.
+    let tmp = TempDir::new("roll-determinism");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let run_into = |dir: &Path| {
+        let (code, _out, err) = run(&[
+            "roll",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "--out-dir",
+            dir.to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{err}");
+        std::fs::read(dir.join("hdr-48bit_positive.tiff")).unwrap()
+    };
+    let a = run_into(&tmp.path("out-a"));
+    let b = run_into(&tmp.path("out-b"));
+    assert_eq!(a, b, "re-running a roll must be byte-identical");
+}
+
+#[test]
+fn roll_frame_local_override_applies_to_just_that_frame() {
+    // A manifest gives frame 2 a per-frame print-exposure override; frame 1 runs
+    // the shared recipe unchanged. Prove per-frame isolation by matching each
+    // roll output byte-for-byte against the equivalent single `nc convert`.
+    let tmp = TempDir::new("roll-override");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let hdri = fixture("hdri-64bit.tif");
+    let manifest = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{ "frames": [
+                 {{ "input": {hdr:?} }},
+                 {{ "input": {hdri:?}, "params": {{ "print": {{ "print_exposure": 0.5 }} }} }}
+               ] }}"#,
+            hdr = hdr.to_str().unwrap(),
+            hdri = hdri.to_str().unwrap(),
+        ),
+    );
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        "--frames",
+        manifest.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "roll with manifest should succeed:\n{stdout}\n{err}"
+    );
+
+    // The override is recorded on frame 2 only.
+    let report = json(&stdout);
+    let frames = report["frames"].as_array().unwrap();
+    assert!(frames[0].get("overrides").is_none() || frames[0]["overrides"].is_null());
+    assert_eq!(frames[1]["overrides"]["print"]["print_exposure"], 0.5);
+
+    // Frame 1 (no override) == single convert with just the shared recipe.
+    let ref1 = tmp.path("ref1.tiff");
+    let (c1, _o, e1) = run(&[
+        "convert",
+        hdr.to_str().unwrap(),
+        "-o",
+        ref1.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(c1, 0, "{e1}");
+    assert_eq!(
+        std::fs::read(out_dir.join("hdr-48bit_positive.tiff")).unwrap(),
+        std::fs::read(&ref1).unwrap(),
+        "un-overridden frame must match a plain convert"
+    );
+
+    // Frame 2 == single convert with the shared recipe + the same override.
+    let ref2 = tmp.path("ref2.tiff");
+    let (c2, _o, e2) = run(&[
+        "convert",
+        hdri.to_str().unwrap(),
+        "-o",
+        ref2.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--print-exposure",
+        "0.5",
+    ]);
+    assert_eq!(c2, 0, "{e2}");
+    assert_eq!(
+        std::fs::read(out_dir.join("hdri-64bit_positive.tiff")).unwrap(),
+        std::fs::read(&ref2).unwrap(),
+        "overridden frame must match a convert carrying the same override"
+    );
+    // The override actually changed the pixels (frame 2 differs from its no-override form).
+    let ref2_plain = tmp.path("ref2-plain.tiff");
+    let (c3, _o, e3) = run(&[
+        "convert",
+        hdri.to_str().unwrap(),
+        "-o",
+        ref2_plain.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(c3, 0, "{e3}");
+    assert_ne!(
+        std::fs::read(&ref2).unwrap(),
+        std::fs::read(&ref2_plain).unwrap(),
+        "the print-exposure override must change the output"
+    );
+}
+
+#[test]
+fn roll_records_a_failed_frame_and_exits_nonzero() {
+    // Batch resilience: a bad frame (missing input → decode error) is recorded in
+    // the report and the roll continues, converting the good frame; the roll then
+    // exits non-zero. stdout stays the JSON report even on the failing exit.
+    let tmp = TempDir::new("roll-partial");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let out_dir = tmp.path("out");
+    let missing = tmp.path("does-not-exist.tif");
+    let (code, stdout, _err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        missing.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "a failed frame must make the roll exit non-zero");
+    let report = json(&stdout);
+    assert_eq!(report["summary"]["succeeded"], 1);
+    assert_eq!(report["summary"]["failed"], 1);
+    // The good frame still produced an output.
+    assert!(is_tiff(&out_dir.join("hdr-48bit_positive.tiff")));
+    // The failed frame carries an error message and "failed" status.
+    let failed = report["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["status"] == "failed")
+        .expect("a failed frame entry");
+    assert!(
+        failed["error"].is_string(),
+        "failed frame has an error: {failed}"
+    );
+}
+
+#[test]
+fn roll_rejects_same_stem_output_collision() {
+    // Two inputs with the same stem in different dirs map to one output name —
+    // caught loudly up front, before anything is written.
+    let tmp = TempDir::new("roll-collision");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let dir_a = tmp.path("a");
+    let dir_b = tmp.path("b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    std::fs::copy(fixture("hdr-48bit.tif"), dir_a.join("frame.tif")).unwrap();
+    std::fs::copy(fixture("hdr-48bit.tif"), dir_b.join("frame.tif")).unwrap();
+    let (code, _out, err) = run(&[
+        "roll",
+        dir_a.join("frame.tif").to_str().unwrap(),
+        dir_b.join("frame.tif").to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "an output-name collision is a usage error");
+    assert!(err.contains("collides"), "stderr should explain: {err}");
+}
+
+#[test]
+fn roll_directory_input_expands_to_sorted_tiffs() {
+    // A positional directory expands to its .tif/.tiff files (sorted), non-TIFFs
+    // ignored. Copy the fixture under two names + a stray .txt, roll the dir.
+    let tmp = TempDir::new("roll-dir");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let scans = tmp.path("scans");
+    std::fs::create_dir_all(&scans).unwrap();
+    std::fs::copy(fixture("hdr-48bit.tif"), scans.join("b.tif")).unwrap();
+    std::fs::copy(fixture("hdr-48bit.tif"), scans.join("a.tiff")).unwrap();
+    std::fs::write(scans.join("notes.txt"), b"not a scan").unwrap();
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        scans.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "directory roll should succeed:\n{stdout}\n{err}");
+    let report = json(&stdout);
+    assert_eq!(report["summary"]["total"], 2, "only the two TIFFs convert");
+    // Expanded in sorted order: a.tiff before b.tif.
+    let frames = report["frames"].as_array().unwrap();
+    assert!(
+        frames[0]["input"].as_str().unwrap().ends_with("a.tiff"),
+        "frames are sorted: {report}"
+    );
+    assert!(frames[1]["input"].as_str().unwrap().ends_with("b.tif"));
+    assert!(is_tiff(&out_dir.join("a_positive.tiff")));
+    assert!(is_tiff(&out_dir.join("b_positive.tiff")));
+    // The .txt is not treated as a frame.
+    assert!(!out_dir.join("notes_positive.tiff").exists());
+}
+
+#[test]
+fn roll_empty_batch_errors_loudly_on_both_paths() {
+    // An empty `--frames` manifest and positional inputs matching no files both
+    // fail loudly as usage errors (exit 2), before anything is written.
+    let tmp = TempDir::new("roll-empty");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+
+    // (a) empty manifest.
+    let manifest = write_file(&tmp.path("empty.json"), r#"{ "frames": [] }"#);
+    let (code, _out, err) = run(&[
+        "roll",
+        "--frames",
+        manifest.to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out-a").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "an empty manifest is a usage error");
+    assert!(
+        err.contains("lists no frames"),
+        "stderr should explain: {err}"
+    );
+
+    // (b) a positional directory that contains no TIFFs.
+    let empty_dir = tmp.path("empty-dir");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+    let (code, _out, err) = run(&[
+        "roll",
+        empty_dir.to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out-b").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "inputs matching no files is a usage error");
+    assert!(
+        err.contains("matched no files"),
+        "stderr should explain: {err}"
+    );
+}
+
+/// A shared recipe with a NON-explicit (region) film base — every frame
+/// re-estimates its own Dmin, so the roll is not truly frozen.
+const ROLL_RECIPE_REGION: &str = r#"{
+  "algorithm": "density",
+  "film_base": { "source": { "region": [0, 0, 502, 462] } }
+}"#;
+
+#[test]
+fn roll_warns_when_film_base_is_not_frozen() {
+    // A non-explicit shared base is a loud roll-level warning (the roll is not
+    // color-consistent), but not a hard failure — the batch still converts.
+    let tmp = TempDir::new("roll-notfrozen");
+    let recipe = write_file(&tmp.path("region.json"), ROLL_RECIPE_REGION);
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "a non-frozen base warns, not fails:\n{stdout}\n{err}"
+    );
+    let report = json(&stdout);
+    assert_eq!(report["summary"]["succeeded"], 1);
+    // The roll-level warning names the problem and the fix, and is echoed to stderr.
+    let w = report["warnings"]
+        .as_array()
+        .expect("roll-level warnings array");
+    assert!(
+        w.iter().any(|m| m.as_str().unwrap().contains("NOT frozen")
+            && m.as_str().unwrap().contains("nc estimate")),
+        "roll-level not-frozen warning present: {report}"
+    );
+    assert!(
+        err.contains("NOT frozen"),
+        "warning echoed to stderr: {err}"
+    );
+}
+
+#[test]
+fn roll_strict_promotes_a_warning_while_still_emitting_the_report() {
+    // `--strict` turns the not-frozen roll-level warning into a non-zero exit, but
+    // the machine-readable report still lands on stdout first (pairs with the
+    // warning test above). The frames themselves convert (failed == 0).
+    let tmp = TempDir::new("roll-strict");
+    let recipe = write_file(&tmp.path("region.json"), ROLL_RECIPE_REGION);
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--strict",
+    ]);
+    assert_eq!(code, 1, "--strict promotes the warning to a failing exit");
+    let report = json(&stdout); // report still emitted before the gate
+    assert_eq!(
+        report["summary"]["failed"], 0,
+        "the frame converted; the non-zero exit is the strict gate, not a frame failure"
+    );
+    assert!(
+        !report["warnings"].as_array().unwrap().is_empty(),
+        "the promoted warning is still in the report: {report}"
+    );
+    assert!(err.contains("strict"), "stderr should explain: {err}");
+}
+
+#[test]
+fn roll_warns_on_per_frame_film_base_override() {
+    // film_base is meant to be roll-fixed, but a per-frame override that sets it is
+    // applied (the frame converts with its overridden base) with a loud,
+    // `--strict`-promotable warning — not rejected.
+    let tmp = TempDir::new("roll-fb-override");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let manifest_txt = format!(
+        r#"{{ "frames": [
+             {{ "input": {hdr:?},
+                "params": {{ "film_base": {{ "source": {{ "explicit": [0.8, 0.5, 0.4] }} }} }} }}
+           ] }}"#,
+        hdr = hdr.to_str().unwrap(),
+    );
+    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
+    let roll_args = |out: &str, strict: bool| -> Vec<String> {
+        let mut a = vec![
+            "roll".to_string(),
+            "--frames".to_string(),
+            manifest.to_str().unwrap().to_string(),
+            "--out-dir".to_string(),
+            tmp.path(out).to_str().unwrap().to_string(),
+            "--params".to_string(),
+            recipe.to_str().unwrap().to_string(),
+        ];
+        if strict {
+            a.push("--strict".to_string());
+        }
+        a
+    };
+
+    // Without --strict: the frame converts (exit 0) with a loud roll-level warning.
+    let args = roll_args("out", false);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        code, 0,
+        "an override warns, it does not fail:\n{stdout}\n{err}"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["succeeded"], 1,
+        "the frame still converts"
+    );
+    let w = report["warnings"]
+        .as_array()
+        .expect("roll-level warnings array");
+    assert!(
+        w.iter().any(|m| m
+            .as_str()
+            .unwrap()
+            .contains("overriding the roll-fixed base")),
+        "the per-frame film_base override warns loudly: {report}"
+    );
+    assert!(
+        err.contains("overriding the roll-fixed base"),
+        "warning echoed to stderr: {err}"
+    );
+
+    // With --strict: the same warning promotes to a non-zero exit, report still emits.
+    let args = roll_args("out-strict", true);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        code, 1,
+        "--strict promotes the override warning to a failing exit"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["failed"], 0,
+        "the frame converted; the exit is the strict gate"
+    );
+    assert!(!report["warnings"].as_array().unwrap().is_empty());
+    assert!(err.contains("strict"), "stderr should explain: {err}");
+}
+
+#[test]
+fn roll_failed_frame_keeps_a_warning_raised_before_the_failure() {
+    // A frame that warns (sigmoid ignores --density-gamma) and *then* fails
+    // (missing input → decode error) still reports the earlier warning.
+    let tmp = TempDir::new("roll-warn-then-fail");
+    let recipe = write_file(
+        &tmp.path("sig.json"),
+        r#"{ "algorithm": "sigmoid",
+             "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+             "density": { "dmax": { "explicit": 1.6 }, "density_gamma": 2.0 } }"#,
+    );
+    let missing = tmp.path("does-not-exist.tif");
+    let (code, stdout, _err) = run(&[
+        "roll",
+        missing.to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "the failed frame makes the roll exit non-zero");
+    let report = json(&stdout);
+    let f = &report["frames"][0];
+    assert_eq!(f["status"], "failed");
+    assert!(f["error"].is_string(), "failed frame carries an error: {f}");
+    assert!(
+        f["warnings"].as_array().unwrap().iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("sigmoid ignores --density-gamma")),
+        "the warning raised before the failure survives in the report: {f}"
+    );
+}
+
+#[test]
+fn roll_two_frame_output_is_byte_identical_on_rerun() {
+    // Determinism across a MULTI-frame batch: every per-frame output is
+    // byte-identical when the same batch + recipe runs twice.
+    let tmp = TempDir::new("roll-determinism2");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let run_into = |dir: &Path| {
+        let (code, _out, err) = run(&[
+            "roll",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "--out-dir",
+            dir.to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{err}");
+    };
+    let a = tmp.path("out-a");
+    let b = tmp.path("out-b");
+    run_into(&a);
+    run_into(&b);
+    for name in ["hdr-48bit_positive.tiff", "hdri-64bit_positive.tiff"] {
+        assert_eq!(
+            std::fs::read(a.join(name)).unwrap(),
+            std::fs::read(b.join(name)).unwrap(),
+            "{name} must be byte-identical across runs"
+        );
+    }
+}
+
+#[test]
+fn roll_frame_sidecar_records_the_merged_recipe() {
+    // Each frame's sidecar records that frame's MERGED effective recipe — an
+    // overridden frame's sidecar carries its own overridden value, not the shared.
+    let tmp = TempDir::new("roll-sidecar");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let hdri = fixture("hdri-64bit.tif");
+    let manifest = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{ "frames": [
+                 {{ "input": {hdr:?} }},
+                 {{ "input": {hdri:?}, "params": {{ "print": {{ "print_exposure": 0.5 }} }} }}
+               ] }}"#,
+            hdr = hdr.to_str().unwrap(),
+            hdri = hdri.to_str().unwrap(),
+        ),
+    );
+    let out_dir = tmp.path("out");
+    let (code, _out, err) = run(&[
+        "roll",
+        "--frames",
+        manifest.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let read_sidecar = |name: &str| -> serde_json::Value {
+        let txt = std::fs::read_to_string(out_dir.join(name)).unwrap();
+        serde_json::from_str(&txt).unwrap()
+    };
+    let overridden = read_sidecar("hdri-64bit_positive.tiff.json");
+    let shared = read_sidecar("hdr-48bit_positive.tiff.json");
+    assert_eq!(
+        overridden["print"]["print_exposure"].as_f64().unwrap(),
+        0.5,
+        "the overridden frame's sidecar records its merged (overridden) value"
+    );
+    assert_ne!(
+        shared["print"]["print_exposure"].as_f64().unwrap(),
+        0.5,
+        "the un-overridden frame's sidecar keeps the shared value, not the override"
+    );
+}
+
+#[test]
+fn roll_manifest_output_into_subdirectory_is_created() {
+    // A manifest output naming a subdirectory (`sub/x.tiff`) has its parent
+    // created before the encode, so the write succeeds.
+    let tmp = TempDir::new("roll-subdir");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let manifest = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{ "frames": [ {{ "input": {hdr:?}, "output": "sub/deep/x.tiff" }} ] }}"#,
+            hdr = hdr.to_str().unwrap(),
+        ),
+    );
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        "--frames",
+        manifest.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "subdir output should be created:\n{stdout}\n{err}");
+    assert!(
+        is_tiff(&out_dir.join("sub/deep/x.tiff")),
+        "the manifest subdirectory output was written"
+    );
+}

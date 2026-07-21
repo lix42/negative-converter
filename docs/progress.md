@@ -2148,3 +2148,144 @@ The tasks (all deps `[x]` ⇒ executable now, except where noted):
 (pre-release makes it moot — folded into `input-color-management` lifting the
 rejection). **Open:** pick a first task — the doc-accuracy half of
 `release-readiness` is the quickest, most user-visible win.
+
+## roll-conversion
+**Status:** done (implementation; user ships the checkbox)
+**Updated:** 2026-07-19
+
+- Goal: add a **roll workflow** — convert a batch of frames from ONE shared,
+  frozen recipe so the whole roll is color-consistent and reproducible. This is
+  the **batch-apply** half of plan→recipe→apply: it replays a *provided* frozen
+  recipe over N frames, independent of how the recipe was produced. The
+  auto-cascade that *generates* the recipe is the separate, dependent
+  `base-acquisition-planner` task (NOT built here). Extends design-spec §12 item 6.
+
+### What was built
+- **New `nc roll` subcommand** (not a mode of `convert`) — see the decision below.
+  `RollArgs` in `cli.rs`: positional `inputs` (files / directories / shell globs)
+  **or** `--frames <manifest.json>`; required `-o/--out-dir <DIR>`; `--params`
+  (the shared frozen recipe); `--strict`; the shared `ReportArgs`. Adds **no new
+  recipe keys** — it reuses the existing `ResolvedConfig`/recipe shape; its flags
+  are operational (like `--report`/telemetry).
+- **Shared per-frame core `convert_frame`.** Extracted the decode → film-base →
+  render → optional IR export → encode + sidecar block out of `run_convert` into
+  a pure-of-orchestration `convert_frame(command, input, output, &cfg, &log) ->
+  ConvertedFrame`. Both `run_convert` (single frame) and `run_roll` (per frame)
+  call it, so **a roll frame's output is byte-identical to a single `convert`**
+  with the same effective recipe (verified by a test that diffs the bytes).
+  `run_convert`'s report emission, `--strict` gate, and telemetry stay in the
+  orchestrator (telemetry is `convert`-only). Extracted
+  `reject_unsupported_input_color` (the `input.color` profile guard) so both
+  commands fail identically on a profile-bearing recipe.
+- **Roll report** (`RollReport` on stdout / `--report-file`): `command:"roll"`, the
+  shared frozen `recipe` **once** (its roll-fixed `film_base` / `density.dmax` live
+  there, not repeated per frame), a `frames[]` list (`FrameReport`: input/output,
+  `status` ok|failed, per-frame `film_base`/`dmax`/`white_balance`/`balance_range`/
+  `loss`/`warnings`, the applied `overrides`, and `error` on failure), and a
+  `summary { total, succeeded, failed }`. Emitted via a new generic `emit_json`
+  helper (`emit_report` now wraps it).
+- **Per-frame overrides** via the `--frames` manifest: each entry is
+  `{ input, output?, params? }` where `params` is a *partial* recipe deep-merged
+  (`merge_json`) onto the shared recipe's JSON, then deserialized back with
+  `deny_unknown_fields` (so a typo'd override key is a loud error). This is the
+  frame-local knob (e.g. per-frame `print.print_exposure`) and the shape
+  `base-acquisition-planner` will emit.
+- **Naming scheme:** default per-frame output is `<out-dir>/<input-stem>_positive.tiff`
+  (sidecar `<...>.tiff.json` as usual); a manifest may set an explicit `output`
+  (relative → joined onto out-dir, absolute → verbatim).
+- **Determinism & safety:** positional inputs are sorted+deduped and directories
+  expand to their sorted `.tif`/`.tiff` files, so frame order is deterministic. All
+  per-frame outputs + sidecars (and `--report-file`) are collision-checked against
+  every input and against one another up front (`ensure_roll_targets_distinct`,
+  the multi-input analogue of `ensure_write_targets_distinct`) — a same-stem
+  collision fails loudly (exit 2) before anything is written. `input.export_ir` is
+  rejected in roll mode (one path, N frames would overwrite it).
+
+### Key decisions / notes for dependents
+- **Subcommand vs mode → new `nc roll` subcommand.** `convert` takes a single
+  `input` positional + a single `-o <file>`; batch needs multiple inputs and an
+  output *directory* with a naming scheme plus a differently-shaped roll report.
+  Overloading `convert` would muddy its contract and risk its byte-identical
+  guarantee. A separate subcommand keeps `convert` untouched and lets `roll` own
+  its small operational surface while sharing the recipe machinery and the
+  `convert_frame` core. **Single-frame `convert` output is unchanged** (all
+  pre-existing convert/telemetry integration tests pass verbatim).
+- **Config errors vs runtime errors.** A bad *shared* recipe or a bad per-frame
+  *override* (bad merge, unsupported knob) fails loudly **up front** (exit 2/4)
+  before any frame is converted. A per-frame **runtime** error (unreadable input,
+  degenerate base) is **recorded** (`status:"failed"` + `error`) and the roll
+  **continues**; the process then exits **1** with a summary on stderr — the report
+  (emitted first) carries the per-frame detail. `--strict` promotes any frame's
+  warnings to a failing exit after the report is emitted (convert's contract,
+  aggregated).
+- **Sequential, not parallel.** Frames are converted sequentially for simple,
+  deterministic report ordering and logging. Per-frame output is independent, so
+  `rayon`-parallelizing the loop is a safe future optimization (output bytes are
+  unaffected); left out to keep the scaffold lean.
+
+### Coordination notes
+- **`dmax-reference` reconcile (trivial).** That parallel task changes
+  `density.dmax` semantics + the default render. Roll treats `density.dmax` exactly
+  as it exists on `main` today (it only carries the shared recipe's value through
+  to `convert_frame`). When `dmax-reference` merges, the roll frozen-recipe handling
+  of `density.dmax` needs no code change — the shared recipe simply carries whatever
+  the new semantics define; only the `ROLL_RECIPE` test fixture's explicit
+  `{"dmax":{"explicit":1.6}}` may want a value refresh if defaults shift.
+- **`base-acquisition-planner` (the dependent).** It owns the **plan** step:
+  detect the roll-fixed film base / `Dmax` once and *emit* the frozen recipe (and,
+  for per-frame differences, a `--frames` manifest) that this `nc roll` then
+  applies. The manifest shape (`{ frames: [{ input, output?, params? }] }`, partial
+  `params` deep-merged per frame) is the intended hand-off contract.
+
+### Verification
+- CI gate clean in the worktree: `cargo fmt --all --check`, `cargo clippy
+  --all-targets -- -D warnings`, `cargo build`, `cargo test` all pass. Suite is
+  **305 tests** (252 unit + 53 end-to-end), +13 for this task.
+- New end-to-end tests (`tests/pipeline.rs`, driving the compiled binary against
+  the committed `tests/fixtures/{hdr-48bit,hdri-64bit}.tif`): batch from a
+  hand-authored frozen recipe → per-frame outputs + sidecars + a roll report with
+  the shared Dmin/Dmax once; **re-run is byte-identical**; a `--frames` per-frame
+  `print_exposure` override applies to **just that frame** (each roll output diffed
+  byte-for-byte against the equivalent single `convert`); a missing-input frame is
+  recorded `failed` while the good frame still converts and the roll exits 1; a
+  same-stem output collision is rejected (exit 2). Unit tests cover `merge_json`,
+  the per-frame override merge keeping roll-fixed params, manifest
+  `deny_unknown_fields`, output naming, the export-ir rejection, the target
+  collision guard, and the roll-report shape.
+
+### Review-fix loop (2026-07-19)
+Two-engine review (Codex + 5 pr-review lenses) over the uncommitted changes; all
+findings verified and applied (still uncommitted):
+- **Roll-fixed film-base invariant now enforced.** (a) When the shared recipe's
+  resolved `film_base.source` is not `explicit`, `run_roll` emits a loud
+  **roll-level warning** (new `RollReport.warnings`, echoed to stderr, promoted to
+  a non-zero exit by `--strict`) explaining the roll is not frozen/color-consistent
+  and how to calibrate once — a warning, not a hard error, so best-effort batches
+  stay usable. (b) A per-frame manifest override whose `params` sets `film_base`
+  is **applied** (the frame converts with its overridden base) with the same loud,
+  `--strict`-promotable roll-level warning (`resolve_frames` pushes it into
+  `roll_warnings`) — a warn-and-continue, not a reject, per the user's course
+  correction that roll-fixed-invariant violations warn rather than fail.
+  `density.dmax` overrides stay allowed pending `dmax-reference`.
+- **`FrameReport` de-stringified.** The `status:&str` + all-`Option` payload +
+  `error` layout became a data-carrying `FrameStatus` enum (`Ok { … }` / `Failed
+  { error }`), internally tagged (`#[serde(tag="status")]`) and `#[serde(flatten)]`ed
+  so the JSON wire shape is unchanged (`warnings`/`overrides` are common fields).
+- **Failed frames keep their warnings.** `convert_frame` now accumulates warnings
+  into a caller-owned buffer (`push_warning_buf`); on the `Err` path `run_roll`
+  attaches them to the failed frame's report (previously hardcoded empty), so a
+  frame that warns then fails still surfaces the warning even under `--quiet`.
+- **Manifest subdirectory outputs are created** (`create_dir_all(output.parent())`
+  per frame) before encode. Per-frame command label passed as `"roll"`.
+- **Docs corrected** (design-spec.md + .html together): the shared recipe *config*
+  appears once; each frame additionally echoes its *resolved* base/Dmax (the old
+  "not repeated per frame" wording was wrong). Clarified positional inputs
+  (directories expand; globs are shell-expanded, not by nc). Added a `merge_json`
+  doc note on multi-variant enum overrides being rejected loudly by `from_value`.
+- **Tests added** (now driving 21 roll-related tests): directory expansion (sorted,
+  non-TIFFs ignored), empty-batch errors on both paths, the not-frozen warning +
+  its `--strict` promotion (report still emits, `failed==0`), a two-frame
+  determinism diff, per-frame sidecar records the merged recipe, manifest subdir
+  output, per-frame `film_base` override warns and `--strict`-promotes (frame still
+  converts), a warn-then-fail frame keeping its warning, and a `frame_report_err`
+  unit test.
