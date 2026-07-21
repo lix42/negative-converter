@@ -18,6 +18,11 @@ blind), genuine issues go to **one** fix agent, and the loop repeats until the
 review is clean or LOW-only. Nothing is committed — the user does the final
 manual review and merge.
 
+This is the Claude Code variant, built on the Codex plugin plus the
+pr-review-toolkit engines. A tool-agnostic variant lives at
+`.agents/skills/review-fix-loop/` and intentionally diverges — do not symlink
+them together.
+
 **Why two engines.** Codex and the pr-review-toolkit lenses catch different
 classes of bug. In practice Codex has caught issues every pr-review lens missed
 (a `+inf` non-finite laundering, a JSONL atomic-append race, a case-only path
