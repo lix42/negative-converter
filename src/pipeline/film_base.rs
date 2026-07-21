@@ -527,7 +527,16 @@ fn region_channels(image: &LinearImage, [x, y, w, h]: [u32; 4]) -> Result<[Vec<f
 }
 
 /// Per-channel `p`-quantile transmission over the rectangle `[x, y, w, h]`.
-fn sample_region_at(image: &LinearImage, rect: [u32; 4], p: f32) -> Result<FilmBase> {
+///
+/// `pub(crate)` so the roll-fixed `Dmax` reference measurement
+/// (`cli::run_estimate` → `algo::density::reference_dmax`) can sample the
+/// **median** (`p = 0.5`) transmission of a fully-exposed reference region: unlike
+/// the film base (which wants the region's *maximum* transmission, a high
+/// percentile), the `Dmax` reference wants its *typical* transmission, and the
+/// median is robust to dust/hot pixels without a uniformity gate — relative spread
+/// on near-opaque (near-zero) transmissions is dominated by sensor noise and would
+/// false-alarm, so the median's outlier-resistance is the right guard here.
+pub(crate) fn sample_region_at(image: &LinearImage, rect: [u32; 4], p: f32) -> Result<FilmBase> {
     let mut chans = region_channels(image, rect)?;
     Ok(FilmBase {
         r: percentile(&mut chans[0], p),
@@ -1189,6 +1198,43 @@ mod tests {
         assert_eq!(percentile(&mut v, 0.5), 0.3);
         let mut empty: Vec<f32> = vec![f32::NAN];
         assert_eq!(percentile(&mut empty, 0.5), 0.0);
+    }
+
+    #[test]
+    fn sample_region_at_takes_the_requested_percentile() {
+        // The roll-fixed `Dmax` reference samples the MEDIAN (`p = 0.5`), unlike the
+        // film base's high percentile. On a NON-uniform region the median must land
+        // strictly between the low and high percentiles — a uniform fixture (all
+        // channels equal) could not catch a regression back to `p = 0.995`.
+        let n = 1000u32;
+        let mut buf = Vec::with_capacity((n * 3) as usize);
+        for i in 0..n {
+            let v = i as f32 / (n - 1) as f32; // distinct values 0.0 ..= 1.0
+            buf.extend_from_slice(&[v, v, v]);
+        }
+        let img = LinearImage::new(n, 1, buf, None).unwrap();
+        let rect = [0, 0, n, 1];
+        let median = sample_region_at(&img, rect, 0.5).unwrap();
+        let hi = sample_region_at(&img, rect, 0.995).unwrap();
+        let lo = sample_region_at(&img, rect, 0.005).unwrap();
+        // Median matches the nearest-rank index round((n-1)·0.5) exactly.
+        let want_median = ((n - 1) as f32 * 0.5).round() / (n - 1) as f32;
+        for c in <[f32; 3]>::from(median) {
+            assert!((c - want_median).abs() < 1e-6, "median chan {c}");
+        }
+        // ...and is distinctly between the low and high percentiles (≈ 0.5).
+        assert!(
+            lo.r < median.r && median.r < hi.r,
+            "median {} must sit between lo {} and hi {}",
+            median.r,
+            lo.r,
+            hi.r
+        );
+        assert!(
+            (median.r - 0.5).abs() < 0.01,
+            "median ≈ 0.5, got {}",
+            median.r
+        );
     }
 
     #[test]

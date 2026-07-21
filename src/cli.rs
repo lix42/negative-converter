@@ -20,6 +20,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
+use crate::algo::density;
 use crate::io::decode::{DecodeInfo, decode};
 use crate::io::encode;
 use crate::pipeline::{film_base, stages};
@@ -112,6 +113,15 @@ pub struct EstimateArgs {
     /// border detection).
     #[arg(long, conflicts_with_all = ["film_base", "auto_base"])]
     pub grid: bool,
+    /// Measure the roll-fixed display-white anchor `Dmax` from this region of a
+    /// **fully-exposed reference frame** (the light-struck roll leader), using the
+    /// resolved film base — the plan-phase mirror of `--base-region` for `Dmax`
+    /// (design-spec §8). Reports the measured scalar plus reuse-ready `--d-max` /
+    /// `density.dmax` forms to freeze into a roll recipe. Typically paired with an
+    /// explicit `--film-base` (the `Dmin` measured from the unexposed frame). The
+    /// region is recorded as provenance only, never re-read at apply time.
+    #[arg(long = "d-max-region", value_name = "X,Y,W,H", value_parser = parse_region)]
+    pub d_max_region: Option<[u32; 4]>,
     #[command(flatten)]
     pub film_base: FilmBaseOverrides,
     /// Treat estimation warnings (a non-uniform `--base-region`, grid
@@ -308,17 +318,24 @@ pub struct DensityOverrides {
 
 /// Display-white anchor (`Dmax`) overrides (design-spec §9, `density.dmax`).
 ///
-/// One mutually-exclusive choice, like [`FilmBaseOverrides`]: the three flags
+/// One mutually-exclusive choice, like [`FilmBaseOverrides`]: the four flags
 /// conflict (clap rejects passing more than one) and whichever is given replaces
 /// the recipe's `density.dmax` entirely.
 #[derive(Args, Debug, Default)]
 pub struct DmaxOverrides {
-    /// Explicit display-white anchor density (`Dmax`); a scalar, applied to all
-    /// channels. Reuses one frame's value across a roll for a fixed-print look.
+    /// Explicit roll-fixed display-white anchor density (`Dmax`); a scalar,
+    /// applied to all channels. The roll calibration: the value measured once from
+    /// a fully-exposed reference frame (`estimate --d-max-region`) or a known
+    /// per-stock constant, reused across the roll like an explicit `--film-base`.
     #[arg(long = "d-max", value_name = "D",
-          conflicts_with_all = ["auto_d_max", "no_d_max"])]
+          conflicts_with_all = ["fixed_d_max", "auto_d_max", "no_d_max"])]
     pub d_max: Option<f32>,
-    /// Measure the anchor per frame (the default behavior).
+    /// Use the fixed nominal roll anchor (the default behavior) — a
+    /// scene-independent corrected-density placement reused across the roll.
+    #[arg(long = "fixed-d-max", conflicts_with_all = ["auto_d_max", "no_d_max"])]
+    pub fixed_d_max: bool,
+    /// Measure the anchor per frame (opt-in exposure normalization; brightens
+    /// underexposed frames and breaks roll consistency — grading, not conversion).
     #[arg(long = "auto-d-max", conflicts_with = "no_d_max")]
     pub auto_d_max: bool,
     /// Disable the anchor — scene-referred output (base → 1.0, detail above).
@@ -473,6 +490,32 @@ pub struct ReuseReady {
     pub recipe: FilmBaseParams,
 }
 
+/// A minimal `density`-section recipe fragment carrying only the resolved
+/// roll-fixed `Dmax` (`{ "dmax": { "explicit": <d> } }`), so `estimate`'s
+/// reuse-ready output drops into a roll recipe's `density` section without
+/// pulling in the other density defaults. Serialize-only.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DmaxRecipeFragment {
+    /// The `density.dmax` value — always the tagged `{ "explicit": <d> }` form.
+    pub dmax: DmaxSource,
+}
+
+/// Reuse-ready forms of a measured roll-fixed `Dmax` (`estimate --d-max-region`),
+/// mirroring [`ReuseReady`]: a paste-ready `--d-max <d>` flag and the matching
+/// `density` recipe fragment. Both present together, so the calibrate-once → reuse
+/// workflow (design-spec §8) is copy-paste smooth. Flattened into [`Report`], so
+/// the two forms are the flat top-level keys `d_max_flag` / `d_max_recipe`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DmaxReuseReady {
+    /// Ready-to-paste `--d-max <d>` flag; the value round-trips to the measured `f32`.
+    #[serde(rename = "d_max_flag")]
+    pub flag: String,
+    /// The same measurement as a `density`-section recipe fragment —
+    /// `{ "dmax": { "explicit": <d> } }` — ready to merge into a roll recipe.
+    #[serde(rename = "d_max_recipe")]
+    pub recipe: DmaxRecipeFragment,
+}
+
 /// Machine-readable result emitted on stdout (or `--report-file`). One shape
 /// serves all three commands; irrelevant fields are `None`/empty and omitted
 /// from the JSON (`skip_serializing_if`), so an agent gets a clean object per
@@ -499,13 +542,26 @@ pub struct Report {
     /// Estimated / resolved film base (the `Dmin` anchor).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base: Option<FilmBase>,
-    /// Resolved display-white anchor density (`Dmax`) the density render used
-    /// (`convert`): the auto-measured or explicit value, absent for
-    /// `dmax = none` or the `simple` algorithm. Reported so a roll can reuse a
-    /// frame's anchor deliberately (`--d-max`) — a batch-consistency choice,
-    /// not calibrate-once (design-spec §9).
+    /// Resolved display-white anchor density (`Dmax`): for `convert`, the value
+    /// the density render used (fixed nominal / explicit / auto-measured), absent
+    /// for `dmax = none` or the `simple` algorithm; for `estimate --d-max-region`,
+    /// the scalar measured from the fully-exposed reference frame. Reported so a
+    /// roll can freeze one calibration into `--d-max` / `density.dmax`
+    /// (design-spec §8/§9).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dmax: Option<f32>,
+    /// Reference region `[x, y, w, h]` sampled for the roll-fixed `Dmax`
+    /// (`estimate --d-max-region`) — **provenance only**, recorded so the
+    /// calibration is auditable, never a re-read directive baked into a recipe
+    /// (that would break the deterministic-apply contract; design-spec §8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dmax_region: Option<[u32; 4]>,
+    /// Reuse-ready forms of the measured roll-fixed `Dmax` (`estimate
+    /// --d-max-region`): a paste-ready `--d-max <d>` flag and the matching
+    /// `density` recipe fragment. Flattened, so the two forms are the flat
+    /// top-level keys `d_max_flag` / `d_max_recipe`; `None` emits neither.
+    #[serde(flatten)]
+    pub dmax_reuse: Option<DmaxReuseReady>,
     /// Resolved stage-4 white-balance gains `[r, g, b]` the density print render
     /// applied (`convert`): the auto-estimated (`--auto-wb`) or explicit value,
     /// absent for the `simple` algorithm. Reported so a roll can freeze one
@@ -686,10 +742,12 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.density.balance_range = BalanceRange::Auto;
     }
 
-    // dmax anchor: the three flags are mutually exclusive (clap-enforced);
+    // dmax anchor: the four flags are mutually exclusive (clap-enforced);
     // whichever is given replaces the recipe's `density.dmax` entirely.
     if let Some(v) = args.dmax.d_max {
         cfg.density.dmax = DmaxSource::Explicit(v);
+    } else if args.dmax.fixed_d_max {
+        cfg.density.dmax = DmaxSource::Fixed;
     } else if args.dmax.auto_d_max {
         cfg.density.dmax = DmaxSource::Auto;
     } else if args.dmax.no_d_max {
@@ -868,9 +926,9 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     // no anchor) cannot drive it (design-spec §7.3).
     if cfg.algorithm == Algorithm::Sigmoid && cfg.density.dmax == DmaxSource::None {
         return Err(usage(
-            "--algorithm sigmoid needs a display-white anchor (--auto-d-max or \
-             --d-max <d>); --no-d-max / `density.dmax = none` is only supported \
-             by --algorithm density"
+            "--algorithm sigmoid needs a display-white anchor (the default fixed \
+             anchor, --d-max <d>, or --auto-d-max); --no-d-max / `density.dmax = \
+             none` is only supported by --algorithm density"
                 .into(),
         ));
     }
@@ -1301,6 +1359,37 @@ fn convert_frame(
                 "--algorithm sigmoid ignores --density-gamma (got {}); the S-curve's \
                  mid-density slope is --sigmoid-contrast",
                 cfg.density.density_gamma
+            ),
+        );
+    }
+
+    // Domain guard for an explicit / reference-derived `Dmax`. An explicit anchor is
+    // a base-relative density `D` measured under the *default* density-scale/offset
+    // (`estimate --d-max-region`, or a hand-set `--d-max`), but the render subtracts
+    // it from the corrected density `D′ = scale·D + offset`. With non-default
+    // scale/offset the anchor lands in a different density domain than the render
+    // subtracts it from, uniformly mis-anchoring every frame — silently. Warn
+    // loudly (`--strict`-promotable) so the user re-measures the anchor under these
+    // density params (or resets them). `Fixed`/`Auto` are already in the corrected
+    // domain (the nominal is defined there; `Auto` measures the post-correction
+    // buffer), and `simple` consumes neither knob, so the guard is scoped to an
+    // explicit anchor on a density-domain algorithm. (Regional balance is spatial
+    // and cannot fold into any scalar anchor — documented on `reference_dmax`.)
+    if matches!(cfg.density.dmax, DmaxSource::Explicit(_))
+        && matches!(cfg.algorithm, Algorithm::Density | Algorithm::Sigmoid)
+        && (cfg.density.density_scale != DensityParams::default().density_scale
+            || cfg.density.density_offset != DensityParams::default().density_offset)
+    {
+        push_warning_buf(
+            warnings,
+            log,
+            format!(
+                "explicit --d-max is a base-relative density measured under default \
+                 density-scale/offset, but density-scale ({:?}) / density-offset ({:?}) \
+                 are non-default — the anchor is in a different density domain than the \
+                 render subtracts it from, uniformly mis-anchoring the frame; re-measure \
+                 --d-max under these density params or reset them to defaults",
+                cfg.density.density_scale, cfg.density.density_offset
             ),
         );
     }
@@ -2363,6 +2452,66 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     };
     report.film_base = Some(base);
 
+    // Optional roll-fixed `Dmax` measurement from a fully-exposed reference region
+    // (the plan-phase mirror of `--base-region` for `Dmax`, design-spec §8). Needs
+    // a usable base to compute base-relative density; a degenerate base (the grid
+    // path can produce one) is left to the existing degenerate-base handling below
+    // — measuring here would only mask that with a confusing secondary error.
+    if let Some(region) = args.d_max_region {
+        let base_arr = <[f32; 3]>::from(base);
+        // The density divide only needs a finite-positive base; a base outside
+        // `(0, 1]` still yields a (diagnostic) `Dmax`, but is *not* a valid explicit
+        // `--film-base` — see the reuse gating below.
+        let base_divisible = base_arr.iter().all(|v| v.is_finite() && *v > 0.0);
+        if base_divisible {
+            // Median transmission of the reference region (robust to dust on a
+            // near-opaque frame; see `film_base::sample_region_at`), reduced to the
+            // scalar `Dmax` — a base-relative density `D = -log10(t/base)` (raw `D`
+            // per §4; the render's corrected-density domain only under default
+            // density-scale/offset). A degenerate / non-opaque region errors loudly
+            // inside `reference_dmax`.
+            let reference = film_base::sample_region_at(&image, region, 0.5)?;
+            let dmax = density::reference_dmax(<[f32; 3]>::from(reference), &base)?;
+            report.dmax = Some(dmax);
+            report.dmax_region = Some(region);
+            log.info(format_args!(
+                "measured roll-fixed Dmax {dmax} from {region:?}"
+            ));
+            // Implausibly-low anchor for a fully-exposed leader: not a hard error
+            // (thin/unusual stock varies), but a loud, `--strict`-promotable warning
+            // for the user's manual review — a too-low anchor silently blows the
+            // roll too bright.
+            if dmax < density::MIN_PLAUSIBLE_REFERENCE_DMAX {
+                push_warning(
+                    &mut report,
+                    &log,
+                    format!(
+                        "measured reference Dmax {dmax} is implausibly low for a \
+                         fully-exposed leader (expected ≳ {:.1} density) — the region may \
+                         not be a fully-exposed leader; verify --d-max-region before \
+                         freezing this anchor",
+                        density::MIN_PLAUSIBLE_REFERENCE_DMAX
+                    ),
+                );
+            }
+            // Reuse-ready `--d-max` / `density.dmax` forms are gated on the SAME
+            // base-usability check the film-base reuse uses (each channel in
+            // `(0, 1]`), not merely `base_divisible`: a base in `(1, ∞)` divides
+            // fine but is not a valid explicit `--film-base`, so advertising a
+            // `--d-max` measured against it as "reuse-ready" — while the film-base
+            // reuse is withheld — would be a footgun. The diagnostic `dmax` /
+            // `dmax_region` above still emit either way.
+            if validate_explicit_film_base(&base_arr).is_ok() {
+                report.dmax_reuse = Some(DmaxReuseReady {
+                    flag: format!("--d-max {dmax}"),
+                    recipe: DmaxRecipeFragment {
+                        dmax: DmaxSource::Explicit(dmax),
+                    },
+                });
+            }
+        }
+    }
+
     // Reuse-ready forms — attached only when the measurement passes the
     // explicit-base validation `convert` applies: a base outside `(0, 1]` on any
     // channel is still reported as the measurement, but never as "reuse-ready".
@@ -2776,6 +2925,11 @@ mod tests {
         assert_eq!(cfg.density.dmax, DmaxSource::None);
         let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--auto-d-max"]));
         assert_eq!(cfg.density.dmax, DmaxSource::Auto);
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--fixed-d-max"]),
+        );
+        assert_eq!(cfg.density.dmax, DmaxSource::Fixed);
 
         // No flag keeps the recipe's choice; a flag replaces it (flags win).
         let mut recipe = ResolvedConfig::default();
@@ -2785,8 +2939,19 @@ mod tests {
             DmaxSource::Explicit(2.0)
         );
         assert_eq!(
-            merge(recipe, &parse_convert(&["--no-d-max"])).density.dmax,
+            merge(recipe.clone(), &parse_convert(&["--no-d-max"]))
+                .density
+                .dmax,
             DmaxSource::None
+        );
+        // `--fixed-d-max` overrides a recipe's explicit/auto back to the default
+        // fixed anchor (the flags-win escape hatch, since the default is Fixed and
+        // an absent flag never clobbers a recipe value).
+        assert_eq!(
+            merge(recipe, &parse_convert(&["--fixed-d-max"]))
+                .density
+                .dmax,
+            DmaxSource::Fixed
         );
     }
 
@@ -3047,6 +3212,8 @@ mod tests {
         assert_eq!(cfg.density.dmax, DmaxSource::None);
         let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"auto"}}"#).unwrap();
         assert_eq!(cfg.density.dmax, DmaxSource::Auto);
+        let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"fixed"}}"#).unwrap();
+        assert_eq!(cfg.density.dmax, DmaxSource::Fixed);
     }
 
     #[test]
@@ -3054,6 +3221,9 @@ mod tests {
         for pair in [
             ["--d-max", "1.5", "--no-d-max"].as_slice(),
             ["--d-max", "1.5", "--auto-d-max"].as_slice(),
+            ["--d-max", "1.5", "--fixed-d-max"].as_slice(),
+            ["--fixed-d-max", "--auto-d-max"].as_slice(),
+            ["--fixed-d-max", "--no-d-max"].as_slice(),
             ["--auto-d-max", "--no-d-max"].as_slice(),
         ] {
             let mut argv = vec!["nc", "convert", "i", "-o", "o"];
@@ -3077,13 +3247,15 @@ mod tests {
                 "explicit d-max {bad} should fail"
             );
         }
-        // A positive explicit anchor, and Auto / None, all validate.
+        // A positive explicit anchor, and Fixed / Auto / None, all validate.
         let mut cfg = ResolvedConfig::default();
         cfg.density.dmax = DmaxSource::Explicit(1.8);
         validate(&cfg).unwrap();
         cfg.density.dmax = DmaxSource::None;
         validate(&cfg).unwrap();
         cfg.density.dmax = DmaxSource::Auto;
+        validate(&cfg).unwrap();
+        cfg.density.dmax = DmaxSource::Fixed;
         validate(&cfg).unwrap();
     }
 
@@ -3375,6 +3547,51 @@ mod tests {
         assert_eq!(parse_rgb(value).unwrap(), rgb);
         // The two forms carry the same value — never allowed to drift.
         assert_eq!(fragment.source, FilmBaseSource::Explicit(rgb));
+    }
+
+    #[test]
+    fn dmax_reuse_fragment_round_trips_as_a_recipe() {
+        // `estimate --d-max-region`'s `d_max_recipe` fragment must serialize as the
+        // documented `{"dmax":{"explicit":<d>}}` and parse back both as the
+        // `density` section value and inside a full recipe — otherwise the
+        // freeze-into-a-roll-recipe workflow is broken. (Mirrors the film-base
+        // fragment round-trip.)
+        let fragment = DmaxRecipeFragment {
+            dmax: DmaxSource::Explicit(1.2734),
+        };
+        let json = serde_json::to_string(&fragment).unwrap();
+        assert_eq!(json, r#"{"dmax":{"explicit":1.2734}}"#);
+        // Parses as a (partial) `density` section — serde defaults fill the rest.
+        let section: DensityParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(section.dmax, DmaxSource::Explicit(1.2734));
+        // ...and inside a full recipe, which then validates.
+        let recipe: ResolvedConfig =
+            serde_json::from_str(&format!(r#"{{"density":{json}}}"#)).unwrap();
+        assert_eq!(recipe.density.dmax, DmaxSource::Explicit(1.2734));
+        validate(&recipe).unwrap();
+    }
+
+    #[test]
+    fn estimate_parses_d_max_region() {
+        // The plan-phase `--d-max-region` mirror of `--base-region` parses into an
+        // [x,y,w,h] rectangle and coexists with an explicit `--film-base`.
+        let cli = Cli::try_parse_from([
+            "nc",
+            "estimate",
+            "leader.tiff",
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--d-max-region",
+            "10,20,30,40",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Estimate(a) => {
+                assert_eq!(a.d_max_region, Some([10, 20, 30, 40]));
+                assert_eq!(a.film_base.film_base, Some([0.9, 0.55, 0.42]));
+            }
+            _ => unreachable!("expected estimate"),
+        }
     }
 
     #[test]
