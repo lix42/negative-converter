@@ -143,7 +143,7 @@ and pass one ID per call. Verify at the end:
 ```
 gh api graphql -f query='query($o:String!,$n:String!,$pr:Int!,$after:String){repository(owner:$o,name:$n){pullRequest(number:$pr){reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor} nodes{isResolved}}}}}' \
   -f o=OWNER -f n=REPO -F pr=NUMBER \
-  -q '[.data.repository.pullRequest.reviewThreads.nodes[].isResolved]|"resolved=\(map(select(.==true))|length)/\(length)"'
+  -q '.data.repository.pullRequest.reviewThreads | "resolved=\([.nodes[].isResolved] | map(select(. == true)) | length)/\(.nodes | length) hasNextPage=\(.pageInfo.hasNextPage) endCursor=\(.pageInfo.endCursor)"'
 ```
 
 This too caps at `first:100`: if `pageInfo.hasNextPage` is true, re-run with
