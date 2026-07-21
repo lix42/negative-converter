@@ -39,7 +39,7 @@ Two selectors exist:
 
 Collapse onto `types::Algorithm`:
 - Delete `algo::Algorithm`, its `FromStr` impl, and the `#[allow(dead_code)]` at
-  mod.rs:82 (removing an `allow` aligns with the CLAUDE.md goal of keeping those
+  mod.rs:75 (removing an `allow` aligns with the CLAUDE.md goal of keeping those
   minimal).
 - Repoint `AlgoParams::algorithm()` to return `types::Algorithm`, or drop the
   method entirely if it proves to be pure test scaffolding with no non-test caller.
