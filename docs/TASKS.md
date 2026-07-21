@@ -65,7 +65,7 @@ graph TD
   memory-preflight --> streaming-tiled-io
   real-scan-verification --> streaming-tiled-io
   film-base-estimation --> auto-base-redesign
-  auto-base-redesign --> white-holder-support
+  ir-holder-detection --> white-holder-support
   pipeline-orchestration --> estimate-reuse-output
   estimate-reuse-output --> grid-verdict-enum
   film-base-estimation --> grid-verdict-enum
@@ -115,7 +115,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo-density`: `algo-interface`
 - `pipeline-orchestration`: `silverfast-decode`, `tiff-encode`, `color-management`, `film-base-estimation`, `algo-simple`, `algo-density`, `cli-framework`
 - `auto-base-redesign` (post-MVP): `film-base-estimation`
-- `white-holder-support` (post-MVP): `auto-base-redesign`
+- `white-holder-support` (post-MVP): `ir-holder-detection` (the RGB-only fallback
+  for the no-IR path; `auto-base-redesign` is now transitive via `ir-holder-detection`)
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
 - `grid-verdict-enum` (post-MVP): `estimate-reuse-output`, `film-base-estimation`
 - `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`

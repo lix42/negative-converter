@@ -23,6 +23,15 @@ scanner integers.
 > "honest default / fail-loud on embedded profile" option was deliberately
 > skipped because nothing is released yet.
 
+> **Global (cross-roll) tier.** A scanner IT8 profile characterizes the *device*,
+> so it is constant across every roll — the canonical **global** config, one level
+> above the per-roll recipe. The layering is: global defaults → roll recipe
+> (`roll-conversion`) → per-frame override. This task delivers *consuming* an input
+> profile per scan; wiring a device profile as a shared global layer above roll
+> recipes is a roll-workflow concern (`roll-conversion` / `base-acquisition-planner`),
+> and *creating* a profile from an IT8 target (scanner profiling) stays a non-goal
+> (design-spec §2 out-of-scope / §12). See design-spec §12 item 18.
+
 ## Design
 
 A new pure input→working transform stage, orchestrated by the CLI, sitting
