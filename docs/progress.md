@@ -1891,11 +1891,15 @@ Three further items the user decided after the review:
 
 ## real-scan-verification
 **Status:** not started
-**Updated:** —
+**Updated:** 2026-07-21
 
 - Goal: run the verification matrix (inspect/estimate/convert/IR/determinism/
   resources) against the full-size real scans once the user prepares the assets;
   record results here, file follow-up tasks for defects.
+- 2026-07-21: Narrowed this to the current TIFF pipeline so full-size resource
+  measurements can run before the HDR/display roadmap and can inform the
+  `streaming-tiled-io` go/no-go. Final preset and cross-device checks moved to
+  `display-output-acceptance`.
 
 ## perf-instrumentation
 **Status:** parked (superseded by `perf-telemetry`)
@@ -2514,3 +2518,287 @@ verified findings applied:
   four-coupled-spots invariant are untouched — both fixes only add/route report
   warnings (no image-output change). CI gate (`fmt` / `clippy -D warnings` / `build` /
   `test`): clean.
+
+## input-data-semantics
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Replaced the planned automatic input-ICC transform after reviewing
+  SilverFast HDR/HDRi gamma-1 samples and the role of Dmin. The normal path must
+  first establish whether pixels are linear scanner measurements or color-encoded
+  data; an embedded scanner profile is reported but is not sufficient reason to
+  mix channels before component-wise density conversion. This supersedes
+  `input-color-management` and restores the previously skipped fail-loud input
+  contract as the higher-priority work.
+- 2026-07-21: Review found that a single combined `ScannerLinear` option would still combine two facts. The
+  task now resolves transfer encoding separately from measurement meaning:
+  Gamma 1 proves only linear transfer, while supported SilverFast raw-mode
+  evidence must independently establish scanner-device values.
+- 2026-07-21: Replaced the legacy combined assertion in the target contract with
+  independent transfer/meaning CLI and recipe axes, deterministic evidence
+  precedence, override provenance, and an explicit allowed-combination table.
+  An override cannot make an unsupported colorimetric/encoded negative valid.
+
+## scanner-profile-before-density-experiment
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Split scanner-profile placement into a deferred controlled
+  experiment. Compare density-first, ICC-first in a defined linear colorimetric
+  space, and joint scanner+film characterization using target-patch error; do not
+  lift `--input-profile` into the normal workflow without evidence.
+- 2026-07-21: Narrowed after design review: this task now compares only raw
+  density-first versus applying the same conventional scanner ICC to image and
+  Dmin before density. Post-reconstruction characterization is an independent
+  production track and is not blocked on this deferred experiment.
+
+## post-reconstruction-color-characterization
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Added the missing production boundary from reconstructed
+  scanner/film RGB to defined linear ACEScg. It corrects channel mixing and
+  nonlinear color error beyond white balance; assigning an output ICC alone is
+  explicitly not characterization.
+- 2026-07-21: Clarified the stage boundary after review: reconstruction stops at
+  unclamped positive scanner/film RGB, characterization maps that into linear
+  ACEScg, and only then do white balance, exposure, black point, highlight
+  compression, and output rendering run. The task includes splitting the current
+  combined algorithm/print-render boundary.
+- 2026-07-21: Split this mega-task. It now owns only runtime types, artifact
+  loading/versioning, explicit provisional fallback, stage ordering, and the
+  direct scene-master branch. Offline target fitting and measured model selection
+  moved to `color-characterization-calibration`.
+- 2026-07-21: Made the display-branch boundary explicit: the runtime exposes one
+  shared linear adjustment stage for WB/exposure/black placement. SDR and HDR use
+  identical resolved adjustments, then diverge for their own highlight/tone/gamut
+  policy; `scene-master` bypasses both.
+- 2026-07-21: Narrowed runtime ownership further and made color semantics
+  fail-loud: the named-output fallback is a versioned assumed linear Rec.709/D65
+  → ACEScg/D60 transform, while identity device RGB is only an untagged custom
+  diagnostic. Pinned artifact operation/schema/hash validation and a canonical
+  reconstruction-domain compatibility contract covering all sensitive params.
+  Render-stage refactoring moved to `post-characterization-render-pipeline`.
+- 2026-07-21: Corrected that compatibility contract after a second review. A
+  reusable scanner/film/development artifact binds coordinate-defining algorithms,
+  operation policies, and settings—not incidental measured Dmin/Dmax values,
+  regions, or confidence. Those stay reported runtime provenance unless an
+  artifact explicitly declares narrower roll scope. Artifact/contract digests
+  now omit their own field and use RFC 8785 canonical JSON plus SHA-256.
+- 2026-07-21: Final coordinate audit found density Dmax could not simply be
+  omitted while it remained ahead of nonlinear artifact curves. The target now
+  characterizes Dmax-neutral `10^(gamma*D')`, then applies
+  `10^(-gamma*Dmax)` as a scalar ACEScg placement. Sigmoid v1 instead scopes the
+  artifact to exact fixed Dmax because its curve shape changes; simple pins its
+  unclamped affine inversion and has no Dmax.
+- 2026-07-21: Preserved `f32` image buffers while requiring `f64`/equivalent
+  extended-range scalar evaluation across the unanchored density artifact path;
+  this avoids undoing the current anchored exponent's overflow protection before
+  the downstream Dmax gain can cancel scale.
+- 2026-07-21: Corrected Dmax semantics for nonlinear characterization. The
+  characterization runtime now owns one fused, private extended-range
+  `U → artifact → scalar placement` operation and returns placed `f32` ACEScg.
+  Post-artifact Dmax is deterministic roll exposure placement, not a guaranteed
+  white-at-1 anchor; display reference white belongs to the SDR/HDR renderer.
+- 2026-07-21: Corrected the simple canonical boundary: target characterization
+  now receives raw unclamped `1 - scan/Dmin`, not the shipped renderer's later
+  inversion-WB and clip-affine result. Those adjustments are downstream render
+  controls and no longer affect simple artifact identity.
+
+## color-characterization-calibration
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Added the offline calibration half split from the runtime task. It
+  fits matrix/curves against controlled target data, validates held-out Delta E,
+  justifies model complexity, and emits a reproducible versioned artifact with
+  scanner/film/development provenance.
+- 2026-07-21: Added explicit target reference coordinates/illuminant and declared
+  adaptation into ACEScg D60. Calibration normalization may not bake creative WB;
+  artifacts also carry the exact reconstruction-domain compatibility contract.
+- 2026-07-21: Calibration inputs now follow per-algorithm canonical domains:
+  density artifacts fit the Dmax-neutral positive and reuse across scalar Dmax
+  placement; sigmoid v1 fits one exact fixed Dmax; simple fits its pinned affine
+  inversion settings.
+- 2026-07-21: Superseded the prior simple affine wording. Simple calibration fits
+  raw unclamped `1 - scan/Dmin`; inversion WB and black/white placement are
+  excluded from calibration and artifact compatibility.
+
+## post-characterization-render-pipeline
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Split pipeline/routing work from characterization runtime. This task
+  moves WB/exposure/black/highlight controls after characterization, provides the
+  common SDR/HDR source API, and defines a true scene master. The master rejects
+  frame-local auto Dmax, accepts supported `none` or fixed/roll Dmax, and preserves
+  exposure; current `--output-hdr` remains a rendered transitional float TIFF.
+- 2026-07-21: Made the master bypass fail-loud: any non-default downstream render
+  control remaining after CLI/recipe merge is a usage error, never ignored.
+  Added flags-win reset, conflict, and resolved-report provenance requirements.
+- 2026-07-21: Inserted algorithm-specific placement before the output split.
+  Density Dmax is now a scalar gain after characterization; sigmoid/simple arrive
+  already placed under their artifact contracts. Scene-master includes placement
+  but still bypasses every later print/display control.
+- 2026-07-21: Moved ownership of density artifact evaluation and Dmax placement
+  wholly into the characterization runtime. This task now accepts only ordinary
+  placed `f32` ACEScg, cannot observe the private extended-range intermediate,
+  and records the fixed/none placement already applied to a scene master.
+- 2026-07-21: Moved shipped simple inversion-WB and clip-low/high remapping after
+  characterization. Target presets use `print.white_balance` plus new
+  `print.linear_range`; old simple controls are warned conflicting aliases, while
+  legacy no-preset TIFF retains current ordering during migration. Scene master
+  rejects any non-default resolved adjustment.
+
+## display-p3-output
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Planned a deterministic synthesized Display P3 profile (D65/P3
+  primaries with the piecewise sRGB TRC), avoiding dependence on or redistribution
+  of the macOS system profile. This is the SDR rendition and gain-map base.
+- 2026-07-21: Removed the false dependency on scanner/film characterization.
+  Profile synthesis and ACEScg→P3 transforms can be verified with synthetic
+  ACEScg samples; final product integration remains gated downstream.
+- 2026-07-21: Narrowed ownership after review: this task supplies the standard
+  Display P3 destination transform and ICC metadata. Reference white, SDR tone,
+  and gamut rendering belong to `sdr-display-rendering`.
+- 2026-07-21: Tightened ownership to encoding/profile only: SDR rendering owns
+  ACEScg → rendered linear P3. The ICC v4 profile uses D50 PCS/media white,
+  Bradford-adapted D65 P3 colorants and the adaptation tag; D65 remains the
+  destination encoding white, not the ICC media white.
+
+## hdr-output-spike
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Added a decision gate for ISO HDR versus ISO 21496-1 gain-map HDR,
+  HEIC/JPEG containers, encoder/licensing constraints, metadata, reference white,
+  headroom, and cross-platform fallback before committing production code.
+
+## hdr-display-rendering
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Planned a pure scene-linear ACEScg to BT.2020 PQ/HLG render stage.
+  Rec.2100 is a display encoding, not nc's density or internal working space.
+- 2026-07-21: Removed ambiguous ownership of the SDR base; this task now verifies
+  PQ/HLG only, while `sdr-display-rendering` produces the independent SDR render.
+
+## sdr-display-rendering
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Added the missing owner for scene-to-SDR rendering. It consumes
+  characterized linear ACEScg and explicitly resolves print controls, reference
+  white, tone mapping, destination gamut, and P3/sRGB transfer/profile output.
+- 2026-07-21: Coordinated gain-map inputs: SDR reuses the shared linear
+  WB/exposure/black adjustment stage, but owns its stronger SDR highlight/tone
+  policy so that compression is not accidentally imposed on the HDR rendition.
+- 2026-07-21: Made this renderer the sole owner of ACEScg → rendered linear
+  destination RGB, including chromatic adaptation and gamut mapping; Display P3
+  output only transfer-encodes and signals those already-rendered values.
+- 2026-07-21: Corrected the implementation note: the shared linear adjustment
+  stage is owned by `post-characterization-render-pipeline`, not characterization
+  runtime.
+
+## gain-map-hdr-output
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Planned standards-neutral ISO 21496-1 output: Display P3 SDR base
+  plus a gain map reconstructing the HDR rendition, initially targeting HEIC and
+  requiring both Apple and non-Apple interoperability checks.
+- 2026-07-21: Rewired the task to consume `sdr-display-rendering` rather than
+  assuming profile synthesis alone produced an independently valid SDR base.
+- 2026-07-21: Required both renditions to share the identical characterized and
+  adjusted source, and pinned gain-ratio derivation to the standard-required
+  common linear color domain rather than encoded P3/PQ/HLG channel division.
+
+## output-presets
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: `gain-map-hdr` is the intended default. Separate presets make SDR
+  Display P3, sRGB compatibility, linear ACEScg scene master, PQ, and HLG explicit;
+  the ambiguous current `--output-hdr` name will not conflate float data with
+  display HDR.
+- 2026-07-21: Defined fail-loud CLI migration rules: the required output suffix
+  must match the resolved container and is never rewritten; named presets are
+  atomic and reject legacy output-selection flags; explicit combinations use
+  `custom`; legacy flag-only calls retain their transitional TIFF behavior.
+- 2026-07-21: Defined `scene-master` as a direct characterized-linear ACEScg
+  branch that bypasses every print/display control. Removed cross-device checks
+  from this task's definition of done; those remain exclusively in downstream
+  `display-output-acceptance`. Preset mechanics remain independent of offline
+  calibration; final color-accuracy acceptance waits for and exercises a real
+  calibrated artifact as well as the explicit provisional fallback.
+- 2026-07-21: Added the scene-master scale contract (no frame-local auto Dmax),
+  distinguished current rendered `--output-hdr`, and made `roll-conversion` a
+  real dependency. Preset migration now owns resolved-container suffixes,
+  manifest/per-frame validation, shared/custom policy, and collision-free
+  sidecar/report naming; the local stale base must reconcile before implementation.
+- 2026-07-21: Tightened preset/roll semantics: scene-master rejects all effective
+  non-default downstream controls after merge and reports the resolved defaults.
+  Each batch image owns its path-derived sidecar, while one roll report retains
+  stdout/`--report-file` routing and collision-checks against the entire batch.
+- 2026-07-21: Added simple-control migration to the preset contract. Named
+  presets characterize raw inversion first, then apply explicit
+  `print.white_balance` and `print.linear_range`; legacy simple flags/keys warn
+  and alias those fields, conflict with replacements, and are not emitted in new
+  recipes/reports. Scene master rejects their non-default resolved values.
+- 2026-07-21: Clarified that simple aliases preserve requested parameter values,
+  not legacy pixels: WB generally does not commute with a channel-mixing
+  characterization. Activating the new order emits a migration diagnostic and
+  bumps `pipeline_version`; legacy no-preset TIFF retains current ordering during
+  migration.
+- 2026-07-21: Pinned linear-range alias merge semantics. Resolution starts from
+  recipe/default; atomic `--linear-range` conflicts with legacy endpoint flags,
+  otherwise `--clip-low`/`--clip-high` independently override their endpoints.
+  Validation runs after merge, provenance is per endpoint, legacy use warns, and
+  scene master rejects every final non-default range while allowing flags to
+  reset recipe endpoints to `[0,1]`.
+
+## display-output-acceptance
+**Status:** not started
+**Updated:** 2026-07-21
+
+- 2026-07-21: Split final display/HDR acceptance from core real-scan verification.
+  This task waits for output presets and reuses the verified full-size assets to
+  check the gain-map default, explicit presets, metadata, deterministic encoder
+  contracts, and Apple/non-Apple aware plus SDR-fallback readers.
+- 2026-07-21: Added calibrated-characterization acceptance as a real dependency.
+  The matrix exercises both a matching measured artifact and the explicitly
+  warned/reported provisional fallback; output preset implementation itself stays
+  independent of offline calibration.
+- 2026-07-21: Acceptance now distinguishes a compatible measured artifact, the
+  internally valid but provisional assumed-source fallback, and the untagged
+  identity-device diagnostic rejected by named presets. Scene-master acceptance
+  also checks fixed-Dmax cross-frame exposure preservation.
+
+## color-management planning — main reconciliation
+**Status:** documentation reconciled
+**Updated:** 2026-07-21
+
+- Rebased onto `origin/main` after `roll-conversion` (`3b93ae5`) and
+  `dmax-reference` (`06b75fb`) merged. Preserved both append-only implementation
+  histories and marked both tasks complete in the canonical index.
+- Replaced the stale output-preset reconciliation note with the shipped `nc roll`
+  contract: `<stem>_positive.tiff` automatic names today, explicit manifest
+  outputs and per-frame partial recipes, path-derived per-image sidecars, one
+  stdout/`--report-file` roll report, and pre-write collision checks. The future
+  preset task extends those guarantees only where container-specific suffixes and
+  per-frame preset selection require it.
+- Reconciled shipped Dmax behavior with the planned characterized runtime. Today
+  `density.dmax` defaults to roll-fixed `fixed`, `--fixed-d-max` resets a recipe,
+  `nc estimate --d-max-region` emits the reusable explicit scalar, roll mode warns
+  on auto/per-frame Dmax, and the default-render change remains the deferred
+  `pipeline_version 1` boundary. Future characterization keeps the scalar's
+  roll-fixed acquisition but treats density Dmax as post-artifact exposure
+  placement rather than promising display white; sigmoid still scopes the exact
+  numeric Dmax.
+- Review correction: `sdr-display-rendering` returns rendered-linear destination
+  pixels and resolved metadata, never transfer-encoded pixels. Display P3 or the
+  corresponding destination-output stage applies transfer encoding afterward;
+  gain-map construction consumes the pre-transfer rendition for common-linear
+  ratio derivation. This removes the prior double-encoding ambiguity.
