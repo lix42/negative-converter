@@ -26,9 +26,9 @@ built. Correct, at minimum:
   converters (`simple`, `density`, `sigmoid`); fix the count and the diagram.
   (Sweep the design-spec for the same omission.)
 - **Obsolete `--out-depth` flag.** Renamed pre-release to the boolean
-  `--output-hdr` (`cli.rs` guards the removed recipe key). Stale in **two** task
-  files: `docs/tasks/real-scan-verification.md:32` (`--out-depth f32`) and
-  `docs/tasks/pipeline-orchestration.md:49` (`--out-depth f32`). Replace with
+  `--output-hdr` (`cli.rs` guards the removed recipe key). The real-scan task has
+  already been corrected; it remains stale in
+  only `docs/tasks/pipeline-orchestration.md` (`--out-depth f32`). Replace with
   `--output-hdr`. Leave `docs/progress.md` history as-is (it's a dated execution
   log that legitimately records the rename).
 - **Research-report citation tokens.** `docs/negative-convertor-research-report.md`
@@ -70,8 +70,9 @@ be cross-compiled and packaged. State the tested/supported tiers explicitly.
 
 Add a release workflow that builds and publishes binaries per supported platform
 (e.g. a tag-triggered GitHub Actions job producing archives + checksums). Sequence
-this **after** `real-scan-verification` (Phase 7 acceptance) so binaries ship only
-once the default output is validated — the doc fixes in Part 1 need not wait.
+this **after** `display-output-acceptance` so binaries ship only once the default
+output is validated — core `real-scan-verification` supplies earlier
+resource/pipeline evidence, and the doc fixes in Part 1 need not wait.
 
 ## Constraints
 
@@ -103,6 +104,8 @@ once the default output is validated — the doc fixes in Part 1 need not wait.
 
 - [Pipeline orchestration](pipeline-orchestration.md) — the working product the
   corrected docs describe; Part 1 is executable now.
-- Packaging (Part 2) is best sequenced after
-  [Real-scan verification](real-scan-verification.md) (acceptance) so binaries
-  ship on validated defaults — not a hard blocker of the doc corrections.
+
+Sequencing note, not a task dependency: packaging in Part 2 is best done after
+[Display-output acceptance](display-output-acceptance.md) so binaries ship on
+validated defaults. It is not a hard blocker because the documentation corrections
+in Part 1 should remain executable now.

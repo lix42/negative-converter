@@ -1,12 +1,13 @@
-# Real-Scan Verification
+# Real-Scan Core Verification
 
 ## Goal
 
-Verify the shipped end-to-end pipeline against the user's full-size real scans —
+Verify the current TIFF pipeline against the user's full-size real scans —
 the 50–160 MB SilverFast HDR/HDRi assets, not just the small committed fixtures
 that `pipeline-orchestration` was validated on. The deliverable is a completed
 verification matrix (results recorded in `progress.md`) plus a follow-up task for
-every defect found. The user prepares the assets.
+every defect found. This task intentionally does not wait for future display/HDR
+outputs; the user prepares the assets.
 
 ## Design
 
@@ -26,16 +27,17 @@ plus a sample of `~/Pictures/scan/`):
 2. **estimate** — `--base-region` over the film rebate yields a finite,
    plausible base; auto-base behavior on the dark-holder layout fails loudly or
    warns per spec (record which).
-3. **convert, default u16** (density, Auto Dmax) — exit 0; clip fraction small
-   (spot highlights, not the frame); grays plausibly neutral; resolved Dmax in
-   the report.
-4. **convert `--out-depth f32`** — zero-loss report; `--no-d-max` scene-referred
-   output also loss-free.
-5. **IR path (HDRi)** — `--export-ir` writes a matching-dimension IR TIFF;
+3. **convert, current TIFF paths** (density, resolved Dmax) — default 16-bit TIFF
+   and explicit `--output-hdr` rendered float TIFF both exit 0; dimensions,
+   profile, and report are internally consistent, grays are plausibly neutral,
+   and the float path preserves unclamped values reported by the current
+   pipeline. Do not call this transitional print-rendered output the future
+   `scene-master`.
+4. **IR path (HDRi)** — `--export-ir` writes a matching-dimension IR TIFF;
    `--strict` behavior per spec.
-6. **Determinism** — two identical runs → byte-identical TIFF and sidecar;
-   sidecar reloaded via `--params` reproduces the output.
-7. **Resource sanity** — wall-clock and peak memory on the largest scan are
+5. **Determinism** — two identical TIFF runs are byte-identical; sidecar reloaded
+   via `--params` reproduces the resolved output.
+6. **Resource sanity** — wall-clock and peak memory on the largest scan are
    recorded and unsurprising (no accidental quadratic blowup; rayon scaling
    sane).
 

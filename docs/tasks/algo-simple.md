@@ -1,5 +1,12 @@
 # Simple Inversion Algorithm
 
+> **Target-pipeline note:** this completed task records the shipped renderer.
+> Future post-reconstruction characterization stops at raw unclamped
+> `1 - scan/Dmin`; its WB and clip-range controls migrate to downstream shared
+> `print.white_balance` and `print.linear_range` placement. See
+> `post-reconstruction-color-characterization` and
+> `post-characterization-render-pipeline`.
+
 ## Goal
 
 Implement the `simple` converter: channel inversion plus white balance / black-

@@ -1,5 +1,12 @@
 # Display-Range White Anchor (Dmax)
 
+> **Target-pipeline terminology:** this completed task records the shipped
+> pre-artifact renderer, where `D' = Dmax` maps to `1.0`. In the future
+> characterized density path the same parameter supplies a scalar roll
+> exposure-placement gain *after* an arbitrary nonlinear artifact, so it no
+> longer guarantees white at `1.0`; the later SDR/HDR render owns display
+> reference white.
+
 ## Goal
 
 Make the default `density` conversion fill the display range — scene white lands
