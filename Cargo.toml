@@ -14,3 +14,11 @@ rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tiff = "0.11.3"
+
+[dev-dependencies]
+# Reused by the e2e tests (same version as the runtime dep, so `Cargo.lock` is
+# unchanged) to synthesize a near-opaque "reference leader" TIFF fixture on the
+# fly: the real light-struck leader frames (Ektar/Phoenix) aren't committed, and
+# the reference-Dmax path must be exercised with a realistic non-zero transmission
+# (an all-zero region is now a hard error — see `algo::density::reference_dmax`).
+tiff = "0.11.3"

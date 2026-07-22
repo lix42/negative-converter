@@ -201,7 +201,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > only — no ML (the "AI-friendly ≠ ML" rule holds).
 
 - [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md)
-- [ ] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md)
+- [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md)
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [x] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [x] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)

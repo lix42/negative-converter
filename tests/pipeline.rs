@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use tiff::encoder::{TiffEncoder, colortype};
+
 /// The binary under test, provided by Cargo for integration tests.
 const NC: &str = env!("CARGO_BIN_EXE_nc");
 
@@ -17,6 +19,26 @@ fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Synthesize a uniform 16-bit RGB TIFF (the `RGB(16)` chunky layout the decoder
+/// accepts) with every pixel set to `rgb`, at `path`. Stands in for a fully-exposed
+/// reference leader frame in the roll-fixed `Dmax` tests — the real light-struck
+/// leaders (Ektar/Phoenix) aren't committed, and the reference path must be
+/// exercised with a realistic near-opaque *non-zero* transmission (an all-zero
+/// region is now a hard error). Encodes into memory then writes the whole buffer,
+/// so the file can't be left truncated by a dropped writer.
+fn write_uniform_rgb48(path: &Path, rgb: [u16; 3], w: u32, h: u32) {
+    let mut data = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..(w * h) {
+        data.extend_from_slice(&rgb);
+    }
+    let mut buf = Vec::new();
+    {
+        let mut enc = TiffEncoder::new(std::io::Cursor::new(&mut buf)).unwrap();
+        enc.write_image::<colortype::RGB16>(w, h, &data).unwrap();
+    }
+    std::fs::write(path, &buf).unwrap();
 }
 
 /// A unique temp directory that removes itself (and its contents) on drop, so a
@@ -368,6 +390,254 @@ fn estimate_emits_reuse_ready_output_that_round_trips() {
         std::fs::read(&out_flag).unwrap(),
         std::fs::read(&out_recipe).unwrap(),
         "flag and fragment reuse must produce byte-identical outputs"
+    );
+}
+
+#[test]
+fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips() {
+    // The roll-fixed `Dmax` calibration (dmax-reference, design-spec §8): point
+    // `estimate --d-max-region` at a fully-exposed (near-opaque) reference frame,
+    // with an explicit `--film-base` (the `Dmin` from the unexposed frame), and it
+    // measures a single positive scalar `Dmax`, records the region as provenance,
+    // and emits reuse-ready `--d-max` / `density.dmax` forms. Feeding the frozen
+    // scalar back to `convert` reproduces it exactly (deterministic apply).
+    //
+    // A synthesized near-opaque leader stands in for the real one (no real leader
+    // frame is committed — real-leader verification, Ektar/Phoenix, is deferred to
+    // the user per the task). Uniform ~2% transmission (u16 1311/65535 ≈ 0.0200,
+    // within the real leader's ~0.016–0.039 luma), so against the base below it
+    // yields a plausible positive scalar `Dmax` (≈ 1.4) — the reference path is
+    // exercised with a realistic value, and it clears the plausibility floor (no
+    // warning). An all-zero region would now hard-error as degenerate.
+    let tmp = TempDir::new("dmaxref");
+    let leader = tmp.path("leader.tiff");
+    write_uniform_rgb48(&leader, [1311, 1311, 1311], 64, 64);
+    let (code, stdout, err) = run(&[
+        "estimate",
+        leader.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--d-max-region",
+        "0,0,16,16",
+    ]);
+    assert_eq!(code, 0, "reference Dmax estimate should succeed: {err}");
+    let report = json(&stdout);
+    let dmax = report["dmax"].as_f64().expect("a scalar Dmax is reported");
+    assert!(
+        dmax > 0.0 && dmax.is_finite(),
+        "Dmax must be positive: {report}"
+    );
+    // Provenance: the sampled region, not a re-read directive.
+    assert_eq!(
+        report["dmax_region"],
+        serde_json::json!([0, 0, 16, 16]),
+        "the reference region is recorded as provenance: {report}"
+    );
+    // Reuse-ready forms carry exactly the measured scalar.
+    let flag = report["d_max_flag"].as_str().expect("d_max_flag emitted");
+    let value = flag.strip_prefix("--d-max ").expect("flag prefix");
+    assert_eq!(
+        report["d_max_recipe"]["dmax"]["explicit"], report["dmax"],
+        "the recipe fragment must carry the measured scalar: {report}"
+    );
+
+    // Freeze A: the `--d-max` flag value fed to `convert` reproduces the anchor.
+    let out = tmp.path("flag.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--d-max",
+        value,
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        json(&stdout)["dmax"],
+        report["dmax"],
+        "the frozen --d-max scalar must reproduce the measured anchor"
+    );
+
+    // Freeze B: the `density` recipe fragment pasted into a roll recipe loads and
+    // reproduces the same anchor (deterministic apply from the frozen recipe).
+    let recipe = tmp.path("roll.json");
+    std::fs::write(
+        &recipe,
+        serde_json::json!({ "density": report["d_max_recipe"] }).to_string(),
+    )
+    .unwrap();
+    let out2 = tmp.path("recipe.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out2.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "the dmax fragment must load as a valid recipe: {err}"
+    );
+    assert_eq!(
+        json(&stdout)["dmax"],
+        report["dmax"],
+        "the frozen density.dmax must reproduce the measured anchor"
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&out2).unwrap(),
+        "flag and recipe freeze must produce byte-identical outputs"
+    );
+}
+
+#[test]
+fn convert_default_uses_the_fixed_roll_anchor_not_per_frame_auto() {
+    // dmax-reference changed the default render: the anchor is the roll-fixed
+    // nominal `Fixed` (NOMINAL_DMAX = 2.0), not the demoted per-frame `Auto`. Pin
+    // the default's reported anchor, and that `--auto-d-max` (opt-in) differs from
+    // it — proving the default no longer normalizes exposure per frame.
+    let tmp = TempDir::new("dmaxdefault");
+    let fix = fixture("hdr-48bit.tif");
+    let base = ["--film-base", "0.9,0.55,0.42"];
+
+    let out = tmp.path("default.tiff");
+    let mut args = vec![
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ];
+    args.extend_from_slice(&base);
+    let (code, stdout, err) = run(&args);
+    assert_eq!(code, 0, "{err}");
+    let default_dmax = json(&stdout)["dmax"].as_f64().expect("dmax reported");
+    assert!(
+        (default_dmax - 2.0).abs() < 1e-6,
+        "default anchor must be the fixed nominal 2.0, got {default_dmax}"
+    );
+
+    let out2 = tmp.path("auto.tiff");
+    let mut args = vec![
+        "convert",
+        fix.to_str().unwrap(),
+        "-o",
+        out2.to_str().unwrap(),
+        "--auto-d-max",
+    ];
+    args.extend_from_slice(&base);
+    let (code, stdout, err) = run(&args);
+    assert_eq!(code, 0, "{err}");
+    let auto_dmax = json(&stdout)["dmax"].as_f64().expect("dmax reported");
+    assert!(
+        (auto_dmax - default_dmax).abs() > 1e-3,
+        "opt-in --auto-d-max ({auto_dmax}) must differ from the fixed default ({default_dmax})"
+    );
+}
+
+#[test]
+fn estimate_d_max_region_rejects_a_degenerate_all_black_region() {
+    // A reference region on the all-black fixture (transmission 0 → floored) is a
+    // degenerate / clipped sample, not a fully-exposed leader. `reference_dmax`
+    // must hard-error (exit 1) rather than launder the floor into a huge density
+    // and freeze a black-rendering anchor — the Dmin "dark holder → zero channel"
+    // gotcha, applied to Dmax. (This is exactly what the all-black fixture used to
+    // stand in for as a "leader"; that stand-in is now a guarded error.)
+    let fix = fixture("black-48bit.tif");
+    let (code, _stdout, err) = run(&[
+        "estimate",
+        fix.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--d-max-region",
+        "0,0,16,16",
+    ]);
+    assert_eq!(
+        code, 1,
+        "a degenerate (all-black) reference region must fail loudly: {err}"
+    );
+    assert!(
+        err.contains("reference Dmax"),
+        "the error names the reference-Dmax failure: {err}"
+    );
+}
+
+#[test]
+fn estimate_d_max_region_warns_on_an_implausibly_low_reference() {
+    // A mid-tone region only somewhat denser than base yields a valid but
+    // implausibly-low anchor for a fully-exposed leader. `estimate` must not reject
+    // it (thin/unusual stock varies) but must emit a loud, `--strict`-promotable
+    // warning for the user's manual review.
+    let tmp = TempDir::new("dmaxlow");
+    let leader = tmp.path("midtone.tiff");
+    // Uniform 30% transmission (u16 19660/65535 ≈ 0.300): denser than base on every
+    // channel (base min 0.42 > 0.30 ⇒ per-channel density > 0, so no hard error),
+    // but the gray-mean density (≈ 0.30) is well below the plausibility floor (1.0).
+    write_uniform_rgb48(&leader, [19660, 19660, 19660], 32, 32);
+    let region = [
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--d-max-region",
+        "0,0,16,16",
+    ];
+
+    let mut args = vec!["estimate", leader.to_str().unwrap()];
+    args.extend_from_slice(&region);
+    let (code, stdout, err) = run(&args);
+    assert_eq!(
+        code, 0,
+        "implausibly-low reference must not hard-fail: {err}"
+    );
+    let report = json(&stdout);
+    let dmax = report["dmax"].as_f64().expect("a dmax is still measured");
+    assert!(dmax > 0.0 && dmax < 1.0, "a low positive anchor: {dmax}");
+    let warnings = report["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("implausibly low")),
+        "a plausibility warning must be present: {report}"
+    );
+
+    // `--strict` promotes the warning to a failing exit.
+    let mut sargs = vec!["estimate", leader.to_str().unwrap()];
+    sargs.extend_from_slice(&region);
+    sargs.push("--strict");
+    let (scode, _s, serr) = run(&sargs);
+    assert_eq!(
+        scode, 1,
+        "--strict promotes the plausibility warning: {serr}"
+    );
+}
+
+#[test]
+fn estimate_d_max_region_skipped_on_a_degenerate_grid_base() {
+    // When the resolved base is degenerate (a `--grid` on the all-black fixture),
+    // the `--d-max-region` measurement is skipped — measuring against an unusable
+    // base would only mask the degenerate-base error with a confusing secondary
+    // one. The report carries no `dmax`, and the run still hard-errors on the
+    // degenerate base itself (exit 1), same as without `--d-max-region`.
+    let fix = fixture("black-48bit.tif");
+    let (code, stdout, err) = run(&[
+        "estimate",
+        fix.to_str().unwrap(),
+        "--grid",
+        "--d-max-region",
+        "0,0,16,16",
+    ]);
+    assert_eq!(code, 1, "the degenerate grid base still hard-errors: {err}");
+    let report = json(&stdout);
+    assert!(
+        report["dmax"].is_null(),
+        "no Dmax is measured against a degenerate base: {report}"
+    );
+    assert!(
+        err.contains("finite and positive"),
+        "the error is the degenerate-base one, not a secondary Dmax error: {err}"
     );
 }
 
@@ -2388,6 +2658,82 @@ fn roll_warns_on_per_frame_film_base_override() {
     );
     assert!(
         err.contains("overriding the roll-fixed base"),
+        "warning echoed to stderr: {err}"
+    );
+
+    // With --strict: the same warning promotes to a non-zero exit, report still emits.
+    let args = roll_args("out-strict", true);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        code, 1,
+        "--strict promotes the override warning to a failing exit"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["failed"], 0,
+        "the frame converted; the exit is the strict gate"
+    );
+    assert!(!report["warnings"].as_array().unwrap().is_empty());
+    assert!(err.contains("strict"), "stderr should explain: {err}");
+}
+
+#[test]
+fn roll_warns_on_per_frame_dmax_override() {
+    // density.dmax is a roll-fixed calibration (like film_base) since the
+    // dmax-reference task, but a per-frame override that sets it is applied (the
+    // frame converts with its overridden anchor) with a loud, `--strict`-promotable
+    // warning — not rejected. Mirrors `roll_warns_on_per_frame_film_base_override`.
+    let tmp = TempDir::new("roll-dmax-override");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let manifest_txt = format!(
+        r#"{{ "frames": [
+             {{ "input": {hdr:?},
+                "params": {{ "density": {{ "dmax": {{ "explicit": 2.4 }} }} }} }}
+           ] }}"#,
+        hdr = hdr.to_str().unwrap(),
+    );
+    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
+    let roll_args = |out: &str, strict: bool| -> Vec<String> {
+        let mut a = vec![
+            "roll".to_string(),
+            "--frames".to_string(),
+            manifest.to_str().unwrap().to_string(),
+            "--out-dir".to_string(),
+            tmp.path(out).to_str().unwrap().to_string(),
+            "--params".to_string(),
+            recipe.to_str().unwrap().to_string(),
+        ];
+        if strict {
+            a.push("--strict".to_string());
+        }
+        a
+    };
+
+    // Without --strict: the frame converts (exit 0) with a loud roll-level warning.
+    let args = roll_args("out", false);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        code, 0,
+        "an override warns, it does not fail:\n{stdout}\n{err}"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["succeeded"], 1,
+        "the frame still converts"
+    );
+    let w = report["warnings"]
+        .as_array()
+        .expect("roll-level warnings array");
+    assert!(
+        w.iter().any(|m| m
+            .as_str()
+            .unwrap()
+            .contains("overriding the roll-fixed display-white anchor")),
+        "the per-frame density.dmax override warns loudly: {report}"
+    );
+    assert!(
+        err.contains("overriding the roll-fixed display-white anchor"),
         "warning echoed to stderr: {err}"
     );
 

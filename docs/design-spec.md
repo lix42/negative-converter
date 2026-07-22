@@ -173,12 +173,13 @@ where the base is `0`) and is a **scalar** pooled across channels — a per-chan
 `Dmax` would apply three gains in `10^(γ·(D′ − Dmax))`, i.e. a white balance, which
 is the print-render stage's job, not the anchor's. ⚠️ **Distinct from classic
 photographic film `Dmax`** (the negative's physical maximum optical density, at the
-most-exposed point): nc's `Dmax` is a rendering anchor, though the `dmax-reference`
-design derives it *from* a fully-exposed reference frame (near the film's physical
-Dmax). Its **acquisition** (per-frame `auto` vs roll-fixed reference) is being
-decided in `dmax-reference` (§12); its **meaning here — a scalar display-white
-anchor in density units — is fixed.** Never mix it with a transmission (a base
-transmission plus a range is a unit error).
+most-exposed point): nc's `Dmax` is a rendering anchor, though it can be *derived
+from* a fully-exposed reference frame (near the film's physical Dmax). Like `Dmin`,
+it is a **roll-fixed calibration** by default (a film + scanner property, reused
+across the roll — §7.2/§9); the demoted per-frame `auto` is opt-in exposure
+normalization. Its **meaning — a scalar display-white anchor in density units — is
+fixed.** Never mix it with a transmission (a base transmission plus a range is a
+unit error).
 
 **Domain glossary.** *auto-base* — auto-detecting `Dmin` from the unexposed rebate
 (`FilmBaseSource::Auto`). *rebate* — the unexposed film leader between holder and
@@ -300,20 +301,25 @@ to `1.0` and all real detail sits above `1.0`, so a default u16 encode clips the
 whole image; the anchor makes the default output fill the display range. Mathematically the
 anchor factors out as a constant gain `10^(−gamma·Dmax)`, but it is applied **in
 the exponent** — `10^(gamma·(D' − Dmax))` — so an extreme `gamma·D'` cannot
-overflow `f32` before the anchor cancels it. `Dmax` is **frame-local** — a property of the
-scene's own white, unlike the roll-level `Dmin` base — so it is measured per frame
-by default (`density.dmax = auto`); it can be fixed (`{ "explicit": <d> }`) or
-disabled (`"none"`, for bit-exact scene-referred HDR output). See §9.
+overflow `f32` before the anchor cancels it.
 
-> **Under reconsideration (2026-07).** Treating `Dmax` as frame-local `auto`
-> effectively *normalizes exposure per frame* — it brightens underexposed frames
-> and forces an overcast scene's grey to display white — which conflicts with NC's
-> "convert, don't grade" purpose (exposure belongs in Lightroom). The planned
-> direction makes `Dmax` a **roll-fixed calibration** measured once from a
-> fully-exposed reference frame (the light-struck leader), reused like `Dmin`, with
-> per-frame `--auto-d-max` demoted to an opt-in exposure-normalizing mode. See §12
-> item 14 (`dmax-reference`). The frame-local `auto` behavior described above is
-> what currently ships.
+`Dmax` is a **roll-fixed calibration** — a film + scanner property reused across
+the roll, like the `Dmin` base — **not** a per-frame measurement. Anchoring each
+frame's densest pixel to display white *normalizes exposure per frame* (it
+brightens underexposed frames and forces an overcast scene's grey to white), which
+conflicts with NC's "convert faithfully, grade in Lightroom" purpose. The default
+`density.dmax = fixed` therefore resolves a **fixed** anchor in the order
+**measured reference → per-stock constant → nominal**: a value measured once from
+a fully-exposed reference frame (§8, `estimate --d-max-region`) or a known
+per-stock constant is carried as `{ "explicit": <d> }`; with no calibration a
+**nominal** corrected-density anchor (`Dmax ≈ 2.0`, a scene-independent placement
+*in density units* — not a base transmission plus a range) applies. The brightest
+pixel then maps to *wherever it falls* (below white for a dim frame, clipping above
+for a specular), the faithful behavior. `auto` (`--auto-d-max`) — the demoted
+per-frame percentile measurement — remains as an opt-in **exposure-normalizing**
+mode, and `"none"` (`--no-d-max`) disables the anchor for bit-exact scene-referred
+HDR output. See §9. (This is the `dmax-reference` design, §12 item 14; it supersedes
+the earlier frame-local `auto` default.)
 
 **Regional (shadow/highlight) color balance.** A color *crossover* — a cast that
 differs between shadows and highlights (expired film, misprocessing, mixed
@@ -401,8 +407,9 @@ Because both the white knee and the black floor derive from the anchor, the
 S-curve is anchored on `[0, Dmax]` and **requires** one: `density.dmax = none`
 (`--no-d-max`) with `--algorithm sigmoid` is a usage error (exit 2) —
 scene-referred output stays a `density`-algorithm feature. The anchor is
-resolved by the same `density.dmax` machinery (`auto` percentile / explicit
-value) and reported the same way. `density.density_gamma` parameterizes the
+resolved by the same `density.dmax` machinery (the default `fixed` nominal, an
+explicit / reference-derived value, or the opt-in `auto` percentile) and
+reported the same way. `density.density_gamma` parameterizes the
 straight line the S-curve replaces and is **ignored** under `sigmoid` (a report
 warning fires when it was customized); `sigmoid.contrast` is the analogue.
 `--highlight-compress` (a linear-space soft-clip after exposure/WB) composes
@@ -440,7 +447,7 @@ no interactive prompts.
 | `nc convert` | The main pipeline: negative file → positive TIFF. |
 | `nc roll` | Convert a batch of frames from one shared, frozen recipe (the batch-**apply** scaffold). Per-frame outputs into `--out-dir` + a roll-level JSON report. Single-frame `convert` is unchanged; roll is additive. |
 | `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
-| `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. |
+| `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. `--d-max-region` additionally measures the roll-fixed display-white anchor `Dmax` from a fully-exposed reference frame, emitting reuse-ready `--d-max` / `density.dmax` forms. |
 | `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). |
 
 ### Recipes (JSON in/out)
@@ -538,6 +545,25 @@ nc estimate reference.tiff --base-region 200,0,300,3600 --report json
 #     "film_base_recipe": { "source": { "explicit": [0.553, 0.271, 0.159] } }, … }
 nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # …or paste film_base_recipe into roll-A.json as its "film_base" section and batch it.
+
+# Calibrate the roll-fixed display-white anchor `Dmax` the same way: point
+# `--d-max-region` at a fully-exposed (near-opaque) reference frame — the
+# light-struck roll leader — with the roll's Dmin as --film-base. `estimate`
+# reduces that region's per-channel base-relative density D (= corrected density
+# under default density-scale/offset) to one scalar (a gray-density
+# reduction) and reports it in reusable forms: a --d-max flag and a `density`
+# recipe fragment. The region is recorded as provenance (dmax_region), NOT as a
+# re-read directive — the frozen recipe carries the scalar so the apply phase is
+# deterministic. `Dmax` is roll-fixed like `Dmin` (see §7.2/§9).
+nc estimate leader.tiff --film-base 0.553,0.271,0.159 --d-max-region 200,0,300,3600 --report json
+# → { "film_base": { … },
+#     "dmax": 1.6428, "dmax_region": [200, 0, 300, 3600],
+#     "d_max_flag": "--d-max 1.6428",
+#     "d_max_recipe": { "dmax": { "explicit": 1.6428 } }, … }
+nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159 --d-max 1.6428
+# …or paste d_max_recipe into roll-A.json's "density" section. With no reference
+# frame, omit it: the default `density.dmax = fixed` nominal anchor still renders a
+# viewable positive (darker frames stay faithfully darker).
 
 # On a dedicated blank frame, `estimate --grid` samples a fixed 5-cell grid
 # (corners + center) over the frame (or over --base-region) instead of a single
@@ -694,15 +720,23 @@ crossover.
 - `--density-offset R,G,B` — per-channel density offset (orange-mask comp).
 - `--density-gamma <f>` — film/print curve gamma.
 - Display-white anchor (`Dmax`) — a single mutually-exclusive choice, recipe key
-  `density.dmax` (default `"auto"`; see §7.2). The three flags conflict (passing
-  more than one is a usage error); whichever is given replaces a recipe's `dmax`:
-  - `--auto-d-max` (default) ⇒ `"auto"` — measure the anchor per frame from the
-    corrected-density distribution (a high percentile).
-  - `--d-max <d>` ⇒ `{ "explicit": <d> }` — fix the anchor to a scalar density.
-    Reusing one frame's measured value across a roll is a deliberate
-    fixed-print-exposure look; the tradeoff is that darker frames render dim and
-    denser highlights clip against the foreign anchor (it is **not** a
-    calibrate-once property like `Dmin`).
+  `density.dmax` (default `"fixed"`; see §7.2). `Dmax` is a **roll-fixed
+  calibration** like `Dmin`. The four flags conflict (passing more than one is a
+  usage error); whichever is given replaces a recipe's `dmax`:
+  - `--fixed-d-max` (default) ⇒ `"fixed"` — the roll-fixed **nominal** anchor: a
+    scene-independent corrected-density placement (`Dmax ≈ 2.0`, in density units),
+    reused across the roll. The default when no reference / per-stock value has
+    been calibrated.
+  - `--d-max <d>` ⇒ `{ "explicit": <d> }` — the roll-fixed **calibrated** anchor: a
+    scalar measured once from a fully-exposed reference frame
+    (`estimate --d-max-region`, §8) or a known per-stock constant, reused across
+    the roll exactly like an explicit `--film-base`. This is the form a roll recipe
+    freezes.
+  - `--auto-d-max` ⇒ `"auto"` — measure the anchor **per frame** from the
+    corrected-density distribution (a high percentile). This is **per-frame
+    exposure normalization** (it brightens underexposed frames and breaks
+    roll-to-roll consistency), an opt-in grading convenience *demoted* from the
+    former default — not the faithful-conversion default.
   - `--no-d-max` ⇒ `"none"` — disable the anchor; scene-referred output (base →
     `1.0`, detail above), reproducing the pre-anchor render bit-for-bit for HDR
     (`--output-hdr`) workflows. **Density algorithm only** — the sigmoid S-curve
@@ -1042,14 +1076,19 @@ the NLP feature comparison, Phase 6).
     confidence; conversion is deterministic replay. "Auto mode" is just roll
     conversion's default on a batch. Tracked: `roll-conversion`,
     `base-acquisition-planner`, `film-base-content-fallback`.
-14. **Roll-fixed `Dmax` from a fully-exposed reference frame.** Supersedes the
-    frame-local `auto` default (item in §7.2): `Dmax` is a film+scanner
-    calibration, measured once from the light-struck leader (near-opaque in RGB,
-    the max-density endpoint — always available) and reused per roll like `Dmin`.
-    Fixed anchor resolves reference → per-stock constant → a nominal
-    corrected-density anchor (in density units, *not* base transmission plus a
-    range); `--auto-d-max` (per-frame exposure normalization) demoted to opt-in. Tracked:
-    `dmax-reference`.
+14. **Roll-fixed `Dmax` from a fully-exposed reference frame.** *(Implemented —
+    `dmax-reference`.)* Supersedes the frame-local `auto` default: `Dmax` is a
+    film+scanner calibration reused per roll like `Dmin`. The default
+    `density.dmax = fixed` resolves reference → per-stock constant → a nominal
+    corrected-density anchor (`Dmax ≈ 2.0`, in density units — *not* base
+    transmission plus a range); a value measured once from the light-struck leader
+    (near-opaque in RGB, the max-density endpoint — always available) via
+    `estimate --d-max-region` is frozen as `{ "explicit": <d> }`. `--auto-d-max`
+    (per-frame exposure normalization) is demoted to opt-in. This changes the
+    default render, which is a `pipeline_version` bump — a **deferred** obligation:
+    there is no `pipeline_version` code constant yet (`conversion-versioning`,
+    item 16, is unshipped), so when it lands this default must be labeled
+    `pipeline_version 1` (the v0→v1 boundary for the density default).
 15. **IR-assisted film-holder detection.** First consumer of the IR channel
     besides item 1. Chromogenic dyes are IR-transparent, so all such film (base,
     picture, even fully-exposed leader) is bright in IR while the opaque holder is

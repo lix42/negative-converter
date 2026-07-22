@@ -257,24 +257,45 @@ pub struct FilmBaseParams {
 /// (design-spec §7.2/§9, `density.dmax`).
 ///
 /// A single mutually-exclusive choice, like [`FilmBaseSource`] — not independent
-/// flags. `Dmax` is the corrected density of scene white; the render maps it to
-/// display white (`1.0`) so the default u16 encode fills the display range instead
-/// of leaving all detail above `1.0`. Unlike `Dmin` (a roll/scanner property),
-/// `Dmax` is **frame-local** — the scene's own white — so per-frame `Auto` is the
-/// default. Serializes as `"auto"` / `{ "explicit": <d> }` / `"none"`.
+/// flags. `Dmax` is the corrected density that the render maps to display white
+/// (`1.0`) so the default u16 encode fills the display range instead of leaving
+/// all detail above `1.0`.
+///
+/// Like `Dmin`, `Dmax` is a **roll-fixed calibration** (a property of the film
+/// stock + development + scanner), so the default is a *fixed* anchor reused
+/// across the roll — not a per-frame measurement. The `dmax-reference` task
+/// (design-spec §7.2/§12) established this: anchoring each frame's densest pixel
+/// to display white is per-frame *exposure normalization* (it brightens
+/// underexposed frames and forces an overcast grey to white), which conflicts
+/// with NC's "convert faithfully, grade in Lightroom" purpose. The roll-fixed
+/// anchor is resolved reference → per-stock constant → nominal: a value measured
+/// once from a fully-exposed reference frame (or a known per-stock constant) is
+/// carried here as [`Explicit`](Self::Explicit); with no calibration the default
+/// [`Fixed`](Self::Fixed) nominal anchor applies. Serializes as `"fixed"` /
+/// `{ "explicit": <d> }` / `"auto"` / `"none"`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DmaxSource {
-    /// Measure the anchor per frame from the corrected-density distribution
-    /// (a high percentile). This is the default when none of the
-    /// `--d-max` / `--auto-d-max` / `--no-d-max` flags is given.
+    /// Fixed nominal anchor: a scene-independent corrected-density placement
+    /// (`algo::density::NOMINAL_DMAX`), reused across every frame. The default
+    /// when none of the `--d-max` / `--fixed-d-max` / `--auto-d-max` /
+    /// `--no-d-max` flags is given — the roll-fixed behavior when no reference /
+    /// per-stock value has been measured. Because it is a constant, darker frames
+    /// render darker (faithful relative exposure), unlike the per-frame `Auto`.
     #[default]
-    Auto,
-    /// Explicit scalar anchor density. Reusing one frame's measured value across a
-    /// roll is a deliberate fixed-print-exposure look (batch consistency), with the
-    /// tradeoff that darker frames render dim and denser highlights clip against the
-    /// foreign anchor — it is not a calibrate-once property like `Dmin`.
+    Fixed,
+    /// Explicit scalar anchor density — the roll-fixed calibration value. Carries
+    /// a `Dmax` measured once from a fully-exposed reference frame
+    /// (`estimate --d-max-region`) or a known per-stock constant, reused across
+    /// the roll exactly like an explicit `Dmin` base. Frozen into a roll recipe as
+    /// `density.dmax = { "explicit": <d> }`.
     Explicit(f32),
+    /// Measure the anchor per frame from the corrected-density distribution
+    /// (a high percentile). **Per-frame exposure normalization** — an explicit
+    /// opt-in (`--auto-d-max`), *demoted* from the former default: it silently
+    /// brightens underexposed frames and breaks roll-to-roll consistency, so it
+    /// is a grading convenience, not the faithful-conversion default.
+    Auto,
     /// No anchor: scene-referred output (base → `1.0`, exposed detail above it).
     /// Reproduces the pre-anchor render bit-for-bit — HDR f32 workflows rely on it.
     None,
@@ -313,7 +334,7 @@ pub struct DensityParams {
     pub density_offset: [f32; 3],
     /// Film/print curve gamma.
     pub density_gamma: f32,
-    /// Display-white anchor source (default `auto`). Applied in the render
+    /// Display-white anchor source (default `fixed`). Applied in the render
     /// sub-stage at the density→linear boundary, beside `density_gamma`.
     pub dmax: DmaxSource,
     /// Per-channel density offset `[r, g, b]` applied to the **positive's
@@ -337,7 +358,7 @@ impl Default for DensityParams {
             density_scale: [1.0, 1.0, 1.0],
             density_offset: [0.0, 0.0, 0.0],
             density_gamma: 1.0,
-            dmax: DmaxSource::Auto,
+            dmax: DmaxSource::Fixed,
             shadow_balance: [0.0, 0.0, 0.0],
             highlight_balance: [0.0, 0.0, 0.0],
             balance_range: BalanceRange::Auto,
@@ -647,6 +668,10 @@ mod tests {
         // Unit variants are bare lowercase strings; the newtype variant is a
         // tagged object — the same shape convention as `FilmBaseSource`.
         assert_eq!(
+            serde_json::to_string(&DmaxSource::Fixed).unwrap(),
+            "\"fixed\""
+        );
+        assert_eq!(
             serde_json::to_string(&DmaxSource::Auto).unwrap(),
             "\"auto\""
         );
@@ -659,6 +684,7 @@ mod tests {
             r#"{"explicit":1.5}"#
         );
         for src in [
+            DmaxSource::Fixed,
             DmaxSource::Auto,
             DmaxSource::None,
             DmaxSource::Explicit(2.25),
@@ -687,8 +713,11 @@ mod tests {
     }
 
     #[test]
-    fn density_params_default_dmax_is_auto() {
-        assert_eq!(DensityParams::default().dmax, DmaxSource::Auto);
+    fn density_params_default_dmax_is_fixed() {
+        // The default anchor is the roll-fixed nominal `Fixed`, not the demoted
+        // per-frame `Auto` (dmax-reference): the faithful-conversion default must
+        // not normalize exposure per frame.
+        assert_eq!(DensityParams::default().dmax, DmaxSource::Fixed);
     }
 
     #[test]

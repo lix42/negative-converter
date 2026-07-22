@@ -2312,3 +2312,205 @@ three verified Codex P2 findings applied (all `src/cli.rs`):
   a silently short batch; it now propagates each entry error as a usage error
   (exit 2, same class as failing to open the directory). Happy-path expansion test
   added (a per-entry `read_dir` error is not portably reproducible in a unit test).
+## dmax-reference
+
+Made the display-white anchor `Dmax` a **roll-fixed calibration** (like `Dmin`)
+instead of a per-frame measurement, and changed the default render accordingly.
+Uncommitted (the user runs the review loop, then reviews manually).
+
+### What changed
+
+- **`DmaxSource` enum extended** (`types.rs`) from `{ Auto(default), Explicit,
+  None }` to `{ Fixed(default), Explicit, Auto, None }` — one enum, not parallel
+  fields (the flags-win merge stays sound). Wire forms: `"fixed"` /
+  `{ "explicit": <d> }` / `"auto"` / `"none"`. `DensityParams::default().dmax` is
+  now `Fixed`.
+  - **`Fixed`** = the roll-fixed **nominal** anchor `algo::density::NOMINAL_DMAX =
+    2.0` (a scene-independent placement **in corrected-density units**, not base
+    transmission + range). The default when nothing is calibrated.
+  - **`Explicit(d)`** now documents the roll-fixed **calibrated** value (measured
+    reference / per-stock constant), reused across the roll like an explicit
+    `--film-base`. This is the form a roll recipe freezes.
+  - **`Auto`** kept but **demoted** to an opt-in (`--auto-d-max`), documented as
+    per-frame exposure normalization (the 99.5th-percentile measurement is
+    unchanged — only its priority moved).
+  - **`None`** unchanged (bit-exact scene-referred escape hatch preserved).
+- **Resolution order for the default** (design §7.2): measured reference →
+  per-stock constant → nominal. Realized as: a measured/stock value rides in
+  `Explicit`; `Fixed` is the no-calibration nominal fallback. `resolve_dmax`
+  (`density.rs`) gained the `Fixed => Some(NOMINAL_DMAX)` arm; `Fixed` ignores the
+  buffer, so every frame gets the same anchor (the roll-fixed property).
+- **Plan-phase reference measurement** (`estimate --d-max-region X,Y,W,H`), the
+  mirror of `--base-region` for `Dmax`. Point it at a fully-exposed (near-opaque)
+  reference frame — the light-struck leader — with the roll's `Dmin` as
+  `--film-base`; it samples the region's **median** transmission
+  (`film_base::sample_region_at`, now `pub(crate)`; median is robust to dust on a
+  near-opaque frame without a uniformity gate — relative spread on near-zero
+  transmissions is noise-dominated and would false-alarm), reduces the per-channel
+  corrected density to **one scalar** via a gray/mean reduction
+  (`algo::density::reference_dmax`), and reports it. A per-channel `Dmax` would
+  smuggle in white balance (three different gains in the exponent), so the anchor
+  stays a scalar by construction; the unit test
+  `reference_derived_dmax_introduces_no_per_channel_correction` proves the applied
+  gain is identical across channels.
+- **Freeze = scalar, provenance = report.** `estimate --d-max-region` emits
+  reuse-ready forms — `d_max_flag` (`--d-max <d>`) and `d_max_recipe`
+  (`{ "dmax": { "explicit": <d> } }`, drops into a recipe's `density` section) —
+  and records the sampled region as **`dmax_region` provenance only**. There is
+  **no** `{ "reference": … }` recipe form: the frozen recipe carries the scalar so
+  the apply phase re-reads nothing (the deterministic-apply / same-recipe-hash
+  contract stays intact). The e2e test
+  `estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips`
+  drives estimate → freeze (flag and recipe) → convert and asserts byte-identical
+  output.
+- **Four-spot wiring** for the new `--fixed-d-max` flag and reworked group
+  (`cli.rs`): CLI `DmaxOverrides` (added `--fixed-d-max`, all four mutually
+  exclusive), recipe `DensityParams.dmax`, the `merge` arm, and `validate`
+  (`Fixed`/`Auto`/`None` need no value check; `Explicit` stays positive-finite).
+  `--fixed-d-max` exists so a recipe's explicit/auto is CLI-overridable back to the
+  default (an absent presence flag never clobbers a recipe value). Merge test
+  `merge_dmax_flags_map_to_the_source_enum` extended; conflict + validate tests
+  updated.
+- **Sigmoid** unchanged in behavior: it still requires a positive anchor, and the
+  new default `Fixed` (2.0 > 0) satisfies it, so `--algorithm sigmoid` works by
+  default now (previously the default `Auto` also satisfied it). `anchor_error`
+  matches on the resolved `Option<f32>`, not the source enum, so adding `Fixed`
+  needed no change there; the CLI usage message was reworded to mention the default
+  fixed anchor.
+
+### pipeline_version bump — reconcile note (needs orchestrator attention)
+
+This **changes the default render** (frame-local `auto` 99.5th percentile → fixed
+nominal `Dmax = 2.0`). The task said to bump `pipeline_version` by hand. **There is
+no `pipeline_version` code constant to bump yet** — `conversion-versioning` has not
+shipped (grep: `pipeline_version` appears only in `docs/`, and
+`docs/reports/v0-baseline.md` records "pipeline_version 0" as prose). I did **not**
+fabricate a constant: adding an unconsumed `const` trips clippy `-D warnings`
+(dead_code), and wiring it into the report/telemetry record is `conversion-versioning`'s
+design surface (and would collide with the parallel `perf-tel-fix` work). So:
+- Documented the change as **superseding v0** in design-spec §12 (item 14 now
+  "Implemented", and notes the default-render change must be `pipeline_version` ≥ 1).
+  (§7.2 documents the roll-fixed anchor itself but does not mention v0 /
+  `pipeline_version` — only §12 does.)
+- `v0-baseline.md` already anticipates this exact rework as the future **`v1`**
+  ("a later `v1` (auto white-balance, tone curve, Dmax rework)"), so its recorded
+  numbers stand as the v0 reference and need no edit.
+- **Action for `conversion-versioning`:** when it lands, this default must be
+  labeled `pipeline_version 1` (not `v0`), and its golden-output gate should treat
+  this commit as the v0→v1 boundary for the density default.
+
+### Reconcile with parallel tasks
+
+- **`roll-conversion`** (parallel worktree) consumes `density.dmax` from a frozen
+  recipe. The frozen form this task produces is exactly
+  `density.dmax = { "explicit": <scalar> }` (from `estimate --d-max-region`'s
+  `d_max_recipe`, or a hand-set `--d-max`), which is what a roll recipe carries —
+  no re-read directive, deterministic apply. No code dependency either way; the
+  enum default change (`Fixed`) is transparent to a roll recipe that sets `dmax`
+  explicitly.
+- **`conversion-versioning`** — see the pipeline_version note above.
+
+### Verification
+
+- `cargo test`: 250 unit + 50 e2e = **300 passed, 0 failed**. New tests:
+  `fixed_anchor_resolves_to_the_nominal_constant`,
+  `reference_dmax_is_the_gray_mean_of_base_relative_density`,
+  `reference_dmax_rejects_a_non_opaque_region`,
+  `reference_derived_dmax_introduces_no_per_channel_correction` (density.rs);
+  `dmax_reuse_fragment_round_trips_as_a_recipe`, `estimate_parses_d_max_region`
+  (cli.rs); `estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips`,
+  `convert_default_uses_the_fixed_roll_anchor_not_per_frame_auto` (pipeline.rs).
+  The all-black fixture stands in for the near-opaque leader (no real leader frame
+  committed; **real-leader verification, Ektar 1009 / Phoenix 1010, deferred to the
+  user** per the task).
+- CI gate (`fmt` / `clippy -D warnings` / `build` / `test`): clean.
+
+### Review-fix loop (2026-07-19)
+
+A two-engine review (Codex + 5 pr-review lenses) ran over the uncommitted changes;
+the verified findings were applied (still uncommitted). What changed:
+
+- **`reference_dmax` hardened against silent wrong-calibration** (`density.rs`).
+  Previously it only rejected a non-positive *averaged* gray density. Now, on
+  **every** channel, before the gray reduction: (a) a transmission that is
+  non-finite or at/below `SCAN_EPSILON` is a **hard error** — a floored channel
+  (dead sensor / clipped black / dark holder) must not be laundered into `D ≈ 6`
+  and freeze a black-rendering anchor (the `Dmin` "zero channel errors loudly"
+  gotcha, applied to `Dmax`); (b) each channel's base-relative density must be
+  `> 0` (a colored/wrong region can average positive while one channel
+  out-transmits the base). All hard errors are `NcError::Other` (exit 1),
+  consistent with the mirrored `Dmin` guard and the existing test — **not** the
+  `Usage`/exit-2 that finding 1(a) literally named (that contradicted its own
+  "mirror the Dmin guard" instruction and the algo-layer convention).
+- **Plausibility warning** (`density.rs` `MIN_PLAUSIBLE_REFERENCE_DMAX = 1.0`,
+  warned in `cli::run_estimate`). A positive-but-implausibly-low reference density
+  (a mid-tone region, not a leader) is **not** rejected (thin stock varies) but
+  emits a loud, `--strict`-promotable warning. Threshold `1.0` is conservative — a
+  full density decade below the base, well under a real leader's `≈ 2–3`.
+- **Domain guard (finding 3 — fallback approach taken).** The real domain fix
+  (thread `density_scale`/`offset` into the estimate path) is genuinely infeasible
+  in scope: `estimate` resolves only a film base, has no density-correction params,
+  and does *not* build a `ResolvedConfig` (the finding's premise was inaccurate).
+  Instead, `cli::run_convert` now emits a `--strict`-promotable warning when an
+  explicit `--d-max` is combined with non-default `density_scale`/`density_offset`
+  on a density-domain algorithm — the anchor (raw `D`) would otherwise be in a
+  different domain than the render's corrected `D′`. `reference_dmax`'s doc now
+  documents both the scale/offset caveat and the spatial regional-balance caveat
+  (a non-neutral balance can't fold into any scalar anchor).
+- **Reuse gating consistency (finding 4).** The reuse-ready `--d-max` / `density.dmax`
+  forms are now gated on the same `(0, 1]` base-usability check the film-base reuse
+  uses (`validate_explicit_film_base`), not merely `finite && > 0`. A base in
+  `(1, ∞)` still emits the diagnostic `dmax`/`dmax_region` but no longer advertises
+  a reuse-ready `--d-max` measured against a base that isn't a valid `--film-base`.
+- **Docs.** §7.3 MD sigmoid-anchor sentence aligned with the HTML (the default
+  `fixed` nominal, not auto-by-default). §12 item 14 `pipeline_version` reworded as
+  a **deferred** obligation (no constant exists yet) in md+html, and the stale
+  "§12 item 12" cross-ref corrected to item 16. §8 example terminology fixed:
+  raw `-log10(t/base)` is **base-relative density D** (= corrected density under
+  default scale/offset), not "corrected density" (§4). Progress note above
+  corrected: only §12 (not §7.2) mentions v0/`pipeline_version`.
+- **Tests.** The reference-region e2e round-trip now synthesizes a **near-opaque
+  non-zero** leader (~2% transmission) via a new `tiff` dev-dependency + in-test
+  TIFF generator, instead of the all-black fixture (now a guarded error). Added:
+  degenerate all-black region → hard error; per-channel out-transmitting region →
+  hard error; floored/zero channel → hard error (`density.rs`); implausibly-low
+  reference → strict-promotable warning (e2e); degenerate grid base → `--d-max-region`
+  skipped, still hard-errors (e2e); `sample_region_at` median (`p = 0.5`) on a
+  non-uniform region differs from the high/low percentiles (`film_base.rs`).
+
+### Review-fix loop (2026-07-21)
+
+A second review pass (Codex P2 findings) over the still-uncommitted changes. Two
+verified findings applied:
+
+- **B1 — regional balance folded into the Dmax domain guard** (`cli.rs`). The
+  explicit-`Dmax` domain-mismatch warning previously fired only on non-default
+  `density_scale`/`density_offset`. But the render subtracts `Dmax` from
+  `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)`, so a **non-neutral
+  regional balance** also shifts that domain — a reference/explicit `--d-max` reused
+  with a non-neutral shadow/highlight balance silently mis-anchored with no warning.
+  This supersedes the prior "spatial balance can't fold into any scalar anchor,
+  documentation-only" stance (2026-07-19 note): it can't be *folded into* the anchor,
+  but a non-neutral balance still shifts `D′`, so the fixed anchor still mis-anchors —
+  hence it now belongs in the guard. The guard decision was extracted into a pure,
+  testable `explicit_dmax_domain_warning(&ResolvedConfig) -> Option<String>`; the
+  message now names regional balance alongside scale/offset. Test:
+  `explicit_dmax_domain_warning_fires_on_nonneutral_regional_balance`.
+- **B2 — per-channel reference plausibility** (`density.rs` + `cli.rs`). The
+  implausibly-low warning checked only the averaged scalar `dmax`, so a colored region
+  with one dense channel and others barely above base cleared it (base `[1,1,1]`,
+  transmissions ≈ `[0.001, 0.99, 0.99]` → per-channel densities ≈ `[3.0, 0.004, 0.004]`,
+  avg ≈ 1.0 > threshold; the `d ≤ 0` hard error doesn't catch positives). `reference_dmax`
+  now returns a `ReferenceDmax { scalar, per_channel }` (the scalar value is unchanged —
+  still the gray mean); the `d ≤ 0` per-channel hard error is kept. The estimate-side
+  plausibility decision was extracted into a pure
+  `reference_dmax_plausibility_warning(&ReferenceDmax) -> Option<String>` with two
+  distinct, mutually-exclusive shapes: (a) sub-floor gray mean → the existing frame-thin
+  warning; (b) plausible mean but weakest channel below `MIN_PLAUSIBLE_REFERENCE_DMAX` →
+  a new colored/wrong-region warning. Tests: `reference_dmax_exposes_a_weak_channel_a_plausible_scalar_hides`
+  (`density.rs`, the data) and `reference_dmax_plausibility_warns_on_a_weak_channel_a_plausible_scalar_hides`
+  (`cli.rs`, the wiring, covering all three branches).
+- Determinism, `None` bit-exactness, four-flag mutual exclusivity, and the
+  four-coupled-spots invariant are untouched — both fixes only add/route report
+  warnings (no image-output change). CI gate (`fmt` / `clippy -D warnings` / `build` /
+  `test`): clean.
