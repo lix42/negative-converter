@@ -314,6 +314,7 @@ pub trait Converter {
   <thead><tr><th>Command</th><th>Purpose</th></tr></thead>
   <tbody>
     <tr><td><code>nc convert</code></td><td>The main pipeline: negative file → positive TIFF.</td></tr>
+    <tr><td><code>nc roll</code></td><td>Convert a batch of frames from one shared, frozen recipe (the batch-<strong>apply</strong> scaffold). Per-frame outputs into <code>--out-dir</code> + a roll-level JSON report. Single-frame <code>convert</code> is unchanged; roll is additive.</td></tr>
     <tr><td><code>nc inspect</code></td><td>Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for <code>--base-region</code>), suggested <code>Dmin</code>. No output image.</td></tr>
     <tr><td><code>nc estimate</code></td><td>Run only film-base/<code>Dmin</code> estimation; emit JSON with reuse-ready <code>--film-base</code> / recipe-fragment forms. <code>--grid</code> adds 5-cell agreement-checked sampling for blank reference frames.</td></tr>
     <tr><td><code>nc params</code></td><td>Print the full default/effective parameter set as JSON (discovery + recipe scaffolding).</td></tr>
@@ -356,6 +357,31 @@ nc convert in.tiff -o out.tiff \
 # Reuse a roll recipe but override one knob for this frame.
 nc convert frame12.tiff -o frame12_pos.tiff \
   --params roll-A.json --print-exposure 0.15
+
+# Convert a whole roll from ONE shared, frozen recipe (batch-apply). The shared
+# recipe config (roll-fixed film base + Dmax) lives in roll-A.json and appears
+# once at the top of the roll report; each frame additionally echoes the resolved
+# base/Dmax it used. Per-frame outputs are written to out/ as &lt;stem&gt;_positive.tiff.
+nc roll frame01.tiff frame02.tiff frame03.tiff --out-dir out/ --params roll-A.json
+nc roll scans/ --out-dir out/ --params roll-A.json   # a directory expands to its .tif/.tiff
+# Per-frame overrides via a manifest: each frame may carry its own output path
+# and a partial-recipe `params` deep-merged onto the shared recipe for that frame
+# only (the "frame-local" knobs, e.g. print exposure). The manifest is the shape
+# the base-acquisition-planner will emit.
+#   frames.json: { "frames": [
+#     { "input": "frame01.tiff" },
+#     { "input": "frame02.tiff", "params": { "print": { "print_exposure": 0.15 } } } ] }
+nc roll --frames frames.json --out-dir out/ --params roll-A.json
+# The roll report: { "command": "roll", "recipe": { …shared frozen recipe… },
+#   "warnings": [ …roll-level, e.g. base-not-frozen… ],
+#   "frames": [ { "input": …, "output": …, "status": "ok", "film_base": …,
+#     "dmax": …, "warnings": […], "overrides": … }, … ],
+#   "summary": { "total": 3, "succeeded": 3, "failed": 0 } }
+# (each frame's "film_base"/"dmax" is the *resolved* value it used, alongside the
+#  shared recipe config above — not a second copy of a per-frame-varying knob)
+# A frame's failure is recorded (status "failed" + error) and the roll continues;
+# the process then exits non-zero. Determinism: same batch + same recipe ⇒
+# byte-identical output per frame (each frame runs the same core as `convert`).
 
 # Inspect only; let an agent read the JSON and decide parameters.
 nc inspect in.tiff --report json
@@ -495,9 +521,11 @@ nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941</cod
 <ul>
   <li><code>--params &lt;json&gt;</code>, <code>--dump-params &lt;json&gt;</code></li>
   <li><code>--report json|none</code>, <code>--report-file &lt;path&gt;</code></li>
-  <li><code>--strict</code> — promote report warnings (clipping, non-finite samples, grid disagreement, …) to a failing exit (see the Errors section); on <code>convert</code> and <code>estimate</code></li>
+  <li><code>--strict</code> — promote report warnings (clipping, non-finite samples, grid disagreement, …) to a failing exit (see the Errors section); on <code>convert</code>, <code>roll</code>, and <code>estimate</code></li>
   <li><code>-v/--verbose</code>, <code>--quiet</code></li>
 </ul>
+
+<p><strong>Roll (batch, <code>nc roll</code> only — orchestration flags, NOT recipe keys).</strong> <code>nc roll</code> converts many frames from one shared <code>--params</code> recipe; it reuses the exact recipe shape above and adds no new conversion knobs. Its flags are operational (like <code>--report</code>): <code>--out-dir &lt;dir&gt;</code> (per-frame outputs <code>&lt;stem&gt;_positive.tiff</code>), positional <code>inputs</code> (files and directories — a directory is expanded to its <code>.tif</code>/<code>.tiff</code> files, sorted; shell globs are expanded by the shell, not by nc) <strong>or</strong> <code>--frames &lt;manifest.json&gt;</code> (explicit per-frame <code>input</code>/<code>output</code>/partial-recipe <code>params</code> overrides, deep-merged onto the shared recipe for that frame only). The shared recipe <em>configuration</em> (where the roll-fixed film base and <code>density.dmax</code> live) appears once at the top of the roll report; each frame additionally reports the <em>resolved</em> base / <code>Dmax</code> it used — a redundant echo when the recipe pins an explicit base, but meaningful under an <code>auto</code>/<code>region</code> base that resolves per frame. Frame-local knobs are the per-frame <code>params</code> overrides. The film base is meant to be roll-fixed, so the two ways to break that consistency are <strong>loud, <code>--strict</code>-promotable warnings</strong> (not hard errors, so a deliberate best-effort batch stays usable): (1) if the shared recipe's <code>film_base.source</code> is not <code>explicit</code>, each frame re-estimates its own <code>Dmin</code> and the roll is not truly frozen; (2) if a per-frame <code>params</code> override sets <code>film_base</code>, that frame is converted with its overridden base but its <code>Dmin</code> differs from the rest of the roll. <code>input.export_ir</code> is rejected in roll mode (one path, N frames). Determinism: same batch + same recipe ⇒ byte-identical output per frame.</p>
 
 <p><strong>Telemetry (operational, <code>convert</code> only — NOT recipe keys).</strong> Opt-in performance + context telemetry. These are operational flags like <code>--report</code>, so they are <strong>not</strong> conversion knobs: they never enter the recipe/sidecar and never affect the output bytes (telemetry on or off ⇒ byte-identical TIFF + sidecar).</p>
 <ul>
@@ -587,7 +615,7 @@ nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941</cod
   <li><strong>Black &amp; white film support.</strong> The <em>rendering</em> half has graduated into the tracked <code>bw-support</code> task (Phase 6): B&amp;W film is still a density medium, so the <code>density</code> algorithm is the B&amp;W renderer, plus a mono color model that pools R,G,B into one gray so scanner channel mismatch can't tint the output. What remains here is the <em>input</em> half: plain <strong>16-bit RAW</strong> scan files (not the SilverFast HDR/HDRi container). Note B&amp;W negatives have no usable orange mask and no IR defect channel (silver blocks IR) — item 1's IR dust removal must be disabled/guarded for B&amp;W.</li>
   <li><strong>Camera RAW input.</strong> Bayer/X-Trans and DNG ingestion (e.g. <code>rawler</code>/LibRaw) for camera-scanning workflows.</li>
   <li><strong>More output formats.</strong> JPEG/PNG for proofs, EXR for HDR interchange.</li>
-  <li><strong>Roll-level presets &amp; batch mode.</strong> First-class roll recipes (film stock, <code>Dmin</code>, curve params, neutral spots) applied across many frames.</li>
+  <li><strong>Roll-level presets &amp; batch mode.</strong> The <strong>batch-apply scaffold has shipped</strong> as <code>nc roll</code> (task <code>roll-conversion</code>): convert N frames from one shared, frozen recipe (<code>--params</code>), with per-frame overrides via a <code>--frames</code> manifest and a roll-level JSON report (per-frame status + the shared recipe once). See the CLI section. What remains: the auto-cascade that <em>generates</em> the shared recipe (detect the film base / <code>Dmax</code> once for the roll and emit the frozen recipe roll applies) — the dependent <code>base-acquisition-planner</code> task — plus first-class named presets (film stock, neutral spots).</li>
   <li><strong>Scanner ICC profiling workflow &amp; QA harness.</strong> IT8/target-based calibration and ΔE2000 / SSIM regression testing against standard test negatives.</li>
   <li><strong>Robust auto film-base detection.</strong> <em>(Done — implemented as the inward-scan detector, see §9 film-base.)</em> The kept scope shipped together: the detector for the real <code>holder → thin rebate → picture</code> layout (deterministic, fail-loud), the <strong>uniformity warning on <code>--base-region</code></strong> (a mixed rebate/image rectangle otherwise yields a plausible-looking bad base silently), and <code>nc inspect</code> reporting <strong>candidate rebate regions</strong> (coordinates + spread) so CLI users confirm instead of measuring — the same data a future UI would highlight. The opt-in <strong>content-based source</strong> (<code>film_base.source = "content"</code> / <code>--base-content</code>, §9 ladder tier 3) is <strong>reassigned</strong> to the dedicated <code>film-base-content-fallback</code> task (item 13) and is <strong>not</strong> implemented here — the auto-refusal message only <em>suggests</em> it. Remaining: threshold tuning against full-size scans rides <code>real-scan-verification</code>.</li>
   <li><strong>Light film holders.</strong> Auto/border logic assumes a dark holder surround; some holders are white. Add a <code>--holder white|black</code> control (recipe key <code>film_base.holder</code>) so detection knows the surround polarity.</li>

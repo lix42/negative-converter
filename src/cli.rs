@@ -49,6 +49,8 @@ pub struct Cli {
 pub enum Command {
     /// Convert a negative scan to a positive TIFF.
     Convert(ConvertArgs),
+    /// Convert a roll (batch of frames) from one shared, frozen recipe.
+    Roll(RollArgs),
     /// Inspect a scan and emit a JSON report (no output image).
     Inspect(IoArgs),
     /// Run only film-base / Dmin estimation; emit JSON.
@@ -180,6 +182,51 @@ pub struct ConvertArgs {
     #[arg(long, value_name = "PATH")]
     pub telemetry_file: Option<String>,
 
+    #[command(flatten)]
+    pub report: ReportArgs,
+}
+
+/// `nc roll`: convert a batch of frames from ONE shared, frozen recipe so the
+/// whole roll is color-consistent and reproducible (design-spec §8, §12 item 6).
+///
+/// This is the batch-**apply** half of plan→recipe→apply: it replays a *provided*
+/// frozen recipe (hand-authored or `nc params`/`--dump-params`-produced) over N
+/// frames. It deliberately owns no auto-cascade that *generates* the recipe —
+/// that is the separate `base-acquisition-planner` task. Roll-fixed params (the
+/// film base, `density.dmax`) live in the shared `--params` recipe and appear
+/// once in the roll report; frame-local params can be overridden per frame via a
+/// `--frames` manifest.
+///
+/// Unlike `convert`'s single `-o <file>`, roll writes per-frame outputs into an
+/// `--out-dir` (named `<stem>_positive.tiff`) plus a roll-level JSON report on
+/// stdout, so single-frame `convert` stays byte-for-byte unchanged.
+#[derive(Args, Debug)]
+pub struct RollArgs {
+    /// Input scans: files, directories (expanded to their `.tif`/`.tiff` files),
+    /// or shell globs (expanded by the shell). Collected and sorted for a
+    /// deterministic frame order. Mutually exclusive with `--frames`.
+    #[arg(required_unless_present = "frames", conflicts_with = "frames")]
+    pub inputs: Vec<PathBuf>,
+    /// A JSON manifest naming the frames explicitly, each with an optional output
+    /// path and an optional partial-recipe `params` override applied on top of the
+    /// shared recipe for that frame only. Mutually exclusive with positional
+    /// `inputs`. Shape: `{ "frames": [ { "input": "…", "output"?: "…",
+    /// "params"?: { …partial recipe… } }, … ] }`.
+    #[arg(long, value_name = "JSON")]
+    pub frames: Option<PathBuf>,
+    /// Output directory (created if missing). Per-frame outputs are written here
+    /// as `<input-stem>_positive.tiff` unless the manifest gives an explicit
+    /// output path.
+    #[arg(short = 'o', long = "out-dir", value_name = "DIR")]
+    pub out_dir: PathBuf,
+    /// Shared frozen recipe applied to every frame (the roll-fixed film base,
+    /// `density.dmax`, …). Same JSON shape as `convert --params`.
+    #[arg(long = "params", value_name = "JSON")]
+    pub recipe_in: Option<PathBuf>,
+    /// Treat any frame's warnings as a hard error (after the roll report is
+    /// emitted), like `convert --strict`.
+    #[arg(long)]
+    pub strict: bool,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -935,13 +982,20 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 /// Emit a report as JSON to stdout (kept clean) or `--report-file`. `none`
 /// suppresses it entirely.
 pub fn emit_report(report: &Report, format: ReportFormat, file: Option<&Path>) -> Result<()> {
+    emit_json(report, format, file)
+}
+
+/// Emit any serializable report as JSON to stdout (kept clean) or a file. `none`
+/// suppresses it entirely. Shared by the per-command [`Report`] and the roll-level
+/// [`RollReport`].
+fn emit_json<T: Serialize>(value: &T, format: ReportFormat, file: Option<&Path>) -> Result<()> {
     if format == ReportFormat::None {
         return Ok(());
     }
     match file {
-        Some(p) => write_json(p, report),
+        Some(p) => write_json(p, value),
         None => {
-            let json = serde_json::to_string_pretty(report)
+            let json = serde_json::to_string_pretty(value)
                 .map_err(|e| NcError::Other(format!("serializing report: {e}")))?;
             println!("{json}");
             Ok(())
@@ -1045,6 +1099,14 @@ fn push_warning(report: &mut Report, log: &Log, msg: String) {
     report.warnings.push(msg);
 }
 
+/// Like [`push_warning`], but into a caller-owned buffer instead of a [`Report`].
+/// [`convert_frame`] accumulates here so a frame that warns and *then* fails still
+/// hands its warnings back to the caller (the report only rides out on success).
+fn push_warning_buf(warnings: &mut Vec<String>, log: &Log, msg: String) {
+    log.warn(&msg);
+    warnings.push(msg);
+}
+
 // ---------------------------------------------------------------------------
 // Entry point + dispatch
 // ---------------------------------------------------------------------------
@@ -1060,6 +1122,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Params => run_params(),
         Command::Convert(args) => run_convert(args),
+        Command::Roll(args) => run_roll(args),
         Command::Inspect(args) => run_inspect(args),
         Command::Estimate(args) => run_estimate(args),
     }
@@ -1163,6 +1226,239 @@ fn ensure_write_targets_distinct(input: &Path, targets: &[(&str, &Path)]) -> Res
     Ok(())
 }
 
+/// Reject a documented-but-unimplemented `input.color` profile loudly rather
+/// than silently ignoring it (scans are decoded as linear). Shared by `convert`
+/// and `roll` so both fail the same way on a profile-bearing recipe.
+fn reject_unsupported_input_color(cfg: &ResolvedConfig) -> Result<()> {
+    if let InputColor::Profile(p) = &cfg.input.color {
+        return Err(NcError::Unsupported(format!(
+            "--input-profile {p}: input-side color management is not implemented yet; \
+             SilverFast scans are decoded as linear (omit the flag or use --assume-linear)"
+        )));
+    }
+    Ok(())
+}
+
+/// Everything one frame's pipeline produced, for the orchestrator to emit or
+/// aggregate. `convert` (single frame) reads all of it — the report to emit, and
+/// `info` / `recipe_json` / `timings` / `loss` for its optional telemetry record;
+/// `roll` reads only `report` (telemetry is `convert`-only, design-spec §9).
+struct ConvertedFrame {
+    report: Report,
+    info: DecodeInfo,
+    recipe_json: String,
+    /// Per-stage wall clocks; `total` is left `0.0` for the orchestrator to fill
+    /// from its own whole-run clock (this struct times only the stages here).
+    timings: telemetry::TimingInfo,
+    loss: EncodeReport,
+}
+
+/// The per-frame conversion core: decode → film-base estimate → render → optional
+/// IR export → encode + effective-recipe sidecar. Pure of the operational
+/// concerns (`--strict` gating, report emission, telemetry) the callers layer on
+/// top, so `convert` and `roll` share one byte-for-byte identical frame path.
+///
+/// The caller must have already validated `cfg` ([`validate`] +
+/// [`reject_unsupported_input_color`]) and checked write-target collisions;
+/// `convert_frame` assumes a sound config and a safe `output` path. It never
+/// writes to stdout (the report rides back in [`ConvertedFrame`]); progress and
+/// warnings go to stderr via `log`.
+///
+/// Warnings are accumulated into the caller-owned `warnings` buffer (echoed to
+/// stderr as they occur) so they survive an early failure: on success they are
+/// also moved into the returned report, but on the `Err` path they stay in the
+/// caller's buffer — the roll orchestrator attaches them to a failed frame's
+/// report. The caller decides whether `--strict` promotes them.
+fn convert_frame(
+    command: &'static str,
+    input: &Path,
+    output: &Path,
+    cfg: &ResolvedConfig,
+    log: &Log,
+    warnings: &mut Vec<String>,
+) -> Result<ConvertedFrame> {
+    let mut report = Report {
+        command: Some(command),
+        input: Some(input.to_path_buf()),
+        output: Some(output.to_path_buf()),
+        algorithm: Some(cfg.algorithm),
+        film_base_source: Some(cfg.film_base.source.clone()),
+        ..Report::default()
+    };
+
+    // `sigmoid` consumes the density section's scale/offset/dmax but replaces the
+    // stage-3 straight line that `density_gamma` parameterizes, so a customized
+    // gamma would be a silent no-op — the four-spot trap in disguise. Unlike a
+    // fully inert section (e.g. `simple.*` under `--algorithm density`), this is a
+    // *partially* consumed section, so warn loudly instead of staying silent.
+    if cfg.algorithm == Algorithm::Sigmoid
+        && cfg.density.density_gamma != DensityParams::default().density_gamma
+    {
+        push_warning_buf(
+            warnings,
+            log,
+            format!(
+                "--algorithm sigmoid ignores --density-gamma (got {}); the S-curve's \
+                 mid-density slope is --sigmoid-contrast",
+                cfg.density.density_gamma
+            ),
+        );
+    }
+
+    // Stage 1 — decode. Per-stage wall clocks feed the telemetry record only
+    // (they never touch the image/sidecar); measure them regardless of whether
+    // telemetry is enabled so the render path is uniform.
+    let stage_started = Instant::now();
+    let (image, info) = decode(input)?;
+    let decode_ms = elapsed_ms(stage_started);
+    log.info(format_args!(
+        "decoded {:?} {}x{} (ir={})",
+        info.format, info.width, info.height, info.ir_present
+    ));
+    for w in &info.warnings {
+        push_warning_buf(warnings, log, w.clone());
+    }
+
+    // `--export-ir` on a scan with no IR plane can't be honored: fail fast,
+    // before writing any output, rather than after the main encode.
+    let export_ir = cfg.input.export_ir.as_deref().map(PathBuf::from);
+    if export_ir.is_some() && !info.ir_present {
+        return Err(NcError::Unsupported(
+            "--export-ir requested but the input has no IR plane (HDRi input only)".into(),
+        ));
+    }
+    // Note an IR plane that's carried but not consumed — but only when it isn't
+    // being exported: `--export-ir` is the user handling it, so warning (and
+    // failing under `--strict`) would be wrong. This keeps `--strict --export-ir`
+    // a usable workflow on the primary HDRi format.
+    if info.ir_present && export_ir.is_none() {
+        push_warning_buf(
+            warnings,
+            log,
+            "input carries an IR plane; it is preserved but not used in Step 1 \
+             (use --export-ir to write it out)"
+                .into(),
+        );
+    }
+
+    // Stage 2 — film-base estimate. Resolved before the render so its quality
+    // warnings (non-uniform region, cross-edge disagreement) are pushed — and so
+    // echoed to stderr — *before* the fallible render runs, and ride out in the
+    // JSON report on a successful run. (A hard render failure propagates its error
+    // and exit code like every other error path and emits no report; the stderr
+    // warnings still stand.)
+    let stage_started = Instant::now();
+    let base = film_base::estimate(&image, &cfg.film_base)?;
+    let film_base_ms = elapsed_ms(stage_started);
+    report.film_base = Some(base.base);
+    for w in base.warnings {
+        push_warning_buf(warnings, log, w);
+    }
+
+    // Clear any stale lcms2 flag so only errors from *this* render are counted.
+    let _ = cms_error_occurred();
+    // Stages 3–4 — algorithm → output color transform.
+    let rendered = stages::render(
+        &image,
+        &base.base,
+        stages::algo_params(
+            cfg.algorithm,
+            &cfg.simple,
+            &cfg.density,
+            &cfg.sigmoid,
+            &cfg.print,
+        ),
+        &cfg.output,
+    )?;
+    // lcms2 transform/profile failures reach us only through the global handler
+    // (`transform_in_place` is infallible), so check the flag it sets.
+    if cms_error_occurred() {
+        return Err(NcError::Other(
+            "color management (lcms2) reported a runtime error; see stderr".into(),
+        ));
+    }
+    report.dmax = rendered.convert.dmax;
+    report.white_balance = rendered.convert.white_balance;
+    report.balance_range = rendered.convert.balance_range;
+
+    // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
+    // explicitly request).
+    if cfg.output.bigtiff == BigTiff::Auto
+        && encode::plans_bigtiff(&cfg.output, &rendered.image, rendered.icc.len())
+    {
+        push_warning_buf(
+            warnings,
+            log,
+            "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+        );
+    }
+
+    // Optional IR export — before the main encode, so a failing IR write fails
+    // the run without first writing the primary output/sidecar.
+    let mut ir_export_ms = None;
+    if let Some(path) = &export_ir {
+        let stage_started = Instant::now();
+        encode::export_ir(&image, cfg.output.depth(), path)?;
+        ir_export_ms = Some(elapsed_ms(stage_started));
+        log.info(format_args!("wrote IR plane {}", path.display()));
+        report.ir_exported = Some(path.clone());
+    }
+
+    // Stage 5 — encode + effective-recipe sidecar.
+    let stage_started = Instant::now();
+    let loss = encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?;
+    let encode_ms = elapsed_ms(stage_started);
+    report.loss = Some(loss);
+    if loss.any_loss() {
+        push_warning_buf(
+            warnings,
+            log,
+            format!(
+                "output lost {} clipped and {} non-finite of {} samples ({:.2}%)",
+                loss.clipped_total(),
+                loss.non_finite,
+                loss.total_samples,
+                loss.loss_fraction() * 100.0,
+            ),
+        );
+    }
+    // A non-finite sample is a numerical fault, not routine gamut clipping — make
+    // sure it is never fully silenced (the `--quiet --report none` combination
+    // would otherwise suppress both channels of the warning above).
+    if loss.non_finite > 0 && log.quiet {
+        eprintln!(
+            "nc: warning: {} non-finite (NaN/inf) output sample(s) — numerical fault",
+            loss.non_finite
+        );
+    }
+
+    let recipe_json = serde_json::to_string_pretty(cfg)
+        .map_err(|e| NcError::Other(format!("serializing recipe for sidecar: {e}")))?;
+    encode::write_sidecar(output, &recipe_json)?;
+    log.info(format_args!("wrote {}", output.display()));
+
+    // Success: hand the accumulated warnings to the report (the buffer is the
+    // caller's; taking them keeps the two from double-counting). On the `Err`
+    // paths above the buffer is left populated for the caller instead.
+    report.warnings = std::mem::take(warnings);
+
+    Ok(ConvertedFrame {
+        report,
+        info,
+        recipe_json,
+        timings: telemetry::TimingInfo {
+            total: 0.0,
+            decode: decode_ms,
+            film_base: film_base_ms,
+            algorithm: rendered.timings.algorithm_ms,
+            color: rendered.timings.color_ms,
+            encode: encode_ms,
+            ir_export: ir_export_ms,
+        },
+        loss,
+    })
+}
+
 /// `nc convert` — the full pipeline: decode → film-base → algorithm → output
 /// color transform → encode (+ sidecar, + optional IR export). Warnings are
 /// collected into the report and echoed to stderr; `--strict` promotes any of
@@ -1174,14 +1470,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let cfg = merge(load_recipe(args.recipe_in.as_deref())?, &args);
     validate(&cfg)?;
 
-    // `input.color` profiles are parsed into the recipe shape, but input-side
-    // color management is not implemented yet — reject loudly rather than
-    // silently ignoring a documented knob (scans are decoded as linear).
-    if let InputColor::Profile(p) = &cfg.input.color {
-        return Err(NcError::Unsupported(format!(
-            "--input-profile {p}: input-side color management is not implemented              yet; SilverFast scans are decoded as linear (omit the flag or use              --assume-linear)"
-        )));
-    }
+    reject_unsupported_input_color(&cfg)?;
 
     // Guard every write target against the input and against each other before
     // anything is decoded or written.
@@ -1227,170 +1516,25 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     // documented flag isn't rejected; nothing consumes it yet.
     let _ = args.seed;
 
-    let mut report = Report {
-        command: Some("convert"),
-        input: Some(args.input.clone()),
-        output: Some(args.output.clone()),
-        algorithm: Some(cfg.algorithm),
-        film_base_source: Some(cfg.film_base.source.clone()),
-        ..Report::default()
-    };
-
-    // `sigmoid` consumes the density section's scale/offset/dmax but replaces the
-    // stage-3 straight line that `density_gamma` parameterizes, so a customized
-    // gamma would be a silent no-op — the four-spot trap in disguise. Unlike a
-    // fully inert section (e.g. `simple.*` under `--algorithm density`), this is a
-    // *partially* consumed section, so warn loudly instead of staying silent.
-    if cfg.algorithm == Algorithm::Sigmoid
-        && cfg.density.density_gamma != DensityParams::default().density_gamma
-    {
-        push_warning(
-            &mut report,
-            &log,
-            format!(
-                "--algorithm sigmoid ignores --density-gamma (got {}); the S-curve's \
-                 mid-density slope is --sigmoid-contrast",
-                cfg.density.density_gamma
-            ),
-        );
-    }
-
-    // Stage 1 — decode. Per-stage wall clocks feed the telemetry record only
-    // (they never touch the image/sidecar); measure them regardless of whether
-    // telemetry is enabled so the render path is uniform.
-    let stage_started = Instant::now();
-    let (image, info) = decode(&args.input)?;
-    let decode_ms = elapsed_ms(stage_started);
-    log.info(format_args!(
-        "decoded {:?} {}x{} (ir={})",
-        info.format, info.width, info.height, info.ir_present
-    ));
-    for w in &info.warnings {
-        push_warning(&mut report, &log, w.clone());
-    }
-
-    // `--export-ir` on a scan with no IR plane can't be honored: fail fast,
-    // before writing any output, rather than after the main encode.
-    let export_ir = cfg.input.export_ir.as_deref().map(PathBuf::from);
-    if export_ir.is_some() && !info.ir_present {
-        return Err(NcError::Unsupported(
-            "--export-ir requested but the input has no IR plane (HDRi input only)".into(),
-        ));
-    }
-    // Note an IR plane that's carried but not consumed — but only when it isn't
-    // being exported: `--export-ir` is the user handling it, so warning (and
-    // failing under `--strict`) would be wrong. This keeps `--strict --export-ir`
-    // a usable workflow on the primary HDRi format.
-    if info.ir_present && export_ir.is_none() {
-        push_warning(
-            &mut report,
-            &log,
-            "input carries an IR plane; it is preserved but not used in Step 1 \
-             (use --export-ir to write it out)"
-                .into(),
-        );
-    }
-
-    // Stage 2 — film-base estimate. Resolved before the render so its quality
-    // warnings (non-uniform region, cross-edge disagreement) are pushed — and so
-    // echoed to stderr — *before* the fallible render runs, and ride out in the
-    // JSON report on a successful run. (A hard render failure propagates its error
-    // and exit code like every other error path and emits no report; the stderr
-    // warnings still stand.)
-    let stage_started = Instant::now();
-    let base = film_base::estimate(&image, &cfg.film_base)?;
-    let film_base_ms = elapsed_ms(stage_started);
-    report.film_base = Some(base.base);
-    for w in base.warnings {
-        push_warning(&mut report, &log, w);
-    }
-
-    // Clear any stale lcms2 flag so only errors from *this* render are counted.
-    let _ = cms_error_occurred();
-    // Stages 3–4 — algorithm → output color transform.
-    let rendered = stages::render(
-        &image,
-        &base.base,
-        stages::algo_params(
-            cfg.algorithm,
-            &cfg.simple,
-            &cfg.density,
-            &cfg.sigmoid,
-            &cfg.print,
-        ),
-        &cfg.output,
-    )?;
-    // lcms2 transform/profile failures reach us only through the global handler
-    // (`transform_in_place` is infallible), so check the flag it sets.
-    if cms_error_occurred() {
-        return Err(NcError::Other(
-            "color management (lcms2) reported a runtime error; see stderr".into(),
-        ));
-    }
-    report.dmax = rendered.convert.dmax;
-    report.white_balance = rendered.convert.white_balance;
-    report.balance_range = rendered.convert.balance_range;
-
-    // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
-    // explicitly request).
-    if cfg.output.bigtiff == BigTiff::Auto
-        && encode::plans_bigtiff(&cfg.output, &rendered.image, rendered.icc.len())
-    {
-        push_warning(
-            &mut report,
-            &log,
-            "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
-        );
-    }
-
-    // Optional IR export — before the main encode, so a failing IR write fails
-    // the run without first writing the primary output/sidecar.
-    let mut ir_export_ms = None;
-    if let Some(path) = &export_ir {
-        let stage_started = Instant::now();
-        encode::export_ir(&image, cfg.output.depth(), path)?;
-        ir_export_ms = Some(elapsed_ms(stage_started));
-        log.info(format_args!("wrote IR plane {}", path.display()));
-        report.ir_exported = Some(path.clone());
-    }
-
-    // Stage 5 — encode + effective-recipe sidecar.
-    let stage_started = Instant::now();
-    let loss = encode::encode(
-        &rendered.image,
-        &cfg.output,
-        Some(&rendered.icc),
+    // The per-frame pipeline core (decode → film-base → render → encode +
+    // sidecar), shared byte-for-byte with `roll`. Operational concerns the two
+    // orchestrators layer differently — report emission, `--strict` gating,
+    // telemetry — stay out here.
+    let mut warnings = Vec::new();
+    let ConvertedFrame {
+        mut report,
+        info,
+        recipe_json,
+        timings: stage_timings,
+        loss,
+    } = convert_frame(
+        "convert",
+        &args.input,
         &args.output,
+        &cfg,
+        &log,
+        &mut warnings,
     )?;
-    let encode_ms = elapsed_ms(stage_started);
-    report.loss = Some(loss);
-    if loss.any_loss() {
-        push_warning(
-            &mut report,
-            &log,
-            format!(
-                "output lost {} clipped and {} non-finite of {} samples ({:.2}%)",
-                loss.clipped_total(),
-                loss.non_finite,
-                loss.total_samples,
-                loss.loss_fraction() * 100.0,
-            ),
-        );
-    }
-    // A non-finite sample is a numerical fault, not routine gamut clipping — make
-    // sure it is never fully silenced (the `--quiet --report none` combination
-    // would otherwise suppress both channels of the warning above).
-    if loss.non_finite > 0 && log.quiet {
-        eprintln!(
-            "nc: warning: {} non-finite (NaN/inf) output sample(s) — numerical fault",
-            loss.non_finite
-        );
-    }
-
-    let recipe_json = serde_json::to_string_pretty(&cfg)
-        .map_err(|e| NcError::Other(format!("serializing recipe for sidecar: {e}")))?;
-    encode::write_sidecar(&args.output, &recipe_json)?;
-    log.info(format_args!("wrote {}", args.output.display()));
 
     let total_ms = elapsed_ms(started);
     report.elapsed_ms = Some(total_ms);
@@ -1419,15 +1563,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     // kept out of `report.warnings` — see `emit_telemetry`. Skipped on a
     // `--strict` failure so the log stays "one record per successful run".
     if telemetry_requested(&args) && !strict_failure {
-        let timings = telemetry::TimingInfo {
-            total: total_ms,
-            decode: decode_ms,
-            film_base: film_base_ms,
-            algorithm: rendered.timings.algorithm_ms,
-            color: rendered.timings.color_ms,
-            encode: encode_ms,
-            ir_export: ir_export_ms,
-        };
+        // `convert_frame` measured the per-stage wall clocks; the total is this
+        // orchestrator's whole-run clock.
+        let mut timings = stage_timings;
+        timings.total = total_ms;
         emit_telemetry(
             &args,
             &cfg,
@@ -1446,6 +1585,592 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             "--strict: {} warning(s) present (see report)",
             report.warnings.len()
         )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Roll (batch) — plan → recipe → apply, the batch-apply scaffold
+// ---------------------------------------------------------------------------
+
+/// A `--frames` manifest: an explicit list of frames to convert, each optionally
+/// carrying its own output path and a partial-recipe override. `deny_unknown_fields`
+/// so a typo'd top-level key is a loud error, not a silently-ignored frame list.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollManifest {
+    frames: Vec<ManifestFrame>,
+}
+
+/// One frame in a `--frames` manifest. `params` is a *partial* recipe (any subset
+/// of the [`ResolvedConfig`] shape) deep-merged onto the shared recipe for this
+/// frame only — the frame-local override mechanism. `deny_unknown_fields` guards
+/// the entry keys; the merged `params` are validated when deserialized back to a
+/// `ResolvedConfig`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestFrame {
+    input: PathBuf,
+    #[serde(default)]
+    output: Option<PathBuf>,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+/// A frame resolved for conversion: where to read and write, and the effective
+/// config (the shared recipe with any per-frame manifest override merged on top).
+struct PlannedFrame {
+    input: PathBuf,
+    output: PathBuf,
+    cfg: ResolvedConfig,
+    /// The per-frame override applied (manifest `params`), echoed into the roll
+    /// report so a reader sees exactly what differed for this frame; `None` when
+    /// the frame ran the shared recipe unchanged.
+    overrides: Option<serde_json::Value>,
+}
+
+/// The roll-level JSON report emitted on stdout (or `--report-file`): the shared
+/// frozen recipe *configuration* once, any roll-level warnings, the per-frame
+/// status list, and a summary. The shared recipe here is the config every frame
+/// was converted from; each frame additionally reports the *resolved* base/`Dmax`
+/// it used (a redundant echo when the recipe pins an explicit base, meaningful
+/// under an `auto`/`region` base that resolves per frame).
+#[derive(Debug, Serialize)]
+struct RollReport {
+    command: &'static str,
+    /// The shared frozen recipe configuration every frame was converted from —
+    /// where the roll-fixed `film_base` / `density.dmax` config lives, once.
+    recipe: ResolvedConfig,
+    /// Roll-level warnings not tied to a single frame (e.g. the film base is not
+    /// frozen because the shared recipe's `film_base.source` is not `explicit`).
+    /// Echoed to stderr and, like per-frame warnings, promoted to a failing exit
+    /// by `--strict`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    frames: Vec<FrameReport>,
+    summary: RollSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<f64>,
+}
+
+/// Per-frame entry inside a [`RollReport`]. The per-frame *identity*
+/// (`input`/`output`/`warnings`/`overrides`) lives here; the ok-vs-failed
+/// *payload* is the data-carrying [`FrameStatus`] enum, so an "ok" frame can't
+/// carry an `error` and a "failed" frame can't carry a film base — states the old
+/// `status: &str` + all-`Option` layout could encode. `warnings` is common to
+/// both outcomes: a frame that warns and *then* fails still reports its warnings
+/// (they are echoed to stderr as they occur and preserved here regardless).
+#[derive(Debug, Serialize)]
+struct FrameReport {
+    input: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<PathBuf>,
+    /// The outcome payload, flattened so its `status` discriminator and fields
+    /// serialize as flat sibling keys (`"status":"ok"`, `film_base`, … / `error`).
+    #[serde(flatten)]
+    status: FrameStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    /// The per-frame recipe override applied (manifest `params`), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overrides: Option<serde_json::Value>,
+}
+
+/// The ok-vs-failed payload of a [`FrameReport`], each variant carrying only the
+/// fields legal for that outcome. Internally tagged (`#[serde(tag = "status")]`)
+/// and flattened into `FrameReport`, so it serializes the flat
+/// `"status":"ok"`/`"failed"` discriminator with the payload as sibling keys —
+/// the same wire shape the old `status: &str` + `error`/payload `Option`s
+/// produced, minus the illegal combinations.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum FrameStatus {
+    /// A converted frame: the resolved anchors it used (mirrors the relevant
+    /// single-frame [`Report`] fields). Each is `None`/omitted when the algorithm
+    /// or settings didn't produce it (e.g. `simple` has no `dmax`).
+    Ok {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        film_base: Option<FilmBase>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        dmax: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        white_balance: Option<[f32; 3]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        balance_range: Option<[f32; 2]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loss: Option<EncodeReport>,
+    },
+    /// A frame that failed to convert: the failure message. The roll records it
+    /// and continues (the loud non-zero exit is the batch-level signal).
+    Failed { error: String },
+}
+
+/// Roll totals — a quick machine-readable tally alongside the per-frame list.
+#[derive(Debug, Serialize)]
+struct RollSummary {
+    total: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+/// Whether a path has a `.tif`/`.tiff` extension (case-insensitive) — the filter
+/// for expanding a directory argument into frames.
+fn has_tiff_ext(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"))
+        .unwrap_or(false)
+}
+
+/// Expand one positional input into frame paths: a directory yields its
+/// `.tif`/`.tiff` files (sorted for determinism); anything else passes through
+/// verbatim (a missing file surfaces later as a per-frame decode error).
+fn expand_input(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if path.is_dir() {
+        let read_dir = std::fs::read_dir(path).map_err(|e| {
+            NcError::Usage(format!(
+                "cannot read input directory {}: {e}",
+                path.display()
+            ))
+        })?;
+        // Propagate a per-entry read error rather than dropping it: a silently
+        // skipped entry would shorten the batch without a word (fail-loud
+        // violation). Same usage-error class (exit 2) as failing to open the dir.
+        let mut entries: Vec<PathBuf> = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| {
+                NcError::Usage(format!(
+                    "cannot read an entry in input directory {}: {e}",
+                    path.display()
+                ))
+            })?;
+            let p = entry.path();
+            if p.is_file() && has_tiff_ext(&p) {
+                entries.push(p);
+            }
+        }
+        entries.sort();
+        out.extend(entries);
+    } else {
+        out.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
+/// Default per-frame output name in the out-dir: `<input-stem>_positive.tiff`.
+fn default_output_name(input: &Path, out_dir: &Path) -> PathBuf {
+    let stem = input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "frame".to_string());
+    out_dir.join(format!("{stem}_positive.tiff"))
+}
+
+/// Resolve a frame's output path: a manifest's explicit path (absolute used
+/// verbatim, relative joined onto the out-dir) or the default `<stem>_positive.tiff`.
+fn resolve_frame_output(explicit: Option<&Path>, input: &Path, out_dir: &Path) -> PathBuf {
+    match explicit {
+        Some(o) if o.is_absolute() => o.to_path_buf(),
+        Some(o) => out_dir.join(o),
+        None => default_output_name(input, out_dir),
+    }
+}
+
+/// Deep-merge `overlay` into `base`: JSON objects merge key-by-key (recursively),
+/// any other value replaces. Layers a per-frame partial-recipe override onto the
+/// shared recipe's JSON before it is deserialized back to a validated
+/// [`ResolvedConfig`] — a partial override keeps the shared values it doesn't
+/// mention (a plain `serde` deserialize of the partial would reset them to
+/// defaults instead).
+///
+/// Switching a multi-variant enum via an override is safe, not silent: the merged
+/// value must still deserialize as that enum. An externally-tagged enum such as
+/// [`FilmBaseSource`] serializes as a one-key map (`{"region":[…]}`), so an
+/// override that flips it to another variant (`{"explicit":[…]}`) must *replace*
+/// the whole map — a key-by-key merge would union the tags into `{"region":…,
+/// "explicit":…}`, which no externally-tagged enum can deserialize, turning an
+/// override that should apply into a confusing `from_value` rejection. The
+/// [`is_variant_switch`] guard catches exactly that signature (both sides are
+/// single-key objects with *different* keys) and replaces wholesale; a malformed
+/// override is still rejected loudly by the `from_value` in [`resolve_frames`],
+/// never applied half-merged.
+fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
+    if is_variant_switch(base, overlay) {
+        *base = overlay.clone();
+        return;
+    }
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                merge_json(b.entry(k.clone()).or_insert(serde_json::Value::Null), v);
+            }
+        }
+        (b, o) => *b = o.clone(),
+    }
+}
+
+/// The externally-tagged-enum-variant-switch signature: `base` and `overlay` are
+/// both single-key objects with *different* keys (e.g. `{"region":[…]}` vs
+/// `{"explicit":[…]}`). Deep-merging such a pair would leave a two-tag object that
+/// no externally-tagged enum deserializes, so [`merge_json`] replaces it wholesale
+/// instead. A unit variant serializes as a bare string (`"auto"`), not an object,
+/// so switching to/from it never reaches here — the plain replace arm handles it.
+fn is_variant_switch(base: &serde_json::Value, overlay: &serde_json::Value) -> bool {
+    match (base, overlay) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            b.len() == 1 && o.len() == 1 && b.keys().next() != o.keys().next()
+        }
+        _ => false,
+    }
+}
+
+/// Load a `--frames` manifest. A read failure or invalid/unknown-key JSON is a
+/// usage error (a config mistake), like [`load_recipe`].
+fn load_manifest(path: &Path) -> Result<RollManifest> {
+    let txt = std::fs::read_to_string(path).map_err(|e| {
+        NcError::Usage(format!(
+            "cannot read --frames manifest {}: {e}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str(&txt)
+        .map_err(|e| NcError::Usage(format!("invalid --frames manifest {}: {e}", path.display())))
+}
+
+/// Roll mode writes one output per frame into a shared directory, so a single
+/// `input.export_ir` path — which every frame would overwrite — is nonsensical.
+/// Reject it loudly rather than silently clobbering one IR file N times.
+fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
+    if cfg.input.export_ir.is_some() {
+        return Err(NcError::Usage(
+            "input.export_ir (--export-ir) is not supported in roll mode: it names a \
+             single path that every frame would overwrite; export the IR plane per \
+             frame with `nc convert` instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the per-frame plan from the `--frames` manifest or the positional inputs,
+/// resolving each frame's effective config (shared recipe + any per-frame
+/// override) and output path. Config errors (a bad override, an unsupported knob)
+/// fail loudly here, before any frame is converted; runtime errors (a bad decode,
+/// a degenerate base) surface per frame during conversion. A per-frame override
+/// that touches the roll-fixed `film_base` is not rejected — it is applied, with a
+/// loud roll-level warning pushed to `roll_warnings` (like the not-frozen warning),
+/// so a deliberate per-frame base stays possible while the color-consistency break
+/// is surfaced and `--strict`-promotable.
+fn resolve_frames(
+    args: &RollArgs,
+    shared: &ResolvedConfig,
+    roll_warnings: &mut Vec<String>,
+    log: &Log,
+) -> Result<Vec<PlannedFrame>> {
+    let out_dir = args.out_dir.as_path();
+    let mut planned = Vec::new();
+    match &args.frames {
+        Some(manifest_path) => {
+            let manifest = load_manifest(manifest_path)?;
+            if manifest.frames.is_empty() {
+                return Err(NcError::Usage(format!(
+                    "--frames manifest {} lists no frames",
+                    manifest_path.display()
+                )));
+            }
+            // The shared recipe as JSON, so a per-frame partial override can be
+            // deep-merged onto it and deserialized back with `deny_unknown_fields`.
+            let shared_value = serde_json::to_value(shared)
+                .map_err(|e| NcError::Other(format!("serializing shared recipe: {e}")))?;
+            for mf in manifest.frames {
+                let (cfg, overrides) = match mf.params {
+                    Some(ov) => {
+                        // `film_base` is roll-fixed: the whole batch is meant to
+                        // share one frozen base. A per-frame override *may* still
+                        // set it (a deliberate per-frame base stays possible), but
+                        // doing so gives this frame a different Dmin from the rest
+                        // of the roll and breaks color consistency — so warn loudly
+                        // (roll-level, `--strict`-promotable) and continue, applying
+                        // the override, rather than rejecting. (`density.dmax` is
+                        // still per-frame `auto` by default on this branch; the
+                        // `dmax-reference` task will make `Dmax` roll-fixed too and
+                        // should revisit whether it warrants the same warning.)
+                        if ov.get("film_base").is_some() {
+                            let msg = format!(
+                                "frame {}: a per-frame `params` override sets `film_base`, \
+                                 overriding the roll-fixed base — this frame's Dmin differs \
+                                 from the rest of the roll, breaking color consistency. Set \
+                                 the base once in the shared --params recipe (and drop the \
+                                 per-frame `film_base`) if you want a frozen, consistent roll.",
+                                mf.input.display()
+                            );
+                            log.warn(&msg);
+                            roll_warnings.push(msg);
+                        }
+                        let mut v = shared_value.clone();
+                        merge_json(&mut v, &ov);
+                        let cfg: ResolvedConfig = serde_json::from_value(v).map_err(|e| {
+                            NcError::Usage(format!(
+                                "frame {}: invalid params override: {e}",
+                                mf.input.display()
+                            ))
+                        })?;
+                        validate(&cfg)?;
+                        reject_unsupported_input_color(&cfg)?;
+                        reject_roll_unsupported(&cfg)?;
+                        (cfg, Some(ov))
+                    }
+                    None => (shared.clone(), None),
+                };
+                let output = resolve_frame_output(mf.output.as_deref(), &mf.input, out_dir);
+                planned.push(PlannedFrame {
+                    input: mf.input,
+                    output,
+                    cfg,
+                    overrides,
+                });
+            }
+        }
+        None => {
+            let mut inputs = Vec::new();
+            for p in &args.inputs {
+                expand_input(p, &mut inputs)?;
+            }
+            inputs.sort();
+            inputs.dedup();
+            if inputs.is_empty() {
+                return Err(NcError::Usage(
+                    "no input frames to convert (the inputs matched no files)".into(),
+                ));
+            }
+            for input in inputs {
+                let output = default_output_name(&input, out_dir);
+                planned.push(PlannedFrame {
+                    input,
+                    output,
+                    cfg: shared.clone(),
+                    overrides: None,
+                });
+            }
+        }
+    }
+    Ok(planned)
+}
+
+/// Guard every roll write target (per-frame outputs + sidecars, `--report-file`)
+/// against every input scan and against one another — so a same-stem collision or
+/// a target aimed at an input fails loudly up front rather than clobbering a scan
+/// or a just-written sibling. The roll-input analogue of
+/// [`ensure_write_targets_distinct`] (multiple inputs, case-insensitivity-aware).
+fn ensure_roll_targets_distinct(inputs: &[&Path], targets: &[(String, PathBuf)]) -> Result<()> {
+    let input_keys: Vec<PathBuf> = inputs.iter().map(|p| collision_key(p)).collect();
+    let mut seen: Vec<(&str, PathBuf)> = Vec::with_capacity(targets.len());
+    for (label, path) in targets {
+        let key = collision_key(path);
+        if input_keys.iter().any(|ik| keys_collide(ik, &key)) {
+            return Err(NcError::Usage(format!(
+                "{label} ({}) would overwrite an input scan",
+                path.display()
+            )));
+        }
+        if let Some((other, _)) = seen.iter().find(|(_, k)| keys_collide(k, &key)) {
+            return Err(NcError::Usage(format!(
+                "{label} ({}) collides with {other}",
+                path.display()
+            )));
+        }
+        seen.push((label.as_str(), key));
+    }
+    Ok(())
+}
+
+/// Map a successfully-converted frame's [`Report`] to its [`FrameReport`] entry.
+fn frame_report_ok(pf: &PlannedFrame, report: Report) -> FrameReport {
+    FrameReport {
+        input: pf.input.clone(),
+        output: Some(pf.output.clone()),
+        status: FrameStatus::Ok {
+            film_base: report.film_base,
+            dmax: report.dmax,
+            white_balance: report.white_balance,
+            balance_range: report.balance_range,
+            loss: report.loss,
+        },
+        warnings: report.warnings,
+        overrides: pf.overrides.clone(),
+    }
+}
+
+/// A failed frame's [`FrameReport`] entry — the error message plus any warnings
+/// accumulated before the failure point (decode/IR/film-base notices), so a frame
+/// that warns and then fails still reports them (and they aren't lost to `--quiet`).
+fn frame_report_err(pf: &PlannedFrame, err: &NcError, warnings: Vec<String>) -> FrameReport {
+    FrameReport {
+        input: pf.input.clone(),
+        output: Some(pf.output.clone()),
+        status: FrameStatus::Failed {
+            error: err.to_string(),
+        },
+        warnings,
+        overrides: pf.overrides.clone(),
+    }
+}
+
+/// `nc roll` — convert a batch of frames from one shared, frozen recipe (the
+/// batch-apply scaffold, design-spec §8/§12 item 6). Resolves the plan (frames +
+/// per-frame configs), guards write targets, then converts each frame through the
+/// same [`convert_frame`] core `convert` uses — so per-frame output is
+/// byte-identical to a single `convert` with the same effective recipe. A frame's
+/// failure is recorded and the roll continues; the loud non-zero exit + per-frame
+/// `error` in the roll report are the signal.
+fn run_roll(args: RollArgs) -> Result<()> {
+    let started = Instant::now();
+    let log = Log::new(&args.report);
+
+    // Shared frozen recipe — validated once up front so a broken recipe fails
+    // loudly before any frame is touched.
+    let shared = load_recipe(args.recipe_in.as_deref())?;
+    validate(&shared)?;
+    reject_unsupported_input_color(&shared)?;
+    reject_roll_unsupported(&shared)?;
+
+    // A roll's headline guarantee is one frozen, roll-fixed film base shared by
+    // every frame. Only an *explicit* base delivers that: `auto`/`region` (and the
+    // default, `auto`) re-estimate `Dmin` from each frame's own pixels, so the roll
+    // is neither frozen nor color-consistent even though the report still prints
+    // "one shared recipe". Warn loudly (report + stderr, `--strict`-promotable)
+    // rather than hard-failing, so a best-effort batch stays usable.
+    let mut roll_warnings: Vec<String> = Vec::new();
+    if !matches!(shared.film_base.source, FilmBaseSource::Explicit(_)) {
+        let kind = match shared.film_base.source {
+            FilmBaseSource::Auto => "auto",
+            FilmBaseSource::Region(_) => "region",
+            FilmBaseSource::Explicit(_) => unreachable!(),
+        };
+        let msg = format!(
+            "roll film base is NOT frozen: film_base.source is `{kind}`, so every frame \
+             estimates its own Dmin — the roll is not color-consistent and the shared \
+             recipe is not truly shared. Calibrate the base once (e.g. `nc estimate \
+             --base-region X,Y,W,H <reference-scan>`), then pass the reported explicit \
+             base via `--film-base R,G,B` or a recipe with `film_base.source.explicit`."
+        );
+        log.warn(&msg);
+        roll_warnings.push(msg);
+    }
+
+    // Resolve the plan. A per-frame override that touches the roll-fixed
+    // `film_base` appends its own roll-level warning here (warn-and-continue, like
+    // the not-frozen warning above), so `roll_warnings` is passed in to collect it.
+    let planned = resolve_frames(&args, &shared, &mut roll_warnings, &log)?;
+
+    // Guard every write target (per-frame outputs + sidecars, and the report
+    // file) against every input and against one another before writing anything.
+    // The `--frames` manifest is a read input too — a write target aimed at it
+    // (e.g. `--report-file` equal to the manifest path) must be rejected, not
+    // silently clobbered — so include it in the protected read set.
+    let mut inputs: Vec<&Path> = planned.iter().map(|p| p.input.as_path()).collect();
+    if let Some(frames) = args.frames.as_deref() {
+        inputs.push(frames);
+    }
+    let mut targets: Vec<(String, PathBuf)> = Vec::new();
+    for pf in &planned {
+        targets.push((
+            format!("output for {}", pf.input.display()),
+            pf.output.clone(),
+        ));
+        targets.push((
+            format!("sidecar for {}", pf.input.display()),
+            encode::sidecar_path(&pf.output),
+        ));
+    }
+    if let Some(rf) = args.report.report_file.as_deref() {
+        targets.push(("--report-file".to_string(), rf.to_path_buf()));
+    }
+    ensure_roll_targets_distinct(&inputs, &targets)?;
+
+    // Create the output directory now that the plan is known-good. A manifest may
+    // name a per-frame output in a subdirectory (`sub/x.tiff`), so create each
+    // frame's output parent too — otherwise the encode fails on a missing dir.
+    // (The sidecar is written beside the output, so the same parent covers it.)
+    std::fs::create_dir_all(&args.out_dir).map_err(|e| {
+        NcError::Write(format!(
+            "cannot create --out-dir {}: {e}",
+            args.out_dir.display()
+        ))
+    })?;
+    for pf in &planned {
+        if let Some(parent) = pf.output.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                NcError::Write(format!(
+                    "cannot create output directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+
+    let mut frames = Vec::with_capacity(planned.len());
+    let (mut succeeded, mut failed) = (0usize, 0usize);
+    for pf in &planned {
+        log.info(format_args!("converting {}", pf.input.display()));
+        // Per-frame warnings accumulate here so a frame that warns and then fails
+        // still hands them back (the report only rides out on success).
+        let mut warnings = Vec::new();
+        match convert_frame("roll", &pf.input, &pf.output, &pf.cfg, &log, &mut warnings) {
+            Ok(frame) => {
+                succeeded += 1;
+                frames.push(frame_report_ok(pf, frame.report));
+            }
+            Err(e) => {
+                failed += 1;
+                // Batch resilience: one frame's failure is recorded and the roll
+                // continues (the loud non-zero exit + per-frame `error` are the
+                // signal). Echo to stderr too; stdout stays the JSON report.
+                log.warn(&format!("frame {} failed: {e}", pf.input.display()));
+                frames.push(frame_report_err(pf, &e, warnings));
+            }
+        }
+    }
+
+    // `--strict` promotes any warning to a failing exit (convert's gate,
+    // aggregated across the roll): both the roll-level warnings (e.g. the base is
+    // not frozen) and any per-frame warning. Decided before the report is emitted.
+    let strict_failure =
+        args.strict && (!roll_warnings.is_empty() || frames.iter().any(|f| !f.warnings.is_empty()));
+
+    let total = frames.len();
+    let roll = RollReport {
+        command: "roll",
+        recipe: shared,
+        warnings: roll_warnings,
+        frames,
+        summary: RollSummary {
+            total,
+            succeeded,
+            failed,
+        },
+        elapsed_ms: Some(elapsed_ms(started)),
+    };
+    // Emit the report before the failure gates so the machine-readable per-frame
+    // record still lands even when the roll then exits non-zero (convert/estimate
+    // contract).
+    emit_json(
+        &roll,
+        args.report.report,
+        args.report.report_file.as_deref(),
+    )?;
+
+    if failed > 0 {
+        return Err(NcError::Other(format!(
+            "roll: {failed} of {total} frame(s) failed to convert (see report)"
+        )));
+    }
+    if strict_failure {
+        return Err(NcError::Other(
+            "--strict: the roll produced warnings (see report)".into(),
+        ));
     }
     Ok(())
 }
@@ -2777,6 +3502,366 @@ mod tests {
         assert!(
             matches!(got, Err(NcError::Usage(_))),
             "a case-only telemetry-file/output collision must be a usage error: {got:?}"
+        );
+    }
+
+    // --- roll (batch) --------------------------------------------------------
+
+    #[test]
+    fn roll_requires_input_or_frames_and_they_conflict() {
+        // Neither positional inputs nor --frames → usage error.
+        assert!(Cli::try_parse_from(["nc", "roll", "-o", "out"]).is_err());
+        // Both → mutually exclusive.
+        assert!(
+            Cli::try_parse_from(["nc", "roll", "a.tif", "--frames", "m.json", "-o", "out"])
+                .is_err()
+        );
+        // Either alone (with --out-dir) is fine.
+        assert!(Cli::try_parse_from(["nc", "roll", "a.tif", "b.tif", "-o", "out"]).is_ok());
+        assert!(Cli::try_parse_from(["nc", "roll", "--frames", "m.json", "-o", "out"]).is_ok());
+        // --out-dir is required.
+        assert!(Cli::try_parse_from(["nc", "roll", "a.tif"]).is_err());
+    }
+
+    #[test]
+    fn merge_json_deep_merges_objects_and_replaces_other_values() {
+        // Objects merge key-by-key (recursively); scalars/arrays replace wholesale.
+        let mut base = serde_json::json!({"a": {"x": 1, "y": 2}, "b": 3});
+        let overlay = serde_json::json!({"a": {"y": 20, "z": 30}, "b": [1, 2]});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"a": {"x": 1, "y": 20, "z": 30}, "b": [1, 2]})
+        );
+    }
+
+    #[test]
+    fn merge_json_replaces_enum_variant_switch_but_deep_merges_same_tag() {
+        // An externally-tagged enum variant switch (`region` → `explicit`) must
+        // REPLACE the one-key map, not union the tags — a `{"region":…,
+        // "explicit":…}` object deserializes as no enum variant. Regression guard
+        // for the per-frame `film_base.source` override path.
+        let mut base = serde_json::json!({"film_base": {"source": {"region": [1, 2, 3, 4]}}});
+        let overlay = serde_json::json!({"film_base": {"source": {"explicit": [0.9, 0.5, 0.4]}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"film_base": {"source": {"explicit": [0.9, 0.5, 0.4]}}})
+        );
+        // The SAME tag on both sides is not a variant switch: recurse into it so a
+        // partial override of one sub-field keeps its siblings.
+        let mut base = serde_json::json!({"density": {"dmax": {"auto": {"p": 0.5, "q": 1}}}});
+        let overlay = serde_json::json!({"density": {"dmax": {"auto": {"p": 0.9}}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"density": {"dmax": {"auto": {"p": 0.9, "q": 1}}}})
+        );
+    }
+
+    #[test]
+    fn per_frame_override_can_switch_film_base_variant_and_still_warns() {
+        // A per-frame `params` override that flips the roll-fixed `film_base.source`
+        // from `region` to `explicit` must APPLY (the merged JSON deserializes) and
+        // still raise the roll-level "base overridden" warning. Before the
+        // variant-switch fix the merge unioned the tags and `from_value` rejected
+        // it, turning a valid override into a confusing error.
+        let dir = std::env::temp_dir().join(format!("nc-roll-varswitch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("frames.json");
+        std::fs::write(
+            &manifest,
+            r#"{"frames":[{"input":"a.tif",
+                          "params":{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}}}}]}"#,
+        )
+        .unwrap();
+        let args = RollArgs {
+            inputs: vec![],
+            frames: Some(manifest.clone()),
+            out_dir: dir.clone(),
+            recipe_in: None,
+            strict: false,
+            report: ReportArgs::default(),
+        };
+        let shared = ResolvedConfig {
+            film_base: FilmBaseParams {
+                source: FilmBaseSource::Region([10, 10, 20, 20]),
+            },
+            ..ResolvedConfig::default()
+        };
+        let mut warnings = Vec::new();
+        let log = Log::new(&args.report);
+        let planned = resolve_frames(&args, &shared, &mut warnings, &log);
+        std::fs::remove_dir_all(&dir).ok();
+        let planned = planned.expect("region→explicit override should apply, not error");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].cfg.film_base.source,
+            FilmBaseSource::Explicit([0.9, 0.55, 0.42])
+        );
+        assert!(
+            !warnings.is_empty(),
+            "overriding the roll-fixed film base must still warn"
+        );
+    }
+
+    #[test]
+    fn per_frame_override_keeps_shared_roll_fixed_params() {
+        // The manifest per-frame merge path: a partial override changes only its
+        // own knob and keeps the shared roll-fixed params (film base, Dmax) — the
+        // "frame-local override applies to just that frame" guarantee at the
+        // config level. Mirrors `resolve_frames`' merge.
+        let shared = ResolvedConfig {
+            film_base: FilmBaseParams {
+                source: FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
+            },
+            density: DensityParams {
+                dmax: DmaxSource::Explicit(1.6),
+                ..DensityParams::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        let mut v = serde_json::to_value(&shared).unwrap();
+        let ov: serde_json::Value =
+            serde_json::from_str(r#"{"print":{"print_exposure":0.15}}"#).unwrap();
+        merge_json(&mut v, &ov);
+        let cfg: ResolvedConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(cfg.print.print_exposure, 0.15);
+        assert_eq!(
+            cfg.film_base.source,
+            FilmBaseSource::Explicit([0.9, 0.55, 0.42])
+        );
+        assert_eq!(cfg.density.dmax, DmaxSource::Explicit(1.6));
+    }
+
+    #[test]
+    fn manifest_rejects_unknown_keys_and_parses_overrides() {
+        // `deny_unknown_fields` at both levels catches a typo'd manifest.
+        assert!(serde_json::from_str::<RollManifest>(r#"{"framez":[]}"#).is_err());
+        assert!(
+            serde_json::from_str::<RollManifest>(r#"{"frames":[{"input":"a.tif","bogus":1}]}"#)
+                .is_err()
+        );
+        // A well-formed manifest with a per-frame override + output parses.
+        let m: RollManifest = serde_json::from_str(
+            r#"{"frames":[{"input":"a.tif","output":"a_out.tiff",
+                           "params":{"print":{"print_exposure":0.2}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.frames.len(), 1);
+        assert_eq!(m.frames[0].input, PathBuf::from("a.tif"));
+        assert_eq!(m.frames[0].output, Some(PathBuf::from("a_out.tiff")));
+        assert!(m.frames[0].params.is_some());
+    }
+
+    #[test]
+    fn tiff_ext_and_output_naming() {
+        assert!(has_tiff_ext(Path::new("a.tif")));
+        assert!(has_tiff_ext(Path::new("a.TIFF")));
+        assert!(!has_tiff_ext(Path::new("a.png")));
+        assert!(!has_tiff_ext(Path::new("a")));
+        assert_eq!(
+            default_output_name(Path::new("/scans/frame01.tif"), Path::new("/out")),
+            PathBuf::from("/out/frame01_positive.tiff")
+        );
+        // A manifest output: relative joins the out-dir, absolute is used verbatim,
+        // and `None` falls back to the default name.
+        assert_eq!(
+            resolve_frame_output(
+                Some(Path::new("custom.tiff")),
+                Path::new("/s/f.tif"),
+                Path::new("/out")
+            ),
+            PathBuf::from("/out/custom.tiff")
+        );
+        assert_eq!(
+            resolve_frame_output(
+                Some(Path::new("/abs/c.tiff")),
+                Path::new("/s/f.tif"),
+                Path::new("/out")
+            ),
+            PathBuf::from("/abs/c.tiff")
+        );
+        assert_eq!(
+            resolve_frame_output(None, Path::new("/s/f.tif"), Path::new("/out")),
+            PathBuf::from("/out/f_positive.tiff")
+        );
+    }
+
+    #[test]
+    fn expand_input_lists_sorted_tiffs_and_skips_others() {
+        // Directory expansion after the fail-loud rewrite: `.tif`/`.tiff` files
+        // (case-insensitive) in sorted order, non-TIFF and extension-less entries
+        // skipped. (A per-entry `read_dir` error is not portably reproducible in a
+        // test, so only the happy path is exercised here.)
+        let dir = std::env::temp_dir().join(format!("nc-expand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.tif", "a.TIFF", "c.png", "d"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut out = Vec::new();
+        let got = expand_input(&dir, &mut out);
+        std::fs::remove_dir_all(&dir).ok();
+        got.expect("expanding a readable directory should succeed");
+        assert_eq!(out, vec![dir.join("a.TIFF"), dir.join("b.tif")]);
+    }
+
+    #[test]
+    fn reject_roll_unsupported_rejects_export_ir() {
+        let mut cfg = ResolvedConfig::default();
+        assert!(reject_roll_unsupported(&cfg).is_ok());
+        cfg.input.export_ir = Some("ir.tiff".into());
+        assert!(matches!(
+            reject_roll_unsupported(&cfg),
+            Err(NcError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn ensure_roll_targets_distinct_catches_input_and_sibling_collisions() {
+        // A target aimed at an input scan, and two frames colliding on one output
+        // (e.g. same stem from different dirs), both fail loudly.
+        let inputs = [Path::new("/scans/a.tif"), Path::new("/scans/b.tif")];
+        let clobber_input = vec![("output for a".to_string(), PathBuf::from("/scans/a.tif"))];
+        assert!(matches!(
+            ensure_roll_targets_distinct(&inputs, &clobber_input),
+            Err(NcError::Usage(_))
+        ));
+        let sibling_collision = vec![
+            (
+                "output for a".to_string(),
+                PathBuf::from("/out/img_positive.tiff"),
+            ),
+            (
+                "output for b".to_string(),
+                PathBuf::from("/out/img_positive.tiff"),
+            ),
+        ];
+        assert!(matches!(
+            ensure_roll_targets_distinct(&inputs, &sibling_collision),
+            Err(NcError::Usage(_))
+        ));
+        // Distinct outputs not touching any input are fine.
+        let ok = vec![
+            (
+                "output for a".to_string(),
+                PathBuf::from("/out/a_positive.tiff"),
+            ),
+            (
+                "output for b".to_string(),
+                PathBuf::from("/out/b_positive.tiff"),
+            ),
+        ];
+        assert!(ensure_roll_targets_distinct(&inputs, &ok).is_ok());
+    }
+
+    #[test]
+    fn ensure_roll_targets_distinct_protects_the_frames_manifest() {
+        // `run_roll` adds the `--frames` manifest to the protected read set, so a
+        // write target aimed at it (e.g. `--report-file` equal to the manifest
+        // path) is rejected up front rather than clobbering the manifest.
+        let manifest = Path::new("/rolls/frames.json");
+        let inputs = [Path::new("/scans/a.tif"), manifest];
+        let clobber_manifest = vec![(
+            "--report-file".to_string(),
+            PathBuf::from("/rolls/frames.json"),
+        )];
+        assert!(matches!(
+            ensure_roll_targets_distinct(&inputs, &clobber_manifest),
+            Err(NcError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn roll_report_puts_the_shared_recipe_once() {
+        // The shared recipe *configuration* appears once at the top of the roll
+        // report; each frame additionally echoes the *resolved* base/Dmax it used
+        // (a redundant echo here since the recipe pins an explicit base). The
+        // per-frame entry is the data-carrying `FrameStatus` — an "ok" frame
+        // serializes the flat `"status":"ok"` with its payload as sibling keys.
+        let shared = ResolvedConfig {
+            film_base: FilmBaseParams {
+                source: FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
+            },
+            density: DensityParams {
+                dmax: DmaxSource::Explicit(1.6),
+                ..DensityParams::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        let roll = RollReport {
+            command: "roll",
+            recipe: shared,
+            warnings: vec![],
+            frames: vec![FrameReport {
+                input: PathBuf::from("f1.tif"),
+                output: Some(PathBuf::from("out/f1_positive.tiff")),
+                status: FrameStatus::Ok {
+                    film_base: Some(FilmBase::from([0.9, 0.55, 0.42])),
+                    dmax: Some(1.6),
+                    white_balance: None,
+                    balance_range: None,
+                    loss: None,
+                },
+                warnings: vec![],
+                overrides: None,
+            }],
+            summary: RollSummary {
+                total: 1,
+                succeeded: 1,
+                failed: 0,
+            },
+            elapsed_ms: Some(1.0),
+        };
+        let v = serde_json::to_value(&roll).unwrap();
+        assert_eq!(v["command"], "roll");
+        // f32 round-trips through JSON as f64, so compare the roll-fixed anchors
+        // approximately rather than bit-exactly.
+        let fb: Vec<f64> = v["recipe"]["film_base"]["source"]["explicit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        assert!(
+            (fb[0] - 0.9).abs() < 1e-6
+                && (fb[1] - 0.55).abs() < 1e-6
+                && (fb[2] - 0.42).abs() < 1e-6
+        );
+        assert!((v["recipe"]["density"]["dmax"]["explicit"].as_f64().unwrap() - 1.6).abs() < 1e-6);
+        assert_eq!(v["summary"]["succeeded"], 1);
+        // The flattened `FrameStatus::Ok` still serializes the flat `status`
+        // discriminator and its payload as sibling keys of the frame entry.
+        assert_eq!(v["frames"][0]["status"], "ok");
+        assert_eq!(v["frames"][0]["input"], "f1.tif");
+        let ffb: Vec<f64> = v["frames"][0]["film_base"]
+            .as_object()
+            .expect("per-frame resolved film base is a sibling key of status")
+            .values()
+            .map(|x| x.as_f64().unwrap())
+            .collect();
+        assert_eq!(ffb.len(), 3);
+        assert!((v["frames"][0]["dmax"].as_f64().unwrap() - 1.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn failed_frame_report_keeps_accumulated_warnings() {
+        // A frame that warned before failing still carries those warnings in its
+        // report entry (they aren't reset to empty on the failure path).
+        let pf = PlannedFrame {
+            input: PathBuf::from("bad.tif"),
+            output: PathBuf::from("out/bad_positive.tiff"),
+            cfg: ResolvedConfig::default(),
+            overrides: None,
+        };
+        let warnings = vec!["a warning raised before the failure".to_string()];
+        let fr = frame_report_err(&pf, &NcError::Decode("boom".into()), warnings);
+        let v = serde_json::to_value(&fr).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"], "decode: boom");
+        assert_eq!(
+            v["warnings"][0], "a warning raised before the failure",
+            "a failed frame must keep the warnings accumulated before it failed: {v}"
         );
     }
 }
