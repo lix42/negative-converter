@@ -2520,8 +2520,19 @@ verified findings applied:
   `test`): clean.
 
 ## input-data-semantics
-**Status:** not started
-**Updated:** 2026-07-21
+**Status:** done (`[x]`)
+**Updated:** 2026-07-22
+
+- 2026-07-22: Shipped via `/review-fix-loop` + `/ship`. Two-axis input semantics
+  (`input.transfer`/`input.meaning`) with provenance keyed on the SilverFast XMP
+  packet (tag 700: `Company=LaserSoft Imaging` + `HDRScan=Yes`; `Gamma` feeds the
+  transfer axis via `GammaFact`, with malformed/locale gamma → ambiguous, not
+  linear). Generic/processed/colorimetric RGB16 → `Unknown` → `convert` exit 4
+  with an assert escape-hatch; positive-mode (`Negative=No`) rejected loudly.
+  Reviewed by 6 engines + an adversarial pass + a 2-engine delta re-review, all
+  converged; gates green (299 unit + 86 integration). Deferred follow-ups noted
+  below still to be filed as tracked tasks: (a) provenance re-validation against a
+  broader sample set, (b) positive-mode + embedded-ICC support.
 
 - 2026-07-21: Replaced the planned automatic input-ICC transform after reviewing
   SilverFast HDR/HDRi gamma-1 samples and the role of Dmin. The normal path must
@@ -2538,8 +2549,194 @@ verified findings applied:
   independent transfer/meaning CLI and recipe axes, deterministic evidence
   precedence, override provenance, and an explicit allowed-combination table.
   An override cannot make an unsupported colorimetric/encoded negative valid.
-
-## scanner-profile-before-density-experiment
+- 2026-07-21: **Implemented** (left uncommitted for review). New pure, table-tested
+  resolver module `src/pipeline/input_semantics.rs`:
+  - **Schema / types.** Two independent recipe/CLI axes in `types.rs`:
+    `TransferAssertion { auto, linear }` ⇒ `input.transfer`, and
+    `MeaningAssertion { auto, scanner-device, colorimetric }` ⇒ `input.meaning`
+    (both `clap::ValueEnum` + serde, like `Algorithm`). `InputParams` now holds
+    `transfer` / `meaning` / `export_ir` — the old `InputColor` enum and
+    `input.color` key are **gone**. Resolver output types (in the module):
+    `TransferDescription { linear, unknown }`, `MeasurementMeaning { scanner-device,
+    colorimetric{reference}, unknown }`, `ColorReference`, and evidence records
+    `InputEvidence { axis, kind, detail, provenance?, displaced? }` with
+    `EvidenceKind { user-assertion > structural > descriptive > embedded-icc >
+    default }`. `ContainerColorFacts { raw_mode, gamma, embedded_icc }` is the raw
+    decode→resolver hand-off; `InputColorMetadata` is the resolved bundle.
+  - **Resolver.** `resolve(facts, &InputAssertions) -> Result<InputColorMetadata>`
+    is pure/total for `auto` (never errors — ambiguity ⇒ `Unknown`), erroring only
+    on an explicit assertion that contradicts authoritative structure
+    (`--input-meaning colorimetric` on raw-mode scanner data ⇒ usage/exit 2).
+    `require_convertible` is the convert gate: only `Linear` + `ScannerDevice`
+    passes; else exit 4. SilverFast raw-mode structure proves **both** linear
+    transfer and scanner-device meaning; gamma proves **only** transfer; a
+    non-linear gamma tag contradicting raw-mode linear ⇒ transfer `Unknown`
+    (convert rejects, inspect explains) unless `--input-transfer linear` overrides
+    (records the displaced gamma). Embedded ICC is recorded as informational
+    device-characterization evidence, never applied, and does not establish an axis.
+  - **Wiring.** `io::decode` extracts embedded ICC via TIFF tag 34675
+    (`Tag::IccProfile`) into `DecodeInfo.embedded_icc` (`#[serde(skip)]` — never a
+    byte dump). `convert_frame` resolves + gates after decode (before film-base),
+    attaches an `InputColorReport` (both axes + per-axis evidence + safe ICC
+    summary via lcms2 [class/space/PCS/version/description] + `transfer_decoded`,
+    always `false` in Step 1). `inspect` resolves `auto`/`auto` and reports without
+    gating. CLI-vs-recipe provenance is threaded via a small `InputFromCli` flag
+    into `convert_frame` (roll passes `none()`; its axes are recipe-only).
+  - **Migration.** `--assume-linear` ⇒ loud usage error (points at the two flags);
+    `--input-profile` ⇒ loud unsupported (exit 4, reserved for
+    `scanner-profile-before-density-experiment`); recipe `input.color` ⇒ pinned
+    migration error at load (`reject_legacy_input_color`, ahead of the opaque
+    `deny_unknown_fields` message).
+  - **Tests.** Resolver table tests cover every transfer×meaning combination,
+    evidence precedence, contradictions, override provenance, ICC summary safety,
+    and `transfer_decoded`. Integration tests (`tests/pipeline.rs`): real-scan
+    convert/inspect report resolved axes + structural evidence; colorimetric-on-
+    scanner rejected (exit 2); legacy `input.color` recipe rejected (exit 2);
+    `--input-profile` rejected (exit 4). CI green (fmt/clippy/build/test).
+  - **Decisions / tradeoffs.** (a) `ContainerColorFacts.gamma` is always `None`
+    from real decode — SilverFast carries no gamma tag and establishes linear
+    transfer *structurally*; the field + gamma logic exist for the resolver's
+    synthetic table tests and future encoded/DNG inputs (the "small pure helper,
+    table-tested with synthetic metadata" the task asks for). (b) Provenance is
+    recorded at CLI-flag-vs-recipe granularity (via `InputFromCli`), not deeper.
+    (c) An explicit `--input-meaning scanner-device` on a non-raw file is honored
+    (recorded, displaced "no structural evidence") — decode only accepts SilverFast
+    (always raw-mode) today, so this override path is exercised only by table tests.
+  - **For dependents.** `post-reconstruction-color-characterization` and
+    `scanner-profile-before-density-experiment`: the resolved `InputColorMetadata`
+    (retained `embedded_icc` + evidence) is the hook for a future
+    scanner→working characterization; the working-space assumption in
+    `pipeline::color` is unchanged (still linear Rec.709/D65) but now gated to
+    scanner-device+linear inputs only. `ColorReference` and `RawMode` are the
+    extension points for colorimetric spaces and non-SilverFast raw modes.
+- 2026-07-22: **Review fixes** applied (still uncommitted). Six review engines'
+  unanimous headline was that raw-mode provenance was hardcoded, making the whole
+  Unknown/ambiguity framework dead in production. User-approved resolution and the
+  rest of the confirmed findings:
+  - **P1 (real provenance).** Grounded the heuristic in the user's actual scans
+    (throwaway `#[ignore]` dump, since removed): every genuine HDR (48-bit) and
+    HDRi (64-bit) sample carries `Software = "SilverFast …"`; HDRi also carries a
+    validated IR plane; none carry an embedded ICC. New
+    `DecodeInfo::looks_like_silverfast()` = `Software` contains "silverfast"
+    (case-insensitive) **OR** a validated IR plane is present.
+    `container_color_facts` now sets `raw_mode = looks_like_silverfast().then_some(…)`
+    instead of hardcoding `Some`. A generic/colorimetric RGB16 TIFF → `raw_mode:
+    None` → meaning `Unknown` → `convert` exits 4 with an actionable message
+    naming the `--input-transfer linear --input-meaning scanner-device` escape
+    hatch. Verified end-to-end (generic RGB16 rejected + inspect diagnoses; escape
+    hatch converts; real SilverFast still converts).
+  - **P2 (roll report).** `FrameStatus::Ok` now carries `input_color`, so `nc roll`
+    frame reports include the resolved axes/evidence/ICC summary like single
+    `convert`. Roll test added.
+  - **M1 (roll fail-fast).** `reject_roll_unsupported_input` runs on the shared
+    recipe (and each resolved per-frame override) BEFORE the frame loop, rejecting
+    the unconditionally-unsupported `input.meaning = colorimetric` up front (exit
+    4) rather than after a 100+ MB decode. (Only colorimetric is decidable
+    pre-decode; the other axes stay per-frame gated since they need structural
+    facts.)
+  - **L1.** `has_legacy_input_color` now also runs on per-frame `--frames`
+    manifest override JSON, so a per-frame `input.color` gets the same pinned
+    migration message as the shared recipe.
+  - **S-Low1.** `io::decode` ICC extraction now distinguishes tag ABSENCE
+    (`Ok(None)`, silent) from a genuine READ ERROR / non-byte type (surfaced as a
+    non-fatal decode warning) instead of swallowing everything via `.ok()`.
+  - **L2-precedence-doc.** Reworded the `EvidenceKind` + module docs: the resolver
+    is contradiction-aware, not a blind "higher precedence wins" pick (no `Ord`).
+  - **L3-serde.** `TransferAssertion` → `kebab-case` (matches its mirrors).
+  - **L2-code (serde shape).** `MeasurementMeaning` now serializes as a flat
+    kebab-case **string** (custom `Serialize`); the colorimetric reference moved to
+    a sibling `InputColorReport::meaning_reference` field, so `meaning` is a
+    homogeneous string on the wire.
+  - **Test gaps.** Added: generic-RGB16 reject + escape-hatch (P1/M4), CLI-vs-recipe
+    provenance end-to-end (M2), `--assume-linear` through the binary (M3), IR
+    byte-identity across input resolution (H1), roll input_color (P2), roll
+    colorimetric pre-flight (M1), agreeing-gamma-on-raw branch, flat-`meaning`
+    serialize shape. Renamed `contradictory_gamma_on_raw_is_ambiguous_and_*` to
+    `…_not_convertible` (it exercises `require_convertible`, not the full command).
+  - **Skipped:** optional T-M3 (typed `EvidenceRelation`) — would touch every
+    evidence construction + the report shape for a nice-to-have; deferred to keep
+    scope contained (contradiction is still tested via `detail` substring +
+    per-axis `TransferDescription::Unknown`).
+  - IR bit-identity across input resolution holds because resolution never touches
+    the image buffers (facts are read from `DecodeInfo`, not the pixels).
+- 2026-07-22: **Adversarial-review fix — XMP-based provenance gate** (still
+  uncommitted). Codex flagged the `looks_like_silverfast` heuristic (Software
+  substring OR IR-plane) as a [high]: it misclassified (a) processed SilverFast
+  exports that keep the `Software` tag and (b) a generic RGB16 + matching Gray16
+  multipage (IR-alone branch). User-approved replacement, keyed on SilverFast's
+  XMP mode metadata.
+  - **Grounded first** (throwaway `#[ignore]` dump of TIFF tag 700, removed): every
+    genuine scan carries an XMP packet with `Silverfast:` RDF attributes
+    (namespace URI `LSI/`) — `Company="LaserSoft Imaging"`, `HDRScan="Yes"`,
+    `Gamma="1"`; negatives `Negative="Yes"`, the positive samples `Negative="No"`.
+  - **Dep added:** `roxmltree = "0.21.1"` (read-only, deterministic XML tree; 1
+    locked package). `Cargo.lock` updated + committed.
+  - **decode:** extract tag 700 (`Tag::Unknown(700)`) → UTF-8 → `parse_silverfast_xmp`
+    (roxmltree, reads the `Silverfast:` namespaced attributes) → typed
+    `SilverfastXmp { company, hdr_scan, gamma, negative }` on `DecodeInfo`
+    (serialized in the `decode` report; skipped when absent). Same loud-vs-silent
+    contract as the ICC tag: absence silent, read-error / non-UTF-8 → non-fatal
+    decode warning.
+  - **provenance rewire:** removed `looks_like_silverfast`. `DecodeInfo::is_silverfast_raw_mode()`
+    = `Company=="LaserSoft Imaging" && HDRScan==Some(true)`; `container_color_facts`
+    now sets `raw_mode` from that and feeds `ContainerColorFacts.gamma` from the XMP
+    `Gamma` (finally making the descriptive-gamma path LIVE — a processed export with
+    `HDRScan=Yes` but non-linear `Gamma` now hits structural-linear-vs-descriptive-
+    nonlinear → transfer `Unknown` → rejected; verified end-to-end). Software string
+    and IR-presence are no longer provenance (IR validation still decodes the plane).
+  - **positive-mode:** `DecodeInfo::is_silverfast_positive_mode()` (`Negative==No`);
+    `reject_positive_mode` in `convert_frame` (after the transfer/meaning gate)
+    fails loudly (exit 4, distinct message) rather than misconverting a positive as
+    a negative. `inspect` still reports (doesn't gate).
+  - **Tests:** decode unit (parser fields; provenance from XMP not Software/IR;
+    positive vs negative), integration (RGB16+Gray16-no-XMP rejected; Software-only
+    rejected; synthetic negative converts; non-linear-gamma rejected + inspect shows
+    transfer unknown; positive-mode rejected). Throwaway bash loop over
+    `../nc-assets` confirmed all real negatives (48/64 full+small, samples
+    embedded/non-embedded) resolve scanner-device/linear and both positive samples
+    hit the positive-mode error; committed fixtures already carry the XMP so the
+    existing suite still converts them.
+  - **Deferred follow-ups to file formally:** (a) **positive-mode + embedded-ICC
+    support** — use the `Negative` flag + the retained embedded ICC to convert
+    positive-mode / ICC-embedded SilverFast scans; (b) **re-validate input
+    provenance/metadata detection once we have a wider sample set** — other
+    scanning software, other scanners, cameras, and different SilverFast
+    configurations. The current XMP-Silverfast gate (`Company=LaserSoft Imaging` +
+    `HDRScan=Yes` + `Gamma`) is grounded on a single scanner/software combination
+    (Plustek OpticFilm 8300i, SilverFast 9.2.x); the detection rules should be
+    re-examined against broader real samples when available, so genuine scans from
+    other sources aren't wrongly rejected and the mode/gamma markers still hold
+    (user's explicit request).
+- 2026-07-22: **Delta re-review fixes — three XMP silent-signal-drops** (still
+  uncommitted). Both engines confirmed the gate fails closed; these close the
+  remaining silent drops in the new XMP path.
+  - **F1 (had a wrong-image path): malformed/locale gamma no longer resolves
+    linear.** Introduced `types::GammaFact { Absent, Value(f64), Malformed(String) }`
+    (shared by `io::decode` and the resolver — lives in `types` to avoid an
+    io→pipeline dep) so a *present-but-uninterpretable* gamma is distinct from
+    *absent*. `parse_silverfast_xmp` now yields `Malformed(raw)` for an unparseable
+    `Silverfast:Gamma` (e.g. German-locale `"2,2"`); decode pushes a warning naming
+    the value; `resolve_transfer` treats `Malformed` (even with raw-mode structure)
+    as ambiguous → transfer `Unknown` → convert exit 4. An explicit
+    `--input-transfer linear` still overrides it (records the uninterpretable tag as
+    displaced). nc does **not** guess comma-decimals.
+  - **F2: unrecognized/malformed tag-700 now warns.** When tag 700 is present and
+    valid UTF-8 but `parse_silverfast_xmp` returns `None` (malformed XML, or a
+    namespace/layout that isn't the `LSI/` shape), decode pushes "XMP packet present
+    but no recognizable SilverFast metadata …" instead of silently losing
+    provenance — important for the broader-sample follow-up (a future scanner's
+    namespace diff would otherwise be silent).
+  - **F3: `yes_no` no longer conflates "not yes" with "explicit No".** Returns
+    `Some(true)` for yes, `Some(false)` for no, `None` for anything else — so an
+    unrecognized `Negative` value (`"y"/"1"/…`) is `None`, not a masquerading No,
+    and a genuine negative isn't failed as positive-mode (`is_silverfast_positive_mode`
+    only fires on an explicit `Negative=No`); likewise an unrecognized `HDRScan`
+    → not raw-mode → rejected as unknown (correct).
+  - **Tests:** resolver unit (malformed gamma → Unknown; explicit-linear override
+    records displaced); decode unit (Malformed gamma fact + warning; unrecognized
+    XMP warning; unrecognized yes/no → None); integration (malformed gamma → convert
+    exit 4 + inspect transfer unknown with breadcrumb; unrecognized `Negative` on a
+    genuine negative still converts).
 **Status:** not started
 **Updated:** 2026-07-21
 

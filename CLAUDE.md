@@ -59,9 +59,11 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
   on** in Step 1; IR-based dust removal is a roadmap follow-up. Carry it through,
   don't consume it.
 - Module map (`src/`, all implemented): `types.rs` (shared types),
-  `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages}.rs`
+  `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages,input_semantics}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
-  render; `stages::render` is the pure algorithm→output-color core, stages 3–4),
+  render; `stages::render` is the pure algorithm→output-color core, stages 3–4;
+  `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
+  keyed on SilverFast XMP mode metadata — see the input-semantics note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `cli.rs`, `main.rs`.
   `main`/`cli` are the only orchestrators; stages stay pure. `build.rs` exposes
   the compile target triple as `NC_TARGET` for the telemetry record.
@@ -78,7 +80,8 @@ decode → film-base estimate → algorithm (simple|density) → output color tr
 
 Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 `tiff`, `image`, `palette`, `lcms2`, `serde`/`serde_json`, `rayon`,
-`kamadak-exif` (see `Cargo.toml` for versions; bump with `cargo add`).
+`kamadak-exif`, `roxmltree` (read-only XML — parses the SilverFast XMP packet
+for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
 
 - `cargo build` — build · `cargo test` — all tests · `cargo test <name>` — one test
 - `cargo clippy --all-targets` — lint (keep clean)

@@ -6,10 +6,13 @@
 //! colorimetry must be pinned to build any transform. We treat the working space
 //! as **Rec.709/sRGB primaries, D65 white, linear TRC**. sRGB output is then a
 //! pure tone-curve application (identical primaries); wide-gamut output is a
-//! clean primaries remap. The `--input-profile`/`--assume-linear` knobs
-//! (`InputColor`) are parsed into config but not yet applied; once decode /
-//! orchestration consumes them, any input→working conversion happens upstream of
-//! this stage, so this fixed working space still holds.
+//! clean primaries remap. The input semantic resolver
+//! (`pipeline::input_semantics`) runs upstream of this stage and only admits
+//! inputs whose measurement meaning is scanner-device with a supported linear
+//! transfer — it never applies a source→working transform before density (an
+//! embedded scanner ICC is reported, not applied), so this fixed working space
+//! still holds. A characterized scanner/film → working transform is the separate,
+//! deferred `post-reconstruction-color-characterization` task.
 //!
 //! ## Output spaces
 //! The tone curve is a property of the space, not the output depth, so every

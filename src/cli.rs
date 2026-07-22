@@ -23,12 +23,15 @@ use serde::{Deserialize, Serialize};
 use crate::algo::density;
 use crate::io::decode::{DecodeInfo, decode};
 use crate::io::encode;
+use crate::pipeline::input_semantics::{
+    self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
+};
 use crate::pipeline::{film_base, stages};
 use crate::telemetry;
 use crate::types::{
     Algorithm, BalanceRange, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase,
-    FilmBaseParams, FilmBaseSource, InputColor, InputParams, NcError, OutputParams, PrintParams,
-    Result, SigmoidParams, SimpleParams, WbSource,
+    FilmBaseParams, FilmBaseSource, InputParams, MeaningAssertion, NcError, OutputParams,
+    PrintParams, Result, SigmoidParams, SimpleParams, TransferAssertion, WbSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,15 +248,30 @@ pub struct RollArgs {
 
 /// Input / decode overrides (design-spec §9, stage 1).
 ///
-/// `--assume-linear` and `--input-profile` are the two non-default `input.color`
-/// choices and are mutually exclusive (clap rejects passing both); whichever is
-/// given replaces the recipe's color choice.
+/// `--input-transfer` and `--input-meaning` are the two **independent** input
+/// assertions; each replaces the recipe's value on its own axis (they do not
+/// conflict — they describe different facts). The legacy combined
+/// `--assume-linear` is kept only to emit a migration error (it asserted both
+/// axes at once), and `--input-profile` stays rejected for normal conversion.
 #[derive(Args, Debug, Default)]
 pub struct InputOverrides {
-    /// Treat scanner data as already linear (skip input-profile handling).
-    #[arg(long, conflicts_with = "input_profile")]
+    /// Transfer-encoding assertion (`auto` | `linear`). Independent of
+    /// `--input-meaning`: asserts how samples are encoded, not what they measure.
+    #[arg(long = "input-transfer", value_enum, value_name = "TRANSFER")]
+    pub input_transfer: Option<TransferAssertion>,
+    /// Measurement-meaning assertion (`auto` | `scanner-device` | `colorimetric`).
+    /// Only `scanner-device` + a linear transfer enters density; `colorimetric`
+    /// is recognized but unsupported.
+    #[arg(long = "input-meaning", value_enum, value_name = "MEANING")]
+    pub input_meaning: Option<MeaningAssertion>,
+    /// Deprecated: the old combined assertion. Kept only to emit a migration error
+    /// — it conflated transfer and meaning. Use `--input-transfer` /
+    /// `--input-meaning`.
+    #[arg(long, hide = true)]
     pub assume_linear: bool,
-    /// Input ICC profile selector / path.
+    /// Reserved for the deferred scanner-profile-before-density experiment; not
+    /// supported for normal conversion (rejected loudly). Input-side ICC
+    /// application has no validated placement yet.
     #[arg(long, value_name = "ICC")]
     pub input_profile: Option<String>,
     /// Write the decoded IR plane to this path (HDRi only).
@@ -539,6 +557,14 @@ pub struct Report {
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode: Option<DecodeInfo>,
+    /// Resolved input color semantics (`convert`/`inspect`): the two independent
+    /// axes (transfer encoding + measurement meaning) with per-axis evidence,
+    /// whether an ICC is embedded plus a safe summary, and whether any transfer
+    /// decoding was performed. `convert` only reaches the render once this
+    /// resolves to a supported linear + scanner-device input; `inspect` reports it
+    /// even when the input is ambiguous or unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_color: Option<InputColorReport>,
     /// Estimated / resolved film base (the `Dmin` anchor).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base: Option<FilmBase>,
@@ -682,31 +708,65 @@ fn load_recipe(path: Option<&Path>) -> Result<ResolvedConfig> {
         Some(p) => {
             let txt = std::fs::read_to_string(p)
                 .map_err(|e| NcError::Usage(format!("cannot read recipe {}: {e}", p.display())))?;
+            reject_legacy_input_color(&txt, p)?;
             serde_json::from_str(&txt)
                 .map_err(|e| NcError::Usage(format!("invalid recipe {}: {e}", p.display())))
         }
     }
 }
 
+/// Pinned migration error for the removed combined `input.color` recipe key. It
+/// conflated transfer encoding with measurement meaning; those are now the
+/// independent `input.transfer` / `input.meaning` axes (input-data-semantics).
+/// `deny_unknown_fields` would already reject the key, but with an opaque serde
+/// message — this catches it first with actionable migration guidance, so a
+/// recipe that silently asserted both axes can never load.
+fn reject_legacy_input_color(txt: &str, path: &Path) -> Result<()> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(txt)
+        && has_legacy_input_color(&v)
+    {
+        return Err(NcError::Usage(format!(
+            "recipe {}: `input.color` is no longer supported — it conflated transfer \
+             encoding with measurement meaning. Replace it with the independent keys \
+             `input.transfer` (auto|linear) and `input.meaning` \
+             (auto|scanner-device|colorimetric).",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a recipe/override JSON object carries the removed combined `input.color`
+/// key. Shared by [`reject_legacy_input_color`] (whole-recipe load) and the roll
+/// per-frame override path, so a legacy key gets the same migration guidance
+/// wherever it appears rather than an opaque `deny_unknown_fields` serde error.
+fn has_legacy_input_color(v: &serde_json::Value) -> bool {
+    v.get("input")
+        .and_then(|input| input.get("color"))
+        .is_some()
+}
+
 /// Apply CLI overrides on top of a (recipe or default) config; flags win.
 ///
 /// Pure and total: `Option` overrides replace when `Some`, presence-flag
-/// booleans (`--auto-base`, `--assume-linear`) replace only when set — a `false`
-/// flag never clobbers a recipe `true`, since you disable auto-base by supplying
-/// an explicit base, not by passing `false`.
+/// booleans (`--auto-base`) replace only when set — a `false` flag never clobbers
+/// a recipe `true`, since you disable auto-base by supplying an explicit base, not
+/// by passing `false`. (The deprecated `--assume-linear` / `--input-profile` flags
+/// are rejected before `merge`, so they never reach here.)
 pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
     if let Some(a) = args.algorithm {
         cfg.algorithm = a;
     }
 
-    // input color: `--assume-linear` / `--input-profile` are mutually exclusive
-    // (clap-enforced); whichever is given replaces the recipe's choice, and
-    // neither leaves it untouched. So `--input-profile` over a recipe `linear`
-    // wins cleanly — there's one field, not two booleans to disagree.
-    if args.input_opts.assume_linear {
-        cfg.input.color = InputColor::Linear;
-    } else if let Some(p) = &args.input_opts.input_profile {
-        cfg.input.color = InputColor::Profile(p.clone());
+    // input color: transfer and meaning are independent axes — each override
+    // replaces the recipe's value on its own axis (flags win). The deprecated
+    // `--assume-linear` / `--input-profile` flags are handled (rejected) outside
+    // `merge`, in `reject_deprecated_input_flags`, before this runs.
+    if let Some(t) = args.input_opts.input_transfer {
+        cfg.input.transfer = t;
+    }
+    if let Some(m) = args.input_opts.input_meaning {
+        cfg.input.meaning = m;
     }
     if let Some(p) = &args.input_opts.export_ir {
         cfg.input.export_ir = Some(p.clone());
@@ -798,7 +858,7 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
 
     // output: `--output-hdr` is a presence flag — passing it switches the output
     // to 32-bit float; when absent it must not clobber a recipe's `hdr: true`
-    // (same convention as `--assume-linear`), so only a set flag merges.
+    // (same convention as `--auto-base`), so only a set flag merges.
     // output depth: the two flags are mutually exclusive (clap-enforced);
     // whichever is given replaces the recipe's choice — `--output-sdr` exists
     // so a recipe `hdr: true` stays CLI-overridable (flags win), since an
@@ -1284,17 +1344,104 @@ fn ensure_write_targets_distinct(input: &Path, targets: &[(&str, &Path)]) -> Res
     Ok(())
 }
 
-/// Reject a documented-but-unimplemented `input.color` profile loudly rather
-/// than silently ignoring it (scans are decoded as linear). Shared by `convert`
-/// and `roll` so both fail the same way on a profile-bearing recipe.
-fn reject_unsupported_input_color(cfg: &ResolvedConfig) -> Result<()> {
-    if let InputColor::Profile(p) = &cfg.input.color {
+/// Reject the deprecated input-color CLI flags loudly before merge/convert.
+///
+/// `--assume-linear` (the old *combined* assertion) is a hard usage error with
+/// migration guidance — it must never silently assert both axes. `--input-profile`
+/// stays rejected for normal conversion (input-side ICC application has no
+/// validated placement; it is reserved for the deferred
+/// scanner-profile-before-density experiment). `convert`-only; `roll` takes its
+/// input axes from the shared recipe, whose legacy `input.color` key is rejected
+/// at load by [`reject_legacy_input_color`].
+fn reject_deprecated_input_flags(o: &InputOverrides) -> Result<()> {
+    if o.assume_linear {
+        return Err(NcError::Usage(
+            "--assume-linear was removed: it asserted transfer encoding AND measurement \
+             meaning at once. Assert them independently — `--input-transfer linear` (transfer) \
+             and, for raw scanner data, `--input-meaning scanner-device` (meaning)."
+                .into(),
+        ));
+    }
+    if let Some(p) = &o.input_profile {
         return Err(NcError::Unsupported(format!(
-            "--input-profile {p}: input-side color management is not implemented yet; \
-             SilverFast scans are decoded as linear (omit the flag or use --assume-linear)"
+            "--input-profile {p}: input-side ICC application is not supported for normal \
+             conversion; it is reserved for the deferred scanner-profile-before-density \
+             experiment. SilverFast scans are decoded as linear scanner measurements."
         )));
     }
     Ok(())
+}
+
+/// Which input axes were asserted via a **CLI flag** (vs the recipe) — threaded
+/// into [`convert_frame`] so the resolver records literal CLI-vs-recipe
+/// provenance. `roll` has no per-frame input flags, so it passes
+/// [`InputFromCli::none`].
+#[derive(Clone, Copy, Debug, Default)]
+struct InputFromCli {
+    transfer: bool,
+    meaning: bool,
+}
+
+impl InputFromCli {
+    /// No CLI input assertions (the recipe-driven `roll` case).
+    fn none() -> Self {
+        Self::default()
+    }
+}
+
+/// Build the resolver's [`ContainerColorFacts`] from what the decoder parsed.
+///
+/// `io::decode` accepts *any* 3-channel 16-bit chunky RGB TIFF, not only genuine
+/// SilverFast scans, so raw-mode provenance is derived from the authoritative
+/// SilverFast **XMP mode metadata** ([`DecodeInfo::is_silverfast_raw_mode`],
+/// `Company=LaserSoft Imaging` + `HDRScan=Yes`) rather than assumed or keyed on a
+/// spoofable `Software` string / IR-plane presence: a generic / colorimetric /
+/// processed RGB16 TIFF gets `raw_mode: None`, so its meaning resolves `Unknown`
+/// and `convert` rejects it (unless the user explicitly asserts the axes). The
+/// XMP `Gamma` feeds the descriptive-transfer axis — `Gamma≈1` corroborates
+/// linear; a non-linear gamma on a raw-mode scan makes the transfer ambiguous
+/// (contradiction → `Unknown` → rejected). `embedded_icc` is passed through for
+/// inspection.
+fn container_color_facts(info: &DecodeInfo) -> ContainerColorFacts {
+    ContainerColorFacts {
+        raw_mode: info
+            .is_silverfast_raw_mode()
+            .then_some(RawMode::SilverFastHdr),
+        gamma: info
+            .silverfast_xmp
+            .as_ref()
+            .map(|x| x.gamma.clone())
+            .unwrap_or_default(),
+        embedded_icc: info.embedded_icc.clone(),
+    }
+}
+
+/// Reject a SilverFast **positive-mode** scan (`Negative=No`) loudly. Such a scan
+/// is still raw linear scanner data, so it passes the transfer/meaning gate — but
+/// converting it as a *negative* is silently wrong. This is a small,
+/// clearly-scoped check (distinct from the transfer/meaning resolution) so it is
+/// easy to lift when positive-mode support lands. `inspect` never calls it (it
+/// reports the `Negative` flag via `decode.silverfast_xmp` instead).
+fn reject_positive_mode(info: &DecodeInfo) -> Result<()> {
+    if info.is_silverfast_positive_mode() {
+        return Err(NcError::Unsupported(
+            "input is a SilverFast positive-mode scan (XMP Negative=No); converting it as a \
+             negative would be silently wrong. Positive-mode scans are not yet supported \
+             (follow-up); scan in negative mode, or convert a negative scan."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The merged input assertions plus their CLI/recipe provenance, for the resolver.
+fn input_assertions(cfg: &ResolvedConfig, from_cli: InputFromCli) -> InputAssertions {
+    InputAssertions {
+        transfer: cfg.input.transfer,
+        meaning: cfg.input.meaning,
+        transfer_from_cli: from_cli.transfer,
+        meaning_from_cli: from_cli.meaning,
+    }
 }
 
 /// Everything one frame's pipeline produced, for the orchestrator to emit or
@@ -1316,9 +1463,12 @@ struct ConvertedFrame {
 /// concerns (`--strict` gating, report emission, telemetry) the callers layer on
 /// top, so `convert` and `roll` share one byte-for-byte identical frame path.
 ///
-/// The caller must have already validated `cfg` ([`validate`] +
-/// [`reject_unsupported_input_color`]) and checked write-target collisions;
-/// `convert_frame` assumes a sound config and a safe `output` path. It never
+/// The caller must have already validated `cfg` ([`validate`]), rejected the
+/// deprecated input flags ([`reject_deprecated_input_flags`]), and checked
+/// write-target collisions; `convert_frame` assumes a sound config and a safe
+/// `output` path. It resolves and gates the input color semantics itself
+/// (transfer + meaning, [`input_semantics`]) after decode, before the render. It
+/// never
 /// writes to stdout (the report rides back in [`ConvertedFrame`]); progress and
 /// warnings go to stderr via `log`.
 ///
@@ -1332,6 +1482,7 @@ fn convert_frame(
     input: &Path,
     output: &Path,
     cfg: &ResolvedConfig,
+    input_from_cli: InputFromCli,
     log: &Log,
     warnings: &mut Vec<String>,
 ) -> Result<ConvertedFrame> {
@@ -1383,6 +1534,32 @@ fn convert_frame(
     for w in &info.warnings {
         push_warning_buf(warnings, log, w.clone());
     }
+
+    // Stage 1b — resolve input color semantics (transfer + measurement meaning as
+    // independent axes) and gate: only a supported linear transfer + scanner-device
+    // meaning may enter Dmin/density. An explicit assertion contradicting container
+    // structure is a usage error here; an ambiguous/unsupported input is a loud
+    // unsupported error — never a quietly-wrong image. The resolution rides into
+    // the report (with evidence + a safe ICC summary) regardless.
+    let input_meta = input_semantics::resolve(
+        &container_color_facts(&info),
+        &input_assertions(cfg, input_from_cli),
+    )?;
+    let input_report = InputColorReport::from_metadata(&input_meta);
+    if input_report.icc_unparsable() {
+        push_warning_buf(
+            warnings,
+            log,
+            "embedded ICC profile present but could not be parsed for a summary".into(),
+        );
+    }
+    input_semantics::require_convertible(&input_meta)?;
+    report.input_color = Some(input_report);
+
+    // A SilverFast positive-mode scan passes the transfer/meaning gate (it is raw
+    // linear scanner data) but must not be converted as a negative — reject it
+    // loudly with a distinct message rather than silently misconvert.
+    reject_positive_mode(&info)?;
 
     // `--export-ir` on a scan with no IR plane can't be honored: fail fast,
     // before writing any output, rather than after the main encode.
@@ -1623,10 +1800,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let started = Instant::now();
     let log = Log::new(&args.report);
 
+    reject_deprecated_input_flags(&args.input_opts)?;
     let cfg = merge(load_recipe(args.recipe_in.as_deref())?, &args);
     validate(&cfg)?;
-
-    reject_unsupported_input_color(&cfg)?;
 
     // Guard every write target against the input and against each other before
     // anything is decoded or written.
@@ -1688,6 +1864,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         &args.input,
         &args.output,
         &cfg,
+        InputFromCli {
+            transfer: args.input_opts.input_transfer.is_some(),
+            meaning: args.input_opts.input_meaning.is_some(),
+        },
         &log,
         &mut warnings,
     )?;
@@ -1853,6 +2033,13 @@ enum FrameStatus {
         white_balance: Option<[f32; 3]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         balance_range: Option<[f32; 2]>,
+        /// Resolved input color semantics (transfer + meaning + evidence + ICC
+        /// summary) the frame ran on — mirrors the single-frame `Report` field so a
+        /// roll frame reports the same input semantics `convert` does. Boxed: this
+        /// is the one large field, and unboxed it makes `Ok` dwarf `Failed`
+        /// (`clippy::large_enum_variant`); `Box` serializes transparently.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_color: Option<Box<InputColorReport>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         loss: Option<EncodeReport>,
     },
@@ -2008,6 +2195,29 @@ fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
     Ok(())
 }
 
+/// Roll pre-flight: reject an input assertion that can never yield a convertible
+/// frame **before** decoding the first (100+ MB) scan — restoring the up-front
+/// fail-fast the old `reject_unsupported_input_color` gave (the per-file gate now
+/// lives inside `convert_frame`, after the decode).
+///
+/// Only `input.meaning = colorimetric` is unconditionally unsupported regardless
+/// of the file (colorimetric/encoded negatives have no inverse-transfer /
+/// reconstruction path, so `require_convertible` rejects them for every frame).
+/// The other axes' convertibility depends on per-file structural evidence
+/// (unknown until decode), so they stay gated per frame. Applied to both the
+/// shared recipe and each resolved per-frame override.
+fn reject_roll_unsupported_input(cfg: &ResolvedConfig) -> Result<()> {
+    if cfg.input.meaning == MeaningAssertion::Colorimetric {
+        return Err(NcError::Unsupported(
+            "input.meaning = colorimetric is unsupported for every frame: colorimetric / \
+             encoded negatives have no inverse-transfer/reconstruction path yet. Remove it \
+             or assert a scanner-device meaning."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Build the per-frame plan from the `--frames` manifest or the positional inputs,
 /// resolving each frame's effective config (shared recipe + any per-frame
 /// override) and output path. Config errors (a bad override, an unsupported knob)
@@ -2042,6 +2252,18 @@ fn resolve_frames(
             for mf in manifest.frames {
                 let (cfg, overrides) = match mf.params {
                     Some(ov) => {
+                        // A per-frame override carrying the removed combined key gets
+                        // the same pinned migration guidance as the shared recipe,
+                        // not an opaque `deny_unknown_fields` serde error.
+                        if has_legacy_input_color(&ov) {
+                            return Err(NcError::Usage(format!(
+                                "frame {}: per-frame `params` override uses `input.color`, \
+                                 which is no longer supported — it conflated transfer \
+                                 encoding with measurement meaning. Use the independent keys \
+                                 `input.transfer` / `input.meaning`.",
+                                mf.input.display()
+                            )));
+                        }
                         // `film_base` and `density.dmax` are both roll-fixed
                         // calibrations: the whole batch is meant to share one frozen
                         // base (Dmin) and one display-white anchor (Dmax). A per-frame
@@ -2089,8 +2311,8 @@ fn resolve_frames(
                             ))
                         })?;
                         validate(&cfg)?;
-                        reject_unsupported_input_color(&cfg)?;
                         reject_roll_unsupported(&cfg)?;
+                        reject_roll_unsupported_input(&cfg)?;
                         (cfg, Some(ov))
                     }
                     None => (shared.clone(), None),
@@ -2167,6 +2389,7 @@ fn frame_report_ok(pf: &PlannedFrame, report: Report) -> FrameReport {
             dmax: report.dmax,
             white_balance: report.white_balance,
             balance_range: report.balance_range,
+            input_color: report.input_color.map(Box::new),
             loss: report.loss,
         },
         warnings: report.warnings,
@@ -2204,8 +2427,8 @@ fn run_roll(args: RollArgs) -> Result<()> {
     // loudly before any frame is touched.
     let shared = load_recipe(args.recipe_in.as_deref())?;
     validate(&shared)?;
-    reject_unsupported_input_color(&shared)?;
     reject_roll_unsupported(&shared)?;
+    reject_roll_unsupported_input(&shared)?;
 
     // A roll's headline guarantee is one frozen, roll-fixed film base shared by
     // every frame. Only an *explicit* base delivers that: `auto`/`region` (and the
@@ -2310,7 +2533,15 @@ fn run_roll(args: RollArgs) -> Result<()> {
         // Per-frame warnings accumulate here so a frame that warns and then fails
         // still hands them back (the report only rides out on success).
         let mut warnings = Vec::new();
-        match convert_frame("roll", &pf.input, &pf.output, &pf.cfg, &log, &mut warnings) {
+        match convert_frame(
+            "roll",
+            &pf.input,
+            &pf.output,
+            &pf.cfg,
+            InputFromCli::none(),
+            &log,
+            &mut warnings,
+        ) {
             Ok(frame) => {
                 succeeded += 1;
                 frames.push(frame_report_ok(pf, frame.report));
@@ -2391,6 +2622,25 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     for w in &info.warnings {
         push_warning(&mut report, &log, w.clone());
     }
+
+    // Resolve the input color semantics with no user assertions (auto/auto) so the
+    // report shows the file's *intrinsic* evidence — transfer + measurement meaning
+    // with per-axis evidence and a safe ICC summary. `inspect` is diagnostic: it
+    // reports even ambiguous/unsupported inputs (it never gates like `convert`),
+    // so `resolve` cannot error here (auto assertions never contradict structure).
+    let input_meta =
+        input_semantics::resolve(&container_color_facts(&info), &InputAssertions::auto())
+            .expect("auto/auto resolution never fails");
+    let input_report = InputColorReport::from_metadata(&input_meta);
+    if input_report.icc_unparsable() {
+        push_warning(
+            &mut report,
+            &log,
+            "embedded ICC profile present but could not be parsed for a summary".into(),
+        );
+    }
+    report.input_color = Some(input_report);
+
     if info.ir_present {
         push_warning(
             &mut report,
@@ -3509,23 +3759,16 @@ mod tests {
     fn merge_keeps_recipe_source_until_a_flag_replaces_it() {
         // No flag → the recipe's mutually-exclusive choice survives.
         let mut recipe = ResolvedConfig::default();
-        recipe.input.color = InputColor::Linear;
         recipe.film_base.source = FilmBaseSource::Explicit([0.9, 0.5, 0.4]);
         let cfg = merge(recipe.clone(), &parse_convert(&[]));
-        assert_eq!(cfg.input.color, InputColor::Linear);
         assert_eq!(
             cfg.film_base.source,
             FilmBaseSource::Explicit([0.9, 0.5, 0.4])
         );
 
         // A flag replaces the whole source — no field is left behind to win on
-        // precedence (the #5/#6 fix). `--input-profile` beats a recipe `linear`,
-        // and `--base-region` beats a recipe explicit base.
-        let cfg = merge(
-            recipe,
-            &parse_convert(&["--input-profile", "prophoto", "--base-region", "0,0,100,40"]),
-        );
-        assert_eq!(cfg.input.color, InputColor::Profile("prophoto".into()));
+        // precedence (the #5/#6 fix). `--base-region` beats a recipe explicit base.
+        let cfg = merge(recipe, &parse_convert(&["--base-region", "0,0,100,40"]));
         assert_eq!(
             cfg.film_base.source,
             FilmBaseSource::Region([0, 0, 100, 40])
@@ -3533,21 +3776,72 @@ mod tests {
     }
 
     #[test]
+    fn input_axes_merge_independently_and_flags_win() {
+        // transfer and meaning are independent axes: a flag on one axis replaces
+        // that axis and leaves the other at the recipe value (flags win per axis).
+        let mut recipe = ResolvedConfig::default();
+        recipe.input.transfer = TransferAssertion::Auto;
+        recipe.input.meaning = MeaningAssertion::ScannerDevice;
+
+        // No flags → both recipe values survive.
+        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        assert_eq!(cfg.input.transfer, TransferAssertion::Auto);
+        assert_eq!(cfg.input.meaning, MeaningAssertion::ScannerDevice);
+
+        // `--input-transfer` replaces only the transfer axis.
+        let cfg = merge(
+            recipe.clone(),
+            &parse_convert(&["--input-transfer", "linear"]),
+        );
+        assert_eq!(cfg.input.transfer, TransferAssertion::Linear);
+        assert_eq!(cfg.input.meaning, MeaningAssertion::ScannerDevice);
+
+        // `--input-meaning` replaces only the meaning axis (over a recipe value).
+        let cfg = merge(recipe, &parse_convert(&["--input-meaning", "colorimetric"]));
+        assert_eq!(cfg.input.transfer, TransferAssertion::Auto);
+        assert_eq!(cfg.input.meaning, MeaningAssertion::Colorimetric);
+    }
+
+    #[test]
+    fn deprecated_assume_linear_is_a_migration_error() {
+        // The old combined assertion must never silently assert both axes — it is a
+        // loud usage error (exit 2) pointing at the two independent flags.
+        let args = parse_convert(&["--assume-linear"]);
+        let err = reject_deprecated_input_flags(&args.input_opts).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--input-transfer"));
+    }
+
+    #[test]
+    fn input_profile_stays_rejected_for_convert() {
+        // `--input-profile` is reserved (deferred experiment) — rejected loudly
+        // (exit 4) rather than silently ignored.
+        let args = parse_convert(&["--input-profile", "scanner.icc"]);
+        let err = reject_deprecated_input_flags(&args.input_opts).unwrap_err();
+        assert_eq!(err.exit_code(), 4);
+    }
+
+    #[test]
+    fn legacy_input_color_recipe_key_is_a_migration_error() {
+        // A recipe carrying the removed combined key fails to load with actionable
+        // migration guidance (not an opaque unknown-field message).
+        let err = reject_legacy_input_color(r#"{"input":{"color":"linear"}}"#, Path::new("r.json"))
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("input.transfer"));
+        // A recipe using the new keys passes this migration check.
+        assert!(
+            reject_legacy_input_color(
+                r#"{"input":{"transfer":"linear","meaning":"scanner-device"}}"#,
+                Path::new("r.json"),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn mutually_exclusive_source_flags_are_rejected() {
         // clap must reject conflicting source flags rather than silently picking one.
-        assert!(
-            Cli::try_parse_from([
-                "nc",
-                "convert",
-                "i",
-                "-o",
-                "o",
-                "--assume-linear",
-                "--input-profile",
-                "srgb"
-            ])
-            .is_err()
-        );
         assert!(
             Cli::try_parse_from([
                 "nc",
@@ -4185,6 +4479,7 @@ mod tests {
                     dmax: Some(1.6),
                     white_balance: None,
                     balance_range: None,
+                    input_color: None,
                     loss: None,
                 },
                 warnings: vec![],

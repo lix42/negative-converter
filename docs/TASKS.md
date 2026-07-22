@@ -257,7 +257,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   sigmoid-bounds analogue density lacks) + a degenerate-output (histogram/dynamic-
   range collapse) warning catching the finite-all-black underflow the loss counters
   miss, with a false-positive guard validated on real scans.
-- [ ] [Input data semantics and validation](tasks/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
+- [x] [Input data semantics and validation](tasks/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
 - [ ] [Post-reconstruction characterization runtime](tasks/post-reconstruction-color-characterization.md) — establish the typed scanner/film RGB → linear ACEScg boundary, strict compatible artifact loader, and explicit assumed-source fallback
 - [ ] [Color-characterization calibration](tasks/color-characterization-calibration.md) — fit and validate scanner/film characterization artifacts against controlled target data
 - [ ] [Post-characterization render pipeline](tasks/post-characterization-render-pipeline.md) — move print/display controls after characterization and route true scene-master versus shared SDR/HDR display branches

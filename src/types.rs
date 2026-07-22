@@ -191,31 +191,87 @@ pub type Result<T> = std::result::Result<T, NcError>;
 // serde key names. Defaults are deliberately neutral (identity-ish) placeholders
 // — the algorithm tasks refine them.
 
-/// How the input's color is interpreted on decode (design-spec §9, Input/decode).
+/// Transfer-encoding assertion for the input (design-spec §9, `input.transfer`).
 ///
-/// A single mutually-exclusive choice, not independent flags: the input is taken
-/// as already linear, interpreted through an explicit ICC profile, or (default)
-/// decoded with the file's embedded / default profile. Serializes as `"auto"` /
-/// `"linear"` / `{ "profile": "<icc>" }`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum InputColor {
-    /// Decode with the file's embedded profile, or the documented fallback when
-    /// none is present. This is what passing no input-color flag does.
+/// One of the two **independent** input axes (the other is [`MeaningAssertion`]).
+/// It asserts only how the samples are *encoded*, never what they *measure*:
+/// `Linear` says the transfer is linear (no inverse-transfer decoding needed),
+/// which does not by itself prove scanner-device provenance. `Auto` (default)
+/// lets the input semantic resolver (`pipeline::input_semantics`) decide from
+/// container evidence, failing loudly in `convert` when it stays ambiguous.
+/// Serializes kebab-case (`"auto"` / `"linear"`; kebab-case matches its mirror
+/// [`MeaningAssertion`] and `TransferDescription`, so a future multi-word variant
+/// stays consistent); parsed the same on the CLI via `ValueEnum`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransferAssertion {
+    /// Resolve the transfer from container evidence (structural raw-mode, a
+    /// descriptive gamma tag).
     #[default]
     Auto,
-    /// Treat the scanner data as already linear; apply no input transfer curve.
+    /// Assert a supported linear transfer. Overrides a contradicting descriptive
+    /// gamma tag (recorded as displaced evidence); it cannot override container
+    /// structure that proves a non-linear encoding.
     Linear,
-    /// Interpret the input through this ICC profile selector / path.
-    Profile(String),
+}
+
+/// Measurement-meaning assertion for the input (design-spec §9, `input.meaning`).
+///
+/// The second independent input axis: what the pixel values *are*. Only
+/// [`ScannerDevice`](Self::ScannerDevice) measurements paired with a supported
+/// linear transfer enter Dmin/density without a source→working color transform.
+/// [`Colorimetric`](Self::Colorimetric) is recognized but unsupported (no inverse
+/// transfer/reconstruction path exists yet). `Auto` (default) resolves from
+/// container evidence — an embedded ICC alone does not establish it. Serializes
+/// kebab-case (`"auto"` / `"scanner-device"` / `"colorimetric"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeaningAssertion {
+    /// Resolve the meaning from container evidence.
+    #[default]
+    Auto,
+    /// Assert scanner-device measurements (the supported meaning).
+    ScannerDevice,
+    /// Assert colorimetric RGB. Recognized but unsupported; `convert` rejects it
+    /// even when asserted (an override cannot make it supported).
+    Colorimetric,
+}
+
+/// Descriptive transfer/gamma evidence parsed from container metadata, with a
+/// **third state** the resolver needs: a gamma tag that is *present but
+/// uninterpretable* is ambiguous, **not** absent. Collapsing malformed → absent
+/// would let a raw scan whose gamma is actually non-linear but written unparseably
+/// (e.g. a German-locale `"2,2"` — LaserSoft is German software) silently resolve
+/// to linear and skip the contradiction path. Lives here (not in
+/// `pipeline::input_semantics`) so both `io::decode` (which produces it) and the
+/// resolver (which consumes it) can share it without an io→pipeline dependency.
+#[derive(Clone, Debug, PartialEq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GammaFact {
+    /// No gamma tag present in the metadata.
+    #[default]
+    Absent,
+    /// A gamma tag parsed to this numeric value.
+    Value(f64),
+    /// A gamma tag was present but could not be interpreted as a number (carries
+    /// the offending raw string for the diagnostic). Ambiguous, never linear.
+    Malformed(String),
 }
 
 /// Input / decode knobs (design-spec §9, stage 1).
+///
+/// Transfer and meaning are **two independent axes** (not a single combined
+/// `input.color` choice, which conflated them): the resolver
+/// (`pipeline::input_semantics`) resolves each from separate evidence. There is
+/// deliberately no `input.color` field — the old combined key is rejected with a
+/// migration error at recipe load (see `cli::load_recipe`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct InputParams {
-    /// How to interpret the input's color (default `auto`).
-    pub color: InputColor,
+    /// Transfer-encoding assertion (default `auto`).
+    pub transfer: TransferAssertion,
+    /// Measurement-meaning assertion (default `auto`).
+    pub meaning: MeaningAssertion,
     /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
     /// An input/decode-domain artifact (design-spec §9, Input/decode) — carried
     /// here so `pipeline-orchestration` can drive the IR exporter.
@@ -846,6 +902,41 @@ mod tests {
             serde_json::from_str::<WbSource>("\"gray-world\"").unwrap(),
             WbSource::GrayWorld
         );
+    }
+
+    #[test]
+    fn input_axes_default_to_auto_and_round_trip() {
+        // The two independent input axes default to `auto` and serialize in their
+        // documented wire forms.
+        let p = InputParams::default();
+        assert_eq!(p.transfer, TransferAssertion::Auto);
+        assert_eq!(p.meaning, MeaningAssertion::Auto);
+
+        assert_eq!(
+            serde_json::to_string(&TransferAssertion::Linear).unwrap(),
+            "\"linear\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MeaningAssertion::ScannerDevice).unwrap(),
+            "\"scanner-device\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MeaningAssertion::Colorimetric).unwrap(),
+            "\"colorimetric\""
+        );
+
+        // A partial `input` section fills the untouched axis with its default.
+        let p: InputParams = serde_json::from_str(r#"{"transfer":"linear"}"#).unwrap();
+        assert_eq!(p.transfer, TransferAssertion::Linear);
+        assert_eq!(p.meaning, MeaningAssertion::Auto);
+    }
+
+    #[test]
+    fn input_params_rejects_unknown_and_legacy_color_key() {
+        // `deny_unknown_fields`: the removed combined `color` key is not a field,
+        // so it is rejected at the struct level (the friendlier migration message
+        // is emitted earlier, by `cli::load_recipe`).
+        assert!(serde_json::from_str::<InputParams>(r#"{"color":"linear"}"#).is_err());
     }
 
     #[test]

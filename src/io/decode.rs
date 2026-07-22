@@ -24,7 +24,7 @@ use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 
-use crate::types::{LinearImage, NcError, Result};
+use crate::types::{GammaFact, LinearImage, NcError, Result};
 
 /// Which SilverFast variant a file turned out to be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -34,6 +34,39 @@ pub enum SilverFastFormat {
     Hdr,
     /// 64-bit RGB + IR (two IFDs; IFD1 = IR).
     Hdri,
+}
+
+/// Namespace URI of the `Silverfast:` RDF attributes in the XMP packet — the
+/// authoritative source of SilverFast mode metadata (verified against the real
+/// samples, 2026-07). The XML declares `xmlns:Silverfast="LSI/"`.
+const SILVERFAST_XMP_NS: &str = "LSI/";
+
+/// SilverFast mode metadata parsed from the XMP packet (TIFF tag 700). The
+/// authoritative, mode-specific provenance the input semantic resolver keys on —
+/// not the (spoofable, export-surviving) `Software` string or IR-plane presence.
+/// Every genuine SilverFast scan carries these `Silverfast:` RDF attributes;
+/// negatives have `Negative=Yes`, positive-mode scans `Negative=No`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SilverfastXmp {
+    /// `Silverfast:Company` — `"LaserSoft Imaging"` on genuine SilverFast output.
+    pub company: Option<String>,
+    /// `Silverfast:HDRScan` — `Yes` on a raw HDR/HDRi scan (the raw-mode marker).
+    pub hdr_scan: Option<bool>,
+    /// `Silverfast:Gamma` — the scan's transfer gamma ([`GammaFact`]; `1` = linear
+    /// on raw scans). A present-but-uninterpretable value is `Malformed`, not
+    /// absent, so a malformed non-linear gamma can't silently resolve to linear.
+    pub gamma: GammaFact,
+    /// `Silverfast:Negative` — `Yes` for a negative scan, `No` for positive mode.
+    pub negative: Option<bool>,
+}
+
+impl SilverfastXmp {
+    /// Whether this is genuine SilverFast raw-mode provenance: company is
+    /// LaserSoft Imaging AND the scan is flagged `HDRScan=Yes`. This — not the
+    /// `Software` string or an IR plane — is what makes an input scanner-device.
+    fn is_raw_mode(&self) -> bool {
+        self.company.as_deref() == Some("LaserSoft Imaging") && self.hdr_scan == Some(true)
+    }
 }
 
 /// What the decoder found in the file — surfaced by `inspect` / the JSON report
@@ -53,8 +86,89 @@ pub struct DecodeInfo {
     pub make: Option<String>,
     pub model: Option<String>,
     pub software: Option<String>,
+    /// SilverFast mode metadata parsed from the XMP packet (tag 700), when
+    /// present. The authoritative provenance the resolver keys on; `None` for a
+    /// file with no (or unparsable) SilverFast XMP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub silverfast_xmp: Option<SilverfastXmp>,
+    /// Embedded ICC profile bytes (TIFF tag 34675 `InterColorProfile`), when the
+    /// primary IFD carries one. Retained verbatim for the input-semantic resolver
+    /// (device-characterization metadata; reported as a safe summary, never
+    /// applied before density). **Not serialized** — the report emits a summary
+    /// via `pipeline::input_semantics`, not the raw bytes.
+    #[serde(skip)]
+    pub embedded_icc: Option<Vec<u8>>,
     /// Non-fatal notes (e.g. extra IFDs beyond the IR plane that we ignored).
     pub warnings: Vec<String>,
+}
+
+impl DecodeInfo {
+    /// Whether the file carries genuine SilverFast HDR/HDRi raw-mode provenance —
+    /// the evidence the input semantic resolver keys `raw_mode` on.
+    ///
+    /// `decode` accepts *any* 3-channel 16-bit chunky RGB TIFF, so this must be a
+    /// real provenance check. It is keyed on the SilverFast **XMP mode metadata**
+    /// (`Company=LaserSoft Imaging` + `HDRScan=Yes`), not the `Software` string (a
+    /// processed export keeps it) or IR-plane presence (a generic RGB16 + Gray16
+    /// multipage forges it) — both of which the adversarial review showed
+    /// misclassify. A file without that XMP resolves to `Unknown` meaning and is
+    /// rejected by `convert` unless the user explicitly asserts the axes.
+    pub fn is_silverfast_raw_mode(&self) -> bool {
+        self.silverfast_xmp
+            .as_ref()
+            .is_some_and(SilverfastXmp::is_raw_mode)
+    }
+
+    /// Whether the scan is a SilverFast **positive-mode** scan (`Negative=No`).
+    /// Such a scan is still raw linear — it passes the transfer/meaning gate — but
+    /// converting it as a negative is silently wrong, so `convert` rejects it (a
+    /// separate, clearly-scoped check; positive-mode support is a follow-up).
+    pub fn is_silverfast_positive_mode(&self) -> bool {
+        self.silverfast_xmp.as_ref().and_then(|x| x.negative) == Some(false)
+    }
+}
+
+/// Parse the SilverFast `Silverfast:` RDF attributes out of an XMP packet.
+///
+/// The packet is a standard XMP/RDF document (`<rdf:Description … Silverfast:*=…>`);
+/// we read the mode attributes off whichever element carries the `Silverfast`
+/// namespace. Read-only, deterministic (`roxmltree`). Returns `None` when the XML
+/// doesn't parse or carries no `Silverfast` namespace — callers treat that as "no
+/// SilverFast provenance", which the resolver rejects.
+fn parse_silverfast_xmp(xml: &str) -> Option<SilverfastXmp> {
+    let doc = roxmltree::Document::parse(xml).ok()?;
+    // The `Silverfast:` attributes all sit on one `rdf:Description` element; find
+    // it by any of its namespaced attributes rather than assuming the RDF layout.
+    let node = doc.descendants().find(|n| {
+        n.attribute((SILVERFAST_XMP_NS, "Company")).is_some()
+            || n.attribute((SILVERFAST_XMP_NS, "HDRScan")).is_some()
+    })?;
+    // Yes/No flag: `Some(true)`/`Some(false)` for an explicit yes/no, `None` for a
+    // missing or *unrecognized* value — an unrecognized value must NOT masquerade
+    // as an explicit "No" (that would fail a genuine negative scan as positive-mode
+    // or a raw scan as non-HDR).
+    let yes_no = |name| match node.attribute((SILVERFAST_XMP_NS, name)) {
+        Some(v) if v.trim().eq_ignore_ascii_case("yes") => Some(true),
+        Some(v) if v.trim().eq_ignore_ascii_case("no") => Some(false),
+        _ => None,
+    };
+    // Gamma: distinguish absent from present-but-uninterpretable (a locale-formatted
+    // "2,2" must be `Malformed`, never dropped to "linear").
+    let gamma = match node.attribute((SILVERFAST_XMP_NS, "Gamma")) {
+        None => GammaFact::Absent,
+        Some(v) => match v.trim().parse::<f64>() {
+            Ok(g) => GammaFact::Value(g),
+            Err(_) => GammaFact::Malformed(v.trim().to_owned()),
+        },
+    };
+    Some(SilverfastXmp {
+        company: node
+            .attribute((SILVERFAST_XMP_NS, "Company"))
+            .map(str::to_owned),
+        hdr_scan: yes_no("HDRScan"),
+        gamma,
+        negative: yes_no("Negative"),
+    })
 }
 
 /// Decode a SilverFast HDR/HDRi TIFF at `path` into a linear `f32` image,
@@ -104,6 +218,96 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     let software = dec.get_tag_ascii_string(Tag::Software).ok();
 
     let mut warnings = Vec::new();
+
+    // Embedded ICC profile (tag 34675), if present — retained for the input
+    // semantic resolver (reported as a summary, never applied before density).
+    // ICC extraction is inspection-only, so a malformed tag is a non-fatal
+    // *warning*, not a decode error — but it must not be swallowed silently
+    // (fail-loud): distinguish tag ABSENCE (`Ok(None)` → no note) from a genuine
+    // tag READ ERROR or a non-byte value type (surfaced as a warning), so an
+    // unreadable profile isn't reported as "no profile".
+    let embedded_icc = match dec.find_tag(Tag::IccProfile) {
+        Ok(None) => None,
+        Ok(Some(value)) => match value.into_u8_vec() {
+            Ok(bytes) if !bytes.is_empty() => Some(bytes),
+            Ok(_) => None, // present but empty — treat as no profile
+            Err(e) => {
+                warnings.push(format!(
+                    "embedded ICC profile tag (34675) is present but not a byte array \
+                     ({e}); ignored for inspection"
+                ));
+                None
+            }
+        },
+        Err(e) => {
+            warnings.push(format!(
+                "embedded ICC profile tag (34675) could not be read ({e}); ignored for \
+                 inspection"
+            ));
+            None
+        }
+    };
+
+    // SilverFast XMP mode metadata (tag 700) — the authoritative provenance the
+    // input semantic resolver keys on. Same loud-vs-silent contract as the ICC
+    // tag: absence is silent (a non-SilverFast file simply has no XMP), but a
+    // genuine read error / non-UTF-8 packet is a non-fatal warning, not swallowed.
+    let silverfast_xmp = match dec.find_tag(Tag::Unknown(700)) {
+        Ok(None) => None,
+        Ok(Some(value)) => match value.into_u8_vec() {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(xml) => {
+                    let parsed = parse_silverfast_xmp(&xml);
+                    // A present, non-empty packet that yields no recognizable
+                    // SilverFast metadata (malformed XML, or a namespace/layout that
+                    // isn't the reverse-engineered `LSI/` shape — e.g. a future
+                    // scanner) must leave a breadcrumb, not silently lose provenance.
+                    if parsed.is_none() && !xml.trim().is_empty() {
+                        warnings.push(
+                            "XMP packet (tag 700) present but no recognizable SilverFast \
+                             metadata (namespace/layout unrecognized); provenance not \
+                             established"
+                                .into(),
+                        );
+                    }
+                    // A present-but-uninterpretable gamma is ambiguous (see F1): warn
+                    // naming the value so the loud transfer=Unknown has a breadcrumb.
+                    if let Some(SilverfastXmp {
+                        gamma: GammaFact::Malformed(raw),
+                        ..
+                    }) = &parsed
+                    {
+                        warnings.push(format!(
+                            "Silverfast:Gamma value {raw:?} is not an interpretable number; \
+                             the transfer is treated as ambiguous (not linear)"
+                        ));
+                    }
+                    parsed
+                }
+                Err(_) => {
+                    warnings.push(
+                        "XMP packet (tag 700) is not valid UTF-8; SilverFast metadata \
+                         ignored"
+                            .into(),
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                warnings.push(format!(
+                    "XMP packet (tag 700) is present but not a byte array ({e}); \
+                     SilverFast metadata ignored"
+                ));
+                None
+            }
+        },
+        Err(e) => {
+            warnings.push(format!(
+                "XMP packet (tag 700) could not be read ({e}); SilverFast metadata ignored"
+            ));
+            None
+        }
+    };
 
     // --- Remaining IFDs: locate the IR plane, skipping preview thumbnails ----
     // High-resolution HDRi scans place a reduced-resolution RGB preview
@@ -207,6 +411,8 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         make,
         model,
         software,
+        silverfast_xmp,
+        embedded_icc,
         warnings,
     };
 
@@ -562,6 +768,212 @@ mod tests {
 
         let (_img, info) = decode(&tmp.0).unwrap();
         assert_eq!(info.software.as_deref(), Some("nc-ship-test"));
+    }
+
+    #[test]
+    fn extracts_embedded_icc_profile_bytes() {
+        // An ICC profile in tag 34675 on IFD0 must be extracted verbatim into
+        // `embedded_icc` (retained for the input semantic resolver); a file
+        // without the tag leaves it `None`.
+        let tmp = temp_path("icc");
+        let rgb: [u16; 6] = [0; 6];
+        let icc: Vec<u8> = (0..128u16).map(|b| b as u8).collect();
+        let mut enc = TiffEncoder::new(std::fs::File::create(&tmp.0).unwrap()).unwrap();
+        let mut image = enc.new_image::<RGB16>(2, 1).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::IccProfile, &icc[..])
+            .unwrap();
+        image.write_data(&rgb).unwrap();
+
+        let (_img, info) = decode(&tmp.0).unwrap();
+        assert_eq!(info.embedded_icc.as_deref(), Some(&icc[..]));
+
+        let noicc = temp_path("noicc");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&noicc.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        let (_img, info) = decode(&noicc.0).unwrap();
+        assert!(info.embedded_icc.is_none());
+    }
+
+    /// Minimal synthetic SilverFast XMP packet (the real one is ~150 KB; only the
+    /// `Silverfast:` mode attributes matter). `attrs` is the attribute list on the
+    /// `rdf:Description` element.
+    fn silverfast_xmp_packet(attrs: &str) -> String {
+        format!(
+            "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
+             <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+             <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+             <rdf:Description rdf:about=\"\" xmlns:Silverfast=\"LSI/\" {attrs}/>\
+             </rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+        )
+    }
+
+    /// Write a 2x1 RGB16 TIFF carrying the given XMP packet in tag 700.
+    fn write_rgb16_with_xmp(path: &Path, xmp: &str) {
+        let rgb: [u16; 6] = [0; 6];
+        let mut enc = TiffEncoder::new(std::fs::File::create(path).unwrap()).unwrap();
+        let mut image = enc.new_image::<RGB16>(2, 1).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(700), xmp.as_bytes())
+            .unwrap();
+        image.write_data(&rgb).unwrap();
+    }
+
+    #[test]
+    fn parse_silverfast_xmp_extracts_mode_fields() {
+        let neg = silverfast_xmp_packet(
+            r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="Yes""#,
+        );
+        let x = parse_silverfast_xmp(&neg).expect("negative XMP parses");
+        assert_eq!(x.company.as_deref(), Some("LaserSoft Imaging"));
+        assert_eq!(x.hdr_scan, Some(true));
+        assert_eq!(x.gamma, GammaFact::Value(1.0));
+        assert_eq!(x.negative, Some(true));
+        assert!(x.is_raw_mode());
+
+        // Positive mode: same raw-mode markers, Negative=No.
+        let pos = silverfast_xmp_packet(
+            r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="No""#,
+        );
+        let x = parse_silverfast_xmp(&pos).unwrap();
+        assert_eq!(x.negative, Some(false));
+        assert!(x.is_raw_mode());
+
+        // A non-linear gamma is surfaced (drives the contradiction path upstream).
+        let g = silverfast_xmp_packet(
+            r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="2.2""#,
+        );
+        assert_eq!(
+            parse_silverfast_xmp(&g).unwrap().gamma,
+            GammaFact::Value(2.2)
+        );
+
+        // A present-but-uninterpretable gamma (locale comma) is Malformed, NOT
+        // absent — so it can't silently resolve to linear (F1).
+        let bad = silverfast_xmp_packet(
+            r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="2,2""#,
+        );
+        assert_eq!(
+            parse_silverfast_xmp(&bad).unwrap().gamma,
+            GammaFact::Malformed("2,2".into())
+        );
+
+        // An unrecognized yes/no value is `None`, not a masquerading explicit "No"
+        // (F3): a `Negative="y"` must not read as positive-mode.
+        let weird = silverfast_xmp_packet(
+            r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Negative="y""#,
+        );
+        assert_eq!(parse_silverfast_xmp(&weird).unwrap().negative, None);
+
+        // No `Silverfast` namespace, and malformed XML, both yield None.
+        assert!(parse_silverfast_xmp("<x><y/></x>").is_none());
+        assert!(parse_silverfast_xmp("<not valid xml").is_none());
+    }
+
+    #[test]
+    fn malformed_gamma_warns_and_is_not_absent() {
+        // F1 end of decode: a raw scan with a locale-formatted gamma keeps the
+        // Malformed fact AND pushes a decode warning naming the value.
+        let tmp = temp_path("badgamma");
+        write_rgb16_with_xmp(
+            &tmp.0,
+            &silverfast_xmp_packet(
+                r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="2,2" Silverfast:Negative="Yes""#,
+            ),
+        );
+        let (_img, info) = decode(&tmp.0).unwrap();
+        assert_eq!(
+            info.silverfast_xmp.unwrap().gamma,
+            GammaFact::Malformed("2,2".into())
+        );
+        assert!(
+            info.warnings
+                .iter()
+                .any(|w| w.contains("2,2") && w.contains("ambiguous")),
+            "expected a malformed-gamma warning, got {:?}",
+            info.warnings
+        );
+    }
+
+    #[test]
+    fn unrecognized_xmp_warns_and_yields_no_metadata() {
+        // F2: a present, valid-UTF-8 XMP packet with no recognizable SilverFast
+        // namespace leaves a breadcrumb rather than silently losing provenance.
+        let tmp = temp_path("foreignxmp");
+        write_rgb16_with_xmp(
+            &tmp.0,
+            r#"<?xpacket begin=""?><x:xmpmeta xmlns:x="adobe:ns:meta/"><other>data</other></x:xmpmeta>"#,
+        );
+        let (_img, info) = decode(&tmp.0).unwrap();
+        assert!(info.silverfast_xmp.is_none());
+        assert!(
+            info.warnings
+                .iter()
+                .any(|w| w.contains("no recognizable SilverFast metadata")),
+            "expected an unrecognized-XMP warning, got {:?}",
+            info.warnings
+        );
+    }
+
+    #[test]
+    fn raw_mode_provenance_comes_from_xmp_not_software_or_ir() {
+        // A bare RGB16 TIFF (no XMP) is NOT raw mode.
+        let generic = temp_path("generic");
+        let rgb: [u16; 6] = [0; 6];
+        let mut enc = TiffEncoder::new(std::fs::File::create(&generic.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        let (_img, info) = decode(&generic.0).unwrap();
+        assert!(info.silverfast_xmp.is_none());
+        assert!(!info.is_silverfast_raw_mode());
+
+        // A `Software="SilverFast …"` tag but NO XMP is NOT sufficient (the old
+        // substring heuristic misclassified processed exports that keep it).
+        let sw = temp_path("sfsoftware");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&sw.0).unwrap()).unwrap();
+        let mut image = enc.new_image::<RGB16>(2, 1).unwrap();
+        image
+            .encoder()
+            .write_tag(Tag::Software, "SilverFast 9.2.8 (Dec 29 2025)")
+            .unwrap();
+        image.write_data(&rgb).unwrap();
+        let (_img, info) = decode(&sw.0).unwrap();
+        assert!(!info.is_silverfast_raw_mode());
+
+        // A validated IR plane but NO XMP is NOT sufficient either (a generic
+        // RGB16 + Gray16 multipage would otherwise forge provenance).
+        let ir: [u16; 2] = [0, 65535];
+        let hdri = temp_path("irnoxmp");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&hdri.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(2, 1, &rgb).unwrap();
+        enc.write_image::<Gray16>(2, 1, &ir).unwrap();
+        let (_img, info) = decode(&hdri.0).unwrap();
+        assert!(info.ir_present && !info.is_silverfast_raw_mode());
+
+        // A SilverFast negative XMP IS raw mode, and not positive-mode.
+        let neg = temp_path("xmpneg");
+        write_rgb16_with_xmp(
+            &neg.0,
+            &silverfast_xmp_packet(
+                r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="Yes""#,
+            ),
+        );
+        let (_img, info) = decode(&neg.0).unwrap();
+        assert!(info.is_silverfast_raw_mode());
+        assert!(!info.is_silverfast_positive_mode());
+
+        // A SilverFast positive XMP is raw mode but flagged positive.
+        let pos = temp_path("xmppos");
+        write_rgb16_with_xmp(
+            &pos.0,
+            &silverfast_xmp_packet(
+                r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="No""#,
+            ),
+        );
+        let (_img, info) = decode(&pos.0).unwrap();
+        assert!(info.is_silverfast_raw_mode());
+        assert!(info.is_silverfast_positive_mode());
     }
 
     // --- real-scan fixture tests (committed under tests/fixtures) -------------

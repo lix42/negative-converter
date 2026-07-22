@@ -41,6 +41,45 @@ fn write_uniform_rgb48(path: &Path, rgb: [u16; 3], w: u32, h: u32) {
     std::fs::write(path, &buf).unwrap();
 }
 
+/// Minimal synthetic SilverFast XMP packet (the real one is ~150 KB; only the
+/// `Silverfast:` mode attributes matter). `attrs` is the attribute list on the
+/// `rdf:Description` element.
+fn silverfast_xmp(attrs: &str) -> String {
+    format!(
+        "<?xpacket begin=\"\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\
+         <x:xmpmeta xmlns:x=\"adobe:ns:meta/\">\
+         <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+         <rdf:Description rdf:about=\"\" xmlns:Silverfast=\"LSI/\" {attrs}/>\
+         </rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+    )
+}
+
+/// Write an 8x8 RGB16 TIFF with optional SilverFast XMP (tag 700), an optional
+/// `Software` tag, and an optional matching Gray16 IR page — the levers the
+/// provenance gate keys on (and the two holes the adversarial review flagged:
+/// Software-only and IR-only).
+fn write_rgb16(path: &Path, xmp: Option<&str>, software: Option<&str>, with_ir: bool) {
+    use tiff::tags::Tag;
+    let (w, h) = (8u32, 8u32);
+    let rgb = vec![20000u16; (w * h * 3) as usize];
+    let mut enc = TiffEncoder::new(std::fs::File::create(path).unwrap()).unwrap();
+    let mut image = enc.new_image::<colortype::RGB16>(w, h).unwrap();
+    if let Some(s) = software {
+        image.encoder().write_tag(Tag::Software, s).unwrap();
+    }
+    if let Some(x) = xmp {
+        image
+            .encoder()
+            .write_tag(Tag::Unknown(700), x.as_bytes())
+            .unwrap();
+    }
+    image.write_data(&rgb).unwrap();
+    if with_ir {
+        let ir = vec![0u16; (w * h) as usize];
+        enc.write_image::<colortype::Gray16>(w, h, &ir).unwrap();
+    }
+}
+
 /// A unique temp directory that removes itself (and its contents) on drop, so a
 /// failing test can't leak output TIFFs.
 struct TempDir(PathBuf);
@@ -997,8 +1036,10 @@ fn verbose_keeps_stdout_clean_json_and_logs_to_stderr() {
         stderr.contains("decoded"),
         "progress log should be on stderr: {stderr}"
     );
+    // Check the actual stderr log marker (`nc: decoded …`), not a bare "decoded"
+    // substring — the JSON report legitimately carries a `transfer_decoded` field.
     assert!(
-        !stdout.contains("decoded"),
+        !stdout.contains("nc: decoded"),
         "stdout must not carry log lines"
     );
 }
@@ -1116,8 +1157,8 @@ fn inspect_rejects_report_file_over_input() {
 
 #[test]
 fn convert_rejects_unapplied_input_profile() {
-    // `input.color = profile` is parsed but input-side CM isn't implemented in
-    // Step 1 — it must fail loudly (exit 4), not silently ignore the profile.
+    // `--input-profile` is reserved for the deferred scanner-profile-before-density
+    // experiment — it must fail loudly (exit 4), not silently ignore the profile.
     let dir = TempDir::new("inprofile");
     let out = dir.path("out.tiff");
     let fix = fixture("hdr-48bit.tif");
@@ -1130,8 +1171,541 @@ fn convert_rejects_unapplied_input_profile() {
         "scanner.icc",
     ]);
     assert_eq!(code, 4, "unapplied input profile must exit 4: {err}");
-    assert!(err.contains("not implemented"), "stderr: {err}");
+    assert!(err.contains("not supported"), "stderr: {err}");
     assert!(!out.exists());
+}
+
+#[test]
+fn convert_reports_resolved_input_color_for_real_scan() {
+    // A real SilverFast HDR scan resolves independently to a linear transfer and
+    // scanner-device meaning, then reaches the render — reported with evidence.
+    let tmp = TempDir::new("inputcolor");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0, "convert should succeed: {err}");
+    let ic = &json(&stdout)["input_color"];
+    assert_eq!(ic["transfer"], "linear");
+    assert_eq!(ic["meaning"], "scanner-device");
+    assert_eq!(ic["transfer_decoded"], false);
+    assert_eq!(ic["icc_embedded"], false);
+    // Both axes carry structural evidence.
+    let ev = ic["evidence"].as_array().unwrap();
+    assert!(
+        ev.iter()
+            .any(|e| e["axis"] == "transfer" && e["kind"] == "structural")
+    );
+    assert!(
+        ev.iter()
+            .any(|e| e["axis"] == "meaning" && e["kind"] == "structural")
+    );
+}
+
+#[test]
+fn inspect_reports_input_color_evidence() {
+    let (code, stdout, err) = run(&["inspect", fixture("hdri-64bit.tif").to_str().unwrap()]);
+    assert_eq!(code, 0, "inspect should succeed: {err}");
+    let ic = &json(&stdout)["input_color"];
+    assert_eq!(ic["transfer"], "linear");
+    assert_eq!(ic["meaning"], "scanner-device");
+    assert!(ic["evidence"].as_array().is_some_and(|e| !e.is_empty()));
+}
+
+#[test]
+fn convert_rejects_colorimetric_assertion_on_scanner_scan() {
+    // An explicit meaning that contradicts the raw-mode scanner structure fails
+    // loudly (usage error, exit 2) — it never overrides container structure.
+    let tmp = TempDir::new("colorimetric");
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--input-meaning",
+        "colorimetric",
+    ]);
+    assert_eq!(
+        code, 2,
+        "colorimetric-vs-structure must be a usage error: {err}"
+    );
+    assert!(err.contains("contradicts"), "stderr: {err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn convert_rejects_legacy_input_color_recipe_key() {
+    // A recipe carrying the removed combined `input.color` key fails to load with
+    // a pinned migration message — it never silently asserts both axes.
+    let tmp = TempDir::new("legacycolor");
+    let out = tmp.path("out.tiff");
+    let recipe = tmp.path("recipe.json");
+    std::fs::write(&recipe, r#"{"input":{"color":"linear"}}"#).unwrap();
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "legacy input.color must be a usage error: {err}");
+    assert!(err.contains("input.transfer"), "stderr: {err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn generic_rgb16_without_silverfast_provenance_is_rejected() {
+    // A plain RGB16 TIFF with no SilverFast Software tag and no IR plane carries
+    // no raw-mode provenance — meaning resolves Unknown, so `convert` rejects it
+    // (exit 4, not a silently-wrong negative) and `inspect` reports the ambiguity.
+    let tmp = TempDir::new("generic");
+    let src = tmp.path("generic.tif");
+    write_uniform_rgb48(&src, [30000, 20000, 15000], 8, 8);
+    let out = tmp.path("out.tiff");
+
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 4, "generic RGB16 must be Unsupported (exit 4): {err}");
+    assert!(
+        err.contains("--input-transfer linear --input-meaning scanner-device"),
+        "error must suggest the explicit-assertion escape hatch: {err}"
+    );
+    assert!(!out.exists());
+
+    // inspect stays diagnostic — reports meaning unknown with evidence, no failure.
+    let (code, stdout, _err) = run(&["inspect", src.to_str().unwrap()]);
+    assert_eq!(code, 0, "inspect never fails on ambiguity");
+    let ic = &json(&stdout)["input_color"];
+    assert_eq!(ic["meaning"], "unknown");
+    assert!(ic["evidence"].as_array().is_some_and(|e| !e.is_empty()));
+}
+
+#[test]
+fn explicit_assertion_escape_hatch_converts_generic_rgb16() {
+    // The user can take responsibility for a raw scan lacking provenance by
+    // asserting both axes explicitly — that reaches the render (exit 0), and the
+    // report records the assertions' provenance.
+    let tmp = TempDir::new("escape");
+    let src = tmp.path("generic.tif");
+    write_uniform_rgb48(&src, [30000, 20000, 15000], 8, 8);
+    let out = tmp.path("out.tiff");
+
+    let (code, stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--input-transfer",
+        "linear",
+        "--input-meaning",
+        "scanner-device",
+    ]);
+    assert_eq!(
+        code, 0,
+        "explicit assertions must convert a generic RGB16: {err}"
+    );
+    assert!(is_tiff(&out));
+    let ic = &json(&stdout)["input_color"];
+    assert_eq!(ic["transfer"], "linear");
+    assert_eq!(ic["meaning"], "scanner-device");
+    // Both axes carry a user-assertion evidence record with CLI provenance.
+    let ev = ic["evidence"].as_array().unwrap();
+    assert!(ev.iter().any(|e| {
+        e["kind"] == "user-assertion"
+            && e["provenance"]
+                .as_str()
+                .is_some_and(|p| p.contains("CLI flag"))
+    }));
+}
+
+#[test]
+fn input_assertion_provenance_distinguishes_cli_from_recipe() {
+    // M2: the CLI-vs-recipe provenance is observable end-to-end. A recipe-sourced
+    // assertion reports `input.… (recipe)`; a CLI-flag assertion reports
+    // `--input-… (CLI flag)`.
+    let tmp = TempDir::new("prov");
+    let src = tmp.path("generic.tif");
+    write_uniform_rgb48(&src, [30000, 20000, 15000], 8, 8);
+    let recipe = tmp.path("recipe.json");
+    std::fs::write(
+        &recipe,
+        r#"{"input":{"transfer":"linear","meaning":"scanner-device"},
+            "film_base":{"source":{"explicit":[0.9,0.55,0.42]}}}"#,
+    )
+    .unwrap();
+
+    // Recipe-only: both assertions attributed to the recipe.
+    let out1 = tmp.path("out1.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out1.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "recipe assertions convert: {err}");
+    let ev = json(&stdout)["input_color"]["evidence"].clone();
+    let ev = ev.as_array().unwrap();
+    assert!(ev.iter().any(|e| {
+        e["kind"] == "user-assertion"
+            && e["provenance"]
+                .as_str()
+                .is_some_and(|p| p.contains("(recipe)"))
+    }));
+
+    // CLI flag over the recipe: the transfer assertion now reports CLI provenance.
+    let out2 = tmp.path("out2.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out2.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--input-transfer",
+        "linear",
+    ]);
+    assert_eq!(code, 0, "cli override converts: {err}");
+    let ev = json(&stdout)["input_color"]["evidence"].clone();
+    let ev = ev.as_array().unwrap();
+    assert!(ev.iter().any(|e| {
+        e["axis"] == "transfer"
+            && e["kind"] == "user-assertion"
+            && e["provenance"]
+                .as_str()
+                .is_some_and(|p| p.contains("CLI flag"))
+    }));
+}
+
+#[test]
+fn assume_linear_flag_is_a_migration_error_through_the_binary() {
+    // M3: the deprecated combined flag must fail loudly (exit 2) with migration
+    // guidance — it must never silently assert both axes.
+    let tmp = TempDir::new("assumelinear");
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--assume-linear",
+    ]);
+    assert_eq!(code, 2, "--assume-linear must be a usage error: {err}");
+    assert!(err.contains("--input-transfer"), "stderr: {err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn ir_plane_bit_identical_across_input_resolution() {
+    // H1: IR is measurement data, never color-transformed — so the exported IR
+    // plane must be byte-identical regardless of how the input color resolves
+    // (auto vs an explicit scanner-device assertion take different resolver paths).
+    let tmp = TempDir::new("ir-identity");
+    let src = fixture("hdri-64bit.tif");
+    let src = src.to_str().unwrap();
+
+    let out_auto = tmp.path("out-auto.tiff");
+    let ir_auto = tmp.path("ir-auto.tiff");
+    let (code, _o, err) = run(&[
+        "convert",
+        src,
+        "-o",
+        out_auto.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--algorithm",
+        "simple",
+        "--export-ir",
+        ir_auto.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "auto convert: {err}");
+
+    let out_expl = tmp.path("out-expl.tiff");
+    let ir_expl = tmp.path("ir-expl.tiff");
+    let (code, _o, err) = run(&[
+        "convert",
+        src,
+        "-o",
+        out_expl.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--algorithm",
+        "simple",
+        "--export-ir",
+        ir_expl.to_str().unwrap(),
+        "--input-transfer",
+        "linear",
+        "--input-meaning",
+        "scanner-device",
+    ]);
+    assert_eq!(code, 0, "explicit-assertion convert: {err}");
+
+    let a = std::fs::read(&ir_auto).unwrap();
+    let b = std::fs::read(&ir_expl).unwrap();
+    assert_eq!(
+        a, b,
+        "exported IR must be byte-identical across input resolution"
+    );
+}
+
+#[test]
+fn roll_frame_report_includes_resolved_input_color() {
+    // P2: a roll frame report must carry the resolved input semantics (mirrors
+    // single-frame `convert`), not drop them.
+    let tmp = TempDir::new("roll-ic");
+    let out_dir = tmp.path("out");
+    let recipe = tmp.path("recipe.json");
+    std::fs::write(
+        &recipe,
+        r#"{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}}}"#,
+    )
+    .unwrap();
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "roll should succeed: {err}");
+    let frame = &json(&stdout)["frames"][0];
+    assert_eq!(frame["input_color"]["transfer"], "linear");
+    assert_eq!(frame["input_color"]["meaning"], "scanner-device");
+}
+
+#[test]
+fn roll_rejects_colorimetric_shared_recipe_before_decode() {
+    // M1: an unconditionally-unsupported shared assertion fails fast, before the
+    // first (large) scan is decoded — exit 4 with an actionable message.
+    let tmp = TempDir::new("roll-colorimetric");
+    let out_dir = tmp.path("out");
+    let recipe = tmp.path("recipe.json");
+    std::fs::write(&recipe, r#"{"input":{"meaning":"colorimetric"}}"#).unwrap();
+    let (code, _stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 4,
+        "colorimetric shared recipe must be Unsupported: {err}"
+    );
+    assert!(err.contains("colorimetric"), "stderr: {err}");
+    // Fail-fast: no output directory contents were produced.
+    assert!(
+        !out_dir.join("hdr-48bit_positive.tiff").exists(),
+        "no frame should be written on the pre-flight reject"
+    );
+}
+
+// --- XMP-based SilverFast provenance gate (adversarial-review hardening) ------
+
+/// Attribute list for a genuine raw negative scan.
+const XMP_NEG: &str = r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="Yes""#;
+
+#[test]
+fn rgb16_plus_gray16_without_xmp_is_rejected() {
+    // Adversarial hole #1: a generic RGB16 + matching Gray16 multipage (an IR-like
+    // second page) must NOT be treated as a raw scanner scan without XMP.
+    let tmp = TempDir::new("ir-forge");
+    let src = tmp.path("forged.tif");
+    write_rgb16(&src, None, None, true); // IR page, no XMP
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 4, "RGB16+Gray16 without XMP must be rejected: {err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn software_silverfast_string_without_xmp_is_rejected() {
+    // Adversarial hole #2: a `Software="SilverFast …"` string (which a processed
+    // export keeps) is NOT sufficient provenance without the XMP mode metadata.
+    let tmp = TempDir::new("sw-forge");
+    let src = tmp.path("sw.tif");
+    write_rgb16(&src, None, Some("SilverFast 9.2.8 (Jun 11 2026)"), false);
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(
+        code, 4,
+        "Software string without XMP must be rejected: {err}"
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn silverfast_xmp_negative_converts() {
+    // A genuine raw negative (XMP Company+HDRScan=Yes+Gamma=1+Negative=Yes) reaches
+    // the render and reports scanner-device / linear.
+    let tmp = TempDir::new("xmp-neg");
+    let src = tmp.path("neg.tif");
+    write_rgb16(&src, Some(&silverfast_xmp(XMP_NEG)), None, false);
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0, "synthetic SilverFast negative must convert: {err}");
+    assert!(is_tiff(&out));
+    let ic = &json(&stdout)["input_color"];
+    assert_eq!(ic["transfer"], "linear");
+    assert_eq!(ic["meaning"], "scanner-device");
+}
+
+#[test]
+fn silverfast_xmp_nonlinear_gamma_is_rejected() {
+    // Contradiction path is LIVE: a raw-mode scan (HDRScan=Yes) whose XMP Gamma is
+    // non-linear (a processed export) → ambiguous transfer → convert exits 4;
+    // inspect stays diagnostic and reports transfer unknown.
+    let tmp = TempDir::new("xmp-gamma");
+    let src = tmp.path("g.tif");
+    let attrs = r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="2.2" Silverfast:Negative="Yes""#;
+    write_rgb16(&src, Some(&silverfast_xmp(attrs)), None, false);
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(
+        code, 4,
+        "non-linear gamma on raw mode must be rejected: {err}"
+    );
+    assert!(!out.exists());
+
+    let (code, stdout, _err) = run(&["inspect", src.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(json(&stdout)["input_color"]["transfer"], "unknown");
+}
+
+#[test]
+fn silverfast_positive_mode_is_rejected() {
+    // A positive-mode scan (XMP Negative=No) passes the transfer/meaning gate but
+    // must be rejected loudly with the distinct positive-mode message rather than
+    // silently converted as a negative.
+    let tmp = TempDir::new("xmp-pos");
+    let src = tmp.path("pos.tif");
+    let attrs = r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="No""#;
+    write_rgb16(&src, Some(&silverfast_xmp(attrs)), None, false);
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 4, "positive-mode scan must be rejected: {err}");
+    assert!(err.contains("positive-mode"), "stderr: {err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn silverfast_malformed_gamma_is_ambiguous_and_rejected() {
+    // F1 end-to-end: a raw-mode scan whose XMP Gamma is locale-formatted ("2,2")
+    // must NOT silently resolve to linear — decode warns, transfer resolves
+    // Unknown, and convert exits 4 (rather than converting a possibly-non-linear
+    // scan as linear).
+    let tmp = TempDir::new("xmp-badgamma");
+    let src = tmp.path("g.tif");
+    let attrs = r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="2,2" Silverfast:Negative="Yes""#;
+    write_rgb16(&src, Some(&silverfast_xmp(attrs)), None, false);
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(
+        code, 4,
+        "malformed gamma must be rejected, not silently linear: {err}"
+    );
+    assert!(!out.exists());
+
+    // inspect stays diagnostic: transfer unknown + a breadcrumb naming the value.
+    let (code, stdout, _err) = run(&["inspect", src.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let report = json(&stdout);
+    assert_eq!(report["input_color"]["transfer"], "unknown");
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("2,2")),
+        "inspect report must carry the malformed-gamma breadcrumb: {stdout}"
+    );
+}
+
+#[test]
+fn silverfast_unrecognized_negative_value_still_converts_a_negative() {
+    // F3 end-to-end: a genuine negative whose `Negative` reads as an unrecognized
+    // token (not "yes"/"no") must NOT be misread as positive-mode and rejected —
+    // an unrecognized value is `None`, not an explicit "No", so it still converts.
+    let tmp = TempDir::new("xmp-weirdneg");
+    let src = tmp.path("n.tif");
+    let attrs = r#"Silverfast:Company="LaserSoft Imaging" Silverfast:HDRScan="Yes" Silverfast:Gamma="1" Silverfast:Negative="y""#;
+    write_rgb16(&src, Some(&silverfast_xmp(attrs)), None, false);
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(
+        code, 0,
+        "an unrecognized Negative value must not trigger positive-mode rejection: {err}"
+    );
+    assert!(is_tiff(&out));
 }
 
 // --- telemetry (opt-in performance + context record) -------------------------
