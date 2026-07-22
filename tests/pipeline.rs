@@ -2678,6 +2678,82 @@ fn roll_warns_on_per_frame_film_base_override() {
 }
 
 #[test]
+fn roll_warns_on_per_frame_dmax_override() {
+    // density.dmax is a roll-fixed calibration (like film_base) since the
+    // dmax-reference task, but a per-frame override that sets it is applied (the
+    // frame converts with its overridden anchor) with a loud, `--strict`-promotable
+    // warning — not rejected. Mirrors `roll_warns_on_per_frame_film_base_override`.
+    let tmp = TempDir::new("roll-dmax-override");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let manifest_txt = format!(
+        r#"{{ "frames": [
+             {{ "input": {hdr:?},
+                "params": {{ "density": {{ "dmax": {{ "explicit": 2.4 }} }} }} }}
+           ] }}"#,
+        hdr = hdr.to_str().unwrap(),
+    );
+    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
+    let roll_args = |out: &str, strict: bool| -> Vec<String> {
+        let mut a = vec![
+            "roll".to_string(),
+            "--frames".to_string(),
+            manifest.to_str().unwrap().to_string(),
+            "--out-dir".to_string(),
+            tmp.path(out).to_str().unwrap().to_string(),
+            "--params".to_string(),
+            recipe.to_str().unwrap().to_string(),
+        ];
+        if strict {
+            a.push("--strict".to_string());
+        }
+        a
+    };
+
+    // Without --strict: the frame converts (exit 0) with a loud roll-level warning.
+    let args = roll_args("out", false);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        code, 0,
+        "an override warns, it does not fail:\n{stdout}\n{err}"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["succeeded"], 1,
+        "the frame still converts"
+    );
+    let w = report["warnings"]
+        .as_array()
+        .expect("roll-level warnings array");
+    assert!(
+        w.iter().any(|m| m
+            .as_str()
+            .unwrap()
+            .contains("overriding the roll-fixed display-white anchor")),
+        "the per-frame density.dmax override warns loudly: {report}"
+    );
+    assert!(
+        err.contains("overriding the roll-fixed display-white anchor"),
+        "warning echoed to stderr: {err}"
+    );
+
+    // With --strict: the same warning promotes to a non-zero exit, report still emits.
+    let args = roll_args("out-strict", true);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(
+        code, 1,
+        "--strict promotes the override warning to a failing exit"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["failed"], 0,
+        "the frame converted; the exit is the strict gate"
+    );
+    assert!(!report["warnings"].as_array().unwrap().is_empty());
+    assert!(err.contains("strict"), "stderr should explain: {err}");
+}
+
+#[test]
 fn roll_failed_frame_keeps_a_warning_raised_before_the_failure() {
     // A frame that warns (sigmoid ignores --density-gamma) and *then* fails
     // (missing input → decode error) still reports the earlier warning.

@@ -2013,10 +2013,11 @@ fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
 /// override) and output path. Config errors (a bad override, an unsupported knob)
 /// fail loudly here, before any frame is converted; runtime errors (a bad decode,
 /// a degenerate base) surface per frame during conversion. A per-frame override
-/// that touches the roll-fixed `film_base` is not rejected — it is applied, with a
-/// loud roll-level warning pushed to `roll_warnings` (like the not-frozen warning),
-/// so a deliberate per-frame base stays possible while the color-consistency break
-/// is surfaced and `--strict`-promotable.
+/// that touches a roll-fixed calibration (`film_base` or `density.dmax`) is not
+/// rejected — it is applied, with a loud roll-level warning pushed to
+/// `roll_warnings` (like the not-frozen warning), so a deliberate per-frame value
+/// stays possible while the color-consistency break is surfaced and
+/// `--strict`-promotable.
 fn resolve_frames(
     args: &RollArgs,
     shared: &ResolvedConfig,
@@ -2041,16 +2042,15 @@ fn resolve_frames(
             for mf in manifest.frames {
                 let (cfg, overrides) = match mf.params {
                     Some(ov) => {
-                        // `film_base` is roll-fixed: the whole batch is meant to
-                        // share one frozen base. A per-frame override *may* still
-                        // set it (a deliberate per-frame base stays possible), but
-                        // doing so gives this frame a different Dmin from the rest
-                        // of the roll and breaks color consistency — so warn loudly
-                        // (roll-level, `--strict`-promotable) and continue, applying
-                        // the override, rather than rejecting. (`density.dmax` is
-                        // still per-frame `auto` by default on this branch; the
-                        // `dmax-reference` task will make `Dmax` roll-fixed too and
-                        // should revisit whether it warrants the same warning.)
+                        // `film_base` and `density.dmax` are both roll-fixed
+                        // calibrations: the whole batch is meant to share one frozen
+                        // base (Dmin) and one display-white anchor (Dmax). A per-frame
+                        // override *may* still set either (a deliberate per-frame value
+                        // stays possible), but doing so gives this frame a different
+                        // Dmin / Dmax from the rest of the roll and breaks color
+                        // consistency — so warn loudly (roll-level,
+                        // `--strict`-promotable) and continue, applying the override,
+                        // rather than rejecting.
                         if ov.get("film_base").is_some() {
                             let msg = format!(
                                 "frame {}: a per-frame `params` override sets `film_base`, \
@@ -2058,6 +2058,23 @@ fn resolve_frames(
                                  from the rest of the roll, breaking color consistency. Set \
                                  the base once in the shared --params recipe (and drop the \
                                  per-frame `film_base`) if you want a frozen, consistent roll.",
+                                mf.input.display()
+                            );
+                            log.warn(&msg);
+                            roll_warnings.push(msg);
+                        }
+                        // `density.dmax` became a roll-fixed calibration in the
+                        // `dmax-reference` task (default `Fixed`, or an `Explicit`
+                        // measured/per-stock anchor frozen into the recipe). A per-frame
+                        // override of it breaks roll consistency exactly like `film_base`.
+                        if ov.get("density").and_then(|d| d.get("dmax")).is_some() {
+                            let msg = format!(
+                                "frame {}: a per-frame `params` override sets `density.dmax`, \
+                                 overriding the roll-fixed display-white anchor — this frame's \
+                                 Dmax differs from the rest of the roll, breaking color \
+                                 consistency. Set Dmax once in the shared --params recipe (and \
+                                 drop the per-frame `density.dmax`) if you want a frozen, \
+                                 consistent roll.",
                                 mf.input.display()
                             );
                             log.warn(&msg);
@@ -2214,9 +2231,28 @@ fn run_roll(args: RollArgs) -> Result<()> {
         roll_warnings.push(msg);
     }
 
-    // Resolve the plan. A per-frame override that touches the roll-fixed
-    // `film_base` appends its own roll-level warning here (warn-and-continue, like
-    // the not-frozen warning above), so `roll_warnings` is passed in to collect it.
+    // `density.dmax` is likewise a roll-fixed calibration by default: `Fixed` (the
+    // nominal constant), `Explicit` (a frozen scalar), and `None` (the bit-exact
+    // scene-referred escape hatch) all treat every frame identically. Only `Auto`
+    // (`--auto-d-max`) re-measures the display-white anchor from each frame's own
+    // pixels, so a shared recipe carrying it is not truly frozen — same
+    // warn-and-continue treatment as the base.
+    if matches!(shared.density.dmax, DmaxSource::Auto) {
+        let msg = "roll Dmax is NOT frozen: density.dmax is `auto`, so every frame measures \
+             its own display-white anchor — the roll is not color-consistent and the \
+             shared recipe is not truly shared. Freeze Dmax once (e.g. `nc estimate \
+             --d-max-region X,Y,W,H <reference-scan>`), then pass the reported anchor \
+             via `--d-max <d>` or a recipe with `density.dmax.explicit`, or accept the \
+             default fixed nominal anchor."
+            .to_string();
+        log.warn(&msg);
+        roll_warnings.push(msg);
+    }
+
+    // Resolve the plan. A per-frame override that touches a roll-fixed calibration
+    // (`film_base` / `density.dmax`) appends its own roll-level warning here
+    // (warn-and-continue, like the not-frozen warnings above), so `roll_warnings`
+    // is passed in to collect it.
     let planned = resolve_frames(&args, &shared, &mut roll_warnings, &log)?;
 
     // Guard every write target (per-frame outputs + sidecars, and the report
