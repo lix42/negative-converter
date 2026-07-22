@@ -132,9 +132,11 @@ reader degrades gracefully — recognized-but-unhandled layouts return an
 After decode, the image is normalized to **linear `f32` scanner RGB measurement
 coordinates** in `[0,1]` (plus an optional `f32` IR plane). These values are not
 silently Rec.709, sRGB, ACEScg, or another colorimetric working space. The input
-semantic resolver (planned: `input-data-semantics`) verifies the transfer and
-measurement meaning before Dmin/density; nothing in the negative algorithm needs
-to know the on-disk container.
+semantic resolver (`pipeline::input_semantics`, task `input-data-semantics`)
+verifies the transfer encoding and measurement meaning as two independent axes
+before Dmin/density — only a supported linear transfer paired with scanner-device
+meaning enters the pipeline, and ambiguity fails loudly (§9 Input/decode);
+nothing in the negative algorithm needs to know the on-disk container.
 
 ### Terminology & value domains
 
@@ -313,8 +315,10 @@ own parameter struct and can be unit-tested in isolation.
                                      ▼  output image (+ output.json)
 ```
 
-Stages 1's semantic resolution and 4's characterization are planned follow-ups.
-The current code already has decode, Dmin/algorithm, print controls,
+Stage 1's semantic resolution is **implemented** (`pipeline::input_semantics`,
+task `input-data-semantics`; see §4 and §9); stage 4's characterization remains a
+planned follow-up. The current code already has decode, Dmin/algorithm, print
+controls,
 working→output ICC transform, and TIFF encode, but its print controls still live
 inside the algorithm render. Landing stage 4 must split that boundary: film-domain
 reconstruction stays in stage 3; density's Dmax subtraction moves out of its
@@ -782,28 +786,84 @@ Unknown keys are rejected (see §8).
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
   Recipe key `input.export_ir`.
-- Input color handling currently uses the combined, mutually-exclusive recipe key
-  `input.color`. This is a **transitional schema**, not a durable contract and not
-  a promise that an
-  embedded profile will be applied before density:
-  - default `"auto"` currently accepts supported SilverFast HDR/HDRi as linear
-    scanner measurements; `input-data-semantics` will resolve transfer encoding
-    and scanner-device meaning as independent axes. Gamma 1 alone will not be
-    accepted as proof of raw scanner provenance.
-  - `--assume-linear` ⇒ `input.color = "linear"` — legacy combined assertion;
-    it will be replaced/deprecated because linear transfer does not prove
-    scanner-device meaning.
-  - `--input-profile <icc>` ⇒ `input.color = { "profile": "<icc>" }` —
-    accepted in the recipe shape but **not applied**: `convert` rejects it loudly
-    (exit 4). It is reserved for the deferred before-density experiment; there is
-    no commitment to make it the normal conversion path.
-  Passing both is a usage error; either flag replaces a recipe's `input.color`.
-  `input-data-semantics` replaces this with independent transfer and meaning
-  assertions in CLI and recipe form. Explicit assertions outrank parsed metadata
-  and are reported with provenance; authoritative raw/container evidence outranks
-  descriptive tags; contradictions fail loudly. Only scanner-device + supported
-  linear transfer enters Dmin/density. Colorimetric/encoded negatives remain
-  unsupported until their own inverse-transfer/reconstruction path exists.
+- Input color is resolved as **two independent axes** before Dmin/density — the
+  transfer encoding and the measurement meaning — never a single combined
+  assertion. Each is a mutually-exclusive assertion with its own recipe key; the
+  two never conflict (they describe different facts), so each flag replaces only
+  its own axis:
+  - `--input-transfer <auto|linear>` ⇒ `input.transfer` (default `"auto"`) —
+    how the samples are *encoded*. `linear` asserts a linear transfer (no
+    inverse-transfer decoding); it does **not** prove scanner-device provenance.
+  - `--input-meaning <auto|scanner-device|colorimetric>` ⇒ `input.meaning`
+    (default `"auto"`) — what the pixel axes *are*. Only `scanner-device` (with a
+    supported linear transfer) enters Dmin/density without a source→working
+    transform. `colorimetric` is recognized but **unsupported** (no inverse
+    transfer/reconstruction path exists yet); `convert` rejects it even when
+    asserted (an override cannot make it supported).
+  - `auto` on either axis resolves from container evidence and **fails loudly in
+    `convert`** when it stays ambiguous — nothing is silently labelled linear
+    Rec.709 for lacking an ICC. `nc inspect` still reports the evidence so the
+    file is diagnosable.
+  Resolution and precedence (deterministic, `pipeline::input_semantics`):
+  an explicit assertion outranks a descriptive tag which outranks the
+  absence-of-evidence default; authoritative container structure (SilverFast
+  HDR/HDRi raw mode) proves *both* a linear transfer and scanner-device meaning.
+  Raw-mode provenance is **detected from SilverFast's XMP mode metadata** (TIFF
+  tag 700), not assumed from "we decoded it" and not keyed on spoofable signals:
+  the decoder accepts any 3-channel 16-bit chunky RGB TIFF, so a file is treated
+  as SilverFast raw mode only when its XMP carries `Silverfast:Company =
+  "LaserSoft Imaging"` **and** `Silverfast:HDRScan = Yes` (grounded in the real
+  sample scans). The `Software` string and IR-plane presence are deliberately
+  **not** provenance — a processed export keeps the `Software` tag, and a generic
+  RGB16 + Gray16 multipage forges an IR-like plane; both are rejected. The XMP
+  `Silverfast:Gamma` feeds the transfer axis (`Gamma ≈ 1` corroborates linear; a
+  non-linear gamma on a raw-mode scan makes the transfer ambiguous). A gamma value
+  that is **present but uninterpretable** (e.g. a locale-formatted `"2,2"`) is
+  treated as ambiguous, **not** linear (transfer → `unknown`, with a decode
+  warning naming the value) — nc does not guess the locale. A tag-700 packet that
+  is present but yields **no recognizable SilverFast metadata** (malformed, or an
+  unrecognized namespace/layout — e.g. a future scanner) emits a warning and
+  establishes no provenance rather than silently dropping it. A **generic /
+  colorimetric / processed RGB16 TIFF** (e.g. one carrying an sRGB ICC) therefore
+  resolves `meaning: unknown` and is **rejected by `convert`** (exit 4, with an
+  error suggesting `--input-transfer linear --input-meaning scanner-device` if the
+  user knows it is a raw scan) — never silently converted as a raw negative.
+  Gamma 1 establishes **only** the transfer axis (never raw-mode provenance or
+  meaning). An explicit assertion that contradicts authoritative structure (e.g.
+  `--input-meaning colorimetric` on a raw-mode scanner scan) **fails** rather than
+  overriding it (exit 2); an explicit assertion that overrides a descriptive tag
+  is honored and records the displaced tag. Every explicit override is reported
+  with its CLI-vs-recipe provenance. A descriptive gamma tag that contradicts
+  raw-mode linear semantics makes the transfer **ambiguous** (rejected by
+  `convert`, explained by `inspect`) unless an explicit `--input-transfer linear`
+  resolves it.
+  - An **embedded scanner ICC** (TIFF tag 34675) is retained and reported as
+    device-characterization metadata (a safe class/space/PCS/version/description
+    summary — never a raw byte dump), but it is **never applied before density**
+    and does not by itself establish either axis.
+  - IR remains measurement data — never color-transformed, bit-identical before
+    and after input resolution.
+  - The removed combined key `input.color` (and the `--assume-linear` flag) is
+    rejected with a pinned migration error — it must never silently assert both
+    axes.
+  - `--input-profile <icc>` stays **rejected for normal conversion** (exit 4):
+    input-side ICC application has no validated placement and is reserved for the
+    deferred `scanner-profile-before-density-experiment`.
+  - A SilverFast **positive-mode** scan (XMP `Silverfast:Negative = No`) is raw
+    linear scanner data, so it passes the transfer/meaning gate — but converting
+    it as a negative would be silently wrong, so `convert` **rejects it loudly**
+    (exit 4) with a distinct "positive-mode not yet supported" message.
+    Positive-mode support (and embedded-ICC handling) is a follow-up.
+  `nc inspect`, the `convert` report, **and each `nc roll` frame report** expose
+  the resolved `input_color`: both axes with per-axis evidence, whether an ICC is
+  embedded plus the safe summary, and `transfer_decoded` (whether any
+  inverse-transfer decoding was performed — always `false` in Step 1, which
+  accepts only already-linear samples). `meaning` is always a flat string
+  (`scanner-device` / `colorimetric` / `unknown`); the colorimetric detail rides
+  in a sibling `meaning_reference` field so consumers can key `meaning` uniformly.
+  In roll mode a shared recipe (or per-frame override) asserting the
+  unconditionally-unsupported `input.meaning: colorimetric` is rejected up front
+  (exit 4), before any frame is decoded.
 
 ### Film base / Dmin (stage 2)
 The base source is a single mutually-exclusive choice, recipe key
@@ -1201,6 +1261,16 @@ Warnings (e.g. clipped highlights/shadows, IR present but ignored, BigTIFF
 auto-promoted) are surfaced in the JSON report and on stderr, without failing the
 run unless `--strict` is set.
 
+**Input-semantic resolution** (§9 Input/decode) maps to these codes: an
+ambiguous or unsupported input (transfer/meaning that cannot reach a supported
+linear + scanner-device resolution — including an asserted `colorimetric`
+meaning) is an **unsupported** input, exit 4; an explicit assertion that
+contradicts authoritative container structure, the removed combined `input.color`
+recipe key, and the deprecated `--assume-linear` flag are **usage** errors, exit
+2; `--input-profile` (reserved, not applied) is unsupported, exit 4. `nc inspect`
+never fails on ambiguity — it reports the per-axis evidence so the file stays
+diagnosable.
+
 A **degenerate resolved film base** (a zero / negative / non-finite channel)
 maps to exit 1 (generic error) on both estimate paths: the single-measurement
 path via `film_base::estimate`'s finite-and-positive guard, and `nc estimate
@@ -1357,18 +1427,18 @@ the NLP feature comparison, Phase 6).
     reusing the fail-soft `writeln!(stdout)` pattern the `--telemetry-file -` sink
     already uses. Pre-existing on `main`, independent of the telemetry work.
     Tracked: `stdout-broken-pipe-safety`.
-18. **Input data semantics and validation.** Resolve transfer encoding separately
-    from whether values are scanner-device measurements, colorimetric RGB, or
-    unknown. Inspect and report evidence for both; Gamma 1 establishes only a
-    linear transfer and does not prove raw-mode provenance, while an embedded ICC
-    does not automatically authorize mixing channels before Dmin. Only supported
-    SilverFast HDR/HDRi inputs with positive raw-mode evidence and a linear
-    transfer stay in scanner coordinates through density; ambiguity fails loudly
-    and IR remains untouched. Replace/deprecate the combined `--assume-linear` /
-    `input.color` assertion with independent CLI/recipe assertions; explicit
+18. **Input data semantics and validation — DELIVERED** (`input-data-semantics`;
+    the contract is now §4 + §9). Transfer encoding is resolved separately from
+    whether values are scanner-device measurements, colorimetric RGB, or unknown,
+    with evidence reported for both; Gamma 1 establishes only a linear transfer and
+    does not prove raw-mode provenance, and an embedded ICC does not authorize
+    mixing channels before Dmin. Only inputs with positive raw-mode evidence and a
+    linear transfer stay in scanner coordinates through density; ambiguity fails
+    loudly and IR remains untouched. The combined `--assume-linear` / `input.color`
+    assertion was replaced by the independent `input.transfer` / `input.meaning`
+    CLI/recipe axes (the old forms now emit a pinned migration error); explicit
     overrides have deterministic evidence precedence and reported provenance but
-    cannot make unsupported colorimetric/encoded negatives valid. Tracked:
-    `input-data-semantics`.
+    cannot make unsupported colorimetric/encoded negatives valid.
 19. **Conventional scanner ICC before density — deferred experiment.** Compare
     `scanner RGB → Dmin/log density` against applying the same scanner ICC to image
     and Dmin first, using only a defined linear destination and controlled target

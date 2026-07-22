@@ -379,6 +379,8 @@ mod tests {
             make: None,
             model: None,
             software: None,
+            silverfast_xmp: None,
+            embedded_icc: None,
             warnings: vec![],
         }
     }
