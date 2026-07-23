@@ -76,6 +76,7 @@ graph TD
   pipeline-orchestration --> memory-preflight
   pipeline-orchestration --> dependency-hygiene
   pipeline-orchestration --> release-readiness
+  pipeline-orchestration --> value-domain-terminology
   memory-preflight --> streaming-tiled-io
   real-scan-verification --> streaming-tiled-io
   film-base-estimation --> auto-base-redesign
@@ -190,6 +191,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `display-output-acceptance` (post-MVP): `output-presets`, `real-scan-verification`, `color-characterization-calibration`
 - `transactional-output-writes` (post-MVP, hardening): `pipeline-orchestration`
 - `memory-preflight` (post-MVP, hardening): `pipeline-orchestration`
+- `value-domain-terminology` (post-MVP, cleanup, **preserves data flow**): `pipeline-orchestration`
 - `dependency-hygiene` (post-MVP, cleanup): `pipeline-orchestration` (dep removal is standalone)
 - `release-readiness` (post-MVP, productization): `pipeline-orchestration` (doc fixes now; packaging best after `display-output-acceptance`)
 - `streaming-tiled-io` (post-MVP, **evaluate-first**): `memory-preflight`, `real-scan-verification`
@@ -320,6 +322,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   Phase B (expensive, **evaluate-first**): strip/tile decode + streaming encode.
   STEP 0 gate — evaluate from measured peak whether this is needed at all; if data
   is insufficient, collect it first; proceed only if real scans exceed the budget.
+- [ ] [Value-domain terminology & Dmin/Dmax clarity](tasks/value-domain-terminology.md) — extract design-spec §4 terminology into a standalone doc + an agent skill, and make `Dmin`/`Dmax` human-clear. Preserves the data flow; details at execution.
 - [ ] [Dependency & module hygiene](tasks/dependency-hygiene.md) — from the
   hygiene review: drop three unused crates (`image`, `kamadak-exif`, `palette` —
   verified builds without them; `image` pulls a large codec tree) and unify the two
