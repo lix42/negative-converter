@@ -132,7 +132,9 @@ standing constraints:
 - Finish with **all four CI gates green**, in order:
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
   `cargo build` → `cargo test`.
-- Edit `docs/design-spec.md` and `docs/design-spec.html` **together**.
+- `docs/design-spec.md` is the **sole maintained design source** — edit it there.
+  The rendered HTML companion is retired and may be regenerated after the feature
+  roadmap stabilizes; do not recreate or hand-edit it.
 - Respect four-coupled-spots for any knob (CLI field + `*Params` + merge arm +
   validate + a merge test).
 - Report back with a per-item summary and the **verbatim** final gate results.

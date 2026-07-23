@@ -187,6 +187,9 @@ does not inherit this proposal's artifact or physical-neutralization assumptions
 
 ## Dependencies
 
+_Historical: this task is closed—superseded (see the notice at the top); the
+dependencies below are decision history, not a live prerequisite set._
+
 - [Input data semantics and validation](input-data-semantics.md)
 - [Color management](color-management.md)
 - [Roll-fixed Dmax from a fully-exposed reference frame](dmax-reference.md)

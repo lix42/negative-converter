@@ -25,7 +25,7 @@ reconstruction, and density-curve rendering.
 
 The master includes Dmin normalization, negative reconstruction, the exponential
 or sigmoid density curve, and supported fixed/roll Dmax placement. It bypasses
-all later white balance, exposure, black/white placement, highlight compression,
+all later white balance, exposure, black/range placement, highlight compression,
 display tone mapping, gamut mapping, and transfer encoding.
 
 After recipe/CLI merge, `film-master` rejects frame-local auto Dmax and every

@@ -27,7 +27,7 @@ resolves container, depth, primaries/profile, transfer function, tone/gamut
 mapping, and required metadata.
 
 `film-master` branches directly from NC film RGB v1 mapped linear ACEScg and bypasses
-white balance, exposure, black/white placement, highlight compression, SDR/HDR tone
+white balance, exposure, black/range placement, highlight compression, SDR/HDR tone
 mapping, and display gamut mapping. It preserves the intentional film, lens,
 development, scanner, reconstruction, and curve rendering; it is not a physical
 scene-linear recovery. Named display presets use the SDR or HDR rendering
@@ -134,7 +134,7 @@ preserve misleading terminology.
   flags-win resets to defaults, complete resolved-report provenance, and the
   absence of a silent-ignore option.
 - Simple migration tests prove named display presets map raw inversion before
-  applying resolved WB/black/white placement, while `film-master`
+  applying resolved WB/black/range placement, while `film-master`
   rejects non-default new controls and legacy aliases. Help, recipes, and reports
   use the replacement names and emit the pinned warned-alias behavior for the old
   names.

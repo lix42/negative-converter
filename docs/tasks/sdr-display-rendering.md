@@ -13,13 +13,13 @@ Implement a pure deterministic display branch:
 
 ```text
 linear ACEScg film rendering
-→ shared linear display adjustments (white balance/exposure/black/white placement)
+→ shared linear display adjustments (white balance/exposure/black/range placement)
 → SDR reference-white and tone mapping
 → chromatic adaptation + destination gamut mapping
 → rendered linear Display P3 or sRGB
 ```
 
-Reference white, SDR highlight roll-off, black/white placement, and gamut behavior must
+Reference white, SDR highlight roll-off, black/range placement, and gamut behavior must
 be explicit resolved parameters, not side effects of clipping or an ICC transform.
 This task is the sole owner of ACEScg → rendered linear destination RGB,
 including chromatic adaptation and gamut mapping. The Display P3 task consumes

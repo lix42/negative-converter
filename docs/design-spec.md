@@ -153,7 +153,7 @@ plane is a separate single channel, carried but not consumed (§6.1).
 | **transmission** (raw scan value) | fraction of light the film passes | more transparent film, thinner negative, brighter pixel *in the raw scan* — a **darker** scene | `[0, 1]` (= `u16`/65535) | `io::decode`, `LinearImage.rgb` |
 | **film base / `Dmin`** | the unexposed rebate's transmission — the per-channel *relative* maximum transmission | (the ceiling of transmission) | `(0, 1]` | `FilmBase`, `film_base::estimate` |
 | **density `D` / `B` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `B = density_scale·D + density_offset` (per-channel corrected density); `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)` (after regional balance, §7.2) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `B`/`D′` shifted by the offset (and, for `D′`, the regional balance) | `density::to_density`, `density::regional_balance`, `DensityImage.density` |
-| **corrected density `D′`** | Dmin-normalized density after scale/offset and regional balance, before the selected density-to-positive curve | **denser** negative — a **brighter** scene | algorithm-defined and unclamped | replacement reconstruction/curve boundary |
+| **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | replacement reconstruction/curve boundary |
 | **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | algorithm-defined and unclamped `f32` | planned typed reconstruction output |
 | **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | planned working-space mapper |
 | **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
@@ -259,7 +259,7 @@ detector proposes as possible rebate.
   with legacy depth/profile/container flags; advanced explicit combinations use
   `custom`. Legacy output flags without a preset retain the transitional TIFF
   behavior until migration is complete. `film-master` branches directly from NC
-  film RGB v1 mapped linear ACEScg and bypasses white balance, exposure, black/white placement,
+  film RGB v1 mapped linear ACEScg and bypasses white balance, exposure, black/range placement,
   highlight compression, and all display tone/gamut rendering; a creatively or
   print/display-adjusted linear master is an explicit `custom` workflow, not the
   default master. An explicitly selected measured correction is exempt: it
@@ -284,6 +284,14 @@ detector proposes as possible rebate.
 
 The conversion is a linear sequence of pure-function stages. Each stage has its
 own parameter struct and can be unit-tested in isolation.
+
+The diagram below depicts the **target / replacement** architecture (tagged
+reconstruction, NC film RGB v1 working-space mapping, and the film-master /
+display-render split). The **current shipped** pipeline implements: decode +
+input-semantics resolution, film-base / `Dmin` estimation, an `Algorithm` +
+`Converter` render with print controls applied *inside* it, a working→output ICC
+transform, and TIFF encode. See the "Architecture" section of `CLAUDE.md` for the
+current-vs-target framing.
 
 ```
                  ┌──────────────────────────────────────────────┐
@@ -354,7 +362,7 @@ rather than a physical scene-linear recovery. Legacy no-preset TIFF calls retain
 their current ordering until preset activation.
 
 Within the display branch, SDR and HDR share the same resolved linear white
-balance, exposure, and black/white placement. They diverge only for output-specific
+balance, exposure, and black/range placement. They diverge only for output-specific
 highlight/reference-white, tone, gamut, and transfer rendering, so a gain-map
 pair starts from one consistently adjusted source without forcing SDR highlight
 compression onto the HDR rendition.
@@ -1084,9 +1092,19 @@ crossover.
 - Target recipe: `reconstruction.type`, then for density
   `reconstruction.density` and tagged `reconstruction.curve`, exactly as shown
   in §8. There are no sibling top-level density or curve sections.
-- The unreleased `--algorithm` flag and old `algorithm` recipe form are rejected
-  with a migration error rather than retained as aliases. The old top-level
-  `density`, `sigmoid`, and `simple` forms are rejected at the same boundary.
+- When the tagged reconstruction schema activates, the `--algorithm` flag and old
+  `algorithm` recipe form will be rejected with a migration error rather than
+  retained as aliases, and the old top-level `density`, `sigmoid`, and `simple`
+  forms will be rejected at the same boundary. (Today's shipped CLI still
+  **accepts** `--algorithm`; see §8 and the current-keys note below.)
+
+> **Current shipped keys.** The released binary implements the legacy transitional
+> schema (§8), **not** the target `reconstruction.*` paths in this section. Today a
+> recipe selects the algorithm with a top-level `algorithm` key and configures it
+> via top-level `density.{density_scale, density_gamma, dmax, shadow_balance,
+> highlight_balance, balance_range}` and `sigmoid.{contrast, toe, shoulder}` (plus
+> `simple`). Write recipes for today's binary against §8's legacy schema; the
+> `reconstruction.*` paths below are the target migration.
 
 ### Density stage (`reconstruction = density`)
 - `--density-scale R,G,B` ⇒ `reconstruction.density.scale` — per-channel
@@ -1189,7 +1207,7 @@ false-positive on legitimate high-contrast conversions).
 - `--black-point <f>` — paper black / shadow floor.
 - Target shared render contract adds `--linear-range LOW,HIGH` /
   `print.linear_range` (default `[0,1]`) for the exact affine
-  `(x-low)/(high-low)` black/white placement. It is distinct from the existing
+  `(x-low)/(high-low)` black/range placement (black/white-point placement). It is distinct from the existing
   density print `black_point` and from SDR/HDR reference white in nits.
 - White balance — a single mutually-exclusive choice, recipe key
   `print.white_balance` (default `{ "explicit": [1, 1, 1] }` = neutral; see

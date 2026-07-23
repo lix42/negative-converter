@@ -15,7 +15,7 @@ SDR Display P3 base + display-HDR rendition → gain map + ISO metadata → cont
 ```
 
 Both renditions must originate from the same ACEScg film-rendering pixels and identical
-resolved shared linear adjustments (white balance, exposure, and black/white placement).
+resolved shared linear adjustments (white balance, exposure, and black/range placement).
 They diverge only in SDR-versus-HDR reference-white, tone, gamut, and transfer
 rendering.
 

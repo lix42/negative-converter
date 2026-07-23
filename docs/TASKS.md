@@ -42,7 +42,7 @@ the future master branch.
 - **pipeline/film_base** — estimate `Dmin` from unexposed border, with CLI override.
 - **pipeline/color** — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
 - **algo** — current `Converter` implementations migrate to tagged `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve.
-- **cli + main** — clap subcommands (`convert`/`inspect`/`estimate`/`params`), recipe load/merge, JSON report, exit codes.
+- **cli + main** — clap subcommands (`convert`/`inspect`/`estimate`/`params`/`roll`), recipe load/merge, JSON report, exit codes.
 
 ### Key choices
 - **Rust**, single static binary. Pure functions per stage; CLI is the only orchestrator.
@@ -114,6 +114,7 @@ graph TD
   color-management --> scanner-profile-before-density-experiment
   input-data-semantics --> negative-reconstruction-density-curves
   dmax-reference --> negative-reconstruction-density-curves
+  algo-sigmoid --> negative-reconstruction-density-curves
   negative-reconstruction-density-curves --> film-rgb-working-space
   color-management --> film-rgb-working-space
   film-rgb-working-space --> film-master-render-pipeline
@@ -185,7 +186,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `conversion-versioning` (post-MVP): `pipeline-orchestration`
 - `input-data-semantics` (post-MVP): `pipeline-orchestration`
 - `scanner-profile-before-density-experiment` (post-MVP, **deferred experiment**): `input-data-semantics`, `color-management`
-- `negative-reconstruction-density-curves` (post-MVP): `input-data-semantics`, `dmax-reference`
+- `negative-reconstruction-density-curves` (post-MVP): `input-data-semantics`, `dmax-reference`, `algo-sigmoid`
 - `film-rgb-working-space` (post-MVP): `negative-reconstruction-density-curves`, `color-management`
 - `film-master-render-pipeline` (post-MVP): `film-rgb-working-space`, `dmax-reference`
 - `optional-color-correction-profiles` (post-MVP, **optional / deferred**): `film-rgb-working-space`, `film-master-render-pipeline`; no downstream blockers
@@ -268,7 +269,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   range collapse) warning catching the finite-all-black underflow the loss counters
   miss, with a false-positive guard validated on real scans.
 - [x] [Input data semantics and validation](tasks/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
-- [x] [Post-reconstruction characterization runtime](tasks/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by the four tasks listed immediately below
+- [x] [Post-reconstruction characterization runtime](tasks/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `negative-reconstruction-density-curves`, `film-rgb-working-space`, `film-master-render-pipeline`, and `optional-color-correction-profiles`
 - [ ] [Negative reconstruction and density curves](tasks/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
 - [ ] [NC Film RGB working-space mapping](tasks/film-rgb-working-space.md) — map every film rendering through versioned NC film RGB v1 into typed linear ACEScg/D60
 - [ ] [Film-master and shared display pipeline](tasks/film-master-render-pipeline.md) — route intentional ACEScg film rendering to `film-master` or shared WB → exposure → black/range adjustments before SDR/HDR

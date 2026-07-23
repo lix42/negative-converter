@@ -141,3 +141,5 @@ forms fail loudly rather than silently changing meaning.
 
 - [Input data semantics and validation](input-data-semantics.md)
 - [Roll-fixed Dmax from a fully-exposed reference frame](dmax-reference.md)
+- [Sigmoid / H&D-curve tone algorithm](algo-sigmoid.md) — this task preserves the
+  exact shipped sigmoid implementation, so it is a real implementation prerequisite
