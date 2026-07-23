@@ -1,5 +1,14 @@
 # Post-Reconstruction Characterization Runtime
 
+**Status:** closed—superseded (2026-07-23)
+
+This proposal is retained as historical decision context and was not
+implemented. NC does not aim to recover a physically neutral scene: film stock,
+lens, development, and scanner character are intentional parts of the default
+rendering. Any future measured neutralization must be an explicitly selected
+correction profile, not a dependency of P3, HDR, output presets, or display
+acceptance. Replacement film-preserving pipeline tasks are defined separately.
+
 ## Goal
 
 Establish the runtime boundary that maps a reconstructed scanner/film-dependent
