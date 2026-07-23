@@ -37,7 +37,7 @@ plus a sample of `~/Pictures/scan/`):
    profile, and report are internally consistent, grays are plausibly neutral,
    and the float path preserves unclamped values reported by the current
    pipeline. Do not call this transitional print-rendered output the future
-   `scene-master`.
+   `film-master`.
 4. **IR path (HDRi)** — `--export-ir` writes a matching-dimension IR TIFF;
    `--strict` behavior per spec.
 5. **Determinism** — two identical TIFF runs are byte-identical; sidecar reloaded

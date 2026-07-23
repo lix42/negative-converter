@@ -2811,8 +2811,13 @@ verified findings applied:
   controls and no longer affect simple artifact identity.
 
 ## color-characterization-calibration
-**Status:** not started
-**Updated:** 2026-07-21
+**Status:** superseded
+**Updated:** 2026-07-23
+
+- 2026-07-23: Superseded by `optional-color-correction-profiles`. Measured
+  neutralization is now an explicitly selected, non-blocking correction feature;
+  it is not part of the default film-preserving pipeline and no display task
+  depends on it.
 
 - 2026-07-21: Added the offline calibration half split from the runtime task. It
   fits matrix/curves against controlled target data, validates held-out Delta E,
@@ -2830,8 +2835,13 @@ verified findings applied:
   excluded from calibration and artifact compatibility.
 
 ## post-characterization-render-pipeline
-**Status:** not started
-**Updated:** 2026-07-21
+**Status:** superseded
+**Updated:** 2026-07-23
+
+- 2026-07-23: Superseded by `film-master-render-pipeline`. The replacement
+  consumes typed NC film RGB v1 mapped ACEScg, renames `scene-master` to
+  `film-master`, and explicitly preserves intentional film rendering rather than
+  claiming physical scene recovery.
 
 - 2026-07-21: Split pipeline/routing work from characterization runtime. This task
   moves WB/exposure/black/highlight controls after characterization, provides the
@@ -2854,6 +2864,83 @@ verified findings applied:
   `print.linear_range`; old simple controls are warned conflicting aliases, while
   legacy no-preset TIFF retains current ordering during migration. Scene master
   rejects any non-default resolved adjustment.
+
+## negative-reconstruction-density-curves
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Defined tagged `simple` and `density` reconstruction. Density owns
+  its parameters and a tagged `exponential { gamma }` or
+  `sigmoid { contrast, toe, shoulder }` curve; exponential is the default. The
+  unreleased `--algorithm` and old recipe schema are rejected cleanly.
+- 2026-07-23: Separated corrected density `D′` from the curve, preserved current
+  exponential pixels and the exact sigmoid equation, moved Dmax ownership to
+  the curve, and made every path return typed `FilmRgbImage`. Simple WB/range
+  moves downstream for named presets while legacy no-preset TIFF ordering stays
+  unchanged through migration.
+- 2026-07-23: Pinned the target recipe to one nested tagged
+  `reconstruction` object: density correction lives under `.density`, while
+  exponential/sigmoid parameters and Dmax live under `.curve`. Pinned every CLI
+  key mapping and made cross-curve fields—including customized gamma with
+  sigmoid—fail after merge instead of being ignored.
+- 2026-07-23: Separated `reconstruction.schema_version = 1` from behavioral
+  `pipeline_version`. Partial input may omit the curve and resolve to tagged
+  exponential defaults, while normalized recipes/reports always emit the curve.
+  The bit-identical refactor/no-preset compatibility does not claim a behavioral
+  bump; `conversion-versioning` owns the prospective bump when named-preset
+  activation and simple reordering change default pixels.
+
+## film-rgb-working-space
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Retired `docs/design-spec.html` as a maintained companion. The
+  Markdown design spec is now the sole source; HTML may be regenerated after the
+  feature roadmap stabilizes.
+- 2026-07-23: Defined NC film RGB v1 as the existing intentional linear
+  Rec.709/D65 interpretation followed by the pinned transform/adaptation to
+  ACEScg/D60. This is NC's film-rendering intent, not a provisional physical-
+  scene claim.
+- 2026-07-23: Added planned private-field `FilmRgbImage` → `AcesCgImage`
+  boundaries, recipe/report mapping identity, unclamped vector fixtures, and a
+  fail-loud prohibition on direct film RGB tagging as a named color output.
+- 2026-07-23: Kept working-space verification local to direct pinned
+  Rec.709/D65 → ACEScg/D60 matrix/adaptation vectors. Cross-encoding and
+  independent display decode-back belong exclusively to display acceptance.
+
+## film-master-render-pipeline
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Replaced `scene-master` with `film-master`: unclamped linear
+  ACEScg containing the intentional film/lens/development/scanner rendering, not
+  physical scene-linear recovery. Reconstruction, density curve, and supported
+  Dmax placement remain in the master; later print/display controls are bypassed.
+- 2026-07-23: Pinned fail-loud rejection of frame-local auto Dmax and non-default
+  downstream controls. Named display outputs share WB → exposure → black/range
+  placement after ACEScg before branching into SDR/HDR renderers. Legacy
+  no-preset TIFF ordering remains unchanged until preset migration.
+- 2026-07-23: Clarified that the optional correction task may insert an
+  explicitly selected correction immediately before the split. A corrected
+  unclamped ACEScg master remains `film-master` but must identify the correction;
+  the default master has no profile and this task does not depend on one.
+
+## optional-color-correction-profiles
+**Status:** optional / deferred
+**Updated:** 2026-07-23
+
+- 2026-07-23: Reframed measured scanner/film/development/lens neutralization as
+  an opt-in CCR-like profile after the defined working-space boundary. Profiles
+  must state what they correct and whether a lens is included.
+- 2026-07-23: Kept capture, fitting, curves/matrices, and Delta E validation out
+  of the default pipeline. This task depends on `film-rgb-working-space` and
+  `film-master-render-pipeline` so it owns insertion before the split and
+  corrected-master semantics; it has no downstream dependency edges.
+- 2026-07-23: Pinned selection to `--correction-profile PATH` /
+  `correction.profile.file` (default `null`), with correction immediately after
+  NC film RGB v1 and before the film-master/display split. The optional task owns
+  runtime integration, fail-loud artifact validation, hash/scope provenance, and
+  corrected-master reporting.
 
 ## display-p3-output
 **Status:** not started
@@ -2883,7 +2970,11 @@ verified findings applied:
 
 ## hdr-display-rendering
 **Status:** not started
-**Updated:** 2026-07-21
+**Updated:** 2026-07-23
+
+- 2026-07-23: Rebased the renderer on intentional linear ACEScg film values from
+  `film-master-render-pipeline`; physical scene recovery and optional correction
+  profiles are not prerequisites.
 
 - 2026-07-21: Planned a pure scene-linear ACEScg to BT.2020 PQ/HLG render stage.
   Rec.2100 is a display encoding, not nc's density or internal working space.
@@ -2892,7 +2983,10 @@ verified findings applied:
 
 ## sdr-display-rendering
 **Status:** not started
-**Updated:** 2026-07-21
+**Updated:** 2026-07-23
+
+- 2026-07-23: Rebased the renderer on intentional linear ACEScg film values and
+  the shared post-ACEScg print controls from `film-master-render-pipeline`.
 
 - 2026-07-21: Added the missing owner for scene-to-SDR rendering. It consumes
   characterized linear ACEScg and explicitly resolves print controls, reference
@@ -2922,7 +3016,15 @@ verified findings applied:
 
 ## output-presets
 **Status:** not started
-**Updated:** 2026-07-21
+**Updated:** 2026-07-23
+
+- 2026-07-23: Renamed `scene-master` to `film-master` and defined it as the
+  unclamped linear ACEScg encoding of NC's intentional film rendering. Removed
+  artifact/calibration assumptions; optional correction profiles do not affect
+  preset availability.
+- 2026-07-23: Added `conversion-versioning` as an explicit prerequisite because
+  preset/default activation owns a golden-tested behavioral
+  `pipeline_version` boundary.
 
 - 2026-07-21: `gain-map-hdr` is the intended default. Separate presets make SDR
   Display P3, sRGB compatibility, linear ACEScg scene master, PQ, and HLG explicit;
@@ -2966,7 +3068,22 @@ verified findings applied:
 
 ## display-output-acceptance
 **Status:** not started
-**Updated:** 2026-07-21
+**Updated:** 2026-07-23
+
+- 2026-07-23: Removed calibration from the dependency and acceptance matrix.
+  Acceptance now verifies faithful preservation of NC's intended film rendering,
+  cross-encoding consistency, tone/gamut behavior, metadata, determinism, and
+  viewer interoperability rather than agreement with a physical scene.
+- 2026-07-23: Made acceptance reproducible with a versioned golden manifest,
+  canonical pre-encode buffers, independent decode-back oracles, quantitative
+  bounds for float/SDR/PQ/HLG/gain-map outputs, normalized metadata comparison,
+  and a separate binary manual-viewer interoperability rubric.
+- 2026-07-23: Refined PQ/HLG acceptance to a bit-depth/transfer-derived
+  independent quantization oracle (half-code lossless or spike-approved one-code
+  codec allowance) over observable stored codes; pre-quantization arithmetic is
+  not asserted by the black-box acceptance harness. Pinned
+  cross-encoding exposure/reference-white normalization, D65 CIELAB,
+  Sharma–Wu–Dalal CIEDE2000 parameters, and CIE 1976 u'v' formulas.
 
 - 2026-07-21: Split final display/HDR acceptance from core real-scan verification.
   This task waits for output presets and reuses the verified full-size assets to

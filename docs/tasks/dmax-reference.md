@@ -11,10 +11,9 @@ the default to an explicit, lower-priority "exposure-normalizing" mode.
 > **Terminology.** `Dmax` is a **scalar** in corrected-density (`D′`) space,
 > distinct from classic photographic film Dmax (the negative's physical maximum
 > optical density). The shipped pre-artifact renderer used it as a display-white
-> anchor. In the target characterized density path it supplies
-> `G = 10^(−gamma·Dmax)`, a roll exposure-placement gain applied after the
-> artifact. An arbitrary nonlinear artifact means `D′ = Dmax` is not guaranteed
-> to land at `1.0`; SDR/HDR rendering owns display reference white. This task
+> anchor. In the replacement pipeline, Dmax belongs to the selected density
+> curve: exponential uses it for scalar placement and sigmoid uses it as a
+> curve-shaping input. SDR/HDR rendering owns display reference white. This task
 > changes acquisition/default policy and keeps the parameter's density units.
 
 ## Background
@@ -51,9 +50,9 @@ entirely; `ir-holder-detection`'s holder mask is the complementary
 border-exclusion fix for anyone who keeps per-frame auto-`Dmax`.
 
 **Superseding note:** this task **supersedes the "Dmax is frame-local, auto by
-default" decision from the shipped `dmax-white-anchor` task**. For the target
-characterized density runtime, it also adopts the post-artifact scalar placement
-semantics above; the fused characterization/placement task owns that machinery.
+default" decision from the shipped `dmax-white-anchor` task**. The replacement
+`negative-reconstruction-density-curves` task owns the curve-specific Dmax
+machinery.
 
 ## Design
 
@@ -83,7 +82,7 @@ semantics above; the fused characterization/placement task owns that machinery.
 - **Demote `--auto-d-max`** to an explicit opt-in, documented as per-frame
   exposure normalization (lower priority per the user).
 - Keep `--d-max` (scalar) and `--no-d-max` as today. In the target density path,
-  `--no-d-max` means unity placement and the scene-master preset records that
+  `--no-d-max` means unity exponential placement and the film-master preset records that
   policy; it is not shorthand for a display transfer or reference-white choice.
 - Interacts with `roll-conversion` (`Dmax` is roll-fixed alongside `Dmin`).
 - **This changed the default render** (frame-local auto-`Dmax` → fixed anchor).

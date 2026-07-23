@@ -2,7 +2,7 @@
 
 ## Goal
 
-Render characterized scene-linear working values into a standards-defined HDR
+Render NC's intentional linear ACEScg film values into a standards-defined HDR
 display signal with controlled reference white, highlight behavior, gamut, and
 headroom. Produce BT.2020 PQ first and retain a defined HLG option where useful.
 
@@ -11,7 +11,7 @@ headroom. Produce BT.2020 PQ first and retain a defined HLG option where useful.
 Implement a pure, deterministic stage before container encoding:
 
 ```text
-linear ACEScg
+linear ACEScg film rendering
 → shared linear display adjustments (same WB/exposure/black/white as the SDR branch)
 → HDR reference-white placement
 → highlight tone mapping
@@ -43,5 +43,5 @@ diverges after that common source.
 
 ## Dependencies
 
-- [Post-characterization render pipeline](post-characterization-render-pipeline.md)
+- [Film-master and shared display pipeline](film-master-render-pipeline.md)
 - [HDR still-output spike](hdr-output-spike.md)

@@ -82,8 +82,9 @@ resource/pipeline evidence, and the doc fixes in Part 1 need not wait.
   conversion pipeline is untouched.
 - **License is a user decision** — the task surfaces options and applies the
   choice; it does not make it.
-- **CLAUDE.md pairing.** `design-spec.md` and `design-spec.html` must be edited
-  **together** if the sweep touches the design spec.
+- **Design source.** `design-spec.md` is the sole maintained design document;
+  a rendered HTML companion may be regenerated after the feature roadmap
+  stabilizes.
 
 ## How to Verify
 

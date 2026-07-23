@@ -2,7 +2,7 @@
 
 ## Goal
 
-Render characterized linear ACEScg into an independently valid rendered-linear
+Render NC's intentional linear ACEScg film rendering into an independently valid rendered-linear
 SDR rendition for Display P3 or sRGB. Own reference-white, tone, chromatic
 adaptation, and gamut mapping; the destination-output stage owns transfer
 encoding and signaling for standalone SDR and the base image of gain-map HDR.
@@ -12,7 +12,7 @@ encoding and signaling for standalone SDR and the base image of gain-map HDR.
 Implement a pure deterministic display branch:
 
 ```text
-characterized linear ACEScg
+linear ACEScg film rendering
 → shared linear display adjustments (white balance/exposure/black/white placement)
 → SDR reference-white and tone mapping
 → chromatic adaptation + destination gamut mapping
@@ -28,12 +28,12 @@ attaches profile/signaling metadata. The compatibility path uses
 the same rendering model with sRGB as the smaller destination gamut.
 
 Do not derive this base by clipping PQ/HLG pixels. It and the HDR rendition are
-two intentional renders of the same characterized source, coordinated by the
+two intentional renders of the same mapped film source, coordinated by the
 reference-white/headroom decisions from the HDR spike.
 
 ## Implementation Suggestion
 
-- Reuse `post-characterization-render-pipeline`'s shared linear display-adjustment
+- Reuse `film-master-render-pipeline`'s shared linear display-adjustment
   stage; keep SDR highlight/tone policy separate from HDR highlight/tone policy.
   Gamut mapping remains in this task; destination transfer encoding does not.
 - Return rendered-linear destination pixels plus resolved SDR metadata, including
@@ -58,6 +58,6 @@ reference-white/headroom decisions from the HDR spike.
 
 ## Dependencies
 
-- [Post-characterization render pipeline](post-characterization-render-pipeline.md)
+- [Film-master and shared display pipeline](film-master-render-pipeline.md)
 - [Display P3 output](display-p3-output.md)
 - [HDR still-output spike](hdr-output-spike.md)
