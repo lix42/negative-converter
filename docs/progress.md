@@ -2750,8 +2750,16 @@ verified findings applied:
   production track and is not blocked on this deferred experiment.
 
 ## post-reconstruction-color-characterization
-**Status:** not started
-**Updated:** 2026-07-21
+**Status:** closed—superseded
+**Updated:** 2026-07-23
+
+- 2026-07-23: Closed the artifact-based characterization runtime without
+  implementation. Physical scene recovery is not NC's goal: the rendering
+  contributed by the film stock, lens, development, and scanner is intentional
+  by default. Measured neutralization, if added later, must be an explicitly
+  selected correction rather than a prerequisite for P3, HDR, presets, or
+  display acceptance. Replacement film-preserving reconstruction,
+  working-space, and render-pipeline tasks will be defined separately.
 
 - 2026-07-21: Added the missing production boundary from reconstructed
   scanner/film RGB to defined linear ACEScg. It corrects channel mixing and
