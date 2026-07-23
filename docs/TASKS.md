@@ -90,6 +90,7 @@ graph TD
   perf-telemetry --> telemetry-strategy
   telemetry-strategy --> telemetry-upload
   dmax-white-anchor --> real-scan-verification
+  dmax-reference --> real-scan-verification
   algo-density --> dmax-white-anchor
   algo-interface --> algo-sigmoid
   dmax-white-anchor --> algo-sigmoid
@@ -105,6 +106,7 @@ graph TD
   auto-base-redesign --> ir-holder-detection
   auto-base-redesign --> auto-base-neutral-stock
   dmax-white-anchor --> dmax-reference
+  dmax-reference --> dense-base-dmax-plausibility
   pipeline-orchestration --> roll-conversion
   dmax-white-anchor --> roll-conversion
   pipeline-orchestration --> conversion-versioning
@@ -130,6 +132,7 @@ graph TD
   roll-conversion --> output-presets
   output-presets --> display-output-acceptance
   real-scan-verification --> display-output-acceptance
+  real-scan-verification --> conversion-analysis-tooling
   color-characterization-calibration --> display-output-acceptance
   roll-conversion --> base-acquisition-planner
   auto-base-redesign --> base-acquisition-planner
@@ -155,7 +158,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   `ir-holder-detection` (`auto-base-redesign` is now transitive via `ir-holder-detection`)
 - `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
 - `grid-verdict-enum` (post-MVP): `estimate-reuse-output`, `film-base-estimation`
-- `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
+- `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`, `dmax-reference`
+- `conversion-analysis-tooling` (post-MVP, spike): `real-scan-verification`
 - `perf-instrumentation` (post-MVP, **parked**): `pipeline-orchestration` — LAB
   criterion benches; prototyped and parked on branch
   `prototype/perf-bench-instrumentation`, superseded by `perf-telemetry` as the
@@ -174,6 +178,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `ir-holder-detection` (post-MVP): `auto-base-redesign`
 - `auto-base-neutral-stock` (post-MVP): `auto-base-redesign`
 - `dmax-reference` (post-MVP): `dmax-white-anchor`
+- `dense-base-dmax-plausibility` (post-MVP): `dmax-reference`
 - `roll-conversion` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
 - `base-acquisition-planner` (post-MVP): `roll-conversion`, `auto-base-redesign`, `ir-holder-detection`, `film-base-content-fallback`, `dmax-reference`
 - `conversion-versioning` (post-MVP): `pipeline-orchestration`
@@ -250,6 +255,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 
 - [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md) — shipped legacy pre-artifact semantics; target characterized density reuses its scalar as roll exposure placement, not a guaranteed white=1 anchor
 - [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the planned characterized runtime reinterprets the scalar as post-artifact exposure placement
+- [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [x] [Auto neutral white balance](tasks/auto-neutral-wb.md)
 - [x] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
@@ -283,8 +289,9 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > acceptance separately waits for the new presets, HDR encoders, and a validated
 > characterization artifact.
 
-- [ ] [Real-scan core verification](tasks/real-scan-verification.md) — exercise decoding, Dmin/Dmax, current TIFF conversion, IR, determinism, and resource use on full-size scans without waiting for the display-output roadmap
+- [x] [Real-scan core verification](tasks/real-scan-verification.md) — exercise decoding, Dmin/Dmax, current TIFF conversion, IR, determinism, and resource use on full-size scans without waiting for the display-output roadmap. **Done 2026-07-23** (see `docs/reports/real-scan-verification.md`): all rows pass on 5 real rolls; measured peak ~930 MiB @ 18.7 MP feeds `streaming-tiled-io` STEP 0; frozen recipes + harness feed `display-output-acceptance`; follow-up `dense-base-dmax-plausibility` filed; default-SDR paleness routes to the display-output roadmap
 - [ ] [Display-output acceptance](tasks/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans
+- [ ] [Conversion-analysis tooling (spike)](tasks/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. Spike: decide scope/structure first.
 
 ### Phase 8: Pre-release productization
 > Measurement and hardening before releasing to users (2026-07-14 telemetry

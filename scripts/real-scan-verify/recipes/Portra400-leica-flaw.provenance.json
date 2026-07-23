@@ -1,0 +1,20 @@
+{
+  "roll": "Portra400-leica-flaw",
+  "dmin": {
+    "frame": "20260719-nikon-1034.tif",
+    "region": "1555,1080,2074,1440",
+    "base": {
+      "r": 0.54204625,
+      "g": 0.2466621,
+      "b": 0.14990464
+    },
+    "warnings": ""
+  },
+  "dmax": {
+    "frame": "20260719-nikon-1033.tif",
+    "region": "936,992,1248,1322",
+    "scalar": 1.4434652,
+    "warnings": ""
+  },
+  "note": "center 40% region excludes film holder; scalars frozen for deterministic apply"
+}

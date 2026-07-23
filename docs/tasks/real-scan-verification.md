@@ -24,9 +24,14 @@ plus a sample of `~/Pictures/scan/`):
 
 1. **inspect** — exit 0; `decode` block matches the file (format, dimensions,
    `ir_present`, make/model/software).
-2. **estimate** — `--base-region` over the film rebate yields a finite,
-   plausible base; auto-base behavior on the dark-holder layout fails loudly or
-   warns per spec (record which).
+2. **estimate** — *Dmin*: `--base-region` over the film rebate / unexposed
+   reference frame yields a finite, plausible base; auto-base behavior on the
+   dark-holder layout fails loudly or warns per spec (record which). *Dmax*:
+   acquire the roll-fixed scalar from a **fully-exposed leader** via
+   `--d-max-region` (with the resolved `--film-base`), holder-excluded and
+   symmetric to Dmin — record the scalar and any plausibility warning. Detecting
+   *which* frame is the unexposed / fully-exposed reference belongs to
+   `base-acquisition-planner`, not here; supply the frames.
 3. **convert, current TIFF paths** (density, resolved Dmax) — default 16-bit TIFF
    and explicit `--output-hdr` rendered float TIFF both exit 0; dimensions,
    profile, and report are internally consistent, grays are plausibly neutral,
@@ -63,7 +68,23 @@ every asset class with results recorded in `progress.md`, and a filed follow-up
 task (or explicit "none") for defects. No code changes expected; if any prove
 necessary they go through their own tasks.
 
+## Status / deliverables (executed 2026-07-23)
+
+Matrix run against the five real rolls (all HDRi, 5184×3599). Results, resolved
+per-roll Dmin/Dmax, and the memory/streaming STEP 0 number in
+[`docs/reports/real-scan-verification.md`](../reports/real-scan-verification.md).
+Durable artifacts for downstream tasks under
+[`scripts/real-scan-verify/`](../../scripts/real-scan-verify/) (`harness.sh` +
+`README.md` + frozen per-roll recipes with provenance), plus (uncommitted, large)
+converted images in `../nc-assets/converted/2026-07-22/`. Follow-ups filed:
+[`dense-base-dmax-plausibility`](dense-base-dmax-plausibility.md) (Phoenix);
+[`conversion-analysis-tooling`](conversion-analysis-tooling.md) (harness
+enhancement / asset manifest / NLP comparison); default-SDR paleness routes to the
+display-output roadmap (`sdr-display-rendering`); peak-RSS model note feeds
+`memory-preflight`.
+
 ## Dependencies
 
 - [Pipeline orchestration](pipeline-orchestration.md)
 - [Display-range white anchor (Dmax)](dmax-white-anchor.md)
+- [Roll-fixed Dmax from a fully-exposed reference frame](dmax-reference.md)

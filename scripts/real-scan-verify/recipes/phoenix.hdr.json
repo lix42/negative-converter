@@ -1,0 +1,19 @@
+{
+  "film_base": {
+    "source": {
+      "explicit": [
+        0.36330205,
+        0.26269934,
+        0.42475012
+      ]
+    }
+  },
+  "density": {
+    "dmax": {
+      "explicit": 0.89764357
+    }
+  },
+  "output": {
+    "hdr": true
+  }
+}

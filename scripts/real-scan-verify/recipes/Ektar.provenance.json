@@ -1,0 +1,20 @@
+{
+  "roll": "Ektar",
+  "dmin": {
+    "frame": "20260713-nikon-963.tif",
+    "region": "1414,989,1886,1319",
+    "base": {
+      "r": 0.51679254,
+      "g": 0.2768597,
+      "b": 0.18973067
+    },
+    "warnings": ""
+  },
+  "dmax": {
+    "frame": "20260715-nikon-1009.tif",
+    "region": "1555,1080,2074,1440",
+    "scalar": 1.2933096,
+    "warnings": ""
+  },
+  "note": "center 40% region excludes film holder; scalars frozen for deterministic apply"
+}
