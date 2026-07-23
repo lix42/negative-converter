@@ -17,8 +17,9 @@ explicitly corrected once already.
 ## Source of truth (read these first)
 
 - `docs/design-spec.md` — the authoritative Step-1 design (architecture, pipeline,
-  CLI surface, parameter reference, exit codes, roadmap). `docs/design-spec.html`
-  is the same content for humans; **edit both together** when the design changes.
+  CLI surface, parameter reference, exit codes, roadmap). It is the sole
+  maintained design source; rendered HTML may be regenerated after the feature
+  roadmap stabilizes.
 - `docs/TASKS.md` — the plan: distilled design, the canonical dependency graph,
   and the phased task checklist. This is the control center for what to build next.
 - `docs/tasks/<name>.md` — per-task spec (goal / design / how-to-verify / deps).
@@ -40,25 +41,37 @@ when all its deps are `[x]`), read the task file and the relevant `progress.md`
 sections, then implement. Keep the Mermaid diagram, the canonical dependency list,
 and per-task Dependencies sections in sync — `TASKS.md` wins on conflicts.
 
-## Architecture (Step 1)
+## Architecture
 
-A pure-function pipeline orchestrated by a thin CLI layer. Stages:
+A pure-function pipeline orchestrated by a thin CLI layer.
 
+**Current shipped architecture:**
+
+```text
+decode → film-base → Algorithm + Converter → LinearImage
+       → output color transform → encode
 ```
-decode → film-base estimate → algorithm (simple|density) → output color transform → encode
+
+**Target replacement architecture (open roadmap tasks):**
+
+```text
+decode → film-base → tagged reconstruction + density curve → FilmRgbImage
+       → NC film RGB v1 → linear ACEScg
+         ├→ film-master
+         └→ shared print controls → SDR/HDR render → encode
 ```
 
 - All processing is **32-bit float in a linear working space**; bit-depth
   reduction happens only at the final encode. HDR is a first-class concern.
 - **Density conversion and print rendering are separate sub-stages** — the core
   color-fidelity rule. Don't collapse them.
-- Algorithms are **pluggable** behind a `Converter` trait. Step 1 ships two:
-  `simple` (channel-inversion baseline / debug / B&W) and `density` (Cineon /
-  darktable-negadoctor density-domain, the default).
+- The current algorithms remain pluggable behind `Converter`. The replacement
+  roadmap adopts tagged `simple` or `density` reconstruction, with density
+  selecting an `exponential` (default) or `sigmoid` curve.
 - The **IR channel** (HDRi 64-bit input) is decoded and **preserved but not acted
   on** in Step 1; IR-based dust removal is a roadmap follow-up. Carry it through,
   don't consume it.
-- Module map (`src/`, all implemented): `types.rs` (shared types),
+- Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages,input_semantics}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure algorithm→output-color core, stages 3–4;
@@ -143,6 +156,11 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   mutually-exclusive knobs as **one enum field** (e.g. `FilmBaseSource`,
   `InputColor`), not parallel `Option`/bool fields: independent fields can encode
   illegal combinations and silently break the flags-win merge.
+  *Carve-out:* §9's reconstruction / density-curve entries show **target** recipe
+  paths (`reconstruction.*`), but the shipped binary still implements the legacy
+  transitional schema (`algorithm` + top-level `density`/`sigmoid`/`simple`, §8).
+  Until the tagged-schema migration lands, keep the structs in sync with that
+  legacy schema, not §9's target paths.
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.
@@ -162,8 +180,9 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
     per-algo guards (`algo/simple.rs`, `algo/density.rs`) remain as
     defense-in-depth for any base reaching a converter directly.
   - *Clamping boundary:* range-clamp to the output gamut **only** at the u16
-    encode step; color/algo stages pass values through unclamped (f32 output is
-    HDR/scene-referred). `io::encode` counts every clamped and non-finite (`NaN`)
+    encode step; color/algo stages pass values through unclamped (float output
+    preserves the current rendered working values). `io::encode` counts every
+    clamped and non-finite (`NaN`)
     sample into `EncodeReport` (`types.rs`) so the loss rides back to the
     orchestrator as a report warning (`--strict` promotes it) — never clamp
     silently anywhere.

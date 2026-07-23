@@ -29,7 +29,8 @@ pub fn icc_profile(space: &OutputSpace) -> Result<Vec<u8>, NcError>;
   Rec.2020; pick one and record it in `progress.md`).
 - Working space is linear; build an lcms2 transform from the working profile to
   the chosen output profile. For sRGB output, apply the sRGB tone curve; for
-  linear/scene-referred wide-gamut output, keep it linear.
+  unclamped linear wide-gamut output, keep it linear; linear encoding alone does
+  not claim physical scene recovery.
 - `Custom(path)` loads a user-supplied ICC file.
 
 ## Implementation Suggestion
@@ -39,8 +40,9 @@ pub fn icc_profile(space: &OutputSpace) -> Result<Vec<u8>, NcError>;
   synthesize them from primaries + TRC.
 - Keep the transform operating on the `f32` RGB buffer directly to avoid an extra
   copy; respect channel order.
-- Decide and document whether the output is display-referred (tone-curved) or
-  scene-referred (linear) per space — this affects how `tiff-encode` data looks.
+- Decide and document whether the output is display-rendered (tone-curved) or an
+  unclamped linear working rendering per space — this affects how `tiff-encode`
+  data looks.
 
 ## How to Verify
 

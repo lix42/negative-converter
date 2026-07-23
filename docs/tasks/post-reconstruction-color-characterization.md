@@ -7,7 +7,17 @@ implemented. NC does not aim to recover a physically neutral scene: film stock,
 lens, development, and scanner character are intentional parts of the default
 rendering. Any future measured neutralization must be an explicitly selected
 correction profile, not a dependency of P3, HDR, output presets, or display
-acceptance. Replacement film-preserving pipeline tasks are defined separately.
+acceptance. Current ownership is defined by
+[Negative reconstruction and density curves](negative-reconstruction-density-curves.md),
+[NC Film RGB working-space mapping](film-rgb-working-space.md),
+[Optional color-correction profiles](optional-color-correction-profiles.md),
+and the [Film-master and shared display pipeline](film-master-render-pipeline.md).
+
+Everything below this notice—including **Goal**, **Design**, **How to Verify**,
+and **Dependencies**—records the rejected artifact-based proposal. Its artifact
+contracts, fallback warnings, canonical coordinates, verification plan, and
+dependency list are historical rationale, not current requirements. The linked
+successor specs above are authoritative.
 
 ## Goal
 
@@ -76,8 +86,12 @@ serialization for interoperable implementations. Unknown
 schema versions/models, malformed or non-monotone curves,
 wrong array lengths/order, hash mismatches, and non-finite coefficients or
 results fail loudly. A future 3D LUT requires a new declared model/version, not
-an ambiguous optional field. Artifact production and measured model selection
-belong to `color-characterization-calibration`, not this task.
+an ambiguous optional field. Under this historical proposal, artifact
+production and measured model selection would have belonged to a separate
+calibration task. Current optional fitting, runtime selection, and correction
+provenance are instead owned by
+[Optional color-correction profiles](optional-color-correction-profiles.md);
+the artifact assumptions in this document do not constrain that successor.
 
 Every artifact declares a standardized reconstruction-domain contract. It binds
 to the reconstruction algorithm, pipeline/model versions, operation order, Dmin
@@ -115,10 +129,11 @@ sRGB profile to it. Raw identity device RGB may be preserved only through an
 explicit untagged `custom` diagnostic output, and that domain cannot enter any
 named color-defined preset.
 
-This task ends at ordinary, placed `f32` linear ACEScg (measured artifact or
-explicit assumed-source fallback) and an explicitly typed device-RGB diagnostic domain. The
-separate `post-characterization-render-pipeline` task owns print/display stage
-refactoring and scene-master/display routing.
+This historical task would have ended at ordinary, placed `f32` linear ACEScg
+(measured artifact or explicit assumed-source fallback) and an explicitly typed
+device-RGB diagnostic domain. The current master/display split is owned by the
+[Film-master and shared display pipeline](film-master-render-pipeline.md), which
+does not inherit this proposal's artifact or physical-neutralization assumptions.
 
 ## Implementation Suggestion
 
@@ -171,6 +186,9 @@ refactoring and scene-master/display routing.
 - Output profile assignment alone is not counted as characterization.
 
 ## Dependencies
+
+_Historical: this task is closed—superseded (see the notice at the top); the
+dependencies below are decision history, not a live prerequisite set._
 
 - [Input data semantics and validation](input-data-semantics.md)
 - [Color management](color-management.md)

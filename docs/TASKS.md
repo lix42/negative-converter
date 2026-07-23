@@ -1,8 +1,7 @@
 # Negative Converter — Tasks
 
 Step-1 (MVP) plan for the `nc` CLI negative→positive converter. See
-[design-spec.md](design-spec.md) for the full design (and [design-spec.html](design-spec.html)
-for the human-readable version).
+[design-spec.md](design-spec.md) for the full design.
 
 > **Progress log:** [progress.md](progress.md) records *how* each task is carried
 > out — what was done, decisions made, what works, what doesn't. **Read it before
@@ -22,32 +21,32 @@ Pure-function pipeline stages, orchestrated by the CLI layer:
 
 ```
 decode → validate input semantics → film-base → negative reconstruction
-       → canonical algorithm input → fused characterization/placement → linear ACEScg
-         ├→ scene-master encode
-         └→ display render/profile → encode
+       → density curve → FilmRgbImage → NC film RGB v1 → linear ACEScg
+         ├→ film-master encode
+         └→ shared print controls → SDR/HDR render/profile → encode
 ```
 
-The target scene-master branch bypasses print/display controls and rejects
-frame-local auto Dmax. The characterization runtime fuses Dmax-neutral nonlinear
-artifact evaluation with density's fixed/roll scalar ACEScg exposure-placement
-gain (`none` is unity), returning placed `f32`; sigmoid v1
-pins exact Dmax in its artifact because the curve shape depends on it; simple
-characterizes raw unclamped `1 - scan/Dmin` and has no Dmax. Its current
-inversion-WB and clip remap become downstream WB/black/white placement, not
-artifact coordinates. This preserves artifact reuse and cross-frame exposure where valid.
-After merge it rejects every non-default downstream render control instead of
-ignoring it. Today’s `--output-hdr` is a rendered float TIFF, not that future branch.
+The target `film-master` branch preserves NC's intentional film, lens,
+development, and scanner rendering in unclamped linear ACEScg. It includes
+reconstruction, the selected exponential/sigmoid density curve, and supported
+fixed/roll Dmax placement, but bypasses later print/display controls and rejects
+frame-local auto Dmax. Simple and density paths produce one typed
+`FilmRgbImage`; NC film RGB v1 interprets that rendering consistently as linear
+Rec.709/D65 and maps it into ACEScg/D60. This is film-rendering intent, not
+physical scene recovery. Optional measured correction profiles have no
+downstream blockers. Today’s `--output-hdr` remains a rendered float TIFF, not
+the future master branch.
 
 - **io/decode** — SilverFast HDR (48-bit RGB) / HDRi (64-bit RGB+IR) → linear `f32` scanner measurements (IR preserved, not consumed); input semantics remain explicit rather than silently assigning Rec.709.
-- **io/encode** — current `LinearImage` → 16-bit or 32-bit float TIFF with ICC; planned display output adds ISO gain-map HDR while retaining scene-linear TIFF masters.
+- **io/encode** — current `LinearImage` → 16-bit or 32-bit float TIFF with ICC; planned display output adds ISO gain-map HDR while retaining linear ACEScg film masters.
 - **pipeline/film_base** — estimate `Dmin` from unexposed border, with CLI override.
-- **pipeline/color** — characterize the reconstructed positive into a defined linear working space, then transform/render it for the selected output.
-- **algo** — `Converter` trait + three implementations: `simple` (inversion baseline), `density` (Cineon/negadoctor density-domain, default), and `sigmoid` (density-domain S-curve).
-- **cli + main** — clap subcommands (`convert`/`inspect`/`estimate`/`params`), recipe load/merge, JSON report, exit codes.
+- **pipeline/color** — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
+- **algo** — current `Converter` implementations migrate to tagged `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve.
+- **cli + main** — clap subcommands (`convert`/`inspect`/`estimate`/`params`/`roll`), recipe load/merge, JSON report, exit codes.
 
 ### Key choices
 - **Rust**, single static binary. Pure functions per stage; CLI is the only orchestrator.
-- **Normally 32-bit float linear image buffers:** scanner measurement coordinates before characterization, a defined wide-gamut working space afterward; bit-depth reduction only at encode. The specifically pinned fused density characterization/placement operation may use private `f64`/equivalent extended-range intermediates, then returns ordinary placed `f32` ACEScg.
+- **Normally 32-bit float linear image buffers:** scanner measurement coordinates before reconstruction, typed NC film RGB after the density curve, and linear ACEScg after the versioned working-space mapping; bit-depth reduction only at encode.
 - **Pluggable algorithms** via a `Converter` trait so more can be added later.
 - Density conversion and print rendering are **separate sub-stages** (core fidelity rule).
 - IR channel is **preserved but not acted on** in Step 1 (dust removal is a roadmap follow-up).
@@ -113,27 +112,30 @@ graph TD
   pipeline-orchestration --> input-data-semantics
   input-data-semantics --> scanner-profile-before-density-experiment
   color-management --> scanner-profile-before-density-experiment
-  input-data-semantics --> post-reconstruction-color-characterization
-  color-management --> post-reconstruction-color-characterization
-  dmax-reference --> post-reconstruction-color-characterization
-  post-reconstruction-color-characterization --> color-characterization-calibration
-  post-reconstruction-color-characterization --> post-characterization-render-pipeline
-  dmax-reference --> post-characterization-render-pipeline
+  input-data-semantics --> negative-reconstruction-density-curves
+  dmax-reference --> negative-reconstruction-density-curves
+  algo-sigmoid --> negative-reconstruction-density-curves
+  negative-reconstruction-density-curves --> film-rgb-working-space
+  color-management --> film-rgb-working-space
+  film-rgb-working-space --> film-master-render-pipeline
+  dmax-reference --> film-master-render-pipeline
+  film-rgb-working-space --> optional-color-correction-profiles
+  film-master-render-pipeline --> optional-color-correction-profiles
   color-management --> display-p3-output
   color-management --> hdr-output-spike
-  post-characterization-render-pipeline --> sdr-display-rendering
+  film-master-render-pipeline --> sdr-display-rendering
   display-p3-output --> sdr-display-rendering
   hdr-output-spike --> sdr-display-rendering
-  post-characterization-render-pipeline --> hdr-display-rendering
+  film-master-render-pipeline --> hdr-display-rendering
   hdr-output-spike --> hdr-display-rendering
   sdr-display-rendering --> gain-map-hdr-output
   hdr-display-rendering --> gain-map-hdr-output
   gain-map-hdr-output --> output-presets
   roll-conversion --> output-presets
+  conversion-versioning --> output-presets
   output-presets --> display-output-acceptance
   real-scan-verification --> display-output-acceptance
   real-scan-verification --> conversion-analysis-tooling
-  color-characterization-calibration --> display-output-acceptance
   roll-conversion --> base-acquisition-planner
   auto-base-redesign --> base-acquisition-planner
   ir-holder-detection --> base-acquisition-planner
@@ -184,16 +186,17 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `conversion-versioning` (post-MVP): `pipeline-orchestration`
 - `input-data-semantics` (post-MVP): `pipeline-orchestration`
 - `scanner-profile-before-density-experiment` (post-MVP, **deferred experiment**): `input-data-semantics`, `color-management`
-- `post-reconstruction-color-characterization` (post-MVP): `input-data-semantics`, `color-management`, `dmax-reference`
-- `color-characterization-calibration` (post-MVP): `post-reconstruction-color-characterization`
-- `post-characterization-render-pipeline` (post-MVP): `post-reconstruction-color-characterization`, `dmax-reference`
+- `negative-reconstruction-density-curves` (post-MVP): `input-data-semantics`, `dmax-reference`, `algo-sigmoid`
+- `film-rgb-working-space` (post-MVP): `negative-reconstruction-density-curves`, `color-management`
+- `film-master-render-pipeline` (post-MVP): `film-rgb-working-space`, `dmax-reference`
+- `optional-color-correction-profiles` (post-MVP, **optional / deferred**): `film-rgb-working-space`, `film-master-render-pipeline`; no downstream blockers
 - `display-p3-output` (post-MVP): `color-management`
 - `hdr-output-spike` (post-MVP, spike): `color-management`
-- `sdr-display-rendering` (post-MVP): `post-characterization-render-pipeline`, `display-p3-output`, `hdr-output-spike`
-- `hdr-display-rendering` (post-MVP): `post-characterization-render-pipeline`, `hdr-output-spike`
+- `sdr-display-rendering` (post-MVP): `film-master-render-pipeline`, `display-p3-output`, `hdr-output-spike`
+- `hdr-display-rendering` (post-MVP): `film-master-render-pipeline`, `hdr-output-spike`
 - `gain-map-hdr-output` (post-MVP): `sdr-display-rendering`, `hdr-display-rendering`
-- `output-presets` (post-MVP): `gain-map-hdr-output`, `roll-conversion`
-- `display-output-acceptance` (post-MVP): `output-presets`, `real-scan-verification`, `color-characterization-calibration`
+- `output-presets` (post-MVP): `gain-map-hdr-output`, `roll-conversion`, `conversion-versioning`
+- `display-output-acceptance` (post-MVP): `output-presets`, `real-scan-verification`
 - `transactional-output-writes` (post-MVP, hardening): `pipeline-orchestration`
 - `memory-preflight` (post-MVP, hardening): `pipeline-orchestration`
 - `value-domain-terminology` (post-MVP, cleanup, **preserves data flow**): `pipeline-orchestration`
@@ -253,8 +256,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > Lab Pro comparison (2026-07-13, see `progress.md`). Deterministic statistics
 > only — no ML (the "AI-friendly ≠ ML" rule holds).
 
-- [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md) — shipped legacy pre-artifact semantics; target characterized density reuses its scalar as roll exposure placement, not a guaranteed white=1 anchor
-- [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the planned characterized runtime reinterprets the scalar as post-artifact exposure placement
+- [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md) — shipped legacy semantics; the replacement density-curve stage owns its curve-specific placement/shape meaning
+- [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the replacement density-curve stage preserves scalar exponential placement and sigmoid curve shaping
 - [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
 - [x] [Auto neutral white balance](tasks/auto-neutral-wb.md)
@@ -266,10 +269,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   range collapse) warning catching the finite-all-black underflow the loss counters
   miss, with a false-positive guard validated on real scans.
 - [x] [Input data semantics and validation](tasks/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
-- [x] [Post-reconstruction characterization runtime](tasks/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history, with replacement film-preserving pipeline tasks to follow separately
-- [ ] [Color-characterization calibration](tasks/color-characterization-calibration.md) — fit and validate scanner/film characterization artifacts against controlled target data
-- [ ] [Post-characterization render pipeline](tasks/post-characterization-render-pipeline.md) — move print/display controls after characterization and route true scene-master versus shared SDR/HDR display branches
-- [ ] [Scanner ICC before-density experiment](tasks/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of post-reconstruction characterization
+- [x] [Post-reconstruction characterization runtime](tasks/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `negative-reconstruction-density-curves`, `film-rgb-working-space`, `film-master-render-pipeline`, and `optional-color-correction-profiles`
+- [ ] [Negative reconstruction and density curves](tasks/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
+- [ ] [NC Film RGB working-space mapping](tasks/film-rgb-working-space.md) — map every film rendering through versioned NC film RGB v1 into typed linear ACEScg/D60
+- [ ] [Film-master and shared display pipeline](tasks/film-master-render-pipeline.md) — route intentional ACEScg film rendering to `film-master` or shared WB → exposure → black/range adjustments before SDR/HDR
+- [ ] [Optional color-correction profiles](tasks/optional-color-correction-profiles.md) — **optional / deferred** measured neutralization with explicit selection and provenance; blocks no output task
+- [ ] [Scanner ICC before-density experiment](tasks/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of the superseded characterization proposal and the normal NC film RGB mapping
 
 ### Phase 6B: Color-defined display outputs
 > Establish the color-accurate SDR path first, then add standards-based HDR
@@ -278,16 +283,16 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 
 - [ ] [Display P3 output](tasks/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
 - [ ] [HDR still-output spike](tasks/hdr-output-spike.md) — decide ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy before implementation
-- [ ] [SDR display rendering](tasks/sdr-display-rendering.md) — render characterized linear ACEScg into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
-- [ ] [Display-HDR rendering](tasks/hdr-display-rendering.md) — render characterized scene-linear values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
+- [ ] [SDR display rendering](tasks/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
+- [ ] [Display-HDR rendering](tasks/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
 - [ ] [ISO gain-map HDR output](tasks/gain-map-hdr-output.md) — write a backward-compatible SDR base plus ISO 21496-1 gain map, initially targeting HEIC
 - [ ] [Output presets and guidance](tasks/output-presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
 
 ### Phase 7: Acceptance
 > Core full-size verification runs as soon as the existing TIFF pipeline and
 > Dmax anchor are ready, so it can inform memory/streaming work. Final display
-> acceptance separately waits for the new presets, HDR encoders, and a validated
-> characterization artifact.
+> acceptance separately waits for the new presets and HDR encoders. Optional
+> measured correction profiles do not block it.
 
 - [x] [Real-scan core verification](tasks/real-scan-verification.md) — exercise decoding, Dmin/Dmax, current TIFF conversion, IR, determinism, and resource use on full-size scans without waiting for the display-output roadmap. **Done 2026-07-23** (see `docs/reports/real-scan-verification.md`): all rows pass on 5 real rolls; measured peak ~930 MiB @ 18.7 MP feeds `streaming-tiled-io` STEP 0; frozen recipes + harness feed `display-output-acceptance`; follow-up `dense-base-dmax-plausibility` filed; default-SDR paleness routes to the display-output roadmap
 - [ ] [Display-output acceptance](tasks/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans

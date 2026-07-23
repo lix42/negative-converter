@@ -1,11 +1,10 @@
 # Display-Range White Anchor (Dmax)
 
 > **Target-pipeline terminology:** this completed task records the shipped
-> pre-artifact renderer, where `D' = Dmax` maps to `1.0`. In the future
-> characterized density path the same parameter supplies a scalar roll
-> exposure-placement gain *after* an arbitrary nonlinear artifact, so it no
-> longer guarantees white at `1.0`; the later SDR/HDR render owns display
-> reference white.
+> legacy renderer, where `D' = Dmax` maps to `1.0`. In the replacement pipeline,
+> Dmax belongs to the selected density curve: scalar placement for exponential
+> and curve shaping for sigmoid. The later SDR/HDR render owns display reference
+> white.
 
 ## Goal
 
@@ -33,8 +32,9 @@ lin = 10^(γ·(D' − Dmax))        # scene white (D' = Dmax) → 1.0, base → 
   `DmaxSource { Auto (default) | Explicit(f32 or [f32;3]) | None }` under the
   `density` recipe section, with matching CLI flags (`--d-max`, `--auto-d-max`,
   `--no-d-max` or similar; mutually exclusive via clap group, like
-  `FilmBaseSource`). `None` preserves today's scene-referred behavior for HDR
-  f32 workflows.
+  `FilmBaseSource`). `None` preserves today's unanchored rendering (unity
+  placement: base `1.0`, detail above) for float workflows; it does not recover
+  physical scene values.
 - **Auto measurement is deterministic**, like `film_base::estimate`: a high
   percentile (e.g. 99.x) of the corrected-density distribution, computed after
   `to_density`. Same input + params ⇒ same anchor ⇒ same output. Report the
@@ -48,7 +48,8 @@ lin = 10^(γ·(D' − Dmax))        # scene white (D' = Dmax) → 1.0, base → 
   a foreign anchor. It is **not** a calibrate-once pattern like Dmin.
 - **Spec updates ride along:** correct design-spec §7.2's stage-3 polarity
   (`10^(−γ·D')` → `10^(+γ·D')`, per the algo-density progress note), document the
-  anchor in §7.2, add the keys to §9 — **edit design-spec.md and .html together**.
+  anchor in §7.2, and add the keys to §9. `design-spec.md` is now the sole
+  maintained design source.
 
 ## Implementation Suggestion
 

@@ -21,16 +21,16 @@ around the edges.
 
 ## Status
 
-Pre-implementation. The design and task plan are written; coding hasn't started.
+The Step-1 TIFF converter is implemented, with post-MVP pipeline, display-output,
+and hardening work tracked in the task roadmap.
 
 - [`docs/design-spec.md`](docs/design-spec.md) — full design (architecture,
-  pipeline, CLI surface, parameters). [`docs/design-spec.html`](docs/design-spec.html)
-  is the same content for reading in a browser.
+  pipeline, CLI surface, parameters).
 - [`docs/TASKS.md`](docs/TASKS.md) — the build plan and dependency graph.
 - [`docs/negative-convertor-research-report.md`](docs/negative-convertor-research-report.md)
   — background research.
 
-## Planned usage
+## Usage (current CLI)
 
 ```sh
 # Convert a negative scan to a positive 16-bit TIFF.

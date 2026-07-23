@@ -35,7 +35,7 @@ and verify these against the official ICC registry reference. Do not incorrectly
 write D65 as the ICC media white.
 
 Display P3 is display-referred SDR. It must not be used as nc's scanner
-measurement space or scene-linear master. This task owns destination color
+measurement space or linear ACEScg film master. This task owns destination color
 encoding and profile metadata, not scene-to-display tone or gamut policy.
 
 ## Implementation Suggestion

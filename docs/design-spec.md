@@ -1,9 +1,6 @@
 # Negative Converter — High-Level Design Spec (Step 1)
 
 > Target: Step 1 (MVP) · Language: Rust
->
-> This document is the machine-readable (Markdown) companion to `design-spec.html`.
-> Both contain the same content; the HTML version is for humans, this one is for agents.
 
 ## 1. Purpose
 
@@ -41,14 +38,17 @@ The deterministic core owns the image science. Any future ML assistance (see
   export). Do **not** yet act on it. See §6.1 and §12.
 - Convert negative → positive with **normally 32-bit float linear image buffers**, while
   keeping the domains explicit: scanner measurement RGB through Dmin/density,
-  then a characterized wide-gamut working space after negative reconstruction.
-  The specifically pinned fused density characterization/placement operation may
-  use private `f64`/equivalent extended-range intermediates solely to avoid
-  overflow, then returns ordinary placed `f32` linear ACEScg.
-- **Pluggable algorithm** architecture, shipping **two** algorithms:
+  typed `FilmRgbImage` after inversion/the selected density curve, then typed
+  linear ACEScg after NC film RGB v1 mapping.
+- **Current shipped pluggable algorithm** architecture, shipping **three**
+  algorithm selections:
   1. `simple` — channel inversion + white balance (baseline / debug / B&W).
   2. `density` — density-domain inversion (Kodak Cineon / darktable `negadoctor`
      style) — the real default for color negatives.
+  3. `sigmoid` — the same density reconstruction with an H&D-style S-curve.
+  The target architecture replaces these top-level choices with tagged `simple`
+  or `density` reconstruction; density owns a tagged exponential or sigmoid
+  curve.
 - All conversion parameters controllable via CLI flags and/or a JSON recipe file.
 - Write **TIFF** output, selectable as **16-bit integer** or transitional
   **32-bit rendered float** via a flag.
@@ -58,8 +58,10 @@ The deterministic core owns the image science. Any future ML assistance (see
 ### Out of scope (Step 1) — see §12 Roadmap
 
 - IR-based dust/scratch removal (follow-up task).
-- Additional algorithms beyond the two above (follow-up tasks; the sigmoid /
-  explicit H&D curve has since shipped post-MVP as `--algorithm sigmoid`, §7.3).
+- Additional reconstruction/curve models beyond those listed above (follow-up
+  tasks; the sigmoid /
+  explicit H&D curve has since shipped post-MVP in the legacy
+  `--algorithm sigmoid` schema, §7.3).
 - Black & white film support, incl. plain 16-bit RAW scans (follow-up task).
 - Camera RAW (Bayer/X-Trans) input, DNG processing.
 - ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).
@@ -76,10 +78,9 @@ The deterministic core owns the image science. Any future ML assistance (see
    single most important architectural rule for color fidelity.
 3. **Float-first, explicit-domain internal pipeline.** Image buffers are normally
    linear `f32`, but "linear" does not imply one color space: values are scanner
-   measurements before characterization and defined working RGB afterward. The
-   pinned fused density characterization/placement operation may use private
-   `f64`/equivalent intermediates and returns placed `f32`. Bit-depth reduction
-   happens only at the final encode step.
+   measurements before reconstruction, NC film RGB after the curve, and defined
+   ACEScg film rendering afterward. Bit-depth reduction happens only at the final
+   encode step.
 4. **Deterministic and reproducible.** Same inputs + same params ⇒ identical output.
 5. **Every knob is a flag.** No conversion behavior is reachable only through code.
 6. **Pure functions over classes.** Each pipeline stage is a pure function
@@ -152,9 +153,10 @@ plane is a separate single channel, carried but not consumed (§6.1).
 | **transmission** (raw scan value) | fraction of light the film passes | more transparent film, thinner negative, brighter pixel *in the raw scan* — a **darker** scene | `[0, 1]` (= `u16`/65535) | `io::decode`, `LinearImage.rgb` |
 | **film base / `Dmin`** | the unexposed rebate's transmission — the per-channel *relative* maximum transmission | (the ceiling of transmission) | `(0, 1]` | `FilmBase`, `film_base::estimate` |
 | **density `D` / `B` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `B = density_scale·D + density_offset` (per-channel corrected density); `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)` (after regional balance, §7.2) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `B`/`D′` shifted by the offset (and, for `D′`, the regional balance) | `density::to_density`, `density::regional_balance`, `DensityImage.density` |
-| **canonical characterization input** (linear scanner/film RGB) | algorithm-specific unclamped positive: density uses Dmax-neutral `U = 10^(γ·D′)`; sigmoid v1 uses `S(D′; Dmax, …)` with Dmax artifact-scoped; simple uses raw `U = 1 - scan/Dmin` before WB or black/white placement | **brighter** positive — a **brighter** scene | algorithm-defined and **unclamped** | target boundary within `density::render` / `stages::render` |
-| **working positive** (characterized scene-linear RGB) | canonical input mapped through a versioned scanner/film characterization into linear ACEScg, then algorithm-specific placement: density multiplies scalar `10^(−γ·Dmax)` (`1` for none); sigmoid/simple are already placed by their canonical contract | **brighter** scene-referred value | unclamped `f32`; nominal diffuse white is workflow-defined | planned fused characterization/placement runtime |
-| **rendered display positive** | characterized linear ACEScg after shared white balance/exposure/black/white placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
+| **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | replacement reconstruction/curve boundary |
+| **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | algorithm-defined and unclamped `f32` | planned typed reconstruction output |
+| **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | planned working-space mapper |
+| **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
 | **output sample** (terminal) | the written image value | brighter | preset/container-defined integer or float encoding | `io::encode` and planned HDR encoders |
 
 **The one rule.** As the depicted **scene luminance rises**:
@@ -185,21 +187,19 @@ Ektar base ≈ `[0.53, 0.26, 0.16]`, blue near the bottom). Named for minimum
 *density* but stored as a transmission.
 
 **`Dmax`** is named for nc's shipped **legacy display-white density anchor**: in
-the current pre-artifact density render, corrected density `D′ = Dmax` maps to
-positive `1.0`. It lives in **density space** (a `D′` value,
+the current density render, corrected density `D′ = Dmax` maps to positive
+`1.0`. It lives in **density space** (a `D′` value,
 where the base is `0`) and is a **scalar** pooled across channels — a per-channel
 `Dmax` would apply three gains in `10^(γ·(D′ − Dmax))`, i.e. a white balance, which
 is the print-render stage's job, not the anchor's. ⚠️ **Distinct from classic
-photographic film `Dmax`** (the negative's physical maximum optical density, at the
-most-exposed point). In the **target characterized density pipeline**, the same
-scalar parameter determines roll exposure-placement gain
-`10^(−γ·Dmax)` applied after arbitrary nonlinear characterization. It preserves
-cross-frame ratios but no longer guarantees that `D′ = Dmax` maps to `1.0`; SDR/
-HDR rendering owns display reference white. The shipped `dmax-reference`
+photographic film `Dmax`** (the negative's physical maximum optical density, at
+the most-exposed point). In the replacement pipeline Dmax belongs to the selected
+density curve: exponential uses it for scalar placement and sigmoid uses it as a
+curve-shaping input. SDR/HDR rendering owns display reference white. The shipped
+`dmax-reference`
 workflow derives it *from* a fully-exposed reference frame (near the film's
 physical Dmax) and freezes it as a roll-fixed calibration by default; the demoted
-per-frame `auto` remains opt-in exposure normalization. Its target meaning is a
-scalar exposure-placement parameter in density units. Never mix it with a
+per-frame `auto` remains opt-in exposure normalization. Never mix it with a
 transmission (a base transmission plus a range is a unit error).
 
 **Domain glossary.** *auto-base* — auto-detecting `Dmin` from the unexposed rebate
@@ -221,20 +221,21 @@ detector proposes as possible rebate.
   - default (no `--output-hdr`) → 16-bit integer TIFF (standard archival positive).
   - `--output-hdr` → 32-bit float TIFF with unclamped values **after the current
     print-render controls**. This is a transitional rendered float TIFF, neither
-    the future true scene master nor a Rec.2100 display-HDR image.
+    the future `film-master` nor a Rec.2100 display-HDR image.
 - **Current color selection:** the output color space is a CLI
   option (`--output-profile`). The default depends on output depth:
   - 16-bit (default) output → **sRGB** (standard, display-ready positive).
   - float (`--output-hdr`) output → provisionally transformed/tagged **linear
     ACEScg**, but still after the current print renderer; it is not the target
-    `scene-master`. (`prophoto` and user ICC files are also accepted.)
+    `film-master`. (`prophoto` and user ICC files are also accepted.)
   Either default can be overridden explicitly. Output is tagged with the embedded
   ICC profile for the chosen space.
-- **Color-accuracy caveat:** the current implementation provisionally treats the
-  reconstructed scanner/film RGB as linear Rec.709 before its output transform.
-  That assignment preserves a deterministic pipeline but is not a measured
-  characterization. `post-reconstruction-color-characterization` will establish
-  the real mapping into linear ACEScg before Display P3 or HDR rendering.
+- **Working-space intent:** the current implementation treats reconstructed
+  scanner/film RGB as linear Rec.709 before its output transform. The replacement
+  pipeline standardizes that existing interpretation as **NC film RGB v1** and
+  transforms/adapts it into linear ACEScg/D60 for every named output. This
+  preserves NC's intentional film rendering; it is not a provisional claim about
+  physical scene color. Measured correction is an optional explicit profile.
 - **Target product default (post-MVP):** `gain-map-hdr` — a standards-neutral,
   backward-compatible SDR rendition plus an ISO 21496-1 gain map, initially in
   HEIC subject to the encoder/licensing spike. The SDR base is Display P3; aware
@@ -245,7 +246,7 @@ detector proposes as possible rebate.
   - `gain-map-hdr` — default, backward-compatible display HDR;
   - `display-p3` — wide-gamut SDR;
   - `compatibility` — sRGB SDR;
-  - `scene-master` — unclamped 32-bit float linear ACEScg TIFF;
+  - `film-master` — unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering;
   - `hdr-pq` — single-rendition BT.2020 / Rec.2100 PQ;
   - `hdr-hlg` — explicit HLG/broadcast-oriented output;
   - `custom` — expert-selected format/profile policy.
@@ -257,16 +258,21 @@ detector proposes as possible rebate.
   fails with the accepted suffixes. Named presets are atomic and cannot be mixed
   with legacy depth/profile/container flags; advanced explicit combinations use
   `custom`. Legacy output flags without a preset retain the transitional TIFF
-  behavior until migration is complete. `scene-master` branches directly from
-  characterized linear ACEScg and bypasses white balance, exposure, black/white placement,
-  highlight compression, and all display tone/gamut rendering; an adjusted
-  linear master is an explicit `custom` workflow, not the default master. To
-  preserve cross-frame exposure, `scene-master` rejects frame-local auto Dmax and
-  accepts density `none` or fixed/roll-calibrated Dmax applied as a scalar after
-  characterization. Sigmoid v1 requires the artifact's exact fixed Dmax because
-  it changes nonlinear shape; simple has no Dmax. After recipe/CLI merge it also rejects any
+  behavior until migration is complete. `film-master` branches directly from NC
+  film RGB v1 mapped linear ACEScg and bypasses white balance, exposure, black/range placement,
+  highlight compression, and all display tone/gamut rendering; a creatively or
+  print/display-adjusted linear master is an explicit `custom` workflow, not the
+  default master. An explicitly selected measured correction is exempt: it
+  remains `film-master` and must record profile identity/hash/scope provenance. This
+  master contains intentional film/lens/development/scanner character and is not
+  physical scene-linear recovery. To preserve cross-frame exposure,
+  `film-master` rejects frame-local auto Dmax. Exponential accepts supported
+  `none` or fixed/roll placement; sigmoid uses fixed Dmax as a curve-shaping
+  input; simple has no Dmax. After recipe/CLI merge it also rejects any
   non-default downstream WB/exposure/black/white/highlight/tone/gamut/display-transfer
-  control; there is no silent ignore mode. Adjusted linear output is `custom`.
+  control; there is no silent ignore mode. Creatively or print/display-adjusted
+  linear output is `custom`; measured correction alone does not rename the
+  preset.
 - **Metadata:** the effective parameter set (recipe) and key estimated values are
   written to a **sidecar JSON** next to the output (paired by name; the same shape
   as `--dump-params`). Current TIFF output embeds the ICC profile of the chosen
@@ -278,6 +284,14 @@ detector proposes as possible rebate.
 
 The conversion is a linear sequence of pure-function stages. Each stage has its
 own parameter struct and can be unit-tested in isolation.
+
+The diagram below depicts the **target / replacement** architecture (tagged
+reconstruction, NC film RGB v1 working-space mapping, and the film-master /
+display-render split). The **current shipped** pipeline implements: decode +
+input-semantics resolution, film-base / `Dmin` estimation, an `Algorithm` +
+`Converter` render with print controls applied *inside* it, a working→output ICC
+transform, and TIFF encode. See the "Architecture" section of `CLAUDE.md` for the
+current-vs-target framing.
 
 ```
                  ┌──────────────────────────────────────────────┐
@@ -291,20 +305,20 @@ own parameter struct and can be unit-tested in isolation.
                  └──────────────────────────────────────────────┘
                                      ▼
                  ┌──────────────────────────────────────────────┐
-                 │ 3. Algorithm: negative → positive             │
-                 │    (simple | density | sigmoid) — pluggable   │
-                 │    sub-stages: density convert, correct,      │
-                 │    film curve / invert (no print controls)    │
+                 │ 3. Tagged negative reconstruction              │
+                 │    simple | density                            │
+                 │    density curve: exponential | sigmoid        │
                  └──────────────────────────────────────────────┘
+                                     │ FilmRgbImage
                                      ▼
                  ┌──────────────────────────────────────────────┐
-                 │ 4. Fused characterization + scale placement    │
-                 │    (canonical RGB → placed f32 linear ACEScg)  │
+                 │ 4. NC film RGB v1 working-space mapping        │
+                 │    (linear Rec.709/D65 → linear ACEScg/D60)    │
                  └──────────────────────────────────────────────┘
                           ┌──────────┴──────────┐
                           ▼                     ▼
               ┌──────────────────────┐  ┌─────────────────────────┐
-              │ 5a. Scene master     │  │ 5b. Display rendering   │
+              │ 5a. Film master      │  │ 5b. Display rendering   │
               │ linear ACEScg direct │  │ print controls + SDR/HDR│
               └──────────────────────┘  └─────────────────────────┘
                           └──────────┬──────────┘
@@ -316,48 +330,39 @@ own parameter struct and can be unit-tested in isolation.
 ```
 
 Stage 1's semantic resolution is **implemented** (`pipeline::input_semantics`,
-task `input-data-semantics`; see §4 and §9); stage 4's characterization remains a
-planned follow-up. The current code already has decode, Dmin/algorithm, print
-controls,
-working→output ICC transform, and TIFF encode, but its print controls still live
-inside the algorithm render. Landing stage 4 must split that boundary: film-domain
-reconstruction stays in stage 3; density's Dmax subtraction moves out of its
-exponent so the fused stage 4 evaluates `10^(gamma*D')`, the artifact, and
-`10^(-gamma*Dmax)` exposure placement in private extended range before returning
-placed `f32` ACEScg. For simple, stage 3 ends at raw unclamped
-`1 - scan/Dmin`; its current inversion-WB and clip-low/high affine remap move to
-the downstream shared WB/black/white-placement contract. White balance,
-exposure, black/white placement, highlight compression, and output tone/gamut mapping move after characterization on the
-display branch. The scene-master branch bypasses them and encodes stage 4's
-unclamped linear ACEScg directly, while rejecting frame-local auto Dmax so
-exposure is not normalized per frame. Until stage 4 lands, the current
-implementation remains a transitional rendered path—not the target scene master.
+task `input-data-semantics`; see §4 and §9). The replacement stage 3 adopts a
+tagged reconstruction schema: `simple`, or `density` containing density
+parameters and a tagged `exponential` (default) or `sigmoid` curve. It preserves
+the current exponential pixels and exact sigmoid equation. Dmax belongs to the
+curve stage—scalar placement for exponential, curve shaping for sigmoid. Every
+path returns private-field `FilmRgbImage`.
 
-At stage 4, named color-defined outputs must resolve either a compatible measured
-artifact or the explicit versioned assumed-source fallback: interpret
-reconstructed values as linear Rec.709/D65, Bradford-adapt/transform them into
-linear ACEScg/D60, and warn/report that the result is provisional. Identity
-scanner-device RGB is never typed or tagged as ACEScg; it is available only as an
-explicit untagged `custom` diagnostic and cannot enter named presets. Artifact
-compatibility is bound to a canonical reconstruction-domain contract/hash that
-includes algorithm/pipeline/model versions, operation order, Dmin normalization
-semantics, density-coordinate settings, regional-balance semantics/settings, and
-the algorithm-specific canonical input. Density numeric Dmax is a downstream
-reported scalar and does not identify its artifact. Sigmoid v1 keeps Dmax inside
-its nonlinear input and therefore requires the exact numeric Dmax as an artifact
-scope constraint. Simple pins raw unclamped `1 - scan/Dmin` and has no Dmax; its
-downstream WB and black/white placement do not identify the artifact. Measured
-Dmin values, source regions, and confidence statistics remain
-runtime provenance; a true semantic/model/scope mismatch fails loudly.
-The fused boundary exposes none of density's extended-range canonical/artifact
-intermediates. Artifact v1 pins `matrix3x3-with-input-curves` in the order monotone input curves
-→ 3x3 matrix → ACEScg. Artifact and contract digests are lowercase SHA-256
-over RFC 8785 canonical JSON with their own digest member omitted; unknown versions/
-models, malformed curves/lengths/order, hash mismatches, and non-finite values or
-results are errors.
+Stage 4 defines **NC film RGB v1** as the existing intentional interpretation of
+that film rendering as linear Rec.709/D65, followed by the pinned standard
+transform/adaptation into linear ACEScg/D60. It returns private-field
+`AcesCgImage`. This one mapping is shared by simple and both density curves,
+preserves film/lens/development/scanner differences, and makes no claim of
+physical scene recovery. Named color outputs cannot merely tag `FilmRgbImage`.
+Optional measured correction profiles may be explicitly selected later, but
+they are not part of this default mapping and block no output work.
+The optional task owns `--correction-profile PATH` /
+`correction.profile = {"file": "PATH"}` (default `null`) and inserts correction
+immediately after NC film RGB v1 mapping, before the film-master/display split.
+An explicitly corrected film master remains the `film-master` preset but records
+the profile identity/hash, corrected scope, and provenance; absence is a
+bit-identical no-op.
+
+For simple, stage 3 ends at raw unclamped `1 - scan/Dmin`; current inversion-WB
+and clip-low/high remapping move to the downstream shared contract for named
+presets. White balance, exposure, black/range placement, highlight compression,
+and output tone/gamut mapping live after ACEScg on the display branch. The
+`film-master` branch bypasses them and encodes stage 4 directly, rejects
+frame-local auto Dmax, and records that it contains intentional film rendering
+rather than a physical scene-linear recovery. Legacy no-preset TIFF calls retain
+their current ordering until preset activation.
 
 Within the display branch, SDR and HDR share the same resolved linear white
-balance, exposure, and black/white placement. They diverge only for output-specific
+balance, exposure, and black/range placement. They diverge only for output-specific
 highlight/reference-white, tone, gamut, and transfer rendering, so a gain-map
 pair starts from one consistently adjusted source without forcing SDR highlight
 compression onto the HDR rendition.
@@ -380,11 +385,14 @@ traditional silver B&W film (silver blocks IR like dust) or reliably for
 Kodachrome. So Step 1 preserves the data cheaply now and adds the consuming stage
 later.
 
-## 7. Conversion algorithms
+## 7. Reconstruction and density curves
 
-Algorithms implement a common trait so new ones can be added without touching the
-rest of the pipeline. Selected with `--algorithm <name>`; algorithm-specific
-flags are namespaced.
+The currently shipped implementation selects a boxed `Converter` with
+`--algorithm simple|density|sigmoid` and returns an untyped `LinearImage`. That
+is the **legacy, transitional implementation**, not the target interface. The
+replacement accepts `--reconstruction simple|density`; density then selects
+`--density-curve exponential|sigmoid`. Every target path returns
+`FilmRgbImage`, so only the working-space mapper can construct `AcesCgImage`.
 
 ### 7.1 `simple` — inversion baseline
 
@@ -394,12 +402,10 @@ color negatives (ignores density behavior and the orange mask).
 
 The currently shipped stages are `positive = 1 - scan/Dmin` →
 `invert_white_balance` gain per channel → the `clip_low`/`clip_high` affine
-black/white remap. In the target characterized pipeline, stage 3 ends at the
-pinned unclamped canonical input `U_c = 1 - scan_c/Dmin_c`. The measured Dmin is
-runtime provenance; only the normalization/inversion equation and order define
-artifact coordinates. `simple` has no Dmax. Inversion WB and clip remapping move
-to the downstream shared WB/black/white-placement contract and therefore cannot
-change artifact compatibility. The old flags/`simple.*` recipe keys use a warned
+black/white remap. In the replacement pipeline, stage 3 ends at unclamped
+`U_c = 1 - scan_c/Dmin_c` and returns `FilmRgbImage`. `simple` has no Dmax.
+Inversion WB and clip remapping move after the ACEScg boundary to the downstream
+shared WB/black/range-placement contract. The old flags/`simple.*` recipe keys use a warned
 migration: target presets resolve `--invert-white-balance` to explicit
 `print.white_balance` and clip endpoints to
 `print.linear_range = [low, high]` / atomic `--linear-range LOW,HIGH`. Range
@@ -408,10 +414,12 @@ endpoints and conflicts with either legacy flag. Without it, `--clip-low` and
 `--clip-high` independently override their endpoint, after which finite
 `low < high` is validated. Reports warn and record each endpoint's provenance;
 new recipes/reports emit only replacement names. Named presets apply the values
-only after characterization. Legacy no-preset TIFF calls keep current ordering
+only after NC film RGB mapping. Legacy no-preset TIFF calls keep current ordering
 until migration. Aliases preserve requested values, not legacy
-pixels: per-channel gains generally do not commute with channel-mixing
-characterization. Target activation warns and bumps `pipeline_version`.
+pixels: per-channel gains generally do not commute with the working-space
+matrix. Target activation warns; because preset/default pixels change,
+`conversion-versioning` owns the corresponding golden-tested
+`pipeline_version` bump.
 
 ### 7.2 `density` — density-domain inversion (default)
 
@@ -423,27 +431,20 @@ The credible baseline for color negatives, following Kodak Cineon / darktable
 2. density correction:       B  = per-channel scale·D + offset (orange-mask comp)
    regional balance:         D̄  = mean(B_r, B_g, B_b)   (scalar tone value)
                              D' = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)
-3. canonical positive:       U = 10^(gamma · D')                     (per channel)
-4. fused characterize/place: C = artifact(U)                         (linear ACEScg)
-                             lin = C · G, G = 10^(−gamma · Dmax)      (none → G = 1)
-5. print/display controls:   exposure, black/white placement, white balance, highlight compression
+3. density curve:            exponential { gamma, Dmax } or
+                             sigmoid { contrast, toe, shoulder, Dmax }
+4. typed film positive:      FilmRgbImage
+5. NC film RGB v1 mapping:   linear Rec.709/D65 → linear ACEScg/D60
+6. print/display controls:   white balance, exposure, black/range placement
 ```
 
-Steps 1–3 are negative reconstruction and remain in scanner/film coordinates.
-The current implementation combines step 3 and the legacy Dmax factor as
-`10^(gamma·(D'−Dmax))` before any future artifact. The target pipeline must
-refactor that ordering: nonlinear artifact curves see Dmax-neutral `U`; the Dmax
-factor is a scalar exposure-placement gain in ACEScg afterward, before the
-scene-master/display split. This is required for artifact reuse because a scalar
-cannot be moved through arbitrary nonlinear curves. The characterization runtime
-owns the whole fused `U → artifact → scalar placement` operation: it may evaluate
-private intermediates in `f64` or an equivalent extended-range form, but returns
-ordinary placed `f32` linear ACEScg and exposes no intermediate buffer. This keeps
-removing Dmax from the exponent from reintroducing the overflow the current
-anchored exponent avoids. Step 5 currently executes inside the density
-renderer, but the target characterized pipeline moves it after characterization. This is
-required because a channel-mixing calibration generally does not commute with
-component-wise white balance or nonlinear black/highlight operations.
+Steps 1–2 are density reconstruction. The tagged curve owns the positive mapping
+and Dmax semantics. Exponential preserves the current
+`10^(gamma·(D'−Dmax))` pixels, with Dmax as scalar placement; sigmoid preserves
+the current S-curve exactly and uses Dmax to shape that curve. Both return the
+same typed film RGB boundary before the shared working-space transform. Step 6
+currently executes inside the density renderer, but named presets move it after
+the ACEScg boundary.
 
 **Polarity.** With `D = -log10(scan / Dmin)` the density is `≥ 0` and *grows* with
 the film's optical density — the unexposed base (scene black) sits at `D = 0`, a
@@ -452,32 +453,27 @@ dense negative area (a scene highlight) at large `D`. A positive must brighten a
 reproduce the negative). This matches darktable `negadoctor` (denser negative →
 brighter print).
 
-**Legacy display-white anchor; target exposure placement (`Dmax`).** In the
-currently shipped, pre-artifact density renderer, `Dmax` is the corrected density
+**Legacy display-white anchor; curve-stage Dmax.** In the currently shipped
+density renderer, `Dmax` is the corrected density
 of scene white and the expression `10^(gamma·(D'−Dmax))` guarantees that
 `D' = Dmax` maps to `1.0`. The base maps to `10^(−gamma·Dmax) ≈ 0`; with `none`,
 the current renderer reproduces its pre-anchor output bit-for-bit (base `1.0`,
 detail above). Current `--output-hdr` is still a rendered float TIFF, not the
-target scene-master branch.
+target `film-master` branch.
 
-In the target characterized density path, `Dmax` supplies the deterministic
-scalar roll exposure-placement gain `G = 10^(−gamma·Dmax)` after the artifact.
-For an arbitrary nonlinear artifact, `artifact(10^(gamma·Dmax)) · G` need not be
-`1.0`; the legacy white-anchor invariant survives only for the current
-pre-artifact render (or a suitably identity/homogeneous artifact). Display
-reference white belongs to the later SDR/HDR render. A fixed roll Dmax preserves
-cross-frame exposure ratios; `none` means `G = 1`. Changing numeric density Dmax
-therefore reuses the artifact and changes output by the pinned scalar ratio. This
-factorization does **not** apply to sigmoid: its Dmax moves the nonlinear
-toe/shoulder shape, so v1 sigmoid artifacts require an exact fixed Dmax scope
-constraint and reject auto/different values.
+In the replacement schema, exponential retains Dmax as scalar placement and
+sigmoid retains it as a nonlinear curve-shaping input. Display reference white
+belongs to the later SDR/HDR render. Fixed/roll Dmax preserves cross-frame
+exposure; frame-local auto Dmax is exposure normalization and is rejected for
+`film-master`.
 
 `Dmax` is a **roll-fixed calibration** — a film + scanner property reused across
 the roll, like the `Dmin` base — **not** a per-frame measurement. Anchoring each
 frame's densest pixel to display white *normalizes exposure per frame* (it
 brightens underexposed frames and forces an overcast scene's grey to white), which
-conflicts with NC's "convert faithfully, grade in Lightroom" purpose. The default
-`density.dmax = fixed` therefore resolves a **fixed** anchor in the order
+conflicts with NC's "convert faithfully, grade in Lightroom" purpose. The
+current `density.dmax = fixed` (target
+`reconstruction.curve.dmax = "fixed"`) therefore resolves a **fixed** anchor in the order
 **measured reference → per-stock constant → nominal**: a value measured once from
 a fully-exposed reference frame (§8, `estimate --d-max-region`) or a known
 per-stock constant is carried as `{ "explicit": <d> }`; with no calibration a
@@ -486,8 +482,10 @@ per-stock constant is carried as `{ "explicit": <d> }`; with no calibration a
 pixel then maps to *wherever it falls* (below white for a dim frame, clipping above
 for a specular), the faithful behavior. `auto` (`--auto-d-max`) — the demoted
 per-frame percentile measurement — remains as an opt-in **exposure-normalizing**
-mode, and `"none"` (`--no-d-max`) disables the anchor for bit-exact scene-referred
-HDR output. See §9. (This is the `dmax-reference` design, §12 item 14; it supersedes
+mode, and `"none"` (`--no-d-max`) selects unity exponential placement: an
+unanchored film rendering whose base is `1.0` and whose detail rises above it.
+This does not recover physical scene values. See §9. (This is the
+`dmax-reference` design, §12 item 14; it supersedes
 the earlier frame-local `auto` default.)
 
 **Regional (shadow/highlight) color balance.** A color *crossover* — a cast that
@@ -505,7 +503,8 @@ another receives the highlight one, misfiring on exactly the pixels this control
 exists to fix. Naming is from the **positive's** point of view: low density
 (near base) is a *shadow*, high density a *highlight*, and (by the polarity
 above) a positive balance value brightens that channel in its region. The range
-anchors come from `density.balance_range`: `auto` (default) measures robust
+anchors come from target `reconstruction.density.balance_range` (current
+`density.balance_range`): `auto` (default) measures robust
 percentiles (0.5 % / 99.5 %, nearest-rank over a deterministic sample) of the
 per-pixel tone in a two-pass within step 2 — it cannot anchor on the `auto`
 `Dmax`, which is measured *after* step 2 (circular) — while an explicit
@@ -533,8 +532,8 @@ the output bit-for-bit (measure once, reuse for the roll; §8). Explicit gains
 beat an auto mode **by source**, not value: `--white-balance 1,1,1` over a
 recipe's auto mode means neutral gains, not re-estimation. See §9.
 
-Negative reconstruction (steps 1–3), fused characterization/placement (step 4),
-and print/display rendering (step 5) remain separate, independently parameterized
+Negative reconstruction, density-to-positive curve, working-space mapping, and
+print/display rendering remain separate, independently parameterized
 stages — the core fidelity rule from §3.
 
 ### 7.3 `sigmoid` — density-domain S-curve (H&D / paper response)
@@ -575,34 +574,41 @@ extreme slope would collapse the curve into a hard threshold that silently
 destroys tonal detail.
 
 Because both the white knee and the black floor derive from the anchor, the
-S-curve is anchored on `[0, Dmax]` and **requires** one: `density.dmax = none`
-(`--no-d-max`) with `--algorithm sigmoid` is a usage error (exit 2) —
-scene-referred output stays a `density`-algorithm feature. The anchor is
-resolved by the same `density.dmax` machinery (the default `fixed` nominal, an
-explicit / reference-derived value, or the opt-in `auto` percentile) and
-reported the same way. `density.density_gamma` parameterizes the
-straight line the S-curve replaces and is **ignored** under `sigmoid` (a report
-warning fires when it was customized); `sigmoid.contrast` is the analogue.
+S-curve is anchored on `[0, Dmax]` and **requires** one. In the target schema,
+`curve.dmax = "none"` with `curve.type = "sigmoid"` is a usage error (exit 2);
+unity placement is supported only by the exponential curve. The anchor uses the
+same fixed, explicit/reference-derived, or opt-in auto resolution policy as the
+exponential curve. Gamma exists only in the exponential variant. Supplying
+`--density-gamma` while the resolved curve is sigmoid is an invalid combination
+after merge (exit 2), never a warning or ignored value. The currently shipped
+legacy implementation instead reads sibling `density.density_gamma` and
+`sigmoid.*`; its historical ignored-gamma warning disappears at migration.
 `--highlight-compress` (a linear-space soft-clip after exposure/WB) composes
 with the shoulder rather than being disabled — with the shoulder on and neutral
 print params it simply never engages, since nothing exceeds `1.0`.
 
-### Pluggable interface (sketch)
+### Current and target interfaces (sketch)
 
 ```rust
-/// A negative→positive conversion algorithm.
-/// Pure: no I/O, no hidden state. Parameters live in the implementing struct
-/// (e.g. `Density { density, print }`), keeping the trait object-safe; a
-/// factory maps `--algorithm` + the resolved params to a boxed converter.
+// Current shipped, transitional interface.
 pub trait Converter {
     fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
-
-    /// Optional per-conversion diagnostics for the JSON report (e.g. the
-    /// resolved `Dmax`). Defaulted to `convert` + an empty `ConvertReport`,
-    /// so algorithms with nothing to report only implement `convert`.
     fn convert_reported(&self, image: &LinearImage, base: &FilmBase)
         -> Result<(LinearImage, ConvertReport)> { /* default provided */ }
 }
+
+// Target stage boundaries. Fields are private; only the owning stage constructs
+// each value, and named output code accepts AcesCgImage rather than FilmRgbImage.
+pub struct FilmRgbImage { /* private */ }
+pub struct AcesCgImage { /* private */ }
+
+pub fn reconstruct(
+    image: &LinearImage,
+    base: &FilmBase,
+    config: &Reconstruction,
+) -> Result<(FilmRgbImage, ReconstructionReport)>;
+
+pub fn map_nc_film_rgb_v1(image: FilmRgbImage) -> Result<AcesCgImage>;
 ```
 
 ## 8. CLI design
@@ -628,15 +634,9 @@ no interactive prompts.
   to JSON. Individual `--flag` overrides take precedence over the loaded recipe,
   so an agent can load a roll recipe and tweak one value per frame.
 
-The recipe JSON is **grouped into per-stage objects** (`input`, `film_base`,
-`density`, `sigmoid`, `print`, `simple`, `output`, plus the top-level
-`algorithm`) rather
-than one flat bag of keys. The grouping lets the tool **reject unknown/typo'd
-keys at every level** (a misspelled knob is a hard error, not a silently-ignored
-default → a quietly wrong image). A recipe may be **partial** — any omitted key or
-section falls back to its default. `nc params` prints this exact shape fully
-populated with defaults, so it doubles as a recipe template; `--dump-params`
-writes the same shape with the resolved values. Example:
+The currently shipped recipe is grouped into `input`, `film_base`, `density`,
+`sigmoid`, `print`, `simple`, and `output`, plus top-level `algorithm`. This is
+the **legacy transitional schema** implemented today:
 
 ```json
 {
@@ -647,13 +647,81 @@ writes the same shape with the resolved values. Example:
 }
 ```
 
-Target preset migration adds `print.linear_range` and emits simple WB/range
-adjustments only under `print`. Legacy `simple.invert_white_balance`,
-`simple.clip_low`, and `simple.clip_high` remain accepted solely as warned input
-aliases during migration. A legacy recipe range supplies the baseline only when
-`print.linear_range` is absent. CLI merge then follows the atomic/endpoint rules
-in §9; new output emits only the `print` fields. Legacy no-preset TIFF recipes
-retain current behavior until migration.
+The target recipe replaces all top-level `algorithm`, `density`, `sigmoid`, and
+`simple` selection forms with exactly one tagged `reconstruction` object.
+These are the complete target reconstruction shapes (other stage objects are
+omitted here):
+
+```json
+{
+  "reconstruction": {
+    "schema_version": 1,
+    "type": "simple"
+  }
+}
+```
+
+```json
+{
+  "reconstruction": {
+    "schema_version": 1,
+    "type": "density",
+    "density": {
+      "scale": [1.0, 1.0, 1.0],
+      "offset": [0.0, 0.0, 0.0],
+      "shadow_balance": [0.0, 0.0, 0.0],
+      "highlight_balance": [0.0, 0.0, 0.0],
+      "balance_range": "auto"
+    },
+    "curve": {
+      "type": "exponential",
+      "gamma": 1.0,
+      "dmax": "fixed"
+    }
+  }
+}
+```
+
+```json
+{
+  "reconstruction": {
+    "schema_version": 1,
+    "type": "density",
+    "density": {
+      "scale": [1.0, 1.0, 1.0],
+      "offset": [0.0, 0.0, 0.0],
+      "shadow_balance": [0.0, 0.0, 0.0],
+      "highlight_balance": [0.0, 0.0, 0.0],
+      "balance_range": {"explicit": [0.1, 1.9]}
+    },
+    "curve": {
+      "type": "sigmoid",
+      "contrast": 1.0,
+      "toe": 0.2,
+      "shoulder": 0.2,
+      "dmax": {"explicit": 2.0}
+    }
+  }
+}
+```
+
+`reconstruction.schema_version` is exactly `1`. Partial input may omit it and
+defaults to 1; resolved recipes always emit it. `curve.dmax` accepts
+`"fixed"`, `"auto"`, `"none"`, or
+`{"explicit": <density>}`; `"none"` is valid only for exponential. Omitted
+density fields take the displayed defaults. Partial input may omit
+`reconstruction.curve`, which selects exponential with its defaults; every
+resolved recipe/report emits exactly one tagged curve. Partial objects are
+otherwise permitted. Unknown fields are rejected at every level. The legacy
+top-level forms are rejected with a migration error once this schema activates;
+they are not aliases.
+
+Target preset migration also adds `print.linear_range` and emits simple
+WB/range adjustments only under `print`. Legacy
+`simple.invert_white_balance`, `simple.clip_low`, and `simple.clip_high` are
+accepted solely as warned input aliases during the preset migration described in
+§9; they are not part of `reconstruction`. Legacy no-preset TIFF calls retain
+their current pixel ordering until migration.
 
 ### Reports & determinism
 
@@ -662,15 +730,72 @@ retain current behavior until migration.
 - `--seed <n>` — fix any stochastic step (none in Step 1, reserved).
 - Stable, documented **exit codes** (see §11).
 
+At target-schema activation, the report's effective `recipe.reconstruction` is
+the exact tagged object above. Resolution diagnostics use this exact additional
+shape (unrelated report fields omitted):
+
+```json
+{
+  "recipe": {
+    "reconstruction": {
+      "schema_version": 1,
+      "type": "density",
+      "density": {
+        "scale": [1.0, 1.0, 1.0],
+        "offset": [0.0, 0.0, 0.0],
+        "shadow_balance": [0.0, 0.0, 0.0],
+        "highlight_balance": [0.0, 0.0, 0.0],
+        "balance_range": "auto"
+      },
+      "curve": {"type": "exponential", "gamma": 1.0, "dmax": "fixed"}
+    }
+  },
+  "reconstruction_result": {
+    "type": "density",
+    "curve": {
+      "type": "exponential",
+      "dmax": {
+        "policy": "fixed",
+        "value": 2.0,
+        "provenance": "default"
+      }
+    }
+  },
+  "working_mapping": "nc-film-rgb-v1"
+}
+```
+
+For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object;
+for exponential `"none"`, `dmax` is
+`{"policy":"none","value":null,"provenance":"recipe"}`; for simple,
+`reconstruction_result` is exactly `{"type":"simple"}`. `policy` is one of
+`fixed|explicit|auto|none`, and `provenance` is one of
+`default|recipe|cli|auto-frame`. A scalar measured from a reference and frozen
+into a recipe has `policy = "explicit"` and `provenance = "recipe"`; its capture
+region remains estimate/report provenance rather than a runtime re-read
+directive. `reconstruction.schema_version = 1` versions the wire schema; it is
+not the behavioral `pipeline_version`. The `conversion-versioning` task owns
+stamping and bumping `pipeline_version`, and does so only when default pixels
+change. This bit-identical refactor preserves legacy no-preset pixels and does
+not itself bump that field. Activating named presets and the new simple ordering
+does change pixels and must cross a prospective, golden-tested
+`pipeline_version` boundary owned by `conversion-versioning`. Recipe/report
+round trips, fixtures, and migration errors pin the reconstruction schema.
+
 ### Example invocations
 
 ```bash
-# Default density conversion, 16-bit TIFF out, auto Dmin & Dmax, JSON report.
+# Current shipped default density conversion: auto Dmin, fixed/roll nominal Dmax,
+# 16-bit TIFF, JSON report. This uses the transitional CLI.
 nc convert in.tiff -o out.tiff --algorithm density --report json
+
+# Target equivalent after reconstruction-schema migration.
+nc convert in.tiff -o out.tiff --reconstruction density \
+  --density-curve exponential --report json
 
 # Transitional rendered float TIFF: --no-d-max disables the current legacy Dmax factor
 # (base → 1.0, detail above), then the current print controls still run and the
-# depth-aware default profile (acescg for HDR) applies. This is NOT scene-master.
+# depth-aware default profile (acescg for HDR) applies. This is NOT film-master.
 nc convert in.tiff -o out.tiff \
   --algorithm density --output-hdr --no-d-max \
   --film-base 0.92,0.55,0.42 \
@@ -777,11 +902,11 @@ nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941
 
 ## 9. Parameter reference (grouped by stage)
 
-Every flag is also a recipe key, nested under the stage object shown in each
-heading below (e.g. `--density-gamma` ⇒ `density.density_gamma`, `--output-hdr` ⇒
-`output.hdr`, `--algorithm` ⇒ top-level `algorithm`). Names are binding —
-the recipe structs and this section are kept in sync (`deny_unknown_fields`).
-Unknown keys are rejected (see §8).
+Every conversion flag has a recipe key. Unchanged shipped stages use the paths
+shown below (for example, `--output-hdr` ⇒ `output.hdr`). Reconstruction entries
+show their **target** paths under the tagged `reconstruction` object; §8
+separately records the currently shipped legacy `algorithm`/sibling-section
+shape. Names are binding and unknown keys are rejected (`deny_unknown_fields`).
 
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
@@ -961,15 +1086,47 @@ geometry is forgiving: because `D = -log10(scan/base)`, a base error is a
 downstream (`density_offset`, white balance) — never a shadow/highlight
 crossover.
 
-### Algorithm select
-- `--algorithm simple|density|sigmoid`
+### Reconstruction and density-curve select
+- Target CLI: `--reconstruction simple|density` (default `density`).
+- With density: `--density-curve exponential|sigmoid` (default `exponential`).
+- Target recipe: `reconstruction.type`, then for density
+  `reconstruction.density` and tagged `reconstruction.curve`, exactly as shown
+  in §8. There are no sibling top-level density or curve sections.
+- When the tagged reconstruction schema activates, the `--algorithm` flag and old
+  `algorithm` recipe form will be rejected with a migration error rather than
+  retained as aliases, and the old top-level `density`, `sigmoid`, and `simple`
+  forms will be rejected at the same boundary. (Today's shipped CLI still
+  **accepts** `--algorithm`; see §8 and the current-keys note below.)
 
-### Density stage (algorithm = density, shared by sigmoid)
-- `--density-scale R,G,B` — per-channel density gain.
-- `--density-offset R,G,B` — per-channel density offset (orange-mask comp).
-- `--density-gamma <f>` — film/print curve gamma.
-- Display-white anchor (`Dmax`) — a single mutually-exclusive choice, recipe key
-  `density.dmax` (default `"fixed"`; see §7.2). `Dmax` is a **roll-fixed
+> **Current shipped keys.** The released binary implements the legacy transitional
+> schema (§8), **not** the target `reconstruction.*` paths in this section. Today a
+> recipe selects the algorithm with a top-level `algorithm` key and configures it
+> via top-level `density.{density_scale, density_gamma, dmax, shadow_balance,
+> highlight_balance, balance_range}` and `sigmoid.{contrast, toe, shoulder}` (plus
+> `simple`). Write recipes for today's binary against §8's legacy schema; the
+> `reconstruction.*` paths below are the target migration.
+
+### Density stage (`reconstruction = density`)
+- `--density-scale R,G,B` ⇒ `reconstruction.density.scale` — per-channel
+  density gain.
+- `--density-offset R,G,B` ⇒ `reconstruction.density.offset` — per-channel
+  density offset (orange-mask compensation).
+- `--shadow-balance R,G,B` ⇒
+  `reconstruction.density.shadow_balance`.
+- `--highlight-balance R,G,B` ⇒
+  `reconstruction.density.highlight_balance`.
+- `--auto-balance-range` ⇒
+  `reconstruction.density.balance_range = "auto"`;
+  `--balance-range LO,HI` ⇒
+  `reconstruction.density.balance_range = {"explicit": [lo, hi]}`.
+- `--density-gamma <f>` ⇒ `reconstruction.curve.gamma`, valid only when the
+  resolved curve type is `exponential`.
+- `--sigmoid-contrast <f>`, `--sigmoid-toe <f>`, and
+  `--sigmoid-shoulder <f>` ⇒ `reconstruction.curve.contrast`, `.toe`, and
+  `.shoulder`, valid only when the resolved curve type is `sigmoid`.
+- `Dmax` is owned by the tagged curve. Its target recipe key is
+  `reconstruction.curve.dmax` (default `"fixed"`; see §7.2). It is a
+  **roll-fixed
   calibration** like `Dmin`. The four flags conflict (passing more than one is a
   usage error); whichever is given replaces a recipe's `dmax`:
   - `--fixed-d-max` (default) ⇒ `"fixed"` — the roll-fixed **nominal** anchor: a
@@ -986,22 +1143,23 @@ crossover.
     exposure normalization** (it brightens underexposed frames and breaks
     roll-to-roll consistency), an opt-in grading convenience *demoted* from the
     former default — not the faithful-conversion default.
-  - `--no-d-max` ⇒ `"none"` — disable the anchor; scene-referred output (base →
-    `1.0`, detail above), reproducing the current pre-anchor render bit-for-bit.
-    Current `--output-hdr` remains a rendered float TIFF, not the target scene
-    master. In the target characterized density path, `none` means unity exposure
-    placement. **Density algorithm only** — the sigmoid S-curve
-    is anchored on `[0, Dmax]`, so `sigmoid` + `none` is a usage error (§7.3).
+  - `--no-d-max` ⇒ `"none"` — choose unity exponential placement (base `1.0`,
+    detail above), reproducing the current pre-anchor film rendering
+    bit-for-bit. This is an unanchored film rendering, not a physical-scene
+    recovery. Current `--output-hdr` remains a rendered float TIFF,
+    not the target `film-master`.
+    The sigmoid curve is anchored on `[0, Dmax]`, so `sigmoid` + `none` is a
+    usage error (§7.3).
 - Regional (shadow/highlight) color balance (see §7.2). "Shadow"/"highlight"
   name the **positive's** tone regions (low/high corrected density); a positive
   value brightens that channel in its region. Defaults `[0, 0, 0]` are identity
   — the default output is bit-exact with the unbalanced render:
-  - `--shadow-balance R,G,B` ⇒ `density.shadow_balance` — per-channel density
-    offset applied in the positive's shadows.
-  - `--highlight-balance R,G,B` ⇒ `density.highlight_balance` — per-channel
-    density offset applied in the positive's highlights.
+  - `--shadow-balance R,G,B` — per-channel density offset applied in the
+    positive's shadows.
+  - `--highlight-balance R,G,B` — per-channel density offset applied in the
+    positive's highlights.
   - Tone-ramp anchors — a single mutually-exclusive choice, recipe key
-    `density.balance_range` (default `"auto"`); the two flags conflict, and
+    `reconstruction.density.balance_range` (default `"auto"`); the two flags conflict, and
     whichever is given replaces a recipe's `balance_range`. Only consulted when
     a balance is non-zero:
     - `--auto-balance-range` (default) ⇒ `"auto"` — measure `[lo, hi]` per frame
@@ -1013,21 +1171,22 @@ crossover.
       densities) — pass an explicit range instead.
     - `--balance-range LO,HI` ⇒ `{ "explicit": [lo, hi] }` — fix the ramp anchors
       (`lo < hi`, both finite, and their difference representable in `f32`).
-- The `sigmoid` algorithm shares this whole section (including the regional
-  balance above) **except `density_gamma`**, which parameterizes the
-  straight-line curve it replaces and is ignored under `--algorithm sigmoid` (a
-  report warning fires when it was customized; `sigmoid.contrast` is the
-  analogue).
+- Both density curves share the `reconstruction.density` object, including
+  regional balance. The curve variants have disjoint fields. After recipe/CLI
+  merge, `--density-gamma` with sigmoid, any sigmoid flag with exponential,
+  any curve/Dmax flag with simple, `curve.dmax = "none"` with sigmoid, and
+  `--density-curve` with simple fail as usage errors. Customized gamma under
+  sigmoid is never ignored.
 
-### Sigmoid stage (algorithm = sigmoid)
+### Sigmoid density curve (`reconstruction = density`, `density-curve = sigmoid`)
 The stage-3 S-curve knobs (§7.3); density correction and the later print/display
-render use the `density.*` and `print.*` sections above. Recipe keys drop the flag prefix (`sigmoid.contrast`,
-`sigmoid.toe`, `sigmoid.shoulder`):
+render use `reconstruction.density` and `print`. The exact recipe keys are
+`reconstruction.curve.contrast`, `.toe`, and `.shoulder`:
 - `--sigmoid-contrast <f>` — mid-density slope of the curve in log-output space
   (the `--density-gamma` analogue). Finite and in `(0, 50]`; default `1.0`. The
   upper cap guards against an extreme slope collapsing the S-curve into a hard
-  black/white threshold that silently destroys tonal detail (use `--algorithm
-  density` for genuinely extreme contrast).
+  black/white threshold that silently destroys tonal detail (use the
+  `exponential` density curve for genuinely extreme contrast).
 - `--sigmoid-toe <f>` — toe (shadow) knee width in log10 density units; `0`
   disables the toe. In `[0, 10]`; default `0.2`. The upper cap is far beyond the
   ~`0.05–0.9` photographic range and rejects a degenerate width that would
@@ -1048,7 +1207,7 @@ false-positive on legitimate high-contrast conversions).
 - `--black-point <f>` — paper black / shadow floor.
 - Target shared render contract adds `--linear-range LOW,HIGH` /
   `print.linear_range` (default `[0,1]`) for the exact affine
-  `(x-low)/(high-low)` black/white placement. It is distinct from the existing
+  `(x-low)/(high-low)` black/range placement (black/white-point placement). It is distinct from the existing
   density print `black_point` and from SDR/HDR reference white in nits.
 - White balance — a single mutually-exclusive choice, recipe key
   `print.white_balance` (default `{ "explicit": [1, 1, 1] }` = neutral; see
@@ -1079,7 +1238,7 @@ false-positive on legitimate high-contrast conversions).
 ### Simple algorithm
 - Current legacy controls: `--invert-white-balance R,G,B` and
   `--clip-low <f>` / `--clip-high <f>`. They currently run before the output
-  transform. In the target characterized pipeline they are not simple
+  transform. In the target film-preserving pipeline they are not simple
   reconstruction parameters. Preset migration accepts them as warned aliases:
   inversion WB maps to explicit `print.white_balance`, while clip endpoints map
   to `print.linear_range` / atomic `--linear-range LOW,HIGH`. Resolve the recipe
@@ -1087,19 +1246,21 @@ false-positive on legitimate high-contrast conversions).
   with either legacy range flag; otherwise `--clip-low`/`--clip-high`
   independently override their endpoint. Validate finite `low < high` after
   merge, warn, and report endpoint provenance. New recipes/reports emit only
-  replacement names, and named presets apply them only after characterization.
-  `scene-master` rejects every final non-default range regardless of source;
+  replacement names, and named presets apply them only after NC film RGB mapping.
+  `film-master` rejects every final non-default range regardless of source;
   legacy flags may reset recipe endpoints to `[0,1]`. Legacy no-preset TIFF calls keep current ordering until
   migration. Aliases preserve parameter values, not bit-identical output through
-  a channel-mixing artifact; target activation warns and bumps `pipeline_version`.
+  the working-space matrix; target activation warns, and
+  `conversion-versioning` owns the prospective behavioral-version bump when the
+  changed preset/default pixels activate.
 
 ### Output / encode (current terminal stage; target stages 5–6)
 - `-o, --output <path>` (required)
 - `--output-hdr` — current transitional flag: write a 32-bit float unclamped
-  **rendered** TIFF after the current print controls, not the future scene master
+  **rendered** TIFF after the current print controls, not the future `film-master`
   or Rec.2100 display HDR; without it output is 16-bit integer. Recipe key
   `output.hdr` (bool, default `false`). It will be replaced by the explicit
-  `scene-master`/display-HDR preset model.
+  `film-master`/display-HDR preset model.
 - `--output-sdr` — force the default 16-bit integer output, overriding a
   recipe's `output.hdr = true` (the flags-win escape hatch; an absent
   presence flag never clobbers a recipe value). Conflicts with
@@ -1109,20 +1270,23 @@ false-positive on legitimate high-contrast conversions).
 - `--bigtiff auto|on|off` (default `auto`)
 
 Planned `output-presets` replaces the depth-only default with `gain-map-hdr` and
-explicit `display-p3`, `compatibility`, `scene-master`, `hdr-pq`, `hdr-hlg`, and
-`custom` policies. `scene-master` encodes characterized unclamped linear ACEScg
-before print/display controls and rejects frame-local auto Dmax, accepting
-density `none` or fixed/roll Dmax via fused-runtime scalar placement;
-sigmoid v1 requires its artifact's exact fixed Dmax and simple has none. Named display presets use the SDR/HDR render
+explicit `display-p3`, `compatibility`, `film-master`, `hdr-pq`, `hdr-hlg`, and
+`custom` policies. `film-master` encodes NC film RGB v1 mapped unclamped linear
+ACEScg before print/display controls and rejects frame-local auto Dmax.
+Exponential accepts supported `none` or fixed/roll placement, sigmoid uses fixed
+Dmax for curve shaping, and simple has none. Named display presets use the SDR/HDR render
 branches. The output path stays required; its suffix must match the
 resolved container and is never rewritten silently. A named non-`custom` preset
 conflicts with legacy output-selection flags (`--output-hdr`, `--output-sdr`,
 `--output-profile`, `--bigtiff`); legacy flag-only invocations retain their
-transitional TIFF behavior. After merge, `scene-master` also rejects every
+transitional TIFF behavior. After merge, `film-master` also rejects every
 non-default effective WB, exposure, black, white, highlight, SDR/HDR tone, gamut, or
 display-transfer control from recipe or CLI; it never ignores one. Flags may
 explicitly reset recipe values to defaults, and the resolved report records the
-effective values/provenance and that no display transfer ran. Those preset names are not accepted by the current
+effective values/provenance and that no display transfer ran. A selected
+`correction.profile` is not a downstream creative/print/display control:
+corrected output remains `film-master` and records mandatory profile
+identity/hash/scope provenance. Those preset names are not accepted by the current
 CLI yet. `nc roll` migration is part of the preset task: automatic names use
 each resolved container suffix, manifest/per-frame overrides validate
 independently, and each sidecar derives from its final image path. The single roll
@@ -1143,18 +1307,19 @@ shape above and adds no new conversion knobs. Its flags are operational (like
 positional `inputs` (files and directories — a directory is expanded to its
 `.tif`/`.tiff` files, sorted; shell globs are expanded by the shell, not by nc)
 **or** `--frames <manifest.json>` (explicit per-frame `input`/`output`/partial-recipe
-`params` overrides, deep-merged onto the shared recipe for that frame only). The
-shared recipe *configuration* (where the roll-fixed film base and `density.dmax`
-live) appears once at the top of the roll report; each frame additionally reports
+`params` overrides, deep-merged onto the shared recipe for that frame only).
+The shipped schema stores roll-fixed Dmax at `density.dmax`; the target schema
+stores it at `reconstruction.curve.dmax`. The shared recipe configuration
+appears once at the top of the roll report; each frame additionally reports
 the *resolved* base / `Dmax` it used — a redundant echo when the recipe pins an
 explicit base, but meaningful under an `auto`/`region` base that resolves per
 frame. Frame-local knobs are the per-frame `params` overrides. Roll-fixed
 invariant violations are **loud, `--strict`-promotable warnings** rather than
 hard errors, so a deliberate best-effort batch remains usable: (1) a shared
-`film_base.source` other than `explicit` re-estimates Dmin per frame; (2) shared
-`density.dmax = auto` measures Dmax per frame; (3) a per-frame override that sets
-`film_base` changes that frame's Dmin; and (4) a per-frame override that sets
-`density.dmax` changes that frame's placement. Shared `fixed`, explicit, or
+`film_base.source` other than `explicit` re-estimates Dmin per frame; (2) the
+active Dmax key set to `auto` measures Dmax per frame; (3) a per-frame override
+that sets `film_base` changes that frame's Dmin; and (4) a per-frame override
+that changes the active Dmax key changes that frame's placement. Shared `fixed`, explicit, or
 `none` Dmax policies remain deterministic across the roll. `input.export_ir` is rejected in roll mode (one
 path, N frames). Determinism: same batch + same recipe ⇒ byte-identical output per
 frame.
@@ -1316,10 +1481,11 @@ the NLP feature comparison, Phase 6).
    film base / `Dmax` once for the roll and emit the frozen recipe roll applies) —
    the dependent `base-acquisition-planner` task — plus first-class named presets
    (film stock, neutral spots).
-7. **Color-characterization QA harness.** Target-based calibration and ΔE2000 /
-   SSIM regression testing against controlled negatives. This supports the
-   post-reconstruction scanner/film characterization in item 20; it is distinct
-   from blindly applying a conventional positive-scanner ICC before density.
+7. **Optional color-correction QA harness.** Target-based fitting and ΔE2000 /
+   SSIM regression testing against controlled negatives may support explicitly
+   selected correction profiles. It is not part of the default film-preserving
+   pipeline and is distinct from blindly applying a conventional positive-scanner
+   ICC before density.
 8. **Robust auto film-base detection.** *(Done — implemented as the inward-scan
    detector, see §9 film-base.)* The kept scope shipped together: the detector
    for the real `holder → thin rebate → picture` layout (deterministic,
@@ -1392,9 +1558,9 @@ the NLP feature comparison, Phase 6).
     there is no `pipeline_version` code constant yet (`conversion-versioning`,
     item 16, is unshipped), so when it lands this default must be labeled
     `pipeline_version 1` (the v0→v1 boundary for the density default). In the
-    planned characterized-density runtime, this scalar becomes deterministic
-    post-artifact roll exposure placement rather than a guaranteed display-white
-    anchor; SDR/HDR rendering owns display reference white.
+    replacement pipeline, Dmax belongs to the selected density curve: scalar
+    placement for exponential and curve shaping for sigmoid. SDR/HDR rendering
+    owns display reference white.
 15. **IR-assisted film-holder detection.** First consumer of the IR channel
     besides item 1. Chromogenic dyes are IR-transparent, so all such film (base,
     picture, even fully-exposed leader) is bright in IR while the opaque holder is
@@ -1442,40 +1608,28 @@ the NLP feature comparison, Phase 6).
 19. **Conventional scanner ICC before density — deferred experiment.** Compare
     `scanner RGB → Dmin/log density` against applying the same scanner ICC to image
     and Dmin first, using only a defined linear destination and controlled target
-    error. This alternative workflow neither blocks nor substitutes for normal
-    post-reconstruction characterization. `--input-profile` stays rejected for
+    error. This alternative workflow neither blocks nor substitutes for the
+    normal film-preserving mapping or optional correction profiles.
+    `--input-profile` stays rejected for
     normal conversion unless this experiment validates a supported path. Tracked:
     `scanner-profile-before-density-experiment`.
-20. **Post-reconstruction scanner/film characterization.** Dmin, density, and
-    inversion produce a positive-polarity image whose RGB axes still reflect the
-    scanner spectral response, film dyes, and development. The runtime task owns
-    the typed scanner/film RGB → linear ACEScg boundary and a strict versioned
-    artifact loader. Artifact compatibility binds a canonical reconstruction-
-    domain contract/hash to the algorithm/pipeline version and every calibration-
-    defining Dmin normalization, density, regional-balance, and algorithm-specific
-    canonical input. Density uses Dmax-neutral `10^(gamma*D')`, characterizes it,
-    then applies numeric Dmax as a scalar ACEScg gain, so density Dmax remains a
-    runtime input. Sigmoid v1 pins exact Dmax because it changes nonlinear shape;
-    simple pins raw unclamped `1 - scan/Dmin` and has no Dmax; its current
-    inversion-WB and clip affine remap migrate to downstream display controls and
-    do not identify its artifact. Measured Dmin remains runtime provenance unless
-    a deliberately narrower artifact constrains it. Unknown
-    schema/model/order, malformed curves, bad hashes, mismatches, and non-finite
-    values fail loudly. Both artifact and contract hashes omit their own digest
-    member before RFC 8785 canonicalization and SHA-256. The explicit fallback assumes linear Rec.709/D65 then
-    adapts/transforms to ACEScg/D60 and is always warned as provisional; raw
-    identity device RGB remains only an untagged custom diagnostic. A separate calibration
-    task fits the simplest measured model justified by controlled target data and
-    validates held-out Delta E before producing a real artifact, with declared
-    target illuminant/adaptation and no baked creative WB. A third render-pipeline
-    task moves display controls after characterization. `scene-master` encodes the
-    characterized linear result directly and permits only supported `none` or a
-    fixed/roll Dmax; display branches apply white balance, exposure, black/white placement,
-    highlight compression, and tone/gamut rendering.
-    Assigning an ICC output profile is not characterization. Tracked:
-    `post-reconstruction-color-characterization`,
-    `color-characterization-calibration`,
-    `post-characterization-render-pipeline`.
+20. **Film-preserving reconstruction and working pipeline.** Replace the
+    algorithm enum with tagged simple/density reconstruction and tagged
+    exponential/sigmoid density curves. Preserve current exponential pixels and
+    the exact sigmoid equation; move Dmax ownership into the curve. Every path
+    returns typed `FilmRgbImage`. NC film RGB v1 intentionally interprets those
+    values as linear Rec.709/D65 and transforms/adapts them into typed linear
+    ACEScg/D60. This is NC's film-rendering intent, not physical scene recovery.
+    `film-master` encodes the unclamped ACEScg film rendering directly; named
+    display branches apply shared WB → exposure → black/range placement before
+    SDR/HDR-specific tone, gamut, and transfer work. Legacy no-preset TIFF
+    ordering remains during migration. Optional correction profiles may
+    explicitly neutralize declared scanner/film/development/lens behavior, but
+    block no output task. Tracked:
+    `negative-reconstruction-density-curves`,
+    `film-rgb-working-space`,
+    `film-master-render-pipeline`,
+    `optional-color-correction-profiles`.
 21. **Display P3 SDR output.** The SDR renderer solely maps ACEScg into rendered
     linear Display P3, including adaptation/gamut policy. The P3 output task then
     applies the piecewise sRGB TRC and attaches a deterministic ICC v4 profile:
@@ -1494,17 +1648,17 @@ the NLP feature comparison, Phase 6).
     with the HDR rendition and ISO 21496-1 metadata, initially targeting HEIC and
     requiring both Apple and non-Apple verification. Public terminology is
     standards-neutral (`gain-map-hdr`, not a platform brand). Both renditions
-    share the identical characterized/adjusted source; gain ratios are derived in
+    share the identical mapped/adjusted film source; gain ratios are derived in
     the standard-required common linear color domain, never by dividing encoded
     P3 and PQ/BT.2020 values. Once verified,
     `gain-map-hdr` becomes the default; explicit presets retain Display P3 SDR,
-    sRGB compatibility, linear ACEScg scene master, PQ, HLG, and custom workflows.
+    sRGB compatibility, linear ACEScg film master, PQ, HLG, and custom workflows.
     `nc roll` naming/manifests migrate with presets so suffixes derive from each
     resolved container and per-image sidecars derive from final image paths. One
     roll report remains on stdout or explicit `--report-file`, collision-checked
     against all batch inputs/outputs/sidecars. Core full-size TIFF/resource verification remains independently runnable;
-    final gain-map/preset metadata, calibrated color, explicit-fallback labeling,
-    and cross-device behavior are a separate gate.
+    final gain-map/preset metadata, faithful film-rendering consistency, and
+    cross-device behavior are a separate gate.
     Tracked: `gain-map-hdr-output`, `output-presets`,
     `display-output-acceptance`.
 
@@ -1516,11 +1670,11 @@ All of the Step-1 open questions have since been resolved (kept here as a record
   reverse-engineered and verified against real sample files; documented in §4
   (separate full-resolution grayscale IR IFD, optional preview IFD, structural
   HDR/HDRi detection).
-- ~~Which wide-gamut space to use for the target `scene-master` output~~ —
+- ~~Which wide-gamut space to use for the target `film-master` output~~ —
   **resolved**: **linear ACEScg**. The current `--output-hdr` path can tag its
   rendered float values as ACEScg but is not that master. The target branch lands
-  after scanner/film characterization and before print/display controls; it is
-  not Rec.2100 display HDR. See §5.
+  after NC film RGB v1 mapping and before print/display controls; it is not
+  physical scene recovery or Rec.2100 display HDR. See §5.
 - ~~Whether the embedded TIFF metadata should carry the full recipe~~ —
   **resolved**: the recipe lives in the sidecar JSON only (paired by name with
   the output); the TIFF embeds just the ICC profile. See §5.

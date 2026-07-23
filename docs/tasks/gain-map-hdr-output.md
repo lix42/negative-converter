@@ -8,14 +8,14 @@ the encoder decision from the HDR spike.
 
 ## Design
 
-Combine two independently valid renderings of the characterized image:
+Combine two independently valid renderings of the mapped film image:
 
 ```text
 SDR Display P3 base + display-HDR rendition → gain map + ISO metadata → container
 ```
 
-Both renditions must originate from the same characterized pixels and identical
-resolved shared linear adjustments (white balance, exposure, and black/white placement).
+Both renditions must originate from the same ACEScg film-rendering pixels and identical
+resolved shared linear adjustments (white balance, exposure, and black/range placement).
 They diverge only in SDR-versus-HDR reference-white, tone, gamut, and transfer
 rendering.
 
@@ -37,7 +37,7 @@ rendering model.
 
 - A standards-aware decoder reconstructs the expected HDR rendition from the SDR
   base and gain map within declared tolerance.
-- Tests prove both renditions originate from the identical characterized/shared-
+- Tests prove both renditions originate from the identical mapped/shared-
   adjusted source and that gain ratios are computed in the pinned common linear
   domain, not from encoded P3/PQ/HLG samples.
 - A decoder that ignores the gain map displays the correct SDR Display P3 base.

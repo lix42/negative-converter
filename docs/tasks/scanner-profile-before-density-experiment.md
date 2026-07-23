@@ -21,7 +21,7 @@ B. scanner RGB → scanner ICC → defined linear RGB/XYZ
 
 Pipeline B must use linear coordinates; never divide or take logarithms of PCS
 Lab values. Both variants then receive the same permitted exposure, white
-balance, post-reconstruction characterization, and output transform so the only
+balance, NC film RGB working-space mapping, and output transform so the only
 experimental variable is the pre-density scanner ICC.
 
 Measure target-patch error with a documented Delta E metric and report median
@@ -31,8 +31,8 @@ without improving reconstruction of the photographed scene; report those goals
 separately.
 
 The result decides only whether nc should offer an experimental/supported
-pre-density input-profile path. It does not choose or block the normal
-post-reconstruction characterization.
+pre-density input-profile path. It does not choose or block the normal NC film
+RGB mapping or optional correction-profile work.
 
 ## Implementation Suggestion
 

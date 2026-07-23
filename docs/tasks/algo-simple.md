@@ -1,11 +1,12 @@
 # Simple Inversion Algorithm
 
 > **Target-pipeline note:** this completed task records the shipped renderer.
-> Future post-reconstruction characterization stops at raw unclamped
-> `1 - scan/Dmin`; its WB and clip-range controls migrate to downstream shared
+> The replacement film-preserving pipeline stops reconstruction at raw
+> unclamped `1 - scan/Dmin`, maps the resulting `FilmRgbImage` through NC film
+> RGB v1, and moves WB and clip-range controls to downstream shared
 > `print.white_balance` and `print.linear_range` placement. See
-> `post-reconstruction-color-characterization` and
-> `post-characterization-render-pipeline`.
+> `negative-reconstruction-density-curves`, `film-rgb-working-space`, and
+> `film-master-render-pipeline`.
 
 ## Goal
 
