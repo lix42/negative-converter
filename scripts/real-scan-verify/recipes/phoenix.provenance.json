@@ -1,0 +1,20 @@
+{
+  "roll": "phoenix",
+  "dmin": {
+    "frame": "20260712-nikon-933.tif",
+    "region": "1400,1027,1866,1369",
+    "base": {
+      "r": 0.36330205,
+      "g": 0.26269934,
+      "b": 0.42475012
+    },
+    "warnings": "nc: warning: base-region [1400,1027,1866,1369] is not uniform (worst per-channel relative spread 0.15 > 0.15); the rectangle may mix unexposed rebate with image content — verify it with `nc inspect` "
+  },
+  "dmax": {
+    "frame": "20260715-nikon-1010.tif",
+    "region": "1555,1080,2074,1440",
+    "scalar": 0.89764357,
+    "warnings": "nc: warning: measured reference Dmax 0.89764357 is implausibly low for a fully-exposed leader (expected ≳ 1.0 density) — the region may not be a fully-exposed leader; verify --d-max-region before freezing this anchor "
+  },
+  "note": "center 40% region excludes film holder; scalars frozen for deterministic apply"
+}

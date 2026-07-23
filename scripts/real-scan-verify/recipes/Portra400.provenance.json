@@ -1,0 +1,20 @@
+{
+  "roll": "Portra400",
+  "dmin": {
+    "frame": "20260714-nikon-994.tif",
+    "region": "1555,1080,2074,1440",
+    "base": {
+      "r": 0.5414054,
+      "g": 0.26033416,
+      "b": 0.15742733
+    },
+    "warnings": ""
+  },
+  "dmax": {
+    "frame": "20260717-nikon-1032.tif",
+    "region": "1555,1080,2074,1440",
+    "scalar": 1.7382799,
+    "warnings": ""
+  },
+  "note": "center 40% region excludes film holder; scalars frozen for deterministic apply"
+}

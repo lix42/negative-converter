@@ -2999,3 +2999,30 @@ verified findings applied:
   corresponding destination-output stage applies transfer encoding afterward;
   gain-map construction consumes the pre-transfer rendition for common-linear
   ratio derivation. This removes the prior double-encoding ambiguity.
+
+### Real-scan core verification — executed 2026-07-22 (task: real-scan-verification)
+
+Full matrix run against the user's five real rolls (Ektar, phoenix, Portra160,
+Portra400, Portra400-leica-flaw) on the compiled release binary. Derived numbers
+only — no sample pixels read into context. Full write-up + numbers:
+[`docs/reports/real-scan-verification.md`](reports/real-scan-verification.md);
+rerunnable harness + frozen recipes under `scripts/real-scan-verify/` (see its `README.md`).
+
+- **All assets are HDRi** (`ir_present: true`; IR carried in the transparency-mask
+  IFD), standard frame 5184×3599 ≈ 18.66 MP. Scanner Plustek 8300i / SilverFast 9.2.9.
+- Per-roll `Dmin` (unexposed frame) + `Dmax` (fully-exposed leader) measured from a
+  holder-free center-40% region, frozen to recipes. 4/5 rolls clean.
+- Matrix: inspect ✅ · estimate ✅ (`--auto-base` fails loudly on every frame per the
+  holder layout — correct) · convert 16-bit+float ✅ (float byte-lossless; u16 clips
+  4.8–10.3% high) · IR export + `--strict` ✅ · determinism byte-identical ✅ ·
+  resource ✅.
+- **Resource / streaming STEP 0 input:** measured peak **~930 MiB @ 18.66 MP
+  (~50 MiB/MP)**, ~1.6 s wall — ~1.5× the design's ~600 MB model (model omits the
+  carried IR plane + `to_output` clone). Target = 8 GB M3 MacBook Air (2024),
+  ~4–5 GB usable. Assumed 4× worst case ⇒ ~3.7 GiB (4× MP) to ~15 GiB (4× per side)
+  ⇒ **`memory-preflight` gate required; streaming a conditional GO** pending
+  post-preflight re-measure and the true input envelope.
+- **Follow-ups:** (1) default 16-bit highlight clipping → display-output roadmap;
+  (2) Harman Phoenix dense base trips the `Dmax ≳1.0` floor + base-uniformity check
+  → candidate new task (per-stock/dense-base Dmax handling); (3) widen
+  `memory-preflight` sizing model to count IR + clone. No hard defects.

@@ -172,9 +172,12 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   scans and degrade gracefully on unrecognized layouts. Sample scans live in the
   [nc-assets Google Drive folder](https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6) — the
   canonical source — mirrored locally at `../nc-assets/{48,64}bit-full/` (and
-  `~/Pictures/scan/`; 50–160 MB each). **Never read them into context**; inspect IFD structure with `tiffinfo`, and exercise the
-  pipeline on them with a throwaway `#[ignore]` test that calls `io::decode` and
-  prints only derived numbers (remove it after). Note: real scans are laid out
+  `~/Pictures/scan/`; 50–160 MB each). **Never read them into context**; inspect IFD
+  structure with `exiftool` (`tiffinfo` is not installed here) or `nc inspect`, and
+  exercise the pipeline on them either with a throwaway `#[ignore]` test that calls
+  `io::decode` and prints only derived numbers, or via the committed
+  `scripts/real-scan-verify/` harness (staged verification driving the `nc` binary,
+  derived numbers only — see its `README.md`). Note: real scans are laid out
   `dark holder → thin inset rebate → picture` (the rebate is not the outer margin),
   so `--auto-base` is best-effort; measure `Dmin` once from an unexposed reference
   and reuse it via `--base-region`/`--film-base` (design-spec §8).
