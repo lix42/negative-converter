@@ -2961,17 +2961,46 @@ verified findings applied:
   destination encoding white, not the ICC media white.
 
 ## hdr-output-spike
-**Status:** not started
-**Updated:** 2026-07-21
+**Status:** in progress
+**Updated:** 2026-07-23
 
 - 2026-07-21: Added a decision gate for ISO HDR versus ISO 21496-1 gain-map HDR,
   HEIC/JPEG containers, encoder/licensing constraints, metadata, reference white,
   headroom, and cross-platform fallback before committing production code.
+- 2026-07-23: Started the spike. The investigation will pin exact standards and
+  container profiles, compare cross-platform encoder APIs and licensing, inspect
+  metadata round trips with small reference files, and record numeric rendering
+  policy plus a versioned platform/fallback matrix for downstream tasks.
+- 2026-07-23: Wrote
+  [`docs/hdr-output-spike.md`](hdr-output-spike.md). The
+  provisional implementation choice is JPEG for the default ISO 21496-1 gain-map
+  output and 10-bit 4:4:4 AVIF for explicit PQ/HLG. HEIC is deferred because the
+  portable encoder lacks the final gain-map container API and HEVC/x265 adds
+  licensing and packaging risk.
+- 2026-07-23: Pinned current standards and rendering inputs: ISO 22028-5:2026
+  (which replaced the withdrawn 2023 technical specification), ISO 21496-1:2025,
+  ISO/IEC 23008-12:2025/Amd 1:2025 for a future HEIF path, BT.2100-3,
+  203 cd/m² reference white, 1000 cd/m² initial target peak, 4.926108 linear
+  content headroom, and 2.300448 log2 capacity.
+- 2026-07-23: Prototype PQ/HLG AVIF files carried the intended 10-bit BT.2020
+  CICP values and decoded in macOS ImageIO with 4.92611 PQ headroom. Fixed
+  single-thread encodes were byte-identical on the same build.
+- 2026-07-23: Prototype `libultrahdr` 1.4.0 JPEG metadata decoded in
+  libultrahdr/ExifTool/ImageMagick, but macOS ImageIO rejected the file. Its
+  marker order was ISO APP2, MPF APP2, then JFIF APP0; upstream PR 394 fixes that
+  ordering but is not released. Moving APP0 first and correcting the MPF offset
+  locally still failed ImageIO, so final ISO serialization, repaired Apple
+  decode, physical Android/iPhone/browser viewing, and legal review remain
+  downstream pre-shipping gates; only licensed normative-text review remains a
+  prerequisite for completing the spike itself.
 
 ## hdr-display-rendering
 **Status:** not started
 **Updated:** 2026-07-23
 
+- 2026-07-23: The HDR spike pinned 203 cd/m² reference white, 1000 cd/m² target
+  peak, PQ as the primary path, explicit HLG assumptions, hue-preserving gamut
+  compression, and a 10-bit full-range BT.2020 4:4:4 AVIF encoder boundary.
 - 2026-07-23: Rebased the renderer on intentional linear ACEScg film values from
   `film-master-render-pipeline`; physical scene recovery and optional correction
   profiles are not prerequisites.
@@ -2980,6 +3009,17 @@ verified findings applied:
   Rec.2100 is a display encoding, not nc's density or internal working space.
 - 2026-07-21: Removed ambiguous ownership of the SDR base; this task now verifies
   PQ/HLG only, while `sdr-display-rendering` produces the independent SDR render.
+
+## hdr-avif-output
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Added the missing owner for libavif/libaom FFI, static packaging,
+  AVIF container and metadata conformance, determinism, licensing inputs, and
+  codec-specific decoded-error thresholds. The initial contract is 10-bit
+  full-range 4:4:4 AVIF v1.2 Advanced Profile, AV1 High Profile level ≤ 6.0,
+  with `avif`/`mif1`/`miaf`/`MA1A` brands inside profile limits and explicit
+  grid or general-brand-only behavior for oversized images.
 
 ## sdr-display-rendering
 **Status:** not started
@@ -3003,8 +3043,27 @@ verified findings applied:
 
 ## gain-map-hdr-output
 **Status:** not started
-**Updated:** 2026-07-21
+**Updated:** 2026-07-23
 
+- 2026-07-23: The spike changed the first container from HEIC to JPEG. The task
+  now targets an 8-bit Display P3 base plus a half-resolution RGB map derived in
+  linear Display P3, with final ISO 21496-1 and Android Ultra HDR v1 metadata.
+  Stable libultrahdr 1.4.0 is gated on its JPEG marker-order fix and final-standard
+  serialization; HEIC remains a future container.
+- 2026-07-23: Separated 4.926108 linear display headroom from 2.300448 log2
+  Ultra HDR XMP capacity, required actual per-pixel gain extrema to come from the
+  canonical offset-adjusted formula over independently tone-mapped renderings,
+  and added independent reconstruction plus semantic-agreement and
+  ISO-preference tests for the two metadata dialects.
+- 2026-07-23: Pinned the canonical per-channel gain form to
+  `(HDR + offset_hdr) / (SDR + offset_sdr)` after selecting positive finite
+  offsets. Added fail-loud domain rules and black/near-black/zero/invalid
+  fixtures; no arbitrary epsilon, silent clamp, or `0/0` behavior is permitted.
+- 2026-07-23: Pinned the formula's units to common linear Display P3 normalized
+  by 203 cd/m² reference white: SDR/reference white and 203-nit HDR are `1.0`,
+  while 1000-nit HDR enters as `4.926108...`; offsets use the same domain.
+  Added equal-white gain-1, independently tone-mapped peak, and mixed-unit
+  rejection fixtures so display headroom cannot be mistaken for pixel gain.
 - 2026-07-21: Planned standards-neutral ISO 21496-1 output: Display P3 SDR base
   plus a gain map reconstructing the HDR rendition, initially targeting HEIC and
   requiring both Apple and non-Apple interoperability checks.
@@ -3025,6 +3084,9 @@ verified findings applied:
 - 2026-07-23: Added `conversion-versioning` as an explicit prerequisite because
   preset/default activation owns a golden-tested behavioral
   `pipeline_version` boundary.
+- 2026-07-23: Added `hdr-avif-output` as a prerequisite so PQ/HLG presets cannot
+  become reachable before AVIF encoding, profile/container conformance,
+  packaging, determinism, and codec bounds are implemented.
 
 - 2026-07-21: `gain-map-hdr` is the intended default. Separate presets make SDR
   Display P3, sRGB compatibility, linear ACEScg scene master, PQ, and HLG explicit;

@@ -34,8 +34,8 @@ For representative color and HDR frames, execute this matrix:
    macOS/iPhone software, at least one non-Apple gain-map-aware reader, and one
    SDR-only fallback reader.
 5. **Determinism** — repeated runs meet each encoder's documented contract:
-   byte-identical where promised, otherwise identical decoded pixels and semantic
-   metadata.
+   byte-identical where promised, otherwise decoded pixels within the applicable
+   pinned codec bounds and identical semantic metadata.
 6. **Film-rendering fidelity** — representative stocks, lenses, development
    processes, exponential/sigmoid curves, and scanners retain their intended
    differences through NC film RGB v1 and across named encodings. Acceptance
@@ -58,25 +58,43 @@ decoder independent of nc:
 - `film-master`: decoded float ACEScg must match the canonical ACEScg buffer with
   per-sample maximum absolute error ≤ 2×10⁻⁶ and RMS error ≤ 5×10⁻⁷; metadata
   matches the golden semantic dump exactly.
-- 16-bit SDR (`display-p3`/`compatibility` and the gain-map base): after
+- 16-bit standalone SDR (`display-p3`/`compatibility`): after
   independent ICC/transfer decode to the renderer's canonical linear destination
   RGB, each channel differs by at most 1 code value when re-quantized to 16-bit.
-  If a preset deliberately uses 8-bit, the corresponding bound is 1 of 255.
-- PQ/HLG: the HDR spike must first pin the stored bit depth, codec/chroma path,
-  PQ constants or HLG OETF/OOTF/system gamma/reference display, and whether the
-  path is lossless or permits a one-code codec allowance. The acceptance oracle
-  independently applies that transfer to the canonical absolute-linear BT.2020
-  buffer in binary64, rounds to the pinned integer depth with round-to-nearest,
-  ties-to-even, and compares the independently decoded output with this
-  independently quantized reference. The bound is ≤ 0.5 stored-code step for a
-  lossless path (therefore the same integer code) or ≤ 1 stored-code step only
-  when the spike explicitly approves the codec allowance. This is a black-box
-  stored-code comparison; it does not assert unobservable pre-quantization
-  arithmetic. A codec needing a larger allowance cannot pass without an
-  explicit acceptance-contract revision.
-- Gain-map reconstruction: an independent ISO 21496-1 decoder must match the
-  canonical HDR rendition within max(0.02 nit, 0.5% relative) per channel; its
-  independently decoded SDR base must also pass the SDR bound above.
+- Lossy 8-bit JPEG gain-map base: compare the independent decode with the
+  canonical encoded-Display-P3 base using encoder-task-pinned max/RMS error,
+  structural/perceptual, neutral-ramp, and saturated-patch bounds. A universal
+  one-code-value bound is not valid for JPEG. Record the codec version, quality,
+  chroma mode, and every measured threshold in the manifest.
+- PQ/HLG AVIF: independently apply the pinned transfer to the canonical
+  absolute-linear BT.2020 buffer in binary64, quantize to the 10-bit 4:4:4
+  reference, then compare an independent AVIF decode using encoder-task-pinned
+  max/RMS code error plus ramp, neutral, and saturated-patch thresholds. A
+  universal one-code codec allowance is not valid for lossy AV1. PQ uses
+  Rec.2100/ST 2084 with 203 cd/m² reference white and 1000 cd/m² target peak;
+  the HLG preset must pin its OETF/OOTF/system gamma/reference display in its
+  manifest row.
+- Gain-map reconstruction: independent ISO 21496-1 and Ultra HDR v1
+  implementations must each reconstruct the canonical HDR rendition and declared
+  headroom within max(0.02 nit, 0.5% relative) per channel. Their independently
+  decoded SDR base must also pass the manifest row's lossy 8-bit JPEG gain-map
+  base bounds. A semantic metadata oracle must prove their
+  scale/offset/gamma/capacity meanings agree after dialect-specific unit
+  conversion, and a deliberately conflicting dual-metadata fixture must prove a
+  dual-aware decoder gives ISO 21496-1 precedence. The oracle independently
+  converts both linear Display P3 renderings to reference-white-relative units:
+  SDR/reference white is `1.0`, and HDR absolute luminance is divided by the
+  pinned 203 cd/m² reference white. It then derives each canonical gain as
+  `(HDR_c + offset_hdr,c) / (SDR_c + offset_sdr,c)` using the manifest-pinned
+  positive finite offsets expressed in that same domain. Equal reference-white
+  samples with equal offsets must yield gain 1. A peak row feeds 1000 nits into
+  the formula as `4.926108...`, but computes expected gain from the actual
+  independently tone-mapped SDR sample and offsets rather than equating gain
+  with display headroom. Black, near-black, and zero-channel rows must remain
+  finite without arbitrary epsilon or `0/0` behavior; negative/nonfinite samples
+  and any nonpositive/nonfinite adjusted denominator or gain must fail loudly.
+  Mixing absolute-nit HDR with normalized SDR must produce the pinned unit/domain
+  diagnostic.
 - Deterministic encoders must produce byte-identical files. If the format task
   documents unavoidable container variability, decoded pixels must meet the
   applicable bound and a normalized semantic metadata dump must match exactly;

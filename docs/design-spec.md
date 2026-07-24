@@ -67,7 +67,8 @@ The deterministic core owns the image science. Any future ML assistance (see
 - ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).
 - Batch/roll preset management UI, GUI, scanner ICC profiling workflow.
 - Output formats other than TIFF in Step 1. The post-MVP display-output roadmap
-  now targets ISO gain-map HDR (initially HEIC) plus JPEG/PNG/EXR as appropriate.
+  now targets ISO gain-map HDR in JPEG, single-rendition HDR in AVIF, plus
+  PNG/EXR as appropriate.
 
 ## 3. Design principles
 
@@ -237,11 +238,12 @@ detector proposes as possible rebate.
   preserves NC's intentional film rendering; it is not a provisional claim about
   physical scene color. Measured correction is an optional explicit profile.
 - **Target product default (post-MVP):** `gain-map-hdr` — a standards-neutral,
-  backward-compatible SDR rendition plus an ISO 21496-1 gain map, initially in
-  HEIC subject to the encoder/licensing spike. The SDR base is Display P3; aware
-  readers reconstruct the HDR rendition and unaware readers show the SDR base.
-  This is not Apple-only: ISO 21496-1 is the public model and non-Apple support is
-  an acceptance requirement.
+  backward-compatible Display P3 JPEG rendition plus an ISO 21496-1 gain map and
+  Android Ultra HDR v1 compatibility metadata. Aware readers reconstruct the HDR
+  rendition and unaware readers show the SDR base. This is not Apple-only:
+  ISO 21496-1 is the public model and non-Apple support is an acceptance
+  requirement. HEIC gain maps are deferred pending a portable final-standard
+  encoder and approved HEVC licensing/packaging policy.
 - **Planned presets:**
   - `gain-map-hdr` — default, backward-compatible display HDR;
   - `display-p3` — wide-gamut SDR;
@@ -1637,20 +1639,45 @@ the NLP feature comparison, Phase 6).
     colorants and the required chromatic-adaptation tag. It performs no second
     ACEScg transform. Tracked: `display-p3-output`,
     `sdr-display-rendering`.
-22. **Display HDR rendering and format spike.** First decide the encoder,
-    HEIC/JPEG container details, ISO HDR and ISO 21496-1 metadata, licensing,
-    reference white/headroom, and cross-platform support. Then render linear
-    ACEScg into BT.2020 Rec.2100 PQ (primary still path) or explicit HLG with
-    documented tone and gamut mapping. Rec.2100 is an output encoding, not the
-    density or internal working space. Tracked: `hdr-output-spike`,
-    `hdr-display-rendering`.
+22. **Display HDR rendering and format spike.** The spike selects 10-bit 4:4:4
+    AVIF for single-rendition HDR and JPEG for gain maps. The spike's remaining
+    gate is normative-text review; encoder conformance and device evidence are
+    downstream pre-shipping gates. The renderer places linear ACEScg film
+    values into BT.2020 Rec.2100 PQ (primary still path) or explicit HLG with
+    203 cd/m² reference white, 1000 cd/m² initial target peak, and documented
+    tone and gamut mapping. Rec.2100 is an output encoding, not the density or
+    internal working space. A separate encoder task owns AVIF v1.2 Advanced
+    Profile conformance, AV1 High Profile level ≤ 6.0, container brands,
+    oversized-image/grid behavior, metadata, codec bounds, and static
+    libavif/libaom packaging. Tracked: `hdr-output-spike`,
+    `hdr-display-rendering`, `hdr-avif-output`.
 23. **ISO gain-map HDR and output presets.** Combine a valid Display P3 SDR base
-    with the HDR rendition and ISO 21496-1 metadata, initially targeting HEIC and
-    requiring both Apple and non-Apple verification. Public terminology is
-    standards-neutral (`gain-map-hdr`, not a platform brand). Both renditions
-    share the identical mapped/adjusted film source; gain ratios are derived in
-    the standard-required common linear color domain, never by dividing encoded
-    P3 and PQ/BT.2020 values. Once verified,
+    with the HDR rendition in JPEG, carrying final ISO 21496-1 metadata and
+    Android Ultra HDR v1 compatibility metadata while requiring both Apple and
+    non-Apple verification. Public terminology is standards-neutral
+    (`gain-map-hdr`, not a platform brand). Both renditions share the identical
+    mapped/adjusted film source; an RGB gain map is derived in common linear
+    Display P3, never by dividing encoded P3 and PQ/BT.2020 values. Each ISO
+    21496-1 and Ultra HDR v1 metadata dialect must independently reconstruct the
+    same canonical HDR/headroom within pinned bounds, their parameter meanings
+    must agree after linear/log2 unit conversion, and dual-aware decoders must
+    prefer ISO when both are present. The 203/1000 ratio is linear headroom
+    `4.926108...` but log2 capacity `2.300448...`. Before gain math, both linear
+    Display P3 renderings use reference-white-relative units: SDR/reference white
+    is `1.0`, and HDR absolute luminance is divided by 203 cd/m², making 203 nits
+    `1.0` and 1000 nits `4.926108...`. Offsets use this same domain; mixing
+    absolute-nit HDR with normalized SDR is a fail-loud unit error. After positive
+    finite offsets are pinned, each per-channel gain is exactly
+    `(HDR_c + offset_hdr,c) / (SDR_c + offset_sdr,c)` in common linear Display
+    P3. Samples must be finite and nonnegative; offsets, adjusted denominators,
+    and gains must be finite and positive before logarithm/serialization, with
+    fail-loud handling rather than epsilon injection or `0/0`. Per-pixel extrema
+    derive from this formula over the independently tone-mapped renderings and
+    need not equal either global value. Both dialect serializers consume this
+    same canonical calculation. Equal reference-white samples with equal offsets
+    yield gain 1. A peak sample enters as `4.926108...`, but its gain still uses
+    the actual independently tone-mapped SDR sample and offsets and is not
+    assumed to equal display headroom. Once verified,
     `gain-map-hdr` becomes the default; explicit presets retain Display P3 SDR,
     sRGB compatibility, linear ACEScg film master, PQ, HLG, and custom workflows.
     `nc roll` naming/manifests migrate with presets so suffixes derive from each
@@ -1659,7 +1686,7 @@ the NLP feature comparison, Phase 6).
     against all batch inputs/outputs/sidecars. Core full-size TIFF/resource verification remains independently runnable;
     final gain-map/preset metadata, faithful film-rendering consistency, and
     cross-device behavior are a separate gate.
-    Tracked: `gain-map-hdr-output`, `output-presets`,
+    Tracked: `gain-map-hdr-output`, `hdr-avif-output`, `output-presets`,
     `display-output-acceptance`.
 
 ## 13. Open questions
