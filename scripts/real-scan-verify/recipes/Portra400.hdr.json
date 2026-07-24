@@ -8,12 +8,16 @@
       ]
     }
   },
-  "density": {
-    "dmax": {
-      "explicit": 1.7382799
-    }
-  },
   "output": {
     "hdr": true
+  },
+  "reconstruction": {
+    "type": "density",
+    "curve": {
+      "type": "exponential",
+      "dmax": {
+        "explicit": 1.7382799
+      }
+    }
   }
 }

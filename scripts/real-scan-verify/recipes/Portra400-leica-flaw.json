@@ -8,9 +8,13 @@
       ]
     }
   },
-  "density": {
-    "dmax": {
-      "explicit": 1.4434652
+  "reconstruction": {
+    "type": "density",
+    "curve": {
+      "type": "exponential",
+      "dmax": {
+        "explicit": 1.4434652
+      }
     }
   }
 }
