@@ -202,8 +202,14 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   HDRi on-disk layout; the decoder must be validated against the user's actual
   scans and degrade gracefully on unrecognized layouts. Sample scans live in the
   [nc-assets Google Drive folder](https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6) — the
-  canonical source — mirrored locally at `../nc-assets/{48,64}bit-full/` (and
-  `~/Pictures/scan/`; 50–160 MB each). **Never read them into context**; inspect IFD
+  canonical source (50–160 MB each) — reached locally via a **machine-local
+  symlink** `../nc-assets → <GoogleDrive>/temp/nc-assets` (each machine points its
+  own; not committed). The folder is organized `rolls/<roll>/`, `samples/`,
+  `converted/{nc,nlp}/`, with a tracked `manifest.json` inventory at its root
+  (roles, dims, `ir_present`, checksums, NLP↔source links) — regenerate it with
+  `scripts/analysis/generate_manifest.py` or the `asset-manifest` skill. Decoder
+  unit-test fixtures are committed separately under `tests/fixtures/`.
+  **Never read them into context**; inspect IFD
   structure with `exiftool` (`tiffinfo` is not installed here) or `nc inspect`, and
   exercise the pipeline on them either with a throwaway `#[ignore]` test that calls
   `io::decode` and prints only derived numbers, or via the committed

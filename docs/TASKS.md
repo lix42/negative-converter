@@ -144,6 +144,10 @@ graph TD
   output-presets --> display-output-acceptance
   real-scan-verification --> display-output-acceptance
   real-scan-verification --> conversion-analysis-tooling
+  conversion-analysis-tooling --> asset-manifest
+  asset-manifest --> conversion-metrics
+  conversion-metrics --> nlp-comparison
+  asset-manifest --> drive-asset-migration
   roll-conversion --> base-acquisition-planner
   auto-base-redesign --> base-acquisition-planner
   ir-holder-detection --> base-acquisition-planner
@@ -170,6 +174,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `grid-verdict-enum` (post-MVP): `estimate-reuse-output`, `film-base-estimation`
 - `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`, `dmax-reference`
 - `conversion-analysis-tooling` (post-MVP, spike): `real-scan-verification`
+- `asset-manifest` (post-MVP): `conversion-analysis-tooling`
+- `conversion-metrics` (post-MVP): `asset-manifest`
+- `nlp-comparison` (post-MVP): `conversion-metrics`
+- `drive-asset-migration` (post-MVP, in progress — move+reorg+manifest done): `asset-manifest`
 - `perf-instrumentation` (post-MVP, **parked**): `pipeline-orchestration` — LAB
   criterion benches; prototyped and parked on branch
   `prototype/perf-bench-instrumentation`, superseded by `perf-telemetry` as the
@@ -309,7 +317,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 
 - [x] [Real-scan core verification](tasks/real-scan-verification.md) — exercise decoding, Dmin/Dmax, current TIFF conversion, IR, determinism, and resource use on full-size scans without waiting for the display-output roadmap. **Done 2026-07-23** (see `docs/reports/real-scan-verification.md`): all rows pass on 5 real rolls; measured peak ~930 MiB @ 18.7 MP feeds `streaming-tiled-io` STEP 0; frozen recipes + harness feed `display-output-acceptance`; follow-up `dense-base-dmax-plausibility` filed; default-SDR paleness routes to the display-output roadmap
 - [ ] [Display-output acceptance](tasks/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans
-- [ ] [Conversion-analysis tooling (spike)](tasks/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. Spike: decide scope/structure first.
+- [x] [Conversion-analysis tooling (spike)](tasks/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. **Done 2026-07-23** (spike): scope decided (Python `nctool` toolkit, JSON manifest of rolls+converted, configurable-but-local asset root, NLP global-metrics comparison without registration); split into the four child tasks below; see the task file's "Spike outcome" section.
+- [ ] [Asset manifest](tasks/asset-manifest.md) — tracked JSON manifest of `../nc-assets` (roll frames + roles + derived facts + converted outputs); `generate`/`validate`; retires the hard-coded `ROLLS` array
+- [ ] [Conversion metrics & thumbnails](tasks/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
+- [ ] [NLP vs nc comparison](tasks/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
+- [ ] [Drive asset migration](tasks/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
 
 ### Phase 8: Pre-release productization
 > Measurement and hardening before releasing to users (2026-07-14 telemetry

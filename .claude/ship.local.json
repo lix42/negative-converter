@@ -1,6 +1,10 @@
 {
-  "version": 1,
-  "detectedAt": "2026-06-18T02:35:26Z",
+  "version": 2,
+  "detectedAt": "2026-07-24T22:09:23Z",
+  "host": "claude",
+  "instructions": {
+    "file": "CLAUDE.md"
+  },
   "environment": {
     "hasGitHubRemote": true,
     "defaultBranch": "main"
@@ -15,9 +19,11 @@
     "tasksFile": "docs/TASKS.md"
   },
   "skills": {
-    "review": "pr-review-toolkit:review-pr",
-    "reviseClaudeMd": "claude-md-management:revise-claude-md",
-    "tasksDone": "tasks:tasks-done",
-    "commitPushPr": "commit-commands:commit-push-pr"
+    "localReview": "pr-review-toolkit:review-pr",
+    "documentation": "claude-md-management:revise-claude-md",
+    "taskCompletion": "tasks:tasks-done",
+    "publishing": "commit-commands:commit-push-pr",
+    "ciRepair": null,
+    "reviewFeedback": null
   }
 }
