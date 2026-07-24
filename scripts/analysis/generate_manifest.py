@@ -13,7 +13,7 @@ checksums.
 
 Usage:
     python3 scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc PATH]
-                                                  [--force-hash] [--dry-run]
+                                                  [--reuse-hash] [--dry-run]
 
 ASSET_ROOT defaults to $NC_ASSET_ROOT, else ../nc-assets (the machine-local
 symlink). The `nc` binary is found via --nc, $NC, ./target/release/nc,
@@ -80,9 +80,11 @@ def is_nc(cand: str) -> bool:
     return out.returncode == 0 and v.startswith("nc ") and any(c.isdigit() for c in v)
 
 
-def find_nc(explicit: str | None) -> str | None:
-    for cand in (explicit, os.environ.get("NC"),
-                 "target/release/nc", "target/debug/nc", shutil.which("nc")):
+def find_nc() -> str | None:
+    """Auto-discover this project's nc (verified). An explicit --nc / $NC is
+    validated separately in main() — a bad explicit path is a hard error, not a
+    silent fallback."""
+    for cand in ("target/release/nc", "target/debug/nc", shutil.which("nc")):
         if cand and os.path.exists(cand) and is_nc(cand):
             return os.path.abspath(cand)
     return None
@@ -140,22 +142,29 @@ class Prev:
         self.file: dict[str, dict] = {}
         self.roll: dict[str, dict] = {}
         self.bucket: dict[str, dict] = {}
-        self.frame_by_sha: dict[str, dict] = {}   # role survival across renames
-        self.sample_by_sha: dict[str, dict] = {}  # kind/note survival across renames
+        # sha256 -> [entries] (a list: byte-identical duplicates share a checksum,
+        # and rename-matching must be able to pick the one whose old path is gone).
+        self.frame_by_sha: dict[str, list[dict]] = {}   # role survival across renames
+        self.sample_by_sha: dict[str, list[dict]] = {}  # kind/note survival
+        self.output_by_sha: dict[str, list[dict]] = {}  # note survival
+
+        def by_sha(idx: dict, e: dict) -> None:
+            if e.get("sha256"):
+                idx.setdefault(e["sha256"], []).append(e)
+
         for roll, r in data.get("rolls", {}).items():
             self.roll[roll] = r
             for fr in r.get("frames", []):
                 self.file[fr["file"]] = fr
-                if fr.get("sha256"):
-                    self.frame_by_sha[fr["sha256"]] = fr
+                by_sha(self.frame_by_sha, fr)
         for s in data.get("samples", []):
             self.file[s["file"]] = s
-            if s.get("sha256"):
-                self.sample_by_sha[s["sha256"]] = s
+            by_sha(self.sample_by_sha, s)
         for name, b in data.get("converted", {}).items():
             self.bucket[name] = b
             for o in b.get("outputs", []):
                 self.file[o["file"]] = o
+                by_sha(self.output_by_sha, o)
 
     def sha(self, rel: str, size: int) -> str | None:
         e = self.file.get(rel)
@@ -180,10 +189,24 @@ def main() -> int:
     if not os.path.isdir(A):
         print(f"error: asset root not found: {A}", file=sys.stderr)
         return 2
-    nc = find_nc(args.nc)
-    if not nc:
-        print("warning: nc binary not found; falling back to exiftool for metadata",
-              file=sys.stderr)
+    # An explicit --nc / $NC must be *this* project's CLI — a bad/typo'd path (or
+    # netcat) is a hard error, not a silent degrade to exiftool.
+    explicit_nc = args.nc if args.nc is not None else os.environ.get("NC")
+    if explicit_nc is not None:
+        src = "--nc" if args.nc is not None else "$NC"
+        if not os.path.exists(explicit_nc):
+            print(f"error: {src} path does not exist: {explicit_nc}", file=sys.stderr)
+            return 2
+        if not is_nc(explicit_nc):
+            print(f"error: {src}={explicit_nc} is not this project's nc CLI "
+                  "(its `--version` did not report `nc <ver>`)", file=sys.stderr)
+            return 2
+        nc: str | None = os.path.abspath(explicit_nc)
+    else:
+        nc = find_nc()
+        if not nc:
+            print("warning: nc binary not found; falling back to exiftool for metadata",
+                  file=sys.stderr)
 
     mpath = os.path.join(A, "manifest.json")
     prev_data: dict = {}
@@ -195,6 +218,14 @@ def main() -> int:
             print(f"error: existing {mpath} is not valid JSON ({e}); "
                   "fix it or delete it and re-run", file=sys.stderr)
             return 2
+    # Refuse to update a manifest written by a newer/unsupported schema — this
+    # tool only emits v1 and would silently downgrade it, discarding fields the
+    # old Prev index doesn't understand.
+    prev_ver = prev_data.get("schema_version")
+    if prev_ver is not None and prev_ver != 1:
+        print(f"error: existing {mpath} has unsupported schema_version {prev_ver} "
+              "(this tool writes v1); refusing to overwrite it", file=sys.stderr)
+        return 2
     prev = Prev(prev_data)
     carried: list[str] = []  # files whose authoritative nc metadata was preserved
 
@@ -216,11 +247,16 @@ def main() -> int:
         ap_ = os.path.join(A, relpath)
         e: dict = {}
         e.update(inspect(nc, ap_))
-        size = os.path.getsize(ap_)
-        e["bytes"] = size
-        s = hashed(relpath, size, regenerable)
-        if s:
-            e["sha256"] = s
+        # A file vanishing / becoming unreadable between listing and here must not
+        # abort the whole (possibly hours-long) scan — record a per-file error.
+        try:
+            size = os.path.getsize(ap_)
+            e["bytes"] = size
+            s = hashed(relpath, size, regenerable)
+            if s:
+                e["sha256"] = s
+        except OSError as ex:
+            return {"error": f"{type(ex).__name__}: {ex}", "metadata_source": "none"}
         # Carry authoritative nc metadata forward when a *successful* exiftool
         # fallback would otherwise clobber it (e.g. nc missing on a negative) — but
         # only when the bytes still identify the same file (checksum match), so a
@@ -244,10 +280,13 @@ def main() -> int:
 
     def renamed_prev(by_sha: dict, sha: str | None) -> dict | None:
         """A prior entry with this checksum whose old path is gone from disk — a
-        rename (preserve fields), not a copy (the original still exists → don't)."""
-        cand = by_sha.get(sha) if sha else None
-        if cand and not os.path.exists(os.path.join(A, cand["file"])):
-            return cand
+        rename (preserve fields), not a copy (the original still exists → don't).
+        With byte-identical duplicates, scan all candidates for one whose path
+        disappeared, so a renamed calibration frame isn't missed because a copy
+        still sits at its old path."""
+        for cand in (by_sha.get(sha) or []) if sha else []:
+            if not os.path.exists(os.path.join(A, cand["file"])):
+                return cand
         return None
 
     m: dict = {
@@ -262,6 +301,7 @@ def main() -> int:
     }
 
     # rolls/<roll>/<frame>.tif
+    rename_map: dict[str, str] = {}  # old frame path -> new frame path (for source_frame retarget)
     rolls_dir = os.path.join(A, "rolls")
     for roll in (sorted(os.listdir(rolls_dir)) if os.path.isdir(rolls_dir) else []):
         rp = os.path.join(rolls_dir, roll)
@@ -274,7 +314,12 @@ def main() -> int:
             fm = meta(r)  # compute first so the checksum is available for identity
             # Role preservation: by path, else by checksum for a genuine rename
             # (old path gone — not a copy), else seed, else real.
-            prevf = prev.file.get(r) or renamed_prev(prev.frame_by_sha, fm.get("sha256")) or {}
+            prevf = prev.file.get(r)
+            if prevf is None:
+                prevf = renamed_prev(prev.frame_by_sha, fm.get("sha256"))
+                if prevf is not None:
+                    rename_map[prevf["file"]] = r  # remember rename for source_frame retarget
+            prevf = prevf or {}
             role = prevf.get("role") or SEED_ROLES.get(roll, {}).get(stem) or "real"
             frames.append({"file": r, "role": role, **fm})
         entry = {"stock": prev.roll.get(roll, {}).get("stock")
@@ -357,11 +402,20 @@ def main() -> int:
                     o = {"file": r}
                     if roll:
                         o["roll"] = roll
-                    o["source_frame"] = resolve_source(src_roll, stem)
-                    prevf = prev.file.get(r, {})
+                    o.update(meta(r, regenerable=regenerable))  # sha needed for rename match
+                    # Prior entry: by path, else by checksum for a genuine rename
+                    # (so a renamed non-regenerable output keeps its human `note`).
+                    prevf = (prev.file.get(r)
+                             or renamed_prev(prev.output_by_sha, o.get("sha256")) or {})
+                    # source_frame: resolve by stem; if that fails because the
+                    # source frame was renamed, retarget the prior link through the
+                    # rename map so the nc↔NLP↔source identity survives.
+                    src = resolve_source(src_roll, stem)
+                    if src is None and prevf.get("source_frame") in rename_map:
+                        src = rename_map[prevf["source_frame"]]
+                    o["source_frame"] = src
                     if prevf.get("note"):
                         o["note"] = prevf["note"]
-                    o.update(meta(r, regenerable=regenerable))
                     # encoding: infer from inspected bit depth, not filename — a
                     # V0 `_corr.tif` is a 16-bit sRGB corrected variant, not float.
                     # nc float outputs are linear; nc 16-bit are sRGB.
@@ -413,18 +467,28 @@ def main() -> int:
         print(f"note: {n_ex} entr(ies) used the exiftool fallback; their "
               "format/ir_present are best-effort, not authoritative", file=sys.stderr)
     if errs:
-        print(f"WARNING: {len(errs)} file(s) failed all metadata inspection", file=sys.stderr)
+        print(f"WARNING: {len(errs)} file(s) failed all metadata inspection: "
+              + ", ".join(os.path.basename(e.get("file", "?")) for e in errs),
+              file=sys.stderr)
 
     if args.dry_run:
         print("(dry run — manifest.json not written)")
         return 1 if errs else 0
     # Atomic write: serialize to a same-dir temp, then replace — an interrupted or
-    # failed write never truncates the existing source-of-truth manifest.
+    # failed write never truncates the existing source-of-truth manifest. Clean up
+    # the temp if serialization/replace fails, so no stray .tmp is left behind.
     tmp = mpath + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(m, f, indent=2)
-        f.write("\n")
-    os.replace(tmp, mpath)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(m, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, mpath)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     print("wrote", mpath)
     return 1 if errs else 0
 

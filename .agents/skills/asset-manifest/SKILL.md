@@ -45,9 +45,10 @@ python3 scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc PATH] [--reuse-
 - The `nc` binary is found via `--nc`, `$NC`, `./target/release/nc`,
   `./target/debug/nc`, or `nc` on `PATH` — each candidate is **verified** to be
   this project's CLI (`--version` prints `nc <ver>`), so the system netcat
-  (`/usr/bin/nc`) is never mistaken for it. Build it if missing:
-  `cargo build --release`. Without a valid `nc`, the script falls back to
-  `exiftool` (losing authoritative `format`/`ir_present`) and says so.
+  (`/usr/bin/nc`) is never mistaken for it. An **explicit** `--nc`/`$NC` that is
+  missing or not this CLI is a **hard error** (exit 2), not a silent fallback;
+  only failed *auto-discovery* falls back to `exiftool` (losing authoritative
+  `format`/`ir_present`) with a warning. Build it if missing: `cargo build --release`.
 - `NC_MANIFEST_DATE=$(date +%F)` sets the `generated` field; the script leaves it
   stable rather than stamping wall-clock time (so re-runs stay byte-identical) —
   pass it for a real date.
@@ -96,8 +97,11 @@ positives — which it rejects as unsupported), the generator falls back to
 `format: "tiff"` / `ir_present: false`. Absence of the tag means the values are
 nc-authoritative. If `nc` is missing/fails on a file that previously had
 authoritative values, the generator **carries the prior values forward** (and
-says so) rather than downgrading the source-of-truth. The run exits non-zero only
-when a file fails *all* inspection (an `error` entry).
+says so) — but only when the current bytes still match the prior `sha256`, so a
+file replaced at the same path is never paired with stale metadata. Carry-forward
+is therefore **checksum-gated**: `regenerable` outputs skip checksums, so they are
+not carried (they are reproducible — just re-run with `nc` present). The run exits
+non-zero only when a file fails *all* inspection (an `error` entry).
 
 ## After generating
 

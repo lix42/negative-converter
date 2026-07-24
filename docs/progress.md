@@ -3615,8 +3615,9 @@ rerunnable harness + frozen recipes under `scripts/real-scan-verify/` (see its `
   reports) keeps working unchanged across worktrees; not committed (machine-local).
 - `scripts/analysis/generate_manifest.py` — reusable, update-aware, stdlib
   generator (locates `nc`/exiftool; preserves human fields role/stock/kind/note +
-  bucket regenerable/nc_version/recipe_dir; reuses sha256 when bytes unchanged).
-  **Idempotent** (byte-identical re-run); warm update ~5 s. Reproduces the live
+  bucket regenerable/nc_version/recipe_dir; recomputes sha256 every run by
+  default for source-of-truth integrity, opt-in size-based reuse via
+  `--reuse-hash`). **Idempotent** (byte-identical re-run). Reproduces the live
   manifest and adds `megapixels` on converted outputs.
 - `scripts/analysis/manifest.sample.json` — committed trimmed schema reference
   (every shape; real values; ~7 KB). Update only on **schema** change.

@@ -117,12 +117,16 @@ stage_determinism() {
 }
 
 stage_resource() {
-  # largest scan = a full 5184x3599 frame
+  # Benchmark the WORST CASE: samples/largest.tif (74.6 MP), the largest scan
+  # available — this is what feeds memory-preflight / streaming-tiled-io. Fall
+  # back to the first Ektar real frame (~18.7 MP) only if largest.tif is absent.
   IFS='|' read -r roll uf ff reals <<<"${ROLLS[0]}"; fr=$(echo $reals|awk '{print $1}')
-  echo "resource on $roll/$fr (16-bit):"
-  /usr/bin/time -l "$NC" convert --params "$REC/$roll.json" -o "$ART/res16.tiff" "$A/rolls/$roll/$fr" --report none 2>&1 | grep -E 'real|maximum resident'
-  echo "resource on $roll/$fr (float HDR):"
-  /usr/bin/time -l "$NC" convert --params "$REC/$roll.hdr.json" -o "$ART/reshdr.tiff" "$A/rolls/$roll/$fr" --report none 2>&1 | grep -E 'real|maximum resident'
+  local big="$A/samples/largest.tif"; local label="samples/largest.tif (74.6 MP)"
+  if [ ! -e "$big" ]; then big="$A/rolls/$roll/$fr"; label="$roll/$fr (~18.7 MP; largest.tif missing)"; fi
+  echo "resource on $label (16-bit):"
+  /usr/bin/time -l "$NC" convert --params "$REC/$roll.json" -o "$ART/res16.tiff" "$big" --report none 2>&1 | grep -E 'real|maximum resident'
+  echo "resource on $label (float HDR):"
+  /usr/bin/time -l "$NC" convert --params "$REC/$roll.hdr.json" -o "$ART/reshdr.tiff" "$big" --report none 2>&1 | grep -E 'real|maximum resident'
 }
 
 case "${1:-all}" in

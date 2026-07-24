@@ -147,7 +147,6 @@
         {
           "file": "converted/nc/2026-07-22/Ektar/20260713-nikon-971_positive.tiff",
           "roll": "Ektar",
-          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
           "width": 5184,
           "height": 3599,
           "channels": 3,
@@ -156,12 +155,12 @@
           "ir_present": false,
           "bytes": 111944986,
           "megapixels": 18.66,
+          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
           "encoding": "u16-srgb"
         },
         {
           "file": "converted/nc/2026-07-22/Ektar/20260713-nikon-971_positive_hdr.tiff",
           "roll": "Ektar",
-          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
           "width": 5184,
           "height": 3599,
           "channels": 3,
@@ -171,6 +170,7 @@
           "metadata_source": "exiftool",
           "bytes": 223889078,
           "megapixels": 18.66,
+          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
           "encoding": "f32-linear"
         },
         "\u2026 (trimmed)"
@@ -185,7 +185,6 @@
         {
           "file": "converted/nc/V0/Ektar/971_corr.tif",
           "roll": "Ektar",
-          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
           "width": 5184,
           "height": 3599,
           "channels": 3,
@@ -195,6 +194,7 @@
           "bytes": 111944986,
           "sha256": "d2d37ccdf4aa564cde4147a3542b7792ad0010f71dae06554f5b2ceceeac9fef",
           "megapixels": 18.66,
+          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
           "encoding": "u16-srgb"
         },
         "\u2026 (trimmed)"
@@ -207,8 +207,6 @@
       "outputs": [
         {
           "file": "converted/nlp/2026-07-23/20260722-nikon-1102-positive.tif",
-          "source_frame": "rolls/Portra160-2026-07-22/20260722-nikon-1102.tif",
-          "note": "cropped + float vs source; no pixel registration",
           "width": 4406,
           "height": 2930,
           "channels": 3,
@@ -219,6 +217,8 @@
           "bytes": 155096060,
           "sha256": "b199accc648cdafc6ebfb732f064d287ee63bba84ce893980bde2eefe67bcb83",
           "megapixels": 12.91,
+          "source_frame": "rolls/Portra160-2026-07-22/20260722-nikon-1102.tif",
+          "note": "cropped + float vs source; no pixel registration",
           "encoding": "f32"
         },
         "\u2026 (trimmed)"

@@ -16,7 +16,8 @@ A first manifest already exists — `manifest.json` at the assets root, generate
 2026-07-24 (see `progress.md`) — along with precursor tooling:
 
 - `scripts/analysis/generate_manifest.py` — the update-aware, stdlib generator
-  (idempotent; preserves human fields; reuses unchanged checksums).
+  (idempotent; preserves human fields; recomputes checksums by default, with an
+  opt-in `--reuse-hash` for size-unchanged reuse).
 - `scripts/analysis/manifest.sample.json` — committed trimmed schema reference.
 - the `asset-manifest` **skill** (`.agents/skills/asset-manifest/`) — how to run
   the generator.
