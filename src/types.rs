@@ -646,6 +646,26 @@ impl DensityCurve {
     }
 }
 
+/// Extract an optional field from a raw recipe object, distinguishing an **absent**
+/// key (`Ok(None)`) from a **present** one (`Ok(Some(v))`) — including a present
+/// explicit `null`, which is not a valid value for any of these typed fields and
+/// so errors loudly rather than reading as "absent". A plain `Option<T>` struct
+/// field cannot make this distinction (serde collapses JSON `null` to `None`), so
+/// the tagged deserializers below capture the raw object and use key *presence* to
+/// reject a cross-variant key or a null discriminator that would otherwise be
+/// silently ignored / defaulted.
+fn take_recipe_field<T: serde::de::DeserializeOwned>(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<Option<T>, String> {
+    match obj.get(key) {
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
 impl<'de> Deserialize<'de> for DensityCurve {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
@@ -653,45 +673,54 @@ impl<'de> Deserialize<'de> for DensityCurve {
     {
         use serde::de::Error;
 
-        /// The union of both variants' fields, so a cross-variant key can be
-        /// named in the error instead of surfacing as a generic unknown field.
-        /// `type` is required — a present-but-untagged curve object must not
-        /// guess a variant.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Wire {
-            #[serde(rename = "type")]
-            curve_type: DensityCurveType,
-            gamma: Option<f32>,
-            contrast: Option<f32>,
-            toe: Option<f32>,
-            shoulder: Option<f32>,
-            dmax: Option<DmaxSource>,
+        // Capture the raw object so a cross-variant key is detected by *presence*,
+        // not by its value: a plain `Option<f32>` field turns an explicit `null`
+        // into `None`, indistinguishable from an absent key, and would silently
+        // accept e.g. `{"type":"exponential","contrast":null}` instead of rejecting
+        // the invalid tagged combination. `type` is still required — a
+        // present-but-untagged curve object must not guess a variant.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("reconstruction.curve must be a JSON object"))?;
+
+        const KNOWN: [&str; 6] = ["type", "gamma", "contrast", "toe", "shoulder", "dmax"];
+        if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+            return Err(D::Error::custom(format!(
+                "unknown field `{k}` in reconstruction.curve"
+            )));
         }
 
-        let w = Wire::deserialize(deserializer)?;
-        match w.curve_type {
+        let curve_type: DensityCurveType = take_recipe_field(obj, "type")
+            .map_err(D::Error::custom)?
+            .ok_or_else(|| {
+                D::Error::custom(
+                    "reconstruction.curve is missing `type` (\"exponential\" or \"sigmoid\")",
+                )
+            })?;
+        let dmax: Option<DmaxSource> = take_recipe_field(obj, "dmax").map_err(D::Error::custom)?;
+
+        match curve_type {
             DensityCurveType::Exponential => {
-                for (key, present) in [
-                    ("contrast", w.contrast.is_some()),
-                    ("toe", w.toe.is_some()),
-                    ("shoulder", w.shoulder.is_some()),
-                ] {
-                    if present {
-                        return Err(D::Error::custom(format!(
-                            "`{key}` is a sigmoid-curve key, but the curve type is \
-                             \"exponential\" (its knobs are `gamma` and `dmax`)"
-                        )));
-                    }
+                if let Some(key) = ["contrast", "toe", "shoulder"]
+                    .into_iter()
+                    .find(|k| obj.contains_key(*k))
+                {
+                    return Err(D::Error::custom(format!(
+                        "`{key}` is a sigmoid-curve key, but the curve type is \
+                         \"exponential\" (its knobs are `gamma` and `dmax`)"
+                    )));
                 }
                 let d = ExponentialParams::default();
                 Ok(DensityCurve::Exponential(ExponentialParams {
-                    gamma: w.gamma.unwrap_or(d.gamma),
-                    dmax: w.dmax.unwrap_or(d.dmax),
+                    gamma: take_recipe_field(obj, "gamma")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.gamma),
+                    dmax: dmax.unwrap_or(d.dmax),
                 }))
             }
             DensityCurveType::Sigmoid => {
-                if w.gamma.is_some() {
+                if obj.contains_key("gamma") {
                     return Err(D::Error::custom(
                         "`gamma` is an exponential-curve key, but the curve type is \
                          \"sigmoid\" (the mid-density slope analogue is `contrast`)",
@@ -699,10 +728,16 @@ impl<'de> Deserialize<'de> for DensityCurve {
                 }
                 let d = SigmoidParams::default();
                 Ok(DensityCurve::Sigmoid(SigmoidParams {
-                    contrast: w.contrast.unwrap_or(d.contrast),
-                    toe: w.toe.unwrap_or(d.toe),
-                    shoulder: w.shoulder.unwrap_or(d.shoulder),
-                    dmax: w.dmax.unwrap_or(d.dmax),
+                    contrast: take_recipe_field(obj, "contrast")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.contrast),
+                    toe: take_recipe_field(obj, "toe")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.toe),
+                    shoulder: take_recipe_field(obj, "shoulder")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.shoulder),
+                    dmax: dmax.unwrap_or(d.dmax),
                 }))
             }
         }
@@ -802,18 +837,25 @@ impl<'de> Deserialize<'de> for Reconstruction {
     {
         use serde::de::Error;
 
-        #[derive(Deserialize, Default)]
-        #[serde(default, deny_unknown_fields)]
-        struct Wire {
-            schema_version: Option<u32>,
-            #[serde(rename = "type")]
-            reconstruction_type: Option<ReconstructionType>,
-            density: Option<DensityParams>,
-            curve: Option<DensityCurve>,
+        // Capture the raw object so `type` presence is distinguished from a present
+        // explicit `null`: with `Option<ReconstructionType>`, `{"type":null}` would
+        // collapse to `None` and silently default to density, and `type:"simple"`
+        // would accept a null `density`/`curve` section. Presence-checking rejects
+        // those malformed recipes loudly instead.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("reconstruction must be a JSON object"))?;
+
+        const KNOWN: [&str; 4] = ["schema_version", "type", "density", "curve"];
+        if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+            return Err(D::Error::custom(format!(
+                "unknown field `{k}` in reconstruction"
+            )));
         }
 
-        let w = Wire::deserialize(deserializer)?;
-        if let Some(v) = w.schema_version
+        if let Some(v) =
+            take_recipe_field::<u32>(obj, "schema_version").map_err(D::Error::custom)?
             && v != RECONSTRUCTION_SCHEMA_VERSION
         {
             return Err(D::Error::custom(format!(
@@ -821,22 +863,35 @@ impl<'de> Deserialize<'de> for Reconstruction {
                  (this build reads schema_version {RECONSTRUCTION_SCHEMA_VERSION})"
             )));
         }
-        match w.reconstruction_type.unwrap_or_default() {
+
+        // `type` present-but-null errors here (null is not a valid tag); absent
+        // defaults to density.
+        let reconstruction_type: ReconstructionType = take_recipe_field(obj, "type")
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        match reconstruction_type {
             ReconstructionType::Simple => {
-                if w.density.is_some() || w.curve.is_some() {
-                    return Err(D::Error::custom(
-                        "reconstruction.type = \"simple\" takes no `density` or `curve` \
-                         section — density correction and density curves belong to \
-                         `type = \"density\"`",
-                    ));
+                if let Some(key) = ["density", "curve"]
+                    .into_iter()
+                    .find(|k| obj.contains_key(*k))
+                {
+                    return Err(D::Error::custom(format!(
+                        "reconstruction.type = \"simple\" takes no `{key}` section — \
+                         density correction and density curves belong to \
+                         `type = \"density\"`"
+                    )));
                 }
                 Ok(Reconstruction::Simple)
             }
             ReconstructionType::Density => Ok(Reconstruction::Density {
-                density: w.density.unwrap_or_default(),
+                density: take_recipe_field(obj, "density")
+                    .map_err(D::Error::custom)?
+                    .unwrap_or_default(),
                 // An omitted curve normalizes to tagged exponential defaults —
                 // omission never survives into a resolved recipe.
-                curve: w.curve.unwrap_or_default(),
+                curve: take_recipe_field(obj, "curve")
+                    .map_err(D::Error::custom)?
+                    .unwrap_or_default(),
             }),
         }
     }
@@ -1110,6 +1165,31 @@ mod tests {
         // A key belonging to neither variant is still an unknown field.
         assert!(
             serde_json::from_str::<DensityCurve>(r#"{"type":"exponential","gama":1.2}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn tagged_recipes_reject_null_valued_cross_variant_and_tag_keys() {
+        // A present-but-null cross-variant key must be rejected by *presence*, not
+        // silently read as absent (the trap a plain `Option<f32>`/`Option<T>` field
+        // would fall into: serde collapses JSON `null` to `None`).
+        let err = serde_json::from_str::<DensityCurve>(r#"{"type":"exponential","contrast":null}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("sigmoid-curve key"), "{err}");
+        assert!(
+            serde_json::from_str::<DensityCurve>(r#"{"type":"sigmoid","gamma":null}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("exponential-curve key")
+        );
+        // A null discriminator must not silently default to density…
+        assert!(serde_json::from_str::<Reconstruction>(r#"{"type":null}"#).is_err());
+        // …and a null forbidden section under `simple` must still be rejected.
+        let err = serde_json::from_str::<Reconstruction>(r#"{"type":"simple","density":null}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("takes no `density`"), "{err}");
+        assert!(
+            serde_json::from_str::<Reconstruction>(r#"{"type":"simple","curve":null}"#).is_err()
         );
     }
 
