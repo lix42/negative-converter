@@ -284,7 +284,6 @@ mod tests {
 #[cfg(test)]
 mod golden {
     use super::*;
-    use crate::io::encode;
     use crate::types::{
         BalanceRange, DensityCurve, DensityParams, DmaxSource, ExponentialParams, SigmoidParams,
         WbSource,
@@ -684,78 +683,50 @@ mod golden {
         format!("{h:016x}")
     }
 
-    /// Render + encode the synthetic negative, decode the written TIFF back, and
-    /// hash only its **pixel samples** (prefixed with dimensions + sample depth).
-    /// The embedded ICC profile and TIFF container metadata are deliberately
-    /// excluded: their exact bytes are only guaranteed identical per
-    /// build/architecture (design-spec §8), not across the host that captured
-    /// these hashes and CI — e.g. Little CMS stamps platform-dependent fields into
-    /// the ICC header. The per-pixel `f32::to_bits` goldens pin the reconstruction
-    /// math; this pins the encode path (u16 quantization and channel layout) in a
-    /// host-portable way.
-    fn tiff_pixels_hash(
-        label: &str,
-        reconstruction: &Reconstruction,
-        output: &OutputParams,
-    ) -> String {
-        use tiff::decoder::{Decoder, DecodingResult};
-        let img = synthetic(16, 16);
-        let base = FilmBase::from([0.9, 0.55, 0.42]);
-        let rendered =
-            render(&img, &base, reconstruction, &PrintParams::default(), output).unwrap();
-        let dir = std::env::temp_dir().join("nc-golden-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{label}.tiff"));
-        let _ = encode::encode(&rendered.image, output, Some(&rendered.icc), &path).unwrap();
-
-        let mut dec = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
-        let (w, h) = dec.dimensions().unwrap();
+    /// Hash the **working-space** reconstruct+print output of the full 16×16
+    /// synthetic frame (`f32::to_bits` over RGB then IR). This is the
+    /// architecture-stable boundary. The downstream steps — the lcms2
+    /// working→output color transform (inside [`render`]) and the u16/f32 encode
+    /// — are NOT bit-identical across platforms: design-spec §8 scopes
+    /// byte-identity to a single build/architecture, and Little CMS's color math
+    /// differs by target (a checked-in whole-TIFF hash captured on one host fails
+    /// on another). So this golden pins the reconstruction/print output — the
+    /// surface this refactor actually changed — over a full frame; the per-pixel
+    /// goldens pin the same boundary on a hand-picked vector. The color transform
+    /// and encode are unchanged by this refactor and covered by `pipeline::color`
+    /// / `io::encode` tests.
+    fn frame_pixels_hash(reconstruction: &Reconstruction, print: &PrintParams) -> String {
+        let (out, _report) =
+            reconstruct_and_print(&synthetic(16, 16), &base(), reconstruction, print).unwrap();
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&w.to_le_bytes());
-        bytes.extend_from_slice(&h.to_le_bytes());
-        match dec.read_image().unwrap() {
-            DecodingResult::U16(px) => {
-                bytes.push(16);
-                bytes.extend(px.iter().flat_map(|v| v.to_le_bytes()));
-            }
-            DecodingResult::F32(px) => {
-                bytes.push(32);
-                bytes.extend(px.iter().flat_map(|v| v.to_bits().to_le_bytes()));
-            }
-            _ => panic!("unexpected TIFF sample format for {label}"),
+        bytes.extend(out.rgb.iter().flat_map(|v| v.to_bits().to_le_bytes()));
+        if let Some(ir) = &out.ir {
+            bytes.extend(ir.iter().flat_map(|v| v.to_bits().to_le_bytes()));
         }
         fnv(&bytes)
     }
 
     #[test]
-    fn golden_no_preset_encoded_pixels_are_unchanged() {
-        // The legacy no-preset regression: the full pipeline (reconstruct → legacy
-        // print → output color transform → u16/f32 encode) produces byte-identical
-        // *pixels* to the pre-refactor binary. Hashes captured from the pre-split
-        // code on the same synthetic input; they cover the encode quantization and
-        // layout (the ICC/container is host-dependent and excluded — see
-        // `tiff_pixels_hash`). This is also the proof this task claims no
-        // `pipeline_version` bump: default pixels did not change.
-        let sdr = OutputParams::default();
+    fn golden_no_preset_reconstruction_pixels_are_unchanged() {
+        // The legacy no-preset regression: reconstruction + legacy print produce
+        // byte-identical *pixels* to the pre-refactor binary over the full 16×16
+        // synthetic frame. Hashes captured from the pre-split code on the same
+        // input. The color transform + encode are excluded because they are not
+        // portable across build targets (see `frame_pixels_hash`). This is also
+        // the proof this task claims no `pipeline_version` bump: default pixels did
+        // not change.
+        let print = PrintParams::default();
         assert_eq!(
-            tiff_pixels_hash("density-default-u16", &Reconstruction::default(), &sdr),
-            "4c7fa2f13e530819"
+            frame_pixels_hash(&Reconstruction::default(), &print),
+            "de948c767ff0f4b5"
         );
         assert_eq!(
-            tiff_pixels_hash("simple-default-u16", &Reconstruction::Simple, &sdr),
-            "ef7c2a44ab8cdf10"
+            frame_pixels_hash(&Reconstruction::Simple, &print),
+            "8d19f920870ea9be"
         );
         assert_eq!(
-            tiff_pixels_hash("sigmoid-default-u16", &sigmoid_default_config(), &sdr),
-            "7515ec0fd7fb81df"
-        );
-        let hdr = OutputParams {
-            hdr: true,
-            ..OutputParams::default()
-        };
-        assert_eq!(
-            tiff_pixels_hash("density-default-f32", &Reconstruction::default(), &hdr),
-            "8d1552f86414cd35"
+            frame_pixels_hash(&sigmoid_default_config(), &print),
+            "3bc89e200505e5b9"
         );
     }
 }
