@@ -228,7 +228,13 @@ detector proposes as possible rebate.
   - 16-bit (default) output → **sRGB** (standard, display-ready positive).
   - float (`--output-hdr`) output → provisionally transformed/tagged **linear
     ACEScg**, but still after the current print renderer; it is not the target
-    `film-master`. (`prophoto` and user ICC files are also accepted.)
+    `film-master`. (`prophoto`, `display-p3`, and user ICC files are also
+    accepted; `display-p3` is a wide-gamut SDR destination — P3/D65 with the
+    piecewise sRGB TRC and a synthesized ICC v4 profile. As shipped it, like every
+    output space, transforms *from* the linear Rec.709 working space: a lossless
+    Rec.709→P3 primaries remap — Rec.709 ⊂ P3, no gamut compression — plus the sRGB
+    TRC. Consuming already-rendered linear-P3 values as a pure transfer-encode is
+    the target state once `sdr-display-rendering` lands.)
   Either default can be overridden explicitly. Output is tagged with the embedded
   ICC profile for the chosen space.
 - **Working-space intent:** the current implementation treats reconstructed
@@ -1267,8 +1273,18 @@ false-positive on legitimate high-contrast conversions).
   recipe's `output.hdr = true` (the flags-win escape hatch; an absent
   presence flag never clobbers a recipe value). Conflicts with
   `--output-hdr`; passing both is a usage error.
-- `--output-profile <srgb|prophoto|acescg|path-to-icc>` (default is depth-aware:
-  `srgb` for the 16-bit default, `acescg` for `--output-hdr`)
+- `--output-profile <srgb|prophoto|acescg|display-p3|path-to-icc>` (default is
+  depth-aware: `srgb` for the 16-bit default, `acescg` for `--output-hdr`).
+  `display-p3` tags a wide-gamut SDR Display P3 destination (P3 primaries, D65
+  encoding white, piecewise sRGB TRC) with a deterministically synthesized ICC v4
+  profile (D50 PCS/media white, Bradford-adapted colorants, `chromaticAdaptationTag`).
+  As shipped it transforms from the linear Rec.709 working space like every other
+  output space: a lossless Rec.709→P3 primaries remap (Rec.709 ⊂ P3, no gamut
+  compression) plus the sRGB TRC. Consuming already-rendered linear-P3 values as a
+  pure transfer-encode — and the ACEScg→P3 render and SDR gamut policy that produce
+  them — is the target state owned by `sdr-display-rendering`, not this axis. This
+  is the profile/encoding axis; the full `display-p3` *preset* (container,
+  tone/gamut policy) remains a planned `output-presets` name not yet accepted.
 - `--bigtiff auto|on|off` (default `auto`)
 
 Planned `output-presets` replaces the depth-only default with `gain-map-hdr` and

@@ -293,7 +293,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > rendering and a backward-compatible gain-map output. These tasks define the
 > intended product default that Phase 7 verifies.
 
-- [ ] [Display P3 output](tasks/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
+- [x] [Display P3 output](tasks/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
 - [~] [HDR still-output spike](tasks/hdr-output-spike.md) — decide ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy before implementation
 - [ ] [SDR display rendering](tasks/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
 - [ ] [Display-HDR rendering](tasks/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping

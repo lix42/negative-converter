@@ -453,7 +453,7 @@ pub struct OutputOverrides {
     /// presence flag could set HDR but never clear it).
     #[arg(long)]
     pub output_sdr: bool,
-    /// Output ICC profile (`sRGB` / `prophoto` / `acescg` / path).
+    /// Output ICC profile (`sRGB` / `prophoto` / `acescg` / `display-p3` / path).
     #[arg(long, value_name = "PROFILE")]
     pub output_profile: Option<String>,
     /// BigTIFF promotion policy (default `auto`).
