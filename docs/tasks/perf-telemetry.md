@@ -57,7 +57,7 @@ Telemetry is an operational concern like `--report`/`--verbose`, so its flags ar
   `EncodeReport`). No `success` flag today — a record is emitted only after a
   conversion succeeds, so a constant `true` would carry no information (and could
   contradict `non_finite > 0`); a `success`/`status` field returns with the
-  failure-path record in `telemetry-strategy`/`telemetry-upload`.
+  failure-path record in `telemetry-schema-v2`.
 
 ### Determinism boundary (critical)
 
@@ -89,7 +89,8 @@ is not a filesystem target and is excluded from the check.)
 
 The actual background/server upload. This task produces the record + the local
 JSONL queue an uploader will later drain. Tracked as `telemetry-upload` (depends
-on this task); see design-spec §12.
+on this task through `telemetry-strategy`, `telemetry-schema-v2`, and the
+ingestion-service child); see design-spec §12.
 
 ## Implementation Suggestion
 

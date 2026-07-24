@@ -1520,19 +1520,33 @@ the NLP feature comparison, Phase 6).
     JSON record per `nc convert` (image + per-stage timing + run context) written
     to a local JSONL log and/or one-off file (`--telemetry` / `--telemetry-file`,
     `NC_TELEMETRY_LOG`; see §9), best-effort and byte-identical-output-preserving.
-    **Remaining follow-ups are gated behind a strategy spike** (`telemetry-strategy`)
-    that decides the shape before anything is built — because the questions are
-    coupled (the data you collect drives the backend you need and the consent you
-    must obtain): (a) **infrastructure** — a hosted/owned collection service, **OTel
-    export vs custom ingestion**, and how the local JSONL queue drains (the
-    `telemetry-upload` child: background/out-of-critical-path drain, strictly opt-in
-    with a documented event list and an `NC_TELEMETRY=0`-style off switch, no stdout
-    pollution/blocking/exit-code/output effect); (b) **expanded data** — error/failure
-    events (today only successful runs emit a record; likely an `outcome.status` enum),
-    a **panic/crash hook** (version, backtrace, params *shape* — never pixels or file
-    paths), and coarse usage events (which flags/algorithms were used); and
-    (c) **privacy/consent** — the opt-in model for upload and explicit PII/path
-    scrubbing rules upholding the no-pixels/no-paths invariant. Note: the original
+    The `telemetry-strategy` spike is **complete**; its approved
+    [design note](telemetry-strategy.md) fixes the remaining shape. The client
+    keeps custom JSON (no embedded OTel SDK/Collector) and sends a separately
+    versioned, allowlisted upload projection to an nc-owned Cloudflare Worker +
+    D1 service. Persistent `nc telemetry enable` consent opts into automatic
+    `convert` success/failure/panic collection and detached, crash-safe queue
+    draining from exactly one consent-stored active JSONL plus its derived private
+    sibling spool and immutable generation. Collection consent is an
+    invocation-start snapshot: disable stops new snapshots/helpers and waits for
+    bounded network requests, but an already-running convert may finish one local
+    queued event afterward. Inactive-only purge waits those invocations. Other
+    commands are out of v1; explicit per-run telemetry does not independently
+    enable upload or install the panic hook. Active queue retargeting is rejected;
+    inactive retarget requires the old queue empty. Purge preserves the private
+    spool and stable lock inodes while clearing its data. Active same-path enable
+    is a no-op; inactive same-path enable waits old invocations and the old helper
+    before publishing a fresh generation and launching one replacement.
+    `NC_TELEMETRY=0` disables automatic collection/networking. Upload carries no
+    persistent identity, `params_hash`, exact paths/timestamps/dimensions/sizes,
+    messages, recipe/parameter values, or raw backtraces. The implementation is
+    split into `telemetry-schema-v2`, `telemetry-ingestion-service`,
+    `telemetry-upload`, and `telemetry-panic-hook`; the latter is deliberately
+    described as sanitized Rust **panic reporting**, not general native-crash
+    capture. The anonymous endpoint cannot prove event provenance, so results are
+    advisory/opt-in/unverified rather than exact population rates. V1 is hard
+    capped in a dedicated Cloudflare FREE-plan account with no billing-enabled
+    resources; any paid migration requires explicit approval. Note: the original
     LAB-benchmark `perf-instrumentation` task is **parked** (prototype on
     `prototype/perf-bench-instrumentation`); `perf-telemetry` is the real-world
     successor.

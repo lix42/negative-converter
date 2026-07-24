@@ -2078,6 +2078,114 @@ Three further items the user decided after the review:
   estimate" (md+html); design-spec §9 collision parenthetical now reads
   "(`NC_TELEMETRY_LOG` or the default path)" (md+html).
 
+## telemetry-strategy
+**Status:** done
+**Updated:** 2026-07-23
+
+- 2026-07-23: Started the strategy spike by inventorying the shipped schema,
+  queue behavior, determinism/fail-soft invariants, roadmap constraints, and the
+  existing `telemetry-upload` child. Research and user interview are in progress;
+  no infrastructure, schema, consent, or child-task decision has been made yet.
+- 2026-07-23: Initial research found that OTLP's logs transport is stable and
+  vendor-neutral, but durable delivery still requires a Collector with persistent
+  storage or nc-owned queue/ack/retry logic; adopting OTLP does not replace the
+  uploader design. Flagged an expanded privacy threat model for the design:
+  stable `params_hash` plus precise timestamps, dimensions, and file sizes are
+  path-free but can still correlate or fingerprint workflows. A Rust panic hook
+  can observe panics even with abort behavior, but it is not general native crash
+  capture, and raw panic payloads/backtraces can disclose user paths or data.
+- 2026-07-23: User interview prioritized real-world performance and failure
+  rates, capped initial backend spend at $10/month, rejected persistent install
+  identity and remote `params_hash`, selected sanitized function/module-only panic
+  frames, and accepted a detached `nc telemetry upload-once` helper. Upload
+  consent must be persistent and separate from local collection; enabling it may
+  transmit the previously accumulated explicitly opted-in queue.
+- 2026-07-23: Backend pricing research favors a schema-validating Cloudflare
+  Worker plus D1 for the initial owned ingestion service: expected volume fits
+  the free tier and the paid Workers floor is $5/month. D1 preserves exact rows,
+  unique-event deduplication, and ordinary SQL; Analytics Engine was rejected for
+  v1 because it can sample at high volume and fixes retention at three months,
+  both undesirable for exact failure-rate analysis.
+- 2026-07-23: User approved the final strategy and automatic future success/
+  failure collection under persistent upload consent. Wrote
+  `docs/telemetry-strategy.md` with the infrastructure/protocol, separate local-v2
+  and upload-v1 schemas, exact upload field allowlist, forbidden-data rules,
+  consent UX, locked rotate/spool/ack drain model, panic boundary, retention,
+  query goals, and verification gates. Split implementation into
+  `telemetry-schema-v2`, `telemetry-ingestion-service`, the refined
+  `telemetry-upload`, and `telemetry-panic-hook`; no standalone usage-event task
+  because feature adoption is not a selected goal.
+- 2026-07-23: Review-fix pass hardened the approved docs against twelve verified
+  edge cases without changing status or dependencies: explicit durable
+  raw/batch/temp recovery and fsync ordering; per-panic atomic ready files;
+  request-by-request fail-closed consent and revoke races; one consent-stored
+  managed queue path; a shared machine-readable cross-language contract with
+  complete bounds/enums; convert-only v1 scope; panic fixture ownership; a hard
+  FREE-plan quota/cost boundary; anonymous-provenance caveats and abuse
+  quarantine/kill switch; and realistic no-network-critical-path/bounded-spawn
+  timing requirements.
+- 2026-07-23: Second review-fix pass removed remaining ownership and race
+  ambiguity: consent now stores a permanent selected active JSONL plus a uniquely
+  derived private sibling spool; a shared/exclusive request lease makes disable
+  wait for bounded in-flight HTTPS work; bit depth is correctly 16 bits/sample;
+  the shared schema owns the panic-ready fixture and relational validation; and
+  pure legacy projection is separated from uploader-owned durable ID assignment.
+- 2026-07-23: Third review-fix pass separated invocation-lifetime collection
+  consent from request-lifetime network consent. Supported converts now hold an
+  immutable generation/path collection snapshot through append or panic; disable
+  stops new work and waits only for bounded requests, while inactive-only purge
+  waits collection-exclusive before clearing selected state. Helper A→B retarget
+  checks and a cycle-free collection/drain/gate/request/queue lock order are
+  explicit; per-run telemetry no longer implies panic capture.
+- 2026-07-23: Fourth review-fix pass made queue retarget non-stranding and purge
+  lock-stable. Active A→B is rejected; inactive retarget waits old snapshots and
+  helper work and publishes B only after proving A has no managed event, batch,
+  panic, temp, or quarantine data. Purge now clears data while preserving the
+  active path, spool skeleton, and original queue/drain lock inodes, with
+  Unix/Windows final-transition races required.
+- 2026-07-23: Fifth review-fix pass made active same-path enable a true
+  idempotent no-op and specified an inactive same-path helper handoff: wait drain
+  before gate/request locks, publish a fresh generation only after the old helper
+  exits, then launch exactly one replacement after releasing locks. Panic-hook
+  sequencing now depends on `telemetry-upload`, which owns the consent,
+  collection-lease, spool, reconciliation, and purge runtime it requires;
+  schema-v2 remains transitive.
+- 2026-07-23: Sixth review-fix pass closed the inactive same-path handoff race by
+  acquiring collection-exclusive before drain. A replacement generation/helper
+  now waits both an old conversion's post-disable final append/panic lifetime and
+  the old helper, then publishes only under gate/request exclusion after both
+  finish.
+
+## telemetry-schema-v2
+**Status:** not started
+**Updated:** 2026-07-23
+
+- Goal: add typed local success/failure events and a separately versioned,
+  allowlisted upload projection with random per-event deduplication IDs.
+
+## telemetry-ingestion-service
+**Status:** not started
+**Updated:** 2026-07-23
+
+- Goal: implement the validating Cloudflare Worker + D1 ingestion, exact
+  deduplication, retention, and initial performance/failure analysis queries.
+
+## telemetry-upload
+**Status:** not started
+**Updated:** 2026-07-23
+
+- Goal: implement generation-bound invocation collection and request leases for
+  a selected active JSONL/private spool, durable rotation/recovery, detached
+  draining, non-stranding retarget, lock-stable inactive purge, and
+  retry/quarantine maintenance.
+
+## telemetry-panic-hook
+**Status:** not started
+**Updated:** 2026-07-23
+
+- Goal: capture consented Rust panics through an isolated spool with only
+  sanitized `nc` function/module frames and unchanged normal panic behavior.
+
 ## External review triage — 7 findings → 7 tasks (2026-07-18, docs-only, uncommitted)
 
 An external code review of the Step-1 codebase produced seven findings. Each was
