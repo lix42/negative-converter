@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "generated": "2026-07-24",
+  "note": "SAMPLE / trimmed illustration of nc-assets/manifest.json (the live file lives at the assets root). Shows every schema shape; not exhaustive. Generate the real one with scripts/analysis/generate_manifest.py.",
+  "rolls": {
+    "Ektar": {
+      "stock": "Kodak Ektar 100",
+      "frames": [
+        {
+          "file": "rolls/Ektar/20260713-nikon-963.tif",
+          "role": "unexposed",
+          "width": 4715,
+          "height": 3297,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 133579416,
+          "sha256": "f0f43b838382f34db5340bc52f42054fd87926af74c39d600770221bb286a013",
+          "megapixels": 15.55
+        },
+        {
+          "file": "rolls/Ektar/20260713-nikon-971.tif",
+          "role": "real",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 158474544,
+          "sha256": "5d7ab00ad02251ace6ddbac81f754ff72dc0422792dd19e639d583dcaaa0a5fd",
+          "megapixels": 18.66
+        },
+        {
+          "file": "rolls/Ektar/20260714-nikon-989.tif",
+          "role": "real",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 158474544,
+          "sha256": "8419394d7d7b1b5caea5c6a8e7b0bfbb9744c069afa12d029137e90cf367f74b",
+          "megapixels": 18.66
+        },
+        {
+          "file": "rolls/Ektar/20260714-nikon-991.tif",
+          "role": "real",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 158474544,
+          "sha256": "9b114b803a89d058ce821c7f88fe2b0743402687796b6c25f5315e277250e95c",
+          "megapixels": 18.66
+        },
+        {
+          "file": "rolls/Ektar/20260715-nikon-1009.tif",
+          "role": "leader",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 158474546,
+          "sha256": "2107adc73cc5bcbb5a9dc21f8da8192747422ead852190daac31a7ef1124e3ee",
+          "megapixels": 18.66
+        }
+      ]
+    },
+    "Portra160-2026-07-22": {
+      "stock": "Kodak Portra 160",
+      "note": "NLP comparison source; no in-roll unexposed/leader reference frame",
+      "frames": [
+        {
+          "file": "rolls/Portra160-2026-07-22/20260722-nikon-1096.tif",
+          "role": "real",
+          "width": 5184,
+          "height": 3600,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 158524834,
+          "sha256": "bffa51e66db53cd5693667ed7877d40fcbb72861c1c42aeb7cdd9e31234b0859",
+          "megapixels": 18.66
+        },
+        {
+          "file": "rolls/Portra160-2026-07-22/20260722-nikon-1097.tif",
+          "role": "real",
+          "width": 5184,
+          "height": 3600,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdri",
+          "ir_present": true,
+          "bytes": 158524834,
+          "sha256": "769cc7261f078378f2d833cd4b61a97c0d48abfc8cd091cd09ff6a2e8a3bec48",
+          "megapixels": 18.66
+        },
+        "\u2026 (trimmed)"
+      ]
+    }
+  },
+  "samples": [
+    {
+      "file": "samples/largest.tif",
+      "width": 10368,
+      "height": 7200,
+      "channels": 3,
+      "bits": 16,
+      "format": "hdri",
+      "ir_present": true,
+      "bytes": 606480032,
+      "sha256": "3e6027d47fa0e09c2d7171c9c97f4d1dc75fac4a63b91ea6c74d4cfc78ace40e",
+      "megapixels": 74.65,
+      "kind": "perf-worst-case",
+      "note": "largest/highest-res scan available (~4x a standard 18.7 MP frame); memory-preflight / streaming-tiled-io worst case"
+    },
+    {
+      "file": "samples/icc/negative-embeded.tif",
+      "width": 434,
+      "height": 309,
+      "channels": 3,
+      "bits": 16,
+      "format": "hdri",
+      "ir_present": true,
+      "bytes": 1233074,
+      "sha256": "92bfcc89136a8034693ce06cc2f0e0f83bcdb20582bb8f7ecd60499f0ffc9445",
+      "megapixels": 0.13,
+      "kind": "icc-embed-test"
+    }
+  ],
+  "converted": {
+    "nc/2026-07-22": {
+      "producer": "nc",
+      "regenerable": true,
+      "nc_version": "0.1.0",
+      "recipe_dir": "(repo) scripts/real-scan-verify/recipes",
+      "note": "16-bit sRGB + float HDR per real frame; regenerable via the harness (sha256 omitted)",
+      "outputs": [
+        {
+          "file": "converted/nc/2026-07-22/Ektar/20260713-nikon-971_positive.tiff",
+          "roll": "Ektar",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdr",
+          "ir_present": false,
+          "bytes": 111944986,
+          "megapixels": 18.66,
+          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
+          "encoding": "u16-srgb"
+        },
+        {
+          "file": "converted/nc/2026-07-22/Ektar/20260713-nikon-971_positive_hdr.tiff",
+          "roll": "Ektar",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 32,
+          "format": "tiff",
+          "ir_present": false,
+          "metadata_source": "exiftool",
+          "bytes": 223889078,
+          "megapixels": 18.66,
+          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
+          "encoding": "f32-linear"
+        },
+        "\u2026 (trimmed)"
+      ]
+    },
+    "nc/V0": {
+      "producer": "nc",
+      "regenerable": false,
+      "nc_version": "0.1.0",
+      "note": "v0 baseline artifacts behind docs/reports/v0-baseline.md (Ektar+phoenix); _pos + _corr + jpg previews",
+      "outputs": [
+        {
+          "file": "converted/nc/V0/Ektar/971_corr.tif",
+          "roll": "Ektar",
+          "width": 5184,
+          "height": 3599,
+          "channels": 3,
+          "bits": 16,
+          "format": "hdr",
+          "ir_present": false,
+          "bytes": 111944986,
+          "sha256": "d2d37ccdf4aa564cde4147a3542b7792ad0010f71dae06554f5b2ceceeac9fef",
+          "megapixels": 18.66,
+          "source_frame": "rolls/Ektar/20260713-nikon-971.tif",
+          "encoding": "u16-srgb"
+        },
+        "\u2026 (trimmed)"
+      ]
+    },
+    "nlp/2026-07-23": {
+      "producer": "nlp",
+      "regenerable": false,
+      "note": "Negative Lab Pro conversions of the Portra160-2026-07-22 roll",
+      "outputs": [
+        {
+          "file": "converted/nlp/2026-07-23/20260722-nikon-1102-positive.tif",
+          "width": 4406,
+          "height": 2930,
+          "channels": 3,
+          "bits": 32,
+          "format": "tiff",
+          "ir_present": false,
+          "metadata_source": "exiftool",
+          "bytes": 155096060,
+          "sha256": "b199accc648cdafc6ebfb732f064d287ee63bba84ce893980bde2eefe67bcb83",
+          "megapixels": 12.91,
+          "source_frame": "rolls/Portra160-2026-07-22/20260722-nikon-1102.tif",
+          "note": "cropped + float vs source; no pixel registration",
+          "encoding": "f32"
+        },
+        "\u2026 (trimmed)"
+      ]
+    }
+  },
+  "coverage_gaps": [
+    "NLP: Portra160-2026-07-22 frames without an NLP output: 20260722-nikon-1096.tif, 20260722-nikon-1097.tif"
+  ]
+}

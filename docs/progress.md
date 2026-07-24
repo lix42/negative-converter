@@ -3540,3 +3540,90 @@ rerunnable harness + frozen recipes under `scripts/real-scan-verify/` (see its `
   (2) Harman Phoenix dense base trips the `Dmax ≳1.0` floor + base-uniformity check
   → candidate new task (per-stock/dense-base Dmax handling); (3) widen
   `memory-preflight` sizing model to count IR + clone. No hard defects.
+
+## conversion-analysis-tooling
+**Status:** done (spike)
+**Updated:** 2026-07-23
+
+- Goal: decide scope/structure to grow `real-scan-verify` into a reusable
+  conversion-analysis toolkit (asset manifest, image-library analysis, NLP-vs-nc
+  comparison). Spike deliverable = design note + concretely-scoped child tasks.
+- **Research.** Confirmed the current state: `harness.sh` drives `nc` with a
+  hard-coded `ROLLS` array; **all quantitative numbers today come from nc's own
+  JSON reports** (clip %, Dmin/Dmax) — the numpy/tifffile + ImageMagick analysis
+  the task mentions was ad-hoc and **not committed anywhere**, so the
+  image-library layer is net-new. Assets (`../nc-assets`, ~11 GB rolls + 6.2 GB
+  converted) match the user's three categories: experiments (`48/64bit-*`,
+  `samples/`), rolls (5, each unexposed+leader+real), converted (`V0` = the
+  v0-baseline set; `2026-07-22` = harness output). **numpy/tifffile/Pillow are not
+  installed** (system Python 3.14) → toolkit needs its own venv.
+- **Decisions (with the user, via interview):**
+  - Tooling → **Python package** `scripts/analysis/nctool/`; single entry point;
+    subsumes `real-scan-verify` (`harness.sh` retires/shims).
+  - Asset root → **configurable, local for now**; relative paths + portable
+    checksums so a later Drive switch is one line. Drive = deferred task.
+  - Manifest → **JSON, rolls + converted, experiments excluded**; roles
+    (`unexposed|leader|real`) human-seeded, derived facts generated from
+    `nc inspect`; replaces `ROLLS`. `manifest validate` (orphans/missing/drift) is
+    the cleanup surfacing mechanism (reports, never deletes).
+  - NLP → **global metrics + side-by-side thumbnails, no registration**; align by
+    manifest `source_frame` identity.
+- **Invariant preserved:** only derived numbers (JSON) + downscaled thumbnails
+  leave the tools; full-res pixels read one-at-a-time, never surfaced.
+- **Split into 4 child tasks:** `asset-manifest` → `conversion-metrics` →
+  `nlp-comparison`; `asset-manifest` → `drive-asset-migration` (deferred). Graph
+  wired in TASKS.md.
+- **Cleanup done:** removed 4 stray `.DS_Store` from `../nc-assets`.
+  `converted/V0/` kept (v0-baseline artifacts for `conversion-versioning`).
+- **Next:** `asset-manifest` is the unblocked starting task.
+
+---
+
+**Update 2026-07-24 — assets moved to Google Drive + reorg + first manifest.**
+
+- User relocated nc-assets from local `../nc-assets` to
+  `…/GoogleDrive-devlix42@gmail.com/My Drive/temp/nc-assets` (12 GB) for
+  multi-machine work, and added: `samples/largest.tif` (10368×7200 = **74.6 MP**,
+  HDRi w/ IR — the ~4× perf worst-case the memory report lacked) and an NLP set
+  (`NLP converted/`) for a new roll `Portra160-7-22` (renamed `Portra160-2026-07-22`
+  in the reorg below).
+- **Reorg (full category regroup):** `rolls/{Ektar,phoenix,Portra160,
+  Portra160-2026-07-22,Portra400,Portra400-leica-flaw}`, `samples/`
+  (`largest.tif` + `icc/`), `converted/{nc/{2026-07-22,V0},nlp/2026-07-23}`.
+  Dropped the 48/64bit experiment fixtures (repo tests use committed
+  `tests/fixtures/`, not these); kept `converted/nc/V0` (v0-baseline). Cleaned
+  `.DS_Store`.
+- **Manifest rethink:** lives **at the assets root** (`manifest.json`) with paths
+  **relative to its own dir** → no `asset_root` field, machine-portable; scope
+  broadened to a **full inventory** (rolls+roles, samples, converted nc+nlp).
+  sha256 for irreplaceable data (rolls/samples/NLP/V0); omitted for regenerable
+  nc/2026-07-22 outputs. `source_frame` links + `coverage_gaps`.
+- **Generated** `manifest.json` (throwaway `nc inspect`-driven Python script;
+  formalized later by `asset-manifest`'s `manifest generate`). `nc inspect`
+  corrected exiftool: all frames incl. largest.tif are **hdri w/ IR**. NLP outputs
+  are **4406×2930 32-bit float, cropped** (validates no-registration); frames
+  1096/1097 have no NLP output (coverage gap).
+- Task docs synced (`asset-manifest`, `drive-asset-migration` [now in-progress,
+  not deferred], spike outcome, `nlp-comparison`). **Open:** repo `../nc-assets`
+  convention (recommend machine-local symlink → Drive) — CLAUDE.md/harness still
+  say `../nc-assets`.
+
+**Update 2026-07-24 (cont.) — symlink bridge + committed manifest tooling + skill.**
+
+- Created machine-local symlink `~/src/nc/nc-assets → <Drive>/temp/nc-assets` so
+  the repo's `../nc-assets` convention (CLAUDE.md, harness `A=../nc-assets`,
+  reports) keeps working unchanged across worktrees; not committed (machine-local).
+- `scripts/analysis/generate_manifest.py` — reusable, update-aware, stdlib
+  generator (locates `nc`/exiftool; preserves human fields role/stock/kind/note +
+  bucket regenerable/nc_version/recipe_dir; recomputes sha256 every run by
+  default for source-of-truth integrity, opt-in size-based reuse via
+  `--reuse-hash`). **Idempotent** (byte-identical re-run). Reproduces the live
+  manifest and adds `megapixels` on converted outputs.
+- `scripts/analysis/manifest.sample.json` — committed trimmed schema reference
+  (every shape; real values; ~7 KB). Update only on **schema** change.
+- `asset-manifest` **skill** (`.agents/skills/asset-manifest/` + `.claude/skills/`
+  symlink) — when/how to regenerate, invariants (no pixels; roles preserved),
+  layout the scanner expects.
+- The live `manifest.json` stays in the Drive folder (not committed). `asset-manifest`
+  task doc updated to point at these precursors; remaining task work = fold into
+  `nctool` + add `validate` (orphans/missing/drift).

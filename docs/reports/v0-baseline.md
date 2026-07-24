@@ -29,11 +29,13 @@ The shipped Step-1 default path, driven through the recommended §8 workflow:
 ```
 # Paths are relative to the repo root; sync the nc-assets Google Drive folder
 # (https://drive.google.com/drive/folders/1qXE2jF3MuVnQ2sW0pGTp3URwBJuf_LV6) to ../nc-assets/ first.
+# NOTE: as of 2026-07-24 the folder is reorganized — inputs under rolls/<roll>/
+# and outputs under converted/nc/<version>/; the original v0 run predates that.
 # 1. Measure Dmin per roll from the unexposed reference frame.
-nc estimate ../nc-assets/Ektar/20260713-nikon-963.tif   --base-region 2000,1400,400,400
-nc estimate ../nc-assets/phoenix/20260712-nikon-933.tif --base-region 1500,1500,400,400
+nc estimate ../nc-assets/rolls/Ektar/20260713-nikon-963.tif   --base-region 2000,1400,400,400
+nc estimate ../nc-assets/rolls/phoenix/20260712-nikon-933.tif --base-region 1500,1500,400,400
 # 2. Convert each exposed frame with that fixed base (density, u16 sRGB, auto-Dmax).
-nc convert ../nc-assets/<roll>/<frame>.tif -o ../nc-assets/converted/<roll>/<frame>_pos.tif \
+nc convert ../nc-assets/rolls/<roll>/<frame>.tif -o ../nc-assets/converted/nc/V0/<roll>/<frame>_pos.tif \
   --film-base <roll Dmin>
 ```
 
