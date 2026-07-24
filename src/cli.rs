@@ -29,9 +29,9 @@ use crate::pipeline::input_semantics::{
 use crate::pipeline::{film_base, stages};
 use crate::telemetry;
 use crate::types::{
-    Algorithm, BalanceRange, BigTiff, DensityParams, DmaxSource, EncodeReport, FilmBase,
-    FilmBaseParams, FilmBaseSource, InputParams, MeaningAssertion, NcError, OutputParams,
-    PrintParams, Result, SigmoidParams, SimpleParams, TransferAssertion, WbSource,
+    BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams, DmaxSource, EncodeReport,
+    FilmBase, FilmBaseParams, FilmBaseSource, InputParams, MeaningAssertion, NcError, OutputParams,
+    PrintParams, Reconstruction, ReconstructionType, Result, TransferAssertion, WbSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -150,9 +150,18 @@ pub struct ConvertArgs {
     /// Output positive TIFF.
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
-    /// Conversion algorithm (default `density`).
+    /// Reconstruction type (default `density`).
     #[arg(long, value_enum)]
-    pub algorithm: Option<Algorithm>,
+    pub reconstruction: Option<ReconstructionType>,
+    /// Density-to-positive curve (with `--reconstruction density`; default
+    /// `exponential`).
+    #[arg(long = "density-curve", value_enum)]
+    pub density_curve: Option<DensityCurveType>,
+    /// Removed: the pre-reconstruction algorithm selector. Kept hidden only to
+    /// emit a migration error pointing at `--reconstruction`/`--density-curve`
+    /// (nc is unreleased — no aliases).
+    #[arg(long, hide = true, value_name = "NAME")]
+    pub algorithm: Option<String>,
 
     #[command(flatten)]
     pub input_opts: InputOverrides,
@@ -299,11 +308,17 @@ pub struct FilmBaseOverrides {
     pub auto_base: bool,
 }
 
-/// Density-stage overrides (design-spec §9, `algorithm = density`).
+/// Density-reconstruction overrides (design-spec §9,
+/// `reconstruction = density`). Every flag here maps into the tagged
+/// `reconstruction` object: `--density-scale`/`--density-offset` ⇒
+/// `reconstruction.density.scale`/`.offset`, the regional-balance flags ⇒ the
+/// same-named `reconstruction.density` fields, and `--density-gamma` ⇒
+/// `reconstruction.curve.gamma` (exponential curve only — a merge-time usage
+/// error under sigmoid, never ignored).
 ///
 /// The two `balance_range` flags are mutually exclusive (clap rejects passing
-/// both), like the [`DmaxOverrides`] trio: whichever is given replaces the
-/// recipe's `density.balance_range` entirely.
+/// both), like the [`DmaxOverrides`] quartet: whichever is given replaces the
+/// recipe's `reconstruction.density.balance_range` entirely.
 #[derive(Args, Debug, Default)]
 pub struct DensityOverrides {
     /// Per-channel density gain.
@@ -312,7 +327,7 @@ pub struct DensityOverrides {
     /// Per-channel density offset (orange-mask compensation).
     #[arg(long, value_name = "R,G,B", value_parser = parse_rgb)]
     pub density_offset: Option<[f32; 3]>,
-    /// Film / print curve gamma.
+    /// Exponential-curve gamma (the straight line's slope).
     #[arg(long)]
     pub density_gamma: Option<f32>,
     /// Regional balance: per-channel density offset for the positive's shadows.
@@ -334,11 +349,12 @@ pub struct DensityOverrides {
     pub auto_balance_range: bool,
 }
 
-/// Display-white anchor (`Dmax`) overrides (design-spec §9, `density.dmax`).
+/// Display-white anchor (`Dmax`) overrides (design-spec §9,
+/// `reconstruction.curve.dmax` — the curve stage owns the anchor).
 ///
 /// One mutually-exclusive choice, like [`FilmBaseOverrides`]: the four flags
 /// conflict (clap rejects passing more than one) and whichever is given replaces
-/// the recipe's `density.dmax` entirely.
+/// the recipe curve's `dmax` entirely, whichever curve variant is resolved.
 #[derive(Args, Debug, Default)]
 pub struct DmaxOverrides {
     /// Explicit roll-fixed display-white anchor density (`Dmax`); a scalar,
@@ -361,9 +377,11 @@ pub struct DmaxOverrides {
     pub no_d_max: bool,
 }
 
-/// Sigmoid-algorithm overrides (design-spec §7.3/§9, `algorithm = sigmoid`).
+/// Sigmoid-curve overrides (design-spec §7.3/§9, `density-curve = sigmoid`).
 /// The flags are `--sigmoid-*`-prefixed for namespacing; the recipe keys drop
-/// the prefix (`sigmoid.contrast` etc.), like `--d-max` ⇒ `density.dmax`.
+/// the prefix (`reconstruction.curve.contrast` etc., like `--d-max` ⇒
+/// `reconstruction.curve.dmax`). Each is a merge-time usage error when the
+/// resolved curve is not sigmoid — never silently ignored.
 #[derive(Args, Debug, Default)]
 pub struct SigmoidOverrides {
     /// Mid-density slope of the S-curve (the `--density-gamma` analogue).
@@ -427,18 +445,27 @@ pub struct PrintOverrides {
     pub highlight_compress: Option<f32>,
 }
 
-/// Simple-algorithm overrides (design-spec §9, `algorithm = simple`).
+/// Removed simple-reconstruction controls (design-spec §7.1/§9). Simple
+/// reconstruction now ends at the direct unclamped positive `1 − scan/Dmin`;
+/// its old inversion white balance and clip-range remap are **not**
+/// reconstruction parameters — they return downstream (as explicit
+/// `print.white_balance` and `print.linear_range`) when named output presets
+/// land. Since their defaults were the exact identity, the default simple
+/// output is unchanged; a *customized* value can no longer be expressed, so the
+/// flags are kept hidden solely to emit a migration error (nc is unreleased —
+/// no aliases, no silent behavior change).
 #[derive(Args, Debug, Default)]
 pub struct SimpleOverrides {
-    /// White-balance gains applied to the inverted result.
-    #[arg(long, value_name = "R,G,B", value_parser = parse_rgb)]
-    pub invert_white_balance: Option<[f32; 3]>,
-    /// Low clip point.
-    #[arg(long)]
-    pub clip_low: Option<f32>,
-    /// High clip point.
-    #[arg(long)]
-    pub clip_high: Option<f32>,
+    /// Removed: inversion white-balance gains (returns as `print.white_balance`
+    /// at preset migration).
+    #[arg(long, hide = true, value_name = "R,G,B")]
+    pub invert_white_balance: Option<String>,
+    /// Removed: low clip point (returns as `print.linear_range`).
+    #[arg(long, hide = true, value_name = "F")]
+    pub clip_low: Option<String>,
+    /// Removed: high clip point (returns as `print.linear_range`).
+    #[arg(long, hide = true, value_name = "F")]
+    pub clip_high: Option<String>,
 }
 
 /// Output / encode overrides (design-spec §9, stage 5).
@@ -470,17 +497,18 @@ pub struct OutputOverrides {
 /// defaults filling the gaps, and `--dump-params` / `nc params` serialize it.
 ///
 /// Nested per-stage objects (not a flat bag) so `deny_unknown_fields` can reject
-/// typo'd keys at every level — `serde(flatten)` would defeat that.
+/// typo'd keys at every level — `serde(flatten)` would defeat that. The
+/// algorithm selection is the one tagged `reconstruction` object
+/// (`schema_version` 1, design-spec §8): there are no sibling top-level
+/// `algorithm`/`density`/`sigmoid`/`simple` sections — the removed legacy forms
+/// are rejected with a migration error at recipe load (`load_recipe`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ResolvedConfig {
-    pub algorithm: Algorithm,
+    pub reconstruction: Reconstruction,
     pub input: InputParams,
     pub film_base: FilmBaseParams,
-    pub density: DensityParams,
-    pub sigmoid: SigmoidParams,
     pub print: PrintParams,
-    pub simple: SimpleParams,
     pub output: OutputParams,
 }
 
@@ -508,13 +536,14 @@ pub struct ReuseReady {
     pub recipe: FilmBaseParams,
 }
 
-/// A minimal `density`-section recipe fragment carrying only the resolved
+/// A minimal curve-section recipe fragment carrying only the resolved
 /// roll-fixed `Dmax` (`{ "dmax": { "explicit": <d> } }`), so `estimate`'s
-/// reuse-ready output drops into a roll recipe's `density` section without
-/// pulling in the other density defaults. Serialize-only.
+/// reuse-ready output drops into a roll recipe's `reconstruction.curve` object
+/// without pulling in the other curve defaults. Serialize-only.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DmaxRecipeFragment {
-    /// The `density.dmax` value — always the tagged `{ "explicit": <d> }` form.
+    /// The `reconstruction.curve.dmax` value — always the tagged
+    /// `{ "explicit": <d> }` form.
     pub dmax: DmaxSource,
 }
 
@@ -534,6 +563,116 @@ pub struct DmaxReuseReady {
     pub recipe: DmaxRecipeFragment,
 }
 
+/// Resolution diagnostics for the reconstruction that ran (design-spec §8's
+/// report shape): `{"type":"simple"}`, or `{"type":"density","curve":{…}}`
+/// with the resolved curve type and `dmax` resolution. Serialize-only.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ReconstructionResult {
+    Simple,
+    Density { curve: CurveResult },
+}
+
+/// The resolved curve inside a density [`ReconstructionResult`].
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct CurveResult {
+    /// The curve type that ran (`"exponential"` / `"sigmoid"`).
+    #[serde(rename = "type")]
+    pub curve_type: DensityCurveType,
+    /// The resolved display-white anchor.
+    pub dmax: DmaxResolution,
+}
+
+/// The resolved `Dmax` triple: which policy was configured, the value the curve
+/// actually used this run (`null` for `none`), and where the resolution came
+/// from. A reference-measured scalar frozen into a recipe reports
+/// `explicit`/`recipe`; its capture region stays in the `estimate` record
+/// (provenance, never a re-read directive).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct DmaxResolution {
+    pub policy: DmaxPolicy,
+    /// Always emitted — `null` for `policy = "none"` (fixed report shape).
+    pub value: Option<f32>,
+    pub provenance: DmaxProvenance,
+}
+
+/// The configured `Dmax` policy (`reconstruction.curve.dmax`'s discriminator).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DmaxPolicy {
+    Fixed,
+    Explicit,
+    Auto,
+    None,
+}
+
+impl From<DmaxSource> for DmaxPolicy {
+    fn from(source: DmaxSource) -> Self {
+        match source {
+            DmaxSource::Fixed => DmaxPolicy::Fixed,
+            DmaxSource::Explicit(_) => DmaxPolicy::Explicit,
+            DmaxSource::Auto => DmaxPolicy::Auto,
+            DmaxSource::None => DmaxPolicy::None,
+        }
+    }
+}
+
+/// Where the resolved `Dmax` came from: the built-in default, the recipe file
+/// (or a roll per-frame override), a CLI flag — or, for the `auto` policy, the
+/// per-frame measurement itself (`"auto-frame"`), which is what makes that
+/// policy display-oriented and unsuitable for a film master.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DmaxProvenance {
+    Default,
+    Recipe,
+    Cli,
+    AutoFrame,
+}
+
+/// Where the `reconstruction.curve.dmax` *setting* came from, tracked by the
+/// orchestrators (recipe-key presence / flag presence) and combined with the
+/// resolved policy into the report's [`DmaxProvenance`] — an `auto` policy
+/// always reports `auto-frame`, because the *value* is a per-frame measurement
+/// regardless of who selected the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DmaxSetting {
+    Default,
+    Recipe,
+    Cli,
+}
+
+/// Build the report's `reconstruction_result` from the resolved config, the
+/// render's resolved anchor value, and the tracked `dmax` setting provenance.
+fn reconstruction_result(
+    reconstruction: &Reconstruction,
+    resolved_dmax: Option<f32>,
+    setting: DmaxSetting,
+) -> ReconstructionResult {
+    match reconstruction {
+        Reconstruction::Simple => ReconstructionResult::Simple,
+        Reconstruction::Density { curve, .. } => {
+            let policy = DmaxPolicy::from(curve.dmax());
+            let provenance = match (policy, setting) {
+                (DmaxPolicy::Auto, _) => DmaxProvenance::AutoFrame,
+                (_, DmaxSetting::Cli) => DmaxProvenance::Cli,
+                (_, DmaxSetting::Recipe) => DmaxProvenance::Recipe,
+                (_, DmaxSetting::Default) => DmaxProvenance::Default,
+            };
+            ReconstructionResult::Density {
+                curve: CurveResult {
+                    curve_type: curve.curve_type(),
+                    dmax: DmaxResolution {
+                        policy,
+                        value: resolved_dmax,
+                        provenance,
+                    },
+                },
+            }
+        }
+    }
+}
+
 /// Machine-readable result emitted on stdout (or `--report-file`). One shape
 /// serves all three commands; irrelevant fields are `None`/empty and omitted
 /// from the JSON (`skip_serializing_if`), so an agent gets a clean object per
@@ -550,9 +689,16 @@ pub struct Report {
     /// Output image path, when one was written (`convert`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<PathBuf>,
-    /// Algorithm that ran (`convert`).
+    /// The effective (resolved) recipe the frame ran on (`convert`) — the same
+    /// object written to the sidecar, so `recipe.reconstruction` is the exact
+    /// tagged reconstruction schema (design-spec §8's report shape).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub algorithm: Option<Algorithm>,
+    pub recipe: Option<ResolvedConfig>,
+    /// Resolution diagnostics for the reconstruction that ran (`convert`):
+    /// `{"type":"simple"}`, or a density object carrying the resolved curve
+    /// type and its `dmax = {policy, value, provenance}` (design-spec §8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconstruction_result: Option<ReconstructionResult>,
     /// What the decoder found (`inspect`): format, dimensions, channels, bit
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -569,11 +715,12 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub film_base: Option<FilmBase>,
     /// Resolved display-white anchor density (`Dmax`): for `convert`, the value
-    /// the density render used (fixed nominal / explicit / auto-measured), absent
-    /// for `dmax = none` or the `simple` algorithm; for `estimate --d-max-region`,
-    /// the scalar measured from the fully-exposed reference frame. Reported so a
-    /// roll can freeze one calibration into `--d-max` / `density.dmax`
-    /// (design-spec §8/§9).
+    /// the density curve used (fixed nominal / explicit / auto-measured), absent
+    /// for `dmax = none` or simple reconstruction; for `estimate
+    /// --d-max-region`, the scalar measured from the fully-exposed reference
+    /// frame. Reported so a roll can freeze one calibration into `--d-max` /
+    /// `reconstruction.curve.dmax` (design-spec §8/§9). The structured
+    /// `reconstruction_result` carries the same value with policy + provenance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dmax: Option<f32>,
     /// Reference region `[x, y, w, h]` sampled for the roll-fixed `Dmax`
@@ -700,62 +847,199 @@ fn parse_floats<const N: usize>(s: &str) -> std::result::Result<[f32; N], String
 // Recipe load / merge / validate (pure, unit-tested without the pipeline)
 // ---------------------------------------------------------------------------
 
+/// A loaded recipe plus the load-time fact the report's `Dmax` provenance
+/// needs: whether the file explicitly set `reconstruction.curve.dmax` (after
+/// defaults fill in, a recipe that *wrote* `"fixed"` is indistinguishable from
+/// one that omitted it — the raw JSON is the only witness).
+struct LoadedRecipe {
+    cfg: ResolvedConfig,
+    curve_dmax_present: bool,
+}
+
 /// Load a recipe file into a [`ResolvedConfig`], or the defaults when no recipe
-/// is given. A read failure or invalid/unknown-key JSON is a usage error.
-fn load_recipe(path: Option<&Path>) -> Result<ResolvedConfig> {
+/// is given. A read failure or invalid/unknown-key JSON is a usage error;
+/// removed legacy keys get pinned migration errors first
+/// ([`reject_legacy_recipe_keys`]) rather than opaque serde messages.
+fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
     match path {
-        None => Ok(ResolvedConfig::default()),
+        None => Ok(LoadedRecipe {
+            cfg: ResolvedConfig::default(),
+            curve_dmax_present: false,
+        }),
         Some(p) => {
             let txt = std::fs::read_to_string(p)
                 .map_err(|e| NcError::Usage(format!("cannot read recipe {}: {e}", p.display())))?;
-            reject_legacy_input_color(&txt, p)?;
-            serde_json::from_str(&txt)
-                .map_err(|e| NcError::Usage(format!("invalid recipe {}: {e}", p.display())))
+            // Parse to a raw Value first for the migration checks and the
+            // dmax-presence fact; the typed parse below still owns shape and
+            // unknown-key validation. Unparseable JSON falls through to the
+            // typed parse's error (its message names the recipe).
+            let value: Option<serde_json::Value> = serde_json::from_str(&txt).ok();
+            if let Some(v) = &value {
+                reject_legacy_recipe_keys(v, &format!("recipe {}", p.display()))?;
+            }
+            let cfg = serde_json::from_str(&txt)
+                .map_err(|e| NcError::Usage(format!("invalid recipe {}: {e}", p.display())))?;
+            let curve_dmax_present = value.as_ref().is_some_and(sets_curve_dmax);
+            Ok(LoadedRecipe {
+                cfg,
+                curve_dmax_present,
+            })
         }
     }
 }
 
-/// Pinned migration error for the removed combined `input.color` recipe key. It
-/// conflated transfer encoding with measurement meaning; those are now the
-/// independent `input.transfer` / `input.meaning` axes (input-data-semantics).
-/// `deny_unknown_fields` would already reject the key, but with an opaque serde
-/// message — this catches it first with actionable migration guidance, so a
-/// recipe that silently asserted both axes can never load.
-fn reject_legacy_input_color(txt: &str, path: &Path) -> Result<()> {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(txt)
-        && has_legacy_input_color(&v)
+/// Pinned migration errors for removed recipe keys, shared by the whole-recipe
+/// load and the roll per-frame override path so a legacy key gets the same
+/// actionable guidance wherever it appears (deny_unknown_fields would reject
+/// them anyway, but with an opaque serde message):
+///
+/// - the combined `input.color` (conflated transfer with meaning;
+///   input-data-semantics split it into `input.transfer` / `input.meaning`);
+/// - the top-level `algorithm`/`density`/`sigmoid`/`simple` selection forms,
+///   replaced by the one tagged `reconstruction` object (design-spec §8). nc is
+///   unreleased, so these are rejected, never aliased.
+fn reject_legacy_recipe_keys(v: &serde_json::Value, context: &str) -> Result<()> {
+    if v.get("input")
+        .and_then(|input| input.get("color"))
+        .is_some()
     {
         return Err(NcError::Usage(format!(
-            "recipe {}: `input.color` is no longer supported — it conflated transfer \
+            "{context}: `input.color` is no longer supported — it conflated transfer \
              encoding with measurement meaning. Replace it with the independent keys \
              `input.transfer` (auto|linear) and `input.meaning` \
-             (auto|scanner-device|colorimetric).",
-            path.display()
+             (auto|scanner-device|colorimetric)."
+        )));
+    }
+    if let Some(key) = ["algorithm", "density", "sigmoid", "simple"]
+        .into_iter()
+        .find(|k| v.get(k).is_some())
+    {
+        return Err(NcError::Usage(format!(
+            "{context}: top-level `{key}` is no longer supported — the algorithm \
+             selection moved into one tagged `reconstruction` object \
+             (schema_version 1). Use `reconstruction.type = \"simple\"` (no other \
+             fields) or `reconstruction.type = \"density\"` with density \
+             correction under `reconstruction.density` ({{scale, offset, \
+             shadow_balance, highlight_balance, balance_range}}) and exactly one \
+             tagged curve under `reconstruction.curve` \
+             ({{\"type\":\"exponential\", gamma, dmax}} or \
+             {{\"type\":\"sigmoid\", contrast, toe, shoulder, dmax}}). \
+             See design-spec §8."
         )));
     }
     Ok(())
 }
 
-/// Whether a recipe/override JSON object carries the removed combined `input.color`
-/// key. Shared by [`reject_legacy_input_color`] (whole-recipe load) and the roll
-/// per-frame override path, so a legacy key gets the same migration guidance
-/// wherever it appears rather than an opaque `deny_unknown_fields` serde error.
-fn has_legacy_input_color(v: &serde_json::Value) -> bool {
-    v.get("input")
-        .and_then(|input| input.get("color"))
+/// Whether a recipe/override JSON object explicitly carries
+/// `reconstruction.curve.dmax` — the raw-JSON witness behind the report's
+/// `recipe` Dmax provenance.
+fn sets_curve_dmax(v: &serde_json::Value) -> bool {
+    v.get("reconstruction")
+        .and_then(|r| r.get("curve"))
+        .and_then(|c| c.get("dmax"))
         .is_some()
+}
+
+/// Whether any of the four (clap-mutually-exclusive) `Dmax` flags was passed —
+/// the CLI witness for the report's `Dmax` provenance, and the merge's "replace
+/// the recipe curve's `dmax`" trigger.
+fn dmax_flag_given(o: &DmaxOverrides) -> bool {
+    o.d_max.is_some() || o.fixed_d_max || o.auto_d_max || o.no_d_max
+}
+
+/// The first density-reconstruction / curve / `Dmax` flag present on the
+/// command line, by name — for the merge's invalid-combination errors (e.g. a
+/// curve flag with `--reconstruction simple` must name the offending flag).
+fn active_density_domain_flag(args: &ConvertArgs) -> Option<&'static str> {
+    let d = &args.density;
+    let s = &args.sigmoid;
+    let x = &args.dmax;
+    [
+        ("--density-scale", d.density_scale.is_some()),
+        ("--density-offset", d.density_offset.is_some()),
+        ("--density-gamma", d.density_gamma.is_some()),
+        ("--shadow-balance", d.shadow_balance.is_some()),
+        ("--highlight-balance", d.highlight_balance.is_some()),
+        ("--balance-range", d.balance_range.is_some()),
+        ("--auto-balance-range", d.auto_balance_range),
+        ("--sigmoid-contrast", s.sigmoid_contrast.is_some()),
+        ("--sigmoid-toe", s.sigmoid_toe.is_some()),
+        ("--sigmoid-shoulder", s.sigmoid_shoulder.is_some()),
+        ("--d-max", x.d_max.is_some()),
+        ("--fixed-d-max", x.fixed_d_max),
+        ("--auto-d-max", x.auto_d_max),
+        ("--no-d-max", x.no_d_max),
+    ]
+    .into_iter()
+    .find_map(|(name, present)| present.then_some(name))
 }
 
 /// Apply CLI overrides on top of a (recipe or default) config; flags win.
 ///
-/// Pure and total: `Option` overrides replace when `Some`, presence-flag
-/// booleans (`--auto-base`) replace only when set — a `false` flag never clobbers
-/// a recipe `true`, since you disable auto-base by supplying an explicit base, not
-/// by passing `false`. (The deprecated `--assume-linear` / `--input-profile` flags
-/// are rejected before `merge`, so they never reach here.)
-pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
-    if let Some(a) = args.algorithm {
-        cfg.algorithm = a;
+/// `Option` overrides replace when `Some`, presence-flag booleans
+/// (`--auto-base`) replace only when set — a `false` flag never clobbers a
+/// recipe `true`, since you disable auto-base by supplying an explicit base, not
+/// by passing `false`. (The removed `--algorithm`/simple-control and deprecated
+/// input flags are rejected before `merge`, so they never reach here.)
+///
+/// Fallible where the old flat merge was total: the tagged `reconstruction`
+/// makes some flag/config combinations *invalid* rather than inert, and the
+/// design pins them as post-merge usage errors (exit 2), never ignored —
+/// a density/curve/`Dmax` flag with a resolved `simple` reconstruction, a
+/// sigmoid flag with a resolved `exponential` curve, `--density-gamma` with a
+/// resolved `sigmoid` curve (a customized gamma is a loud error, not the old
+/// warning), and `--density-curve` with `simple`.
+pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConfig> {
+    let usage = |m: String| NcError::Usage(m);
+
+    // --reconstruction: switch the type first, so the per-field flags below land
+    // on the switched-to config. `density` over an existing density recipe keeps
+    // its blocks (the flag is then a no-op assertion); switching from simple
+    // starts from the density defaults; `simple` always resolves to Simple
+    // (there is nothing to carry).
+    if let Some(t) = args.reconstruction {
+        cfg.reconstruction = match (t, cfg.reconstruction) {
+            (ReconstructionType::Simple, _) => Reconstruction::Simple,
+            (ReconstructionType::Density, d @ Reconstruction::Density { .. }) => d,
+            (ReconstructionType::Density, Reconstruction::Simple) => Reconstruction::default(),
+        };
+    }
+
+    // --density-curve: switch the curve variant inside a density reconstruction.
+    // Same-type is a no-op (keeps the recipe's curve knobs); a switch carries
+    // the roll-fixed `dmax` calibration over (it is curve-independent, exactly
+    // as it was algorithm-independent before) and takes the new variant's
+    // defaults for the curve-specific knobs.
+    if let Some(c) = args.density_curve {
+        match &mut cfg.reconstruction {
+            Reconstruction::Simple => {
+                return Err(usage(
+                    "--density-curve selects the density-to-positive curve, but the \
+                     resolved reconstruction is `simple` (no curve stage); pass \
+                     --reconstruction density"
+                        .into(),
+                ));
+            }
+            Reconstruction::Density { curve, .. } => {
+                if curve.curve_type() != c {
+                    let dmax = curve.dmax();
+                    *curve = match c {
+                        DensityCurveType::Exponential => {
+                            DensityCurve::Exponential(crate::types::ExponentialParams {
+                                dmax,
+                                ..Default::default()
+                            })
+                        }
+                        DensityCurveType::Sigmoid => {
+                            DensityCurve::Sigmoid(crate::types::SigmoidParams {
+                                dmax,
+                                ..Default::default()
+                            })
+                        }
+                    };
+                }
+            }
+        }
     }
 
     // input color: transfer and meaning are independent axes — each override
@@ -778,51 +1062,107 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.film_base.source = src;
     }
 
-    // density
-    if let Some(v) = args.density.density_scale {
-        cfg.density.density_scale = v;
-    }
-    if let Some(v) = args.density.density_offset {
-        cfg.density.density_offset = v;
-    }
-    if let Some(v) = args.density.density_gamma {
-        cfg.density.density_gamma = v;
-    }
-    if let Some(v) = args.density.shadow_balance {
-        cfg.density.shadow_balance = v;
-    }
-    if let Some(v) = args.density.highlight_balance {
-        cfg.density.highlight_balance = v;
-    }
-    // balance range: the two flags are mutually exclusive (clap-enforced);
-    // whichever is given replaces the recipe's `density.balance_range` entirely.
-    if let Some(v) = args.density.balance_range {
-        cfg.density.balance_range = BalanceRange::Explicit(v);
-    } else if args.density.auto_balance_range {
-        cfg.density.balance_range = BalanceRange::Auto;
-    }
+    // Density-reconstruction, curve, and Dmax flags — all live inside the tagged
+    // `reconstruction`, so with a resolved `simple` any of them is an invalid
+    // combination (fail loudly, never a silent no-op).
+    match &mut cfg.reconstruction {
+        Reconstruction::Simple => {
+            if let Some(flag) = active_density_domain_flag(args) {
+                return Err(usage(format!(
+                    "{flag} configures density reconstruction, but the resolved \
+                     reconstruction is `simple` (the direct inversion has no density \
+                     correction, curve, or Dmax); pass --reconstruction density"
+                )));
+            }
+        }
+        Reconstruction::Density { density, curve } => {
+            // density block: `--density-scale`/`--density-offset` ⇒
+            // `reconstruction.density.scale`/`.offset`; regional-balance flags ⇒
+            // the same-named density fields.
+            if let Some(v) = args.density.density_scale {
+                density.scale = v;
+            }
+            if let Some(v) = args.density.density_offset {
+                density.offset = v;
+            }
+            if let Some(v) = args.density.shadow_balance {
+                density.shadow_balance = v;
+            }
+            if let Some(v) = args.density.highlight_balance {
+                density.highlight_balance = v;
+            }
+            // balance range: the two flags are mutually exclusive (clap-enforced);
+            // whichever is given replaces the recipe's
+            // `reconstruction.density.balance_range` entirely.
+            if let Some(v) = args.density.balance_range {
+                density.balance_range = BalanceRange::Explicit(v);
+            } else if args.density.auto_balance_range {
+                density.balance_range = BalanceRange::Auto;
+            }
 
-    // dmax anchor: the four flags are mutually exclusive (clap-enforced);
-    // whichever is given replaces the recipe's `density.dmax` entirely.
-    if let Some(v) = args.dmax.d_max {
-        cfg.density.dmax = DmaxSource::Explicit(v);
-    } else if args.dmax.fixed_d_max {
-        cfg.density.dmax = DmaxSource::Fixed;
-    } else if args.dmax.auto_d_max {
-        cfg.density.dmax = DmaxSource::Auto;
-    } else if args.dmax.no_d_max {
-        cfg.density.dmax = DmaxSource::None;
-    }
+            // `--density-gamma` ⇒ `reconstruction.curve.gamma` — exponential
+            // only. A customized gamma under a resolved sigmoid curve is a loud
+            // usage error (the pre-reconstruction code warned-and-ignored; the
+            // tagged schema makes the invalid combination unrepresentable).
+            if let Some(g) = args.density.density_gamma {
+                match curve {
+                    DensityCurve::Exponential(e) => e.gamma = g,
+                    DensityCurve::Sigmoid(_) => {
+                        return Err(usage(format!(
+                            "--density-gamma ({g}) sets the exponential curve's gamma, \
+                             but the resolved curve is sigmoid — its mid-density slope \
+                             is --sigmoid-contrast (or pass --density-curve exponential)"
+                        )));
+                    }
+                }
+            }
 
-    // sigmoid
-    if let Some(v) = args.sigmoid.sigmoid_contrast {
-        cfg.sigmoid.contrast = v;
-    }
-    if let Some(v) = args.sigmoid.sigmoid_toe {
-        cfg.sigmoid.toe = v;
-    }
-    if let Some(v) = args.sigmoid.sigmoid_shoulder {
-        cfg.sigmoid.shoulder = v;
+            // sigmoid flags ⇒ `reconstruction.curve.{contrast, toe, shoulder}` —
+            // sigmoid only; under exponential they are invalid, not inert.
+            let sig = &args.sigmoid;
+            let sigmoid_flag = [
+                ("--sigmoid-contrast", sig.sigmoid_contrast.is_some()),
+                ("--sigmoid-toe", sig.sigmoid_toe.is_some()),
+                ("--sigmoid-shoulder", sig.sigmoid_shoulder.is_some()),
+            ]
+            .into_iter()
+            .find_map(|(name, present)| present.then_some(name));
+            match curve {
+                DensityCurve::Sigmoid(s) => {
+                    if let Some(v) = sig.sigmoid_contrast {
+                        s.contrast = v;
+                    }
+                    if let Some(v) = sig.sigmoid_toe {
+                        s.toe = v;
+                    }
+                    if let Some(v) = sig.sigmoid_shoulder {
+                        s.shoulder = v;
+                    }
+                }
+                DensityCurve::Exponential(_) => {
+                    if let Some(flag) = sigmoid_flag {
+                        return Err(usage(format!(
+                            "{flag} configures the sigmoid curve, but the resolved \
+                             curve is exponential; pass --density-curve sigmoid \
+                             (its slope analogue for exponential is --density-gamma)"
+                        )));
+                    }
+                }
+            }
+
+            // Dmax anchor ⇒ `reconstruction.curve.dmax`: the four flags are
+            // mutually exclusive (clap-enforced); whichever is given replaces
+            // the resolved curve's `dmax` entirely, whichever variant it is.
+            if let Some(v) = args.dmax.d_max {
+                *curve.dmax_mut() = DmaxSource::Explicit(v);
+            } else if args.dmax.fixed_d_max {
+                *curve.dmax_mut() = DmaxSource::Fixed;
+            } else if args.dmax.auto_d_max {
+                *curve.dmax_mut() = DmaxSource::Auto;
+            } else if args.dmax.no_d_max {
+                *curve.dmax_mut() = DmaxSource::None;
+            }
+        }
     }
 
     // print
@@ -845,17 +1185,6 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.print.highlight_compress = v;
     }
 
-    // simple
-    if let Some(v) = args.simple.invert_white_balance {
-        cfg.simple.invert_white_balance = v;
-    }
-    if let Some(v) = args.simple.clip_low {
-        cfg.simple.clip_low = v;
-    }
-    if let Some(v) = args.simple.clip_high {
-        cfg.simple.clip_high = v;
-    }
-
     // output: `--output-hdr` is a presence flag — passing it switches the output
     // to 32-bit float; when absent it must not clobber a recipe's `hdr: true`
     // (same convention as `--auto-base`), so only a set flag merges.
@@ -875,7 +1204,7 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> ResolvedConfig {
         cfg.output.bigtiff = v;
     }
 
-    cfg
+    Ok(cfg)
 }
 
 /// Map the (clap-mutually-exclusive) film-base flags to a [`FilmBaseSource`],
@@ -942,93 +1271,103 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
         FilmBaseSource::Region(_) | FilmBaseSource::Auto => {}
     }
 
-    // Density: gamma and per-channel gain must be positive; offset just finite.
-    positive("--density-gamma", &[cfg.density.density_gamma])?;
-    positive("--density-scale", &cfg.density.density_scale)?;
-    finite("--density-offset", &cfg.density.density_offset)?;
+    // Reconstruction: the tagged config's value checks, per variant. `simple`
+    // carries no further knobs (its old WB/clip controls were removed — see
+    // `SimpleOverrides`), so only `density` has anything to check.
+    if let Reconstruction::Density { density, curve } = &cfg.reconstruction {
+        // Density block: per-channel gain must be positive; offset just finite.
+        positive("--density-scale", &density.scale)?;
+        finite("--density-offset", &density.offset)?;
 
-    // Regional balance: the offsets are density deltas — any finite value
-    // (including negative) is meaningful. An explicit ramp range must be finite
-    // and ordered `lo < hi`: equal anchors would make the ramp divide by zero,
-    // and a recipe can smuggle values the CLI parser never saw.
-    finite("--shadow-balance", &cfg.density.shadow_balance)?;
-    finite("--highlight-balance", &cfg.density.highlight_balance)?;
-    if let BalanceRange::Explicit([lo, hi]) = cfg.density.balance_range {
-        finite("--balance-range", &[lo, hi])?;
-        if lo >= hi {
-            return Err(usage(format!(
-                "--balance-range low ({lo}) must be < high ({hi})"
-            )));
+        // Regional balance: the offsets are density deltas — any finite value
+        // (including negative) is meaningful. An explicit ramp range must be finite
+        // and ordered `lo < hi`: equal anchors would make the ramp divide by zero,
+        // and a recipe can smuggle values the CLI parser never saw.
+        finite("--shadow-balance", &density.shadow_balance)?;
+        finite("--highlight-balance", &density.highlight_balance)?;
+        if let BalanceRange::Explicit([lo, hi]) = density.balance_range {
+            finite("--balance-range", &[lo, hi])?;
+            if lo >= hi {
+                return Err(usage(format!(
+                    "--balance-range low ({lo}) must be < high ({hi})"
+                )));
+            }
+            // The span `hi - lo` divides the ramp; two individually-finite anchors
+            // can still overflow it to `+inf` (e.g. `-3e38,3e38`), which silently
+            // collapses `w_hi` to 0 for every pixel — the highlight balance would
+            // then never apply while the report claims the range was honored. A
+            // representable span is a hard requirement, not just `lo < hi`.
+            if !(hi - lo).is_finite() {
+                return Err(usage(format!(
+                    "--balance-range span (high {hi} − low {lo}) overflows f32; \
+                     use anchors whose difference is representable"
+                )));
+            }
         }
-        // The span `hi - lo` divides the ramp; two individually-finite anchors
-        // can still overflow it to `+inf` (e.g. `-3e38,3e38`), which silently
-        // collapses `w_hi` to 0 for every pixel — the highlight balance would
-        // then never apply while the report claims the range was honored. A
-        // representable span is a hard requirement, not just `lo < hi`.
-        if !(hi - lo).is_finite() {
-            return Err(usage(format!(
-                "--balance-range span (high {hi} − low {lo}) overflows f32; \
-                 use anchors whose difference is representable"
-            )));
+
+        // Dmax anchor: an explicit anchor is a corrected density — scene white
+        // sits at a positive density above the base's `D = 0`, so a non-positive
+        // / non-finite value (e.g. a sign typo) would brighten past white or blow
+        // out. Reject it loudly; `Auto`/`None` need no value check.
+        if let DmaxSource::Explicit(d) = curve.dmax() {
+            positive("--d-max", &[d])?;
         }
-    }
 
-    // Dmax anchor: an explicit anchor is a corrected density — scene white sits at
-    // a positive density above the base's `D = 0`, so a non-positive / non-finite
-    // value (e.g. a sign typo) would brighten past white or blow out. Reject it
-    // loudly; `Auto`/`None` need no value check.
-    if let DmaxSource::Explicit(d) = cfg.density.dmax {
-        positive("--d-max", &[d])?;
-    }
-
-    // Sigmoid: the S-curve is anchored on `[0, Dmax]` — both its white knee and
-    // its black floor derive from the anchor — so `dmax = none` (scene-referred,
-    // no anchor) cannot drive it (design-spec §7.3).
-    if cfg.algorithm == Algorithm::Sigmoid && cfg.density.dmax == DmaxSource::None {
-        return Err(usage(
-            "--algorithm sigmoid needs a display-white anchor (the default fixed \
-             anchor, --d-max <d>, or --auto-d-max); --no-d-max / `density.dmax = \
-             none` is only supported by --algorithm density"
-                .into(),
-        ));
-    }
-    // Contrast (mid-density slope) must be positive AND bounded above: an extreme
-    // slope collapses the S-curve into a hard black/white threshold whose knees
-    // silently launder the blow-out into a finite two-level image (highlights →
-    // exactly 1.0, shadows → the floor) that trips *neither* the clip nor the
-    // non-finite counter — a silent destruction the `density` algorithm avoids
-    // (it overflows to +inf, which is counted). Cap it; use `--algorithm density`
-    // for genuinely extreme contrast.
-    positive("--sigmoid-contrast", &[cfg.sigmoid.contrast])?;
-    if cfg.sigmoid.contrast > crate::algo::sigmoid::SIGMOID_CONTRAST_MAX {
-        return Err(usage(format!(
-            "--sigmoid-contrast ({}) must be <= {} (beyond this the S-curve is a hard \
-             threshold that silently destroys tonal detail; use --algorithm density)",
-            cfg.sigmoid.contrast,
-            crate::algo::sigmoid::SIGMOID_CONTRAST_MAX
-        )));
-    }
-    // Knee widths non-negative AND bounded above: 0 disables a knee, a negative
-    // width would silently be treated as "off" by the curve, and a huge *finite*
-    // width flattens the image into near-uniform tone (giant shoulder → all-black,
-    // giant toe → all-white) with samples that stay finite and in range — the same
-    // silent-destruction class the contrast cap closes. Reject both loudly.
-    finite(
-        "--sigmoid-toe/--sigmoid-shoulder",
-        &[cfg.sigmoid.toe, cfg.sigmoid.shoulder],
-    )?;
-    let knee_max = crate::algo::sigmoid::SIGMOID_KNEE_MAX;
-    if cfg.sigmoid.toe < 0.0
-        || cfg.sigmoid.shoulder < 0.0
-        || cfg.sigmoid.toe > knee_max
-        || cfg.sigmoid.shoulder > knee_max
-    {
-        return Err(usage(format!(
-            "--sigmoid-toe ({}) and --sigmoid-shoulder ({}) must be in [0, {knee_max}] \
-             (0 disables the knee; a larger width flattens the image into near-uniform \
-             tone without tripping the clip/non-finite counters)",
-            cfg.sigmoid.toe, cfg.sigmoid.shoulder
-        )));
+        match curve {
+            DensityCurve::Exponential(e) => {
+                positive("--density-gamma", &[e.gamma])?;
+            }
+            DensityCurve::Sigmoid(s) => {
+                // The S-curve is anchored on `[0, Dmax]` — both its white knee
+                // and its black floor derive from the anchor — so `dmax = none`
+                // (unity placement, no anchor) cannot drive it (design-spec §7.3).
+                if s.dmax == DmaxSource::None {
+                    return Err(usage(
+                        "the sigmoid curve needs a display-white anchor (the default \
+                         fixed anchor, --d-max <d>, or --auto-d-max); --no-d-max / \
+                         `curve.dmax = none` is only supported by the exponential \
+                         curve"
+                            .into(),
+                    ));
+                }
+                // Contrast (mid-density slope) must be positive AND bounded above:
+                // an extreme slope collapses the S-curve into a hard black/white
+                // threshold whose knees silently launder the blow-out into a
+                // finite two-level image (highlights → exactly 1.0, shadows → the
+                // floor) that trips *neither* the clip nor the non-finite counter
+                // — a silent destruction the exponential curve avoids (it
+                // overflows to +inf, which is counted). Cap it; use
+                // `--density-curve exponential` for genuinely extreme contrast.
+                positive("--sigmoid-contrast", &[s.contrast])?;
+                if s.contrast > crate::algo::sigmoid::SIGMOID_CONTRAST_MAX {
+                    return Err(usage(format!(
+                        "--sigmoid-contrast ({}) must be <= {} (beyond this the \
+                         S-curve is a hard threshold that silently destroys tonal \
+                         detail; use --density-curve exponential)",
+                        s.contrast,
+                        crate::algo::sigmoid::SIGMOID_CONTRAST_MAX
+                    )));
+                }
+                // Knee widths non-negative AND bounded above: 0 disables a knee, a
+                // negative width would silently be treated as "off" by the curve,
+                // and a huge *finite* width flattens the image into near-uniform
+                // tone (giant shoulder → all-black, giant toe → all-white) with
+                // samples that stay finite and in range — the same
+                // silent-destruction class the contrast cap closes. Reject both
+                // loudly.
+                finite("--sigmoid-toe/--sigmoid-shoulder", &[s.toe, s.shoulder])?;
+                let knee_max = crate::algo::sigmoid::SIGMOID_KNEE_MAX;
+                if s.toe < 0.0 || s.shoulder < 0.0 || s.toe > knee_max || s.shoulder > knee_max {
+                    return Err(usage(format!(
+                        "--sigmoid-toe ({}) and --sigmoid-shoulder ({}) must be in \
+                         [0, {knee_max}] (0 disables the knee; a larger width flattens \
+                         the image into near-uniform tone without tripping the \
+                         clip/non-finite counters)",
+                        s.toe, s.shoulder
+                    )));
+                }
+            }
+        }
     }
 
     // Print: exposure / black point finite; gains positive. Highlight roll-off is a
@@ -1045,41 +1384,26 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     }
     // Explicit gains must be positive; the auto modes carry no value to check
     // here (estimated gains are guarded at the estimation point, exit 1). An auto
-    // mode only has an effect through a print white-balance stage — the density
-    // and sigmoid algorithms have one (both apply `print.white_balance` via
-    // `render_print`); `simple` does not (`stages::algo_params` never wires
-    // `print` into it). Whitelist the algorithms that consume the gains rather
-    // than blacklist `simple`: a future algorithm that also ignores the print
-    // stage must fail loudly here by default, not silently drop the requested
-    // estimation (exit 0, no gains) — the "forgotten coupled spot" trap.
+    // mode only has an effect through a print white-balance stage — density
+    // reconstruction has one (both curves route through `finish_print`'s WB
+    // slot); `simple` does not (its positive passes through untouched).
+    // Whitelist the reconstruction that consumes the gains rather than blacklist
+    // `simple`: a future reconstruction that also skips the print stage must
+    // fail loudly here by default, not silently drop the requested estimation
+    // (exit 0, no gains) — the "forgotten coupled spot" trap.
     match cfg.print.white_balance {
         WbSource::Explicit(gains) => positive("--white-balance", &gains)?,
         WbSource::GrayWorld | WbSource::Percentile
-            if !matches!(cfg.algorithm, Algorithm::Density | Algorithm::Sigmoid) =>
+            if !matches!(cfg.reconstruction, Reconstruction::Density { .. }) =>
         {
             return Err(usage(
-                "--auto-wb needs --algorithm density or sigmoid (the simple \
-                 algorithm has no print white-balance stage); pass explicit \
-                 --white-balance gains instead, or switch algorithm"
+                "--auto-wb needs --reconstruction density (simple reconstruction \
+                 has no print white-balance stage); pass explicit --white-balance \
+                 gains instead, or switch reconstruction"
                     .into(),
             ));
         }
         WbSource::GrayWorld | WbSource::Percentile => {}
-    }
-
-    // Simple: gains positive; clip range finite and ordered.
-    positive("--invert-white-balance", &cfg.simple.invert_white_balance)?;
-    finite(
-        "--clip-low/--clip-high",
-        &[cfg.simple.clip_low, cfg.simple.clip_high],
-    )?;
-    // Equal endpoints leave a zero-width interval the simple remap can't
-    // normalize without dividing by zero, so require strictly low < high.
-    if cfg.simple.clip_low >= cfg.simple.clip_high {
-        return Err(usage(format!(
-            "--clip-low ({}) must be < --clip-high ({})",
-            cfg.simple.clip_low, cfg.simple.clip_high
-        )));
     }
 
     Ok(())
@@ -1372,6 +1696,42 @@ fn reject_deprecated_input_flags(o: &InputOverrides) -> Result<()> {
     Ok(())
 }
 
+/// Migration errors for the removed algorithm selector and simple-reconstruction
+/// controls. nc is unreleased, so these flags survive only as hidden args that
+/// emit actionable guidance — never as aliases (`reject_legacy_recipe_keys` is
+/// the recipe-side mirror).
+fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
+    if let Some(name) = &args.algorithm {
+        return Err(NcError::Usage(format!(
+            "--algorithm {name} was removed: the selection is now the tagged \
+             reconstruction — use `--reconstruction simple|density`, plus \
+             `--density-curve exponential|sigmoid` for the density curve (the old \
+             `--algorithm sigmoid` is `--reconstruction density --density-curve \
+             sigmoid`). Recipes select it via the one `reconstruction` object \
+             (design-spec §8)."
+        )));
+    }
+    for (flag, present) in [
+        (
+            "--invert-white-balance",
+            args.simple.invert_white_balance.is_some(),
+        ),
+        ("--clip-low", args.simple.clip_low.is_some()),
+        ("--clip-high", args.simple.clip_high.is_some()),
+    ] {
+        if present {
+            return Err(NcError::Usage(format!(
+                "{flag} was removed: it is not a simple-reconstruction parameter — \
+                 simple reconstruction ends at the direct unclamped positive \
+                 `1 - scan/Dmin` (design-spec §7.1). Inversion white balance and the \
+                 clip range return as print controls (print.white_balance / \
+                 print.linear_range) when named output presets land."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Which input axes were asserted via a **CLI flag** (vs the recipe) — threaded
 /// into [`convert_frame`] so the resolver records literal CLI-vs-recipe
 /// provenance. `roll` has no per-frame input flags, so it passes
@@ -1477,12 +1837,17 @@ struct ConvertedFrame {
 /// also moved into the returned report, but on the `Err` path they stay in the
 /// caller's buffer — the roll orchestrator attaches them to a failed frame's
 /// report. The caller decides whether `--strict` promotes them.
+// One over clippy's argument cap: the orchestration core legitimately threads
+// the frame identity, config, and the two report-provenance facts; a params
+// struct for two one-off values would only obscure the call sites.
+#[allow(clippy::too_many_arguments)]
 fn convert_frame(
     command: &'static str,
     input: &Path,
     output: &Path,
     cfg: &ResolvedConfig,
     input_from_cli: InputFromCli,
+    dmax_setting: DmaxSetting,
     log: &Log,
     warnings: &mut Vec<String>,
 ) -> Result<ConvertedFrame> {
@@ -1490,29 +1855,16 @@ fn convert_frame(
         command: Some(command),
         input: Some(input.to_path_buf()),
         output: Some(output.to_path_buf()),
-        algorithm: Some(cfg.algorithm),
+        // The effective recipe (the sidecar's exact object), so
+        // `recipe.reconstruction` is the tagged reconstruction schema.
+        recipe: Some(cfg.clone()),
         film_base_source: Some(cfg.film_base.source.clone()),
         ..Report::default()
     };
 
-    // `sigmoid` consumes the density section's scale/offset/dmax but replaces the
-    // stage-3 straight line that `density_gamma` parameterizes, so a customized
-    // gamma would be a silent no-op — the four-spot trap in disguise. Unlike a
-    // fully inert section (e.g. `simple.*` under `--algorithm density`), this is a
-    // *partially* consumed section, so warn loudly instead of staying silent.
-    if cfg.algorithm == Algorithm::Sigmoid
-        && cfg.density.density_gamma != DensityParams::default().density_gamma
-    {
-        push_warning_buf(
-            warnings,
-            log,
-            format!(
-                "--algorithm sigmoid ignores --density-gamma (got {}); the S-curve's \
-                 mid-density slope is --sigmoid-contrast",
-                cfg.density.density_gamma
-            ),
-        );
-    }
+    // (A customized `--density-gamma` under a resolved sigmoid curve is now a
+    // merge-time usage error — the tagged curve made the old warned-and-ignored
+    // combination unrepresentable, so no warning lives here anymore.)
 
     // Domain guard for an explicit / reference-derived `Dmax` — see
     // `explicit_dmax_domain_warning`. Fires the (`--strict`-promotable) warning when
@@ -1599,17 +1951,12 @@ fn convert_frame(
 
     // Clear any stale lcms2 flag so only errors from *this* render are counted.
     let _ = cms_error_occurred();
-    // Stages 3–4 — algorithm → output color transform.
+    // Stages 3–4 — reconstruction → legacy print → output color transform.
     let rendered = stages::render(
         &image,
         &base.base,
-        stages::algo_params(
-            cfg.algorithm,
-            &cfg.simple,
-            &cfg.density,
-            &cfg.sigmoid,
-            &cfg.print,
-        ),
+        &cfg.reconstruction,
+        &cfg.print,
         &cfg.output,
     )?;
     // lcms2 transform/profile failures reach us only through the global handler
@@ -1622,6 +1969,11 @@ fn convert_frame(
     report.dmax = rendered.convert.dmax;
     report.white_balance = rendered.convert.white_balance;
     report.balance_range = rendered.convert.balance_range;
+    report.reconstruction_result = Some(reconstruction_result(
+        &cfg.reconstruction,
+        rendered.convert.dmax,
+        dmax_setting,
+    ));
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).
@@ -1718,32 +2070,33 @@ fn convert_frame(
 /// density params (or resets them).
 ///
 /// `Fixed`/`Auto` are already in the corrected domain (the nominal is defined there;
-/// `Auto` measures the post-correction, post-balance buffer), and `simple` consumes
-/// none of these knobs, so the guard is scoped to an explicit anchor on a
-/// density-domain algorithm. (Regional balance varies per-tone, so it cannot be
-/// *folded into* a scalar anchor — but a non-neutral balance still shifts `D′`, so a
-/// fixed anchor still mis-anchors; hence it belongs in this guard.)
+/// `Auto` measures the post-correction, post-balance buffer), and `simple` has no
+/// density domain at all, so the guard is scoped to an explicit anchor on a
+/// density reconstruction — either curve; both subtract the anchor from `D′`.
+/// (Regional balance varies per-tone, so it cannot be *folded into* a scalar
+/// anchor — but a non-neutral balance still shifts `D′`, so a fixed anchor still
+/// mis-anchors; hence it belongs in this guard.)
 fn explicit_dmax_domain_warning(cfg: &ResolvedConfig) -> Option<String> {
+    let Reconstruction::Density { density, curve } = &cfg.reconstruction else {
+        return None;
+    };
+    if !matches!(curve.dmax(), DmaxSource::Explicit(_)) {
+        return None;
+    }
     let default_density = DensityParams::default();
-    let nondefault_correction = cfg.density.density_scale != default_density.density_scale
-        || cfg.density.density_offset != default_density.density_offset;
-    let nonneutral_balance = cfg.density.shadow_balance != default_density.shadow_balance
-        || cfg.density.highlight_balance != default_density.highlight_balance;
-    if matches!(cfg.density.dmax, DmaxSource::Explicit(_))
-        && matches!(cfg.algorithm, Algorithm::Density | Algorithm::Sigmoid)
-        && (nondefault_correction || nonneutral_balance)
-    {
+    let nondefault_correction =
+        density.scale != default_density.scale || density.offset != default_density.offset;
+    let nonneutral_balance = density.shadow_balance != default_density.shadow_balance
+        || density.highlight_balance != default_density.highlight_balance;
+    if nondefault_correction || nonneutral_balance {
         Some(format!(
             "explicit --d-max is a base-relative density measured under default \
              density correction, but density-scale ({:?}) / density-offset ({:?}) / \
              regional balance (shadow {:?}, highlight {:?}) are non-default — the \
-             anchor is in a different density domain than the render subtracts it \
+             anchor is in a different density domain than the curve subtracts it \
              from, uniformly mis-anchoring the frame; re-measure --d-max under these \
              density params or reset them to defaults",
-            cfg.density.density_scale,
-            cfg.density.density_offset,
-            cfg.density.shadow_balance,
-            cfg.density.highlight_balance
+            density.scale, density.offset, density.shadow_balance, density.highlight_balance
         ))
     } else {
         None
@@ -1801,7 +2154,18 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     let log = Log::new(&args.report);
 
     reject_deprecated_input_flags(&args.input_opts)?;
-    let cfg = merge(load_recipe(args.recipe_in.as_deref())?, &args);
+    reject_removed_flags(&args)?;
+    let loaded = load_recipe(args.recipe_in.as_deref())?;
+    // Dmax provenance for the report: a CLI flag beats the recipe key beats the
+    // default — the same precedence the merge applies to the value itself.
+    let dmax_setting = if dmax_flag_given(&args.dmax) {
+        DmaxSetting::Cli
+    } else if loaded.curve_dmax_present {
+        DmaxSetting::Recipe
+    } else {
+        DmaxSetting::Default
+    };
+    let cfg = merge(loaded.cfg, &args)?;
     validate(&cfg)?;
 
     // Guard every write target against the input and against each other before
@@ -1868,6 +2232,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             transfer: args.input_opts.input_transfer.is_some(),
             meaning: args.input_opts.input_meaning.is_some(),
         },
+        dmax_setting,
         &log,
         &mut warnings,
     )?;
@@ -1955,6 +2320,7 @@ struct ManifestFrame {
 
 /// A frame resolved for conversion: where to read and write, and the effective
 /// config (the shared recipe with any per-frame manifest override merged on top).
+#[derive(Debug)]
 struct PlannedFrame {
     input: PathBuf,
     output: PathBuf,
@@ -1963,6 +2329,10 @@ struct PlannedFrame {
     /// report so a reader sees exactly what differed for this frame; `None` when
     /// the frame ran the shared recipe unchanged.
     overrides: Option<serde_json::Value>,
+    /// Where this frame's `reconstruction.curve.dmax` setting came from (shared
+    /// recipe / per-frame override ⇒ `Recipe`, else `Default`; roll has no
+    /// per-frame flags) — the report's `Dmax` provenance.
+    dmax_setting: DmaxSetting,
 }
 
 /// The roll-level JSON report emitted on stdout (or `--report-file`): the shared
@@ -2127,19 +2497,36 @@ fn resolve_frame_output(explicit: Option<&Path>, input: &Path, out_dir: &Path) -
 /// defaults instead).
 ///
 /// Switching a multi-variant enum via an override is safe, not silent: the merged
-/// value must still deserialize as that enum. An externally-tagged enum such as
-/// [`FilmBaseSource`] serializes as a one-key map (`{"region":[…]}`), so an
-/// override that flips it to another variant (`{"explicit":[…]}`) must *replace*
-/// the whole map — a key-by-key merge would union the tags into `{"region":…,
-/// "explicit":…}`, which no externally-tagged enum can deserialize, turning an
-/// override that should apply into a confusing `from_value` rejection. The
-/// [`is_variant_switch`] guard catches exactly that signature (both sides are
-/// single-key objects with *different* keys) and replaces wholesale; a malformed
-/// override is still rejected loudly by the `from_value` in [`resolve_frames`],
-/// never applied half-merged.
+/// value must still deserialize as that enum. Two tagged shapes need a
+/// variant-switch rule instead of the key-by-key merge:
+///
+/// - **Externally tagged** (e.g. [`FilmBaseSource`]): a one-key map
+///   (`{"region":[…]}`). Flipping it to another variant (`{"explicit":[…]}`)
+///   must *replace* the whole map — a key-by-key merge would union the tags
+///   into `{"region":…, "explicit":…}`, which no externally-tagged enum can
+///   deserialize, turning an override that should apply into a confusing
+///   `from_value` rejection. [`is_variant_switch`] catches exactly that
+///   signature (both sides single-key objects with *different* keys).
+/// - **Internally tagged** (the `reconstruction` object and its tagged
+///   `curve`): a `"type"` field alongside the variant's own fields. Flipping
+///   the `type` must not deep-merge either — the base's stale variant-specific
+///   fields would survive (`density`/`curve` under a switch to `simple`,
+///   `gamma` under a switch to `sigmoid`) and the fail-loud deserializer would
+///   reject the union. [`internally_tagged_switch`] replaces the object with
+///   the overlay, carrying the base's `dmax` when the overlay doesn't set it —
+///   the one field the curve variants deliberately share (a roll-fixed anchor
+///   survives an exponential↔sigmoid switch), mirroring the CLI [`merge`],
+///   which carries `curve.dmax()` across a `--density-curve` switch.
+///
+/// A malformed override is still rejected loudly by the `from_value` in
+/// [`resolve_frames`], never applied half-merged.
 fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
     if is_variant_switch(base, overlay) {
         *base = overlay.clone();
+        return;
+    }
+    if let Some(switched) = internally_tagged_switch(base, overlay) {
+        *base = switched;
         return;
     }
     match (base, overlay) {
@@ -2165,6 +2552,42 @@ fn is_variant_switch(base: &serde_json::Value, overlay: &serde_json::Value) -> b
         }
         _ => false,
     }
+}
+
+/// The internally-tagged variant switch: `base` and `overlay` are both objects
+/// carrying a `"type"` string discriminator with *different* values — in this
+/// recipe schema that is the `reconstruction` object (`simple`/`density`) and
+/// its tagged `curve` (`exponential`/`sigmoid`); nothing else uses an internal
+/// tag. Returns the replacement object, or `None` when this isn't a type
+/// switch (same/absent tags fall through to the ordinary deep merge, so a
+/// same-variant partial override still keeps its siblings).
+///
+/// The replacement is the overlay itself, plus the base's `dmax` when the
+/// overlay doesn't set one: `dmax` is the single field the curve variants
+/// share by design — a roll-fixed display-white anchor is curve-independent
+/// calibration, so a per-frame `{"curve":{"type":"sigmoid"}}` override keeps
+/// the roll's frozen anchor exactly as the CLI's `--density-curve` switch does
+/// ([`merge`]). Every other base field is variant-specific and must not
+/// survive (the deserializer would loudly reject the union). The
+/// `reconstruction`-level switch has no `dmax` key, so the carry is simply
+/// inert there (`schema_version` needs no carry — omitted input defaults to
+/// the one supported version).
+fn internally_tagged_switch(
+    base: &serde_json::Value,
+    overlay: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let (b, o) = (base.as_object()?, overlay.as_object()?);
+    let (base_type, overlay_type) = (b.get("type")?.as_str()?, o.get("type")?.as_str()?);
+    if base_type == overlay_type {
+        return None;
+    }
+    let mut switched = o.clone();
+    if !switched.contains_key("dmax")
+        && let Some(dmax) = b.get("dmax")
+    {
+        switched.insert("dmax".to_string(), dmax.clone());
+    }
+    Some(serde_json::Value::Object(switched))
 }
 
 /// Load a `--frames` manifest. A read failure or invalid/unknown-key JSON is a
@@ -2231,10 +2654,16 @@ fn reject_roll_unsupported_input(cfg: &ResolvedConfig) -> Result<()> {
 fn resolve_frames(
     args: &RollArgs,
     shared: &ResolvedConfig,
+    shared_dmax_present: bool,
     roll_warnings: &mut Vec<String>,
     log: &Log,
 ) -> Result<Vec<PlannedFrame>> {
     let out_dir = args.out_dir.as_path();
+    let shared_setting = if shared_dmax_present {
+        DmaxSetting::Recipe
+    } else {
+        DmaxSetting::Default
+    };
     let mut planned = Vec::new();
     match &args.frames {
         Some(manifest_path) => {
@@ -2250,20 +2679,15 @@ fn resolve_frames(
             let shared_value = serde_json::to_value(shared)
                 .map_err(|e| NcError::Other(format!("serializing shared recipe: {e}")))?;
             for mf in manifest.frames {
-                let (cfg, overrides) = match mf.params {
+                let (cfg, overrides, dmax_setting) = match mf.params {
                     Some(ov) => {
-                        // A per-frame override carrying the removed combined key gets
+                        // A per-frame override carrying a removed legacy key gets
                         // the same pinned migration guidance as the shared recipe,
                         // not an opaque `deny_unknown_fields` serde error.
-                        if has_legacy_input_color(&ov) {
-                            return Err(NcError::Usage(format!(
-                                "frame {}: per-frame `params` override uses `input.color`, \
-                                 which is no longer supported — it conflated transfer \
-                                 encoding with measurement meaning. Use the independent keys \
-                                 `input.transfer` / `input.meaning`.",
-                                mf.input.display()
-                            )));
-                        }
+                        reject_legacy_recipe_keys(
+                            &ov,
+                            &format!("frame {}: per-frame `params` override", mf.input.display()),
+                        )?;
                         // `film_base` and `density.dmax` are both roll-fixed
                         // calibrations: the whole batch is meant to share one frozen
                         // base (Dmin) and one display-white anchor (Dmax). A per-frame
@@ -2285,23 +2709,30 @@ fn resolve_frames(
                             log.warn(&msg);
                             roll_warnings.push(msg);
                         }
-                        // `density.dmax` became a roll-fixed calibration in the
-                        // `dmax-reference` task (default `Fixed`, or an `Explicit`
-                        // measured/per-stock anchor frozen into the recipe). A per-frame
-                        // override of it breaks roll consistency exactly like `film_base`.
-                        if ov.get("density").and_then(|d| d.get("dmax")).is_some() {
+                        // `reconstruction.curve.dmax` became a roll-fixed calibration
+                        // in the `dmax-reference` task (default `Fixed`, or an
+                        // `Explicit` measured/per-stock anchor frozen into the recipe).
+                        // A per-frame override of it breaks roll consistency exactly
+                        // like `film_base`.
+                        if sets_curve_dmax(&ov) {
                             let msg = format!(
-                                "frame {}: a per-frame `params` override sets `density.dmax`, \
-                                 overriding the roll-fixed display-white anchor — this frame's \
-                                 Dmax differs from the rest of the roll, breaking color \
-                                 consistency. Set Dmax once in the shared --params recipe (and \
-                                 drop the per-frame `density.dmax`) if you want a frozen, \
+                                "frame {}: a per-frame `params` override sets \
+                                 `reconstruction.curve.dmax`, overriding the roll-fixed \
+                                 display-white anchor — this frame's Dmax differs from the \
+                                 rest of the roll, breaking color consistency. Set Dmax once \
+                                 in the shared --params recipe (and drop the per-frame \
+                                 `reconstruction.curve.dmax`) if you want a frozen, \
                                  consistent roll.",
                                 mf.input.display()
                             );
                             log.warn(&msg);
                             roll_warnings.push(msg);
                         }
+                        let setting = if sets_curve_dmax(&ov) {
+                            DmaxSetting::Recipe
+                        } else {
+                            shared_setting
+                        };
                         let mut v = shared_value.clone();
                         merge_json(&mut v, &ov);
                         let cfg: ResolvedConfig = serde_json::from_value(v).map_err(|e| {
@@ -2313,9 +2744,9 @@ fn resolve_frames(
                         validate(&cfg)?;
                         reject_roll_unsupported(&cfg)?;
                         reject_roll_unsupported_input(&cfg)?;
-                        (cfg, Some(ov))
+                        (cfg, Some(ov), setting)
                     }
-                    None => (shared.clone(), None),
+                    None => (shared.clone(), None, shared_setting),
                 };
                 let output = resolve_frame_output(mf.output.as_deref(), &mf.input, out_dir);
                 planned.push(PlannedFrame {
@@ -2323,6 +2754,7 @@ fn resolve_frames(
                     output,
                     cfg,
                     overrides,
+                    dmax_setting,
                 });
             }
         }
@@ -2345,6 +2777,7 @@ fn resolve_frames(
                     output,
                     cfg: shared.clone(),
                     overrides: None,
+                    dmax_setting: shared_setting,
                 });
             }
         }
@@ -2425,7 +2858,10 @@ fn run_roll(args: RollArgs) -> Result<()> {
 
     // Shared frozen recipe — validated once up front so a broken recipe fails
     // loudly before any frame is touched.
-    let shared = load_recipe(args.recipe_in.as_deref())?;
+    let LoadedRecipe {
+        cfg: shared,
+        curve_dmax_present: shared_dmax_present,
+    } = load_recipe(args.recipe_in.as_deref())?;
     validate(&shared)?;
     reject_roll_unsupported(&shared)?;
     reject_roll_unsupported_input(&shared)?;
@@ -2454,29 +2890,38 @@ fn run_roll(args: RollArgs) -> Result<()> {
         roll_warnings.push(msg);
     }
 
-    // `density.dmax` is likewise a roll-fixed calibration by default: `Fixed` (the
-    // nominal constant), `Explicit` (a frozen scalar), and `None` (the bit-exact
-    // scene-referred escape hatch) all treat every frame identically. Only `Auto`
-    // (`--auto-d-max`) re-measures the display-white anchor from each frame's own
-    // pixels, so a shared recipe carrying it is not truly frozen — same
-    // warn-and-continue treatment as the base.
-    if matches!(shared.density.dmax, DmaxSource::Auto) {
-        let msg = "roll Dmax is NOT frozen: density.dmax is `auto`, so every frame measures \
-             its own display-white anchor — the roll is not color-consistent and the \
-             shared recipe is not truly shared. Freeze Dmax once (e.g. `nc estimate \
-             --d-max-region X,Y,W,H <reference-scan>`), then pass the reported anchor \
-             via `--d-max <d>` or a recipe with `density.dmax.explicit`, or accept the \
-             default fixed nominal anchor."
+    // `reconstruction.curve.dmax` is likewise a roll-fixed calibration by default:
+    // `Fixed` (the nominal constant), `Explicit` (a frozen scalar), and `None`
+    // (the bit-exact scene-referred escape hatch) all treat every frame
+    // identically. Only `Auto` (`--auto-d-max`) re-measures the display-white
+    // anchor from each frame's own pixels, so a shared recipe carrying it is not
+    // truly frozen — same warn-and-continue treatment as the base.
+    if let Reconstruction::Density { curve, .. } = &shared.reconstruction
+        && curve.dmax() == DmaxSource::Auto
+    {
+        let msg = "roll Dmax is NOT frozen: reconstruction.curve.dmax is `auto`, so every \
+             frame measures its own display-white anchor — the roll is not \
+             color-consistent and the shared recipe is not truly shared. Freeze Dmax \
+             once (e.g. `nc estimate --d-max-region X,Y,W,H <reference-scan>`), then \
+             pass the reported anchor via `--d-max <d>` or a recipe with \
+             `reconstruction.curve.dmax.explicit`, or accept the default fixed \
+             nominal anchor."
             .to_string();
         log.warn(&msg);
         roll_warnings.push(msg);
     }
 
     // Resolve the plan. A per-frame override that touches a roll-fixed calibration
-    // (`film_base` / `density.dmax`) appends its own roll-level warning here
-    // (warn-and-continue, like the not-frozen warnings above), so `roll_warnings`
-    // is passed in to collect it.
-    let planned = resolve_frames(&args, &shared, &mut roll_warnings, &log)?;
+    // (`film_base` / `reconstruction.curve.dmax`) appends its own roll-level
+    // warning here (warn-and-continue, like the not-frozen warnings above), so
+    // `roll_warnings` is passed in to collect it.
+    let planned = resolve_frames(
+        &args,
+        &shared,
+        shared_dmax_present,
+        &mut roll_warnings,
+        &log,
+    )?;
 
     // Guard every write target (per-frame outputs + sidecars, and the report
     // file) against every input and against one another before writing anything.
@@ -2539,6 +2984,7 @@ fn run_roll(args: RollArgs) -> Result<()> {
             &pf.output,
             &pf.cfg,
             InputFromCli::none(),
+            pf.dmax_setting,
             &log,
             &mut warnings,
         ) {
@@ -2972,7 +3418,8 @@ fn emit_telemetry(
         loss,
         input_bytes: file_len(&args.input),
         output_bytes: file_len(&args.output),
-        algorithm: cfg.algorithm,
+        reconstruction: cfg.reconstruction.reconstruction_type(),
+        curve: cfg.reconstruction.curve_type(),
         params_hash: telemetry::params_hash(recipe_json),
         film_base_source: cfg.film_base.source.clone(),
         dmax: report.dmax,
@@ -3055,6 +3502,7 @@ fn elapsed_ms(started: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ExponentialParams, SigmoidParams};
 
     /// Parse a `convert` invocation (with the required input/output already set)
     /// and return its args, so merge can be tested against the real parser.
@@ -3064,6 +3512,63 @@ mod tests {
         match Cli::try_parse_from(argv).unwrap().command {
             Command::Convert(a) => a,
             _ => unreachable!("expected convert"),
+        }
+    }
+
+    /// A density-reconstruction config from its two blocks (the common test
+    /// constructor — the tagged enum makes field-poking verbose otherwise).
+    fn density_cfg(density: DensityParams, curve: DensityCurve) -> ResolvedConfig {
+        ResolvedConfig {
+            reconstruction: Reconstruction::Density { density, curve },
+            ..ResolvedConfig::default()
+        }
+    }
+
+    fn exponential_cfg(e: ExponentialParams) -> ResolvedConfig {
+        density_cfg(DensityParams::default(), DensityCurve::Exponential(e))
+    }
+
+    fn sigmoid_cfg(s: SigmoidParams) -> ResolvedConfig {
+        density_cfg(DensityParams::default(), DensityCurve::Sigmoid(s))
+    }
+
+    fn simple_cfg() -> ResolvedConfig {
+        ResolvedConfig {
+            reconstruction: Reconstruction::Simple,
+            ..ResolvedConfig::default()
+        }
+    }
+
+    /// The density block of a resolved config (panics on `simple` — the tests
+    /// using it assert a density reconstruction).
+    fn density_of(cfg: &ResolvedConfig) -> &DensityParams {
+        match &cfg.reconstruction {
+            Reconstruction::Density { density, .. } => density,
+            Reconstruction::Simple => panic!("expected a density reconstruction"),
+        }
+    }
+
+    /// The resolved curve of a density config (panics on `simple`).
+    fn curve_of(cfg: &ResolvedConfig) -> &DensityCurve {
+        match &cfg.reconstruction {
+            Reconstruction::Density { curve, .. } => curve,
+            Reconstruction::Simple => panic!("expected a density reconstruction"),
+        }
+    }
+
+    /// The exponential curve's gamma (panics on sigmoid/simple).
+    fn gamma_of(cfg: &ResolvedConfig) -> f32 {
+        match curve_of(cfg) {
+            DensityCurve::Exponential(e) => e.gamma,
+            DensityCurve::Sigmoid(_) => panic!("expected the exponential curve"),
+        }
+    }
+
+    /// The sigmoid curve's knobs (panics on exponential/simple).
+    fn sigmoid_of(cfg: &ResolvedConfig) -> SigmoidParams {
+        match curve_of(cfg) {
+            DensityCurve::Sigmoid(s) => *s,
+            DensityCurve::Exponential(_) => panic!("expected the sigmoid curve"),
         }
     }
 
@@ -3086,30 +3591,205 @@ mod tests {
 
     #[test]
     fn merge_flag_overrides_recipe_else_keeps_recipe_else_default() {
-        let recipe: ResolvedConfig =
-            serde_json::from_str(r#"{"density":{"density_gamma":2.0}}"#).unwrap();
+        let recipe: ResolvedConfig = serde_json::from_str(
+            r#"{"reconstruction":{"curve":{"type":"exponential","gamma":2.0}}}"#,
+        )
+        .unwrap();
 
         // recipe value, no flag → recipe kept
-        let cfg = merge(recipe.clone(), &parse_convert(&[]));
-        assert_eq!(cfg.density.density_gamma, 2.0);
+        let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
+        assert_eq!(gamma_of(&cfg), 2.0);
 
         // matching flag → flag wins
-        let cfg = merge(recipe, &parse_convert(&["--density-gamma", "1.5"]));
-        assert_eq!(cfg.density.density_gamma, 1.5);
+        let cfg = merge(recipe, &parse_convert(&["--density-gamma", "1.5"])).unwrap();
+        assert_eq!(gamma_of(&cfg), 1.5);
 
         // unspecified everywhere → default
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[]));
-        assert_eq!(cfg.density.density_gamma, 1.0);
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[])).unwrap();
+        assert_eq!(gamma_of(&cfg), 1.0);
     }
 
     #[test]
-    fn merge_handles_algorithm_and_array_flags() {
+    fn merge_handles_reconstruction_and_array_flags() {
         let cfg = merge(
             ResolvedConfig::default(),
-            &parse_convert(&["--algorithm", "simple", "--white-balance", "1.1,1.0,0.9"]),
-        );
-        assert_eq!(cfg.algorithm, Algorithm::Simple);
+            &parse_convert(&[
+                "--reconstruction",
+                "simple",
+                "--white-balance",
+                "1.1,1.0,0.9",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(cfg.reconstruction, Reconstruction::Simple);
         assert_eq!(cfg.print.white_balance, WbSource::Explicit([1.1, 1.0, 0.9]));
+    }
+
+    #[test]
+    fn merge_switches_reconstruction_and_curve_variants() {
+        // `--reconstruction density` over a simple recipe starts from the
+        // density defaults (there is nothing to carry).
+        let cfg = merge(
+            simple_cfg(),
+            &parse_convert(&["--reconstruction", "density"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.reconstruction, Reconstruction::default());
+
+        // ...and over a density recipe keeps its blocks (a no-op assertion).
+        let recipe = exponential_cfg(ExponentialParams {
+            gamma: 1.8,
+            dmax: DmaxSource::Explicit(1.6),
+        });
+        let cfg = merge(
+            recipe.clone(),
+            &parse_convert(&["--reconstruction", "density"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.reconstruction, recipe.reconstruction);
+
+        // `--density-curve sigmoid` over an exponential recipe carries the
+        // roll-fixed dmax calibration over and takes sigmoid defaults otherwise.
+        let cfg = merge(recipe, &parse_convert(&["--density-curve", "sigmoid"])).unwrap();
+        assert_eq!(
+            sigmoid_of(&cfg),
+            SigmoidParams {
+                dmax: DmaxSource::Explicit(1.6),
+                ..SigmoidParams::default()
+            }
+        );
+
+        // The reverse switch carries dmax back and takes exponential defaults.
+        let recipe = sigmoid_cfg(SigmoidParams {
+            contrast: 2.0,
+            dmax: DmaxSource::Auto,
+            ..SigmoidParams::default()
+        });
+        let cfg = merge(recipe, &parse_convert(&["--density-curve", "exponential"])).unwrap();
+        assert_eq!(
+            *curve_of(&cfg),
+            DensityCurve::Exponential(ExponentialParams {
+                gamma: 1.0,
+                dmax: DmaxSource::Auto,
+            })
+        );
+
+        // Same-type `--density-curve` is a no-op that keeps the recipe's knobs.
+        let recipe = sigmoid_cfg(SigmoidParams {
+            contrast: 2.0,
+            toe: 0.05,
+            ..SigmoidParams::default()
+        });
+        let cfg = merge(
+            recipe.clone(),
+            &parse_convert(&["--density-curve", "sigmoid"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.reconstruction, recipe.reconstruction);
+    }
+
+    #[test]
+    fn merge_rejects_invalid_tagged_combinations() {
+        // Every density/curve/Dmax flag with a resolved `simple` reconstruction
+        // is a post-merge usage error naming the flag — never a silent no-op.
+        for flags in [
+            ["--reconstruction", "simple", "--density-scale", "1,1,1"].as_slice(),
+            ["--reconstruction", "simple", "--density-gamma", "1.4"].as_slice(),
+            ["--reconstruction", "simple", "--shadow-balance", "0.1,0,0"].as_slice(),
+            ["--reconstruction", "simple", "--balance-range", "0.2,1.8"].as_slice(),
+            ["--reconstruction", "simple", "--auto-balance-range"].as_slice(),
+            ["--reconstruction", "simple", "--sigmoid-contrast", "1.2"].as_slice(),
+            ["--reconstruction", "simple", "--d-max", "1.5"].as_slice(),
+            ["--reconstruction", "simple", "--no-d-max"].as_slice(),
+            [
+                "--reconstruction",
+                "simple",
+                "--density-curve",
+                "exponential",
+            ]
+            .as_slice(),
+        ] {
+            let err = merge(ResolvedConfig::default(), &parse_convert(flags)).unwrap_err();
+            assert!(
+                matches!(err, NcError::Usage(_)),
+                "{flags:?} must be a usage error, got {err}"
+            );
+        }
+
+        // A sigmoid flag with a resolved exponential curve (the default) is
+        // invalid, not inert.
+        let err = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--sigmoid-contrast", "1.2"]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--sigmoid-contrast"), "{err}");
+        assert!(err.to_string().contains("exponential"), "{err}");
+
+        // A customized gamma with a resolved sigmoid curve is a loud usage
+        // error, never ignored or downgraded to a warning.
+        let err = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--density-curve", "sigmoid", "--density-gamma", "1.4"]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, NcError::Usage(_)));
+        assert!(err.to_string().contains("--sigmoid-contrast"), "{err}");
+        // ...including when the sigmoid curve comes from the recipe.
+        let recipe = sigmoid_cfg(SigmoidParams::default());
+        let err = merge(recipe, &parse_convert(&["--density-gamma", "1.4"])).unwrap_err();
+        assert!(matches!(err, NcError::Usage(_)));
+    }
+
+    #[test]
+    fn removed_algorithm_and_simple_flags_are_migration_errors() {
+        // `--algorithm` is rejected with guidance naming the replacement pair.
+        let err = reject_removed_flags(&parse_convert(&["--algorithm", "sigmoid"])).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--reconstruction"), "{err}");
+        assert!(err.to_string().contains("--density-curve"), "{err}");
+
+        // The removed simple controls are rejected, pointing downstream.
+        for flags in [
+            ["--invert-white-balance", "1.1,1.0,0.9"].as_slice(),
+            ["--clip-low", "0.1"].as_slice(),
+            ["--clip-high", "0.9"].as_slice(),
+        ] {
+            let err = reject_removed_flags(&parse_convert(flags)).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{flags:?}");
+            assert!(err.to_string().contains("print"), "{flags:?}: {err}");
+        }
+
+        // A clean invocation passes.
+        assert!(reject_removed_flags(&parse_convert(&[])).is_ok());
+    }
+
+    #[test]
+    fn legacy_recipe_forms_are_migration_errors() {
+        // Each removed top-level selection form fails with guidance naming the
+        // tagged `reconstruction` object — including the old sibling sections.
+        for body in [
+            r#"{"algorithm":"density"}"#,
+            r#"{"density":{"density_gamma":1.8}}"#,
+            r#"{"sigmoid":{"contrast":1.2}}"#,
+            r#"{"simple":{"clip_low":0.1}}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let err = reject_legacy_recipe_keys(&v, "recipe r.json").unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{body}");
+            assert!(err.to_string().contains("reconstruction"), "{body}: {err}");
+        }
+        // ...and through `load_recipe` on a real file.
+        let p = std::env::temp_dir().join(format!("nc-legacy-{}.json", std::process::id()));
+        std::fs::write(&p, r#"{"algorithm":"density"}"#).unwrap();
+        let got = load_recipe(Some(&p));
+        std::fs::remove_file(&p).ok();
+        assert!(matches!(got, Err(NcError::Usage(_))));
+
+        // The new tagged form passes the migration check.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"reconstruction":{"type":"density"}}"#).unwrap();
+        assert!(reject_legacy_recipe_keys(&v, "recipe r.json").is_ok());
     }
 
     #[test]
@@ -3119,12 +3799,14 @@ mod tests {
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&["--auto-wb", "gray-world"]),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.print.white_balance, WbSource::GrayWorld);
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&["--auto-wb", "percentile"]),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.print.white_balance, WbSource::Percentile);
 
         // No flag keeps the recipe's auto mode; a flag replaces it (flags win).
@@ -3132,12 +3814,14 @@ mod tests {
         recipe.print.white_balance = WbSource::GrayWorld;
         assert_eq!(
             merge(recipe.clone(), &parse_convert(&[]))
+                .unwrap()
                 .print
                 .white_balance,
             WbSource::GrayWorld
         );
         assert_eq!(
             merge(recipe.clone(), &parse_convert(&["--auto-wb", "percentile"]))
+                .unwrap()
                 .print
                 .white_balance,
             WbSource::Percentile
@@ -3147,6 +3831,7 @@ mod tests {
         // value equals the default (the variant carries the provenance).
         assert_eq!(
             merge(recipe, &parse_convert(&["--white-balance", "1,1,1"]))
+                .unwrap()
                 .print
                 .white_balance,
             WbSource::Explicit([1.0, 1.0, 1.0])
@@ -3186,7 +3871,7 @@ mod tests {
             serde_json::from_str(r#"{"print":{"white_balance":{"explicit":[1.2,1.0,0.8]}}}"#)
                 .unwrap();
         assert_eq!(cfg.print.white_balance, WbSource::Explicit([1.2, 1.0, 0.8]));
-        // The auto modes validate under the density algorithm (no value to
+        // The auto modes validate under density reconstruction (no value to
         // range-check).
         for mode in [WbSource::GrayWorld, WbSource::Percentile] {
             let mut cfg = ResolvedConfig::default();
@@ -3196,14 +3881,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_auto_wb_with_the_simple_algorithm() {
+    fn validate_rejects_auto_wb_with_simple_reconstruction() {
         // `simple` never reads `print.white_balance`, so an auto mode would be a
         // silent no-op (exit 0, no estimation, no gains). A requested action must
         // fail loudly instead — exit 2 (usage).
-        let mut cfg = ResolvedConfig {
-            algorithm: Algorithm::Simple,
-            ..ResolvedConfig::default()
-        };
+        let mut cfg = simple_cfg();
         for mode in [WbSource::GrayWorld, WbSource::Percentile] {
             cfg.print.white_balance = mode;
             assert!(
@@ -3211,28 +3893,25 @@ mod tests {
                 "{mode:?} with simple must be rejected"
             );
         }
-        // Explicit gains under simple are fine (simple has its own
-        // `invert_white_balance`; `print.white_balance` is inert but not an
-        // action silently dropped).
+        // Explicit gains under simple are fine (`print.white_balance` is inert
+        // there, but not an *action* silently dropped).
         cfg.print.white_balance = WbSource::Explicit([1.1, 1.0, 0.9]);
         validate(&cfg).unwrap();
     }
 
     #[test]
-    fn validate_accepts_auto_wb_with_density_and_sigmoid() {
-        // The whitelist's two arms: both algorithms with a print white-balance
-        // stage must accept an auto mode (the counterpart to the simple
-        // rejection above). Sigmoid needs a Dmax anchor, so set one.
-        for algorithm in [Algorithm::Density, Algorithm::Sigmoid] {
-            let mut cfg = ResolvedConfig {
-                algorithm,
-                ..ResolvedConfig::default()
-            };
-            cfg.density.dmax = DmaxSource::Auto;
+    fn validate_accepts_auto_wb_with_both_density_curves() {
+        // The whitelist's arm: density reconstruction under either curve must
+        // accept an auto mode (the counterpart to the simple rejection above).
+        for curve in [
+            DensityCurve::Exponential(ExponentialParams::default()),
+            DensityCurve::Sigmoid(SigmoidParams::default()),
+        ] {
+            let mut cfg = density_cfg(DensityParams::default(), curve);
             for mode in [WbSource::GrayWorld, WbSource::Percentile] {
                 cfg.print.white_balance = mode;
                 validate(&cfg)
-                    .unwrap_or_else(|e| panic!("{algorithm:?} + {mode:?} must validate: {e}"));
+                    .unwrap_or_else(|e| panic!("{curve:?} + {mode:?} must validate: {e}"));
             }
         }
     }
@@ -3257,43 +3936,53 @@ mod tests {
 
     #[test]
     fn merge_dmax_flags_map_to_the_source_enum() {
-        // Each flag maps to its variant; a forgotten merge arm would leave the
-        // default and silently make the flag a no-op (the four-spot-wiring trap).
+        // Each flag maps to its variant on the resolved curve; a forgotten merge
+        // arm would leave the default and silently make the flag a no-op (the
+        // four-spot-wiring trap).
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&["--d-max", "1.75"]),
-        );
-        assert_eq!(cfg.density.dmax, DmaxSource::Explicit(1.75));
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--no-d-max"]));
-        assert_eq!(cfg.density.dmax, DmaxSource::None);
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--auto-d-max"]));
-        assert_eq!(cfg.density.dmax, DmaxSource::Auto);
+        )
+        .unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.75));
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--no-d-max"])).unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::None);
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--auto-d-max"])).unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Auto);
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&["--fixed-d-max"]),
-        );
-        assert_eq!(cfg.density.dmax, DmaxSource::Fixed);
+        )
+        .unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Fixed);
+
+        // The same flags land on a resolved *sigmoid* curve too — the anchor is
+        // curve-stage state, written through whichever variant is resolved.
+        let cfg = merge(
+            sigmoid_cfg(SigmoidParams::default()),
+            &parse_convert(&["--d-max", "1.4"]),
+        )
+        .unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.4));
 
         // No flag keeps the recipe's choice; a flag replaces it (flags win).
-        let mut recipe = ResolvedConfig::default();
-        recipe.density.dmax = DmaxSource::Explicit(2.0);
+        let recipe = exponential_cfg(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::Explicit(2.0),
+        });
         assert_eq!(
-            merge(recipe.clone(), &parse_convert(&[])).density.dmax,
+            curve_of(&merge(recipe.clone(), &parse_convert(&[])).unwrap()).dmax(),
             DmaxSource::Explicit(2.0)
         );
         assert_eq!(
-            merge(recipe.clone(), &parse_convert(&["--no-d-max"]))
-                .density
-                .dmax,
+            curve_of(&merge(recipe.clone(), &parse_convert(&["--no-d-max"])).unwrap()).dmax(),
             DmaxSource::None
         );
         // `--fixed-d-max` overrides a recipe's explicit/auto back to the default
         // fixed anchor (the flags-win escape hatch, since the default is Fixed and
         // an absent flag never clobbers a recipe value).
         assert_eq!(
-            merge(recipe, &parse_convert(&["--fixed-d-max"]))
-                .density
-                .dmax,
+            curve_of(&merge(recipe, &parse_convert(&["--fixed-d-max"])).unwrap()).dmax(),
             DmaxSource::Fixed
         );
     }
@@ -3305,7 +3994,7 @@ mod tests {
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&[
-                "--algorithm",
+                "--density-curve",
                 "sigmoid",
                 "--sigmoid-contrast",
                 "1.6",
@@ -3314,19 +4003,23 @@ mod tests {
                 "--sigmoid-shoulder",
                 "0.35",
             ]),
-        );
-        assert_eq!(cfg.algorithm, Algorithm::Sigmoid);
-        assert_eq!(cfg.sigmoid.contrast, 1.6);
-        assert_eq!(cfg.sigmoid.toe, 0.1);
-        assert_eq!(cfg.sigmoid.shoulder, 0.35);
+        )
+        .unwrap();
+        let s = sigmoid_of(&cfg);
+        assert_eq!(s.contrast, 1.6);
+        assert_eq!(s.toe, 0.1);
+        assert_eq!(s.shoulder, 0.35);
 
         // No flag keeps the recipe's values; a flag replaces only its own knob.
-        let recipe: ResolvedConfig =
-            serde_json::from_str(r#"{"sigmoid":{"contrast":2.0,"toe":0.05}}"#).unwrap();
-        let cfg = merge(recipe, &parse_convert(&["--sigmoid-shoulder", "0.4"]));
-        assert_eq!(cfg.sigmoid.contrast, 2.0);
-        assert_eq!(cfg.sigmoid.toe, 0.05);
-        assert_eq!(cfg.sigmoid.shoulder, 0.4);
+        let recipe: ResolvedConfig = serde_json::from_str(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","contrast":2.0,"toe":0.05}}}"#,
+        )
+        .unwrap();
+        let cfg = merge(recipe, &parse_convert(&["--sigmoid-shoulder", "0.4"])).unwrap();
+        let s = sigmoid_of(&cfg);
+        assert_eq!(s.contrast, 2.0);
+        assert_eq!(s.toe, 0.05);
+        assert_eq!(s.shoulder, 0.4);
     }
 
     #[test]
@@ -3341,17 +4034,21 @@ mod tests {
             crate::algo::sigmoid::SIGMOID_CONTRAST_MAX + 1.0,
             1e30,
         ] {
-            let mut cfg = ResolvedConfig::default();
-            cfg.sigmoid.contrast = bad;
+            let cfg = sigmoid_cfg(SigmoidParams {
+                contrast: bad,
+                ..SigmoidParams::default()
+            });
             assert!(
                 matches!(validate(&cfg), Err(NcError::Usage(_))),
                 "contrast {bad} should fail"
             );
         }
         // The cap itself is accepted (boundary is inclusive).
-        let mut cfg = ResolvedConfig::default();
-        cfg.sigmoid.contrast = crate::algo::sigmoid::SIGMOID_CONTRAST_MAX;
-        validate(&cfg).unwrap();
+        validate(&sigmoid_cfg(SigmoidParams {
+            contrast: crate::algo::sigmoid::SIGMOID_CONTRAST_MAX,
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
         // Knee widths must be finite, >= 0, AND <= the cap (a negative width would
         // silently read as "knee off"; a huge finite width flattens the image
         // without tripping any counter). Both ends fail loudly.
@@ -3365,9 +4062,11 @@ mod tests {
             (10_000.0, 0.2),
             (0.2, 10_000.0),
         ] {
-            let mut cfg = ResolvedConfig::default();
-            cfg.sigmoid.toe = toe;
-            cfg.sigmoid.shoulder = shoulder;
+            let cfg = sigmoid_cfg(SigmoidParams {
+                toe,
+                shoulder,
+                ..SigmoidParams::default()
+            });
             assert!(
                 matches!(validate(&cfg), Err(NcError::Usage(_))),
                 "toe={toe} shoulder={shoulder} should fail"
@@ -3375,60 +4074,75 @@ mod tests {
         }
         // Zero widths (both knees off = the straight line) and the cap itself are
         // valid (boundary inclusive).
-        let mut cfg = ResolvedConfig::default();
-        cfg.sigmoid.toe = 0.0;
-        cfg.sigmoid.shoulder = 0.0;
-        validate(&cfg).unwrap();
-        let mut cfg = ResolvedConfig::default();
-        cfg.sigmoid.toe = knee_max;
-        cfg.sigmoid.shoulder = knee_max;
-        validate(&cfg).unwrap();
+        validate(&sigmoid_cfg(SigmoidParams {
+            toe: 0.0,
+            shoulder: 0.0,
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
+        validate(&sigmoid_cfg(SigmoidParams {
+            toe: knee_max,
+            shoulder: knee_max,
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
     }
 
     #[test]
     fn validate_rejects_sigmoid_without_a_dmax_anchor() {
         // The S-curve is anchored on [0, Dmax]; `dmax = none` only works for
-        // the density algorithm's scene-referred output.
-        let mut cfg = ResolvedConfig {
-            algorithm: Algorithm::Sigmoid,
-            ..ResolvedConfig::default()
-        };
-        cfg.density.dmax = DmaxSource::None;
+        // the exponential curve's scene-referred output.
+        let cfg = sigmoid_cfg(SigmoidParams {
+            dmax: DmaxSource::None,
+            ..SigmoidParams::default()
+        });
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
         // Auto and Explicit anchors are fine under sigmoid...
-        cfg.density.dmax = DmaxSource::Auto;
-        validate(&cfg).unwrap();
-        cfg.density.dmax = DmaxSource::Explicit(1.4);
-        validate(&cfg).unwrap();
-        // ...and `none` stays valid for the density algorithm.
-        cfg.algorithm = Algorithm::Density;
-        cfg.density.dmax = DmaxSource::None;
-        validate(&cfg).unwrap();
+        validate(&sigmoid_cfg(SigmoidParams {
+            dmax: DmaxSource::Auto,
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
+        validate(&sigmoid_cfg(SigmoidParams {
+            dmax: DmaxSource::Explicit(1.4),
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
+        // ...and `none` stays valid for the exponential curve.
+        validate(&exponential_cfg(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::None,
+        }))
+        .unwrap();
     }
 
     #[test]
-    fn recipe_parses_nested_sigmoid_keys() {
-        // §9 places the sigmoid knobs under `sigmoid.*` (no flag prefix); with
+    fn recipe_parses_tagged_curve_keys() {
+        // §9 places the curve knobs under the tagged `reconstruction.curve`; with
         // `deny_unknown_fields` a misplaced key would silently reject the recipe,
-        // so pin the documented nesting.
+        // so pin the documented nesting for both variants.
         let cfg: ResolvedConfig = serde_json::from_str(
-            r#"{"algorithm":"sigmoid","sigmoid":{"contrast":1.4,"toe":0.15,"shoulder":0.3}}"#,
+            r#"{"reconstruction":{"type":"density",
+                "curve":{"type":"sigmoid","contrast":1.4,"toe":0.15,"shoulder":0.3}}}"#,
         )
         .unwrap();
-        assert_eq!(cfg.algorithm, Algorithm::Sigmoid);
-        assert_eq!(cfg.sigmoid.contrast, 1.4);
-        assert_eq!(cfg.sigmoid.toe, 0.15);
-        assert_eq!(cfg.sigmoid.shoulder, 0.3);
-        // Partial section fills the remaining defaults.
-        let cfg: ResolvedConfig = serde_json::from_str(r#"{"sigmoid":{"toe":0.0}}"#).unwrap();
-        assert_eq!(cfg.sigmoid.toe, 0.0);
-        assert_eq!(cfg.sigmoid.contrast, SigmoidParams::default().contrast);
+        let s = sigmoid_of(&cfg);
+        assert_eq!(s.contrast, 1.4);
+        assert_eq!(s.toe, 0.15);
+        assert_eq!(s.shoulder, 0.3);
+        // A tagged-but-partial curve fills that variant's defaults.
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"reconstruction":{"curve":{"type":"sigmoid","toe":0.0}}}"#)
+                .unwrap();
+        let s = sigmoid_of(&cfg);
+        assert_eq!(s.toe, 0.0);
+        assert_eq!(s.contrast, SigmoidParams::default().contrast);
     }
 
     #[test]
     fn merge_regional_balance_flags() {
-        // Each new knob maps through merge; a forgotten arm would silently make
-        // the flag a no-op (the four-spot-wiring trap).
+        // Each knob maps through merge into `reconstruction.density`; a forgotten
+        // arm would silently make the flag a no-op (the four-spot-wiring trap).
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&[
@@ -3439,33 +4153,33 @@ mod tests {
                 "--balance-range",
                 "0.25,1.75",
             ]),
-        );
-        assert_eq!(cfg.density.shadow_balance, [0.1, 0.0, -0.05]);
-        assert_eq!(cfg.density.highlight_balance, [-0.1, 0.02, 0.0]);
-        assert_eq!(
-            cfg.density.balance_range,
-            BalanceRange::Explicit([0.25, 1.75])
-        );
+        )
+        .unwrap();
+        let d = density_of(&cfg);
+        assert_eq!(d.shadow_balance, [0.1, 0.0, -0.05]);
+        assert_eq!(d.highlight_balance, [-0.1, 0.02, 0.0]);
+        assert_eq!(d.balance_range, BalanceRange::Explicit([0.25, 1.75]));
 
         // No flag keeps the recipe's values; a flag replaces them (flags win),
         // and `--auto-balance-range` overrides a recipe's explicit range.
         let recipe: ResolvedConfig = serde_json::from_str(
-            r#"{"density":{"shadow_balance":[0.2,0.0,0.0],
-                           "balance_range":{"explicit":[0.5,2.5]}}}"#,
+            r#"{"reconstruction":{"density":{"shadow_balance":[0.2,0.0,0.0],
+                                             "balance_range":{"explicit":[0.5,2.5]}}}}"#,
         )
         .unwrap();
-        let cfg = merge(recipe.clone(), &parse_convert(&[]));
-        assert_eq!(cfg.density.shadow_balance, [0.2, 0.0, 0.0]);
+        let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
+        assert_eq!(density_of(&cfg).shadow_balance, [0.2, 0.0, 0.0]);
         assert_eq!(
-            cfg.density.balance_range,
+            density_of(&cfg).balance_range,
             BalanceRange::Explicit([0.5, 2.5])
         );
         let cfg = merge(
             recipe,
             &parse_convert(&["--shadow-balance", "0,0,0", "--auto-balance-range"]),
-        );
-        assert_eq!(cfg.density.shadow_balance, [0.0, 0.0, 0.0]);
-        assert_eq!(cfg.density.balance_range, BalanceRange::Auto);
+        )
+        .unwrap();
+        assert_eq!(density_of(&cfg).shadow_balance, [0.0, 0.0, 0.0]);
+        assert_eq!(density_of(&cfg).balance_range, BalanceRange::Auto);
     }
 
     #[test]
@@ -3488,11 +4202,21 @@ mod tests {
     #[test]
     fn validate_rejects_bad_regional_balance() {
         // Non-finite balance offsets (recipe-smuggleable) fail loudly.
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.shadow_balance = [0.1, f32::NAN, 0.0];
+        let cfg = density_cfg(
+            DensityParams {
+                shadow_balance: [0.1, f32::NAN, 0.0],
+                ..DensityParams::default()
+            },
+            DensityCurve::default(),
+        );
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.highlight_balance = [f32::INFINITY, 0.0, 0.0];
+        let cfg = density_cfg(
+            DensityParams {
+                highlight_balance: [f32::INFINITY, 0.0, 0.0],
+                ..DensityParams::default()
+            },
+            DensityCurve::default(),
+        );
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         // An explicit range must be finite, ordered lo < hi (equal anchors would
@@ -3506,57 +4230,80 @@ mod tests {
             [0.0, f32::INFINITY],
             [-3.0e38, 3.0e38], // finite anchors, span overflows to +inf
         ] {
-            let mut cfg = ResolvedConfig::default();
-            cfg.density.balance_range = BalanceRange::Explicit(bad);
+            let cfg = density_cfg(
+                DensityParams {
+                    balance_range: BalanceRange::Explicit(bad),
+                    ..DensityParams::default()
+                },
+                DensityCurve::default(),
+            );
             assert!(
                 matches!(validate(&cfg), Err(NcError::Usage(_))),
                 "balance range {bad:?} should fail"
             );
         }
 
-        // Negative-density anchors are legal (density_offset can shift D' below
-        // zero), and Auto plus finite balances validate.
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.shadow_balance = [0.1, -0.1, 0.0];
-        cfg.density.balance_range = BalanceRange::Explicit([-0.5, 1.5]);
+        // Negative-density anchors are legal (`offset` can shift D' below zero),
+        // and Auto plus finite balances validate.
+        let cfg = density_cfg(
+            DensityParams {
+                shadow_balance: [0.1, -0.1, 0.0],
+                balance_range: BalanceRange::Explicit([-0.5, 1.5]),
+                ..DensityParams::default()
+            },
+            DensityCurve::default(),
+        );
         validate(&cfg).unwrap();
     }
 
     #[test]
     fn recipe_parses_regional_balance_keys() {
-        // The keys live under `density` (§9); `deny_unknown_fields` would
-        // silently reject a docs-shaped recipe if the structs drifted.
+        // The keys live under `reconstruction.density` (§9);
+        // `deny_unknown_fields` would silently reject a docs-shaped recipe if the
+        // structs drifted.
         let cfg: ResolvedConfig = serde_json::from_str(
-            r#"{"density":{"shadow_balance":[0.1,0.0,-0.05],
-                           "highlight_balance":[-0.1,0.0,0.05],
-                           "balance_range":{"explicit":[0.25,1.75]}}}"#,
+            r#"{"reconstruction":{"density":{"shadow_balance":[0.1,0.0,-0.05],
+                                             "highlight_balance":[-0.1,0.0,0.05],
+                                             "balance_range":{"explicit":[0.25,1.75]}}}}"#,
         )
         .unwrap();
-        assert_eq!(cfg.density.shadow_balance, [0.1, 0.0, -0.05]);
-        assert_eq!(cfg.density.highlight_balance, [-0.1, 0.0, 0.05]);
-        assert_eq!(
-            cfg.density.balance_range,
-            BalanceRange::Explicit([0.25, 1.75])
-        );
+        let d = density_of(&cfg);
+        assert_eq!(d.shadow_balance, [0.1, 0.0, -0.05]);
+        assert_eq!(d.highlight_balance, [-0.1, 0.0, 0.05]);
+        assert_eq!(d.balance_range, BalanceRange::Explicit([0.25, 1.75]));
         let cfg: ResolvedConfig =
-            serde_json::from_str(r#"{"density":{"balance_range":"auto"}}"#).unwrap();
-        assert_eq!(cfg.density.balance_range, BalanceRange::Auto);
+            serde_json::from_str(r#"{"reconstruction":{"density":{"balance_range":"auto"}}}"#)
+                .unwrap();
+        assert_eq!(density_of(&cfg).balance_range, BalanceRange::Auto);
     }
 
     #[test]
-    fn recipe_parses_nested_density_dmax_key() {
-        // The recipe key lives under `density.dmax`; with `deny_unknown_fields` at
-        // every level a misplaced key would silently reject, so pin the documented
-        // (§9) nesting and all three variant wire-forms through `ResolvedConfig`.
-        let cfg: ResolvedConfig =
-            serde_json::from_str(r#"{"density":{"dmax":{"explicit":1.5}}}"#).unwrap();
-        assert_eq!(cfg.density.dmax, DmaxSource::Explicit(1.5));
-        let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"none"}}"#).unwrap();
-        assert_eq!(cfg.density.dmax, DmaxSource::None);
-        let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"auto"}}"#).unwrap();
-        assert_eq!(cfg.density.dmax, DmaxSource::Auto);
-        let cfg: ResolvedConfig = serde_json::from_str(r#"{"density":{"dmax":"fixed"}}"#).unwrap();
-        assert_eq!(cfg.density.dmax, DmaxSource::Fixed);
+    fn recipe_parses_curve_dmax_key() {
+        // The recipe key lives under `reconstruction.curve.dmax` (the curve owns
+        // the anchor); with `deny_unknown_fields` at every level a misplaced key
+        // would silently reject, so pin the documented (§9) nesting and all four
+        // wire-forms through `ResolvedConfig` — on both curve variants.
+        let cfg: ResolvedConfig = serde_json::from_str(
+            r#"{"reconstruction":{"curve":{"type":"exponential","dmax":{"explicit":1.5}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.5));
+        for (wire, expected) in [
+            ("\"none\"", DmaxSource::None),
+            ("\"auto\"", DmaxSource::Auto),
+            ("\"fixed\"", DmaxSource::Fixed),
+        ] {
+            let cfg: ResolvedConfig = serde_json::from_str(&format!(
+                r#"{{"reconstruction":{{"curve":{{"type":"exponential","dmax":{wire}}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(curve_of(&cfg).dmax(), expected, "{wire}");
+        }
+        let cfg: ResolvedConfig = serde_json::from_str(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","dmax":{"explicit":1.4}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.4));
     }
 
     #[test]
@@ -3583,23 +4330,37 @@ mod tests {
         // A recipe can smuggle a non-positive / non-finite anchor past clap's
         // value parser, so validate is the only guard once it's in the config.
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            let mut cfg = ResolvedConfig::default();
-            cfg.density.dmax = DmaxSource::Explicit(bad);
+            let cfg = exponential_cfg(ExponentialParams {
+                gamma: 1.0,
+                dmax: DmaxSource::Explicit(bad),
+            });
             assert!(
                 matches!(validate(&cfg), Err(NcError::Usage(_))),
-                "explicit d-max {bad} should fail"
+                "explicit d-max {bad} should fail (exponential)"
+            );
+            let cfg = sigmoid_cfg(SigmoidParams {
+                dmax: DmaxSource::Explicit(bad),
+                ..SigmoidParams::default()
+            });
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "explicit d-max {bad} should fail (sigmoid)"
             );
         }
-        // A positive explicit anchor, and Fixed / Auto / None, all validate.
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.dmax = DmaxSource::Explicit(1.8);
-        validate(&cfg).unwrap();
-        cfg.density.dmax = DmaxSource::None;
-        validate(&cfg).unwrap();
-        cfg.density.dmax = DmaxSource::Auto;
-        validate(&cfg).unwrap();
-        cfg.density.dmax = DmaxSource::Fixed;
-        validate(&cfg).unwrap();
+        // A positive explicit anchor, and Fixed / Auto / None, all validate on
+        // the exponential curve.
+        for src in [
+            DmaxSource::Explicit(1.8),
+            DmaxSource::None,
+            DmaxSource::Auto,
+            DmaxSource::Fixed,
+        ] {
+            validate(&exponential_cfg(ExponentialParams {
+                gamma: 1.0,
+                dmax: src,
+            }))
+            .unwrap();
+        }
     }
 
     #[test]
@@ -3607,31 +4368,193 @@ mod tests {
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&["--density-gamma", "1.8", "--output-hdr"]),
-        );
+        )
+        .unwrap();
         let json = serde_json::to_string(&cfg).unwrap();
         let back: ResolvedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
+        // The sigmoid form and the simple form round-trip too.
+        for cfg in [
+            merge(
+                ResolvedConfig::default(),
+                &parse_convert(&["--density-curve", "sigmoid", "--sigmoid-toe", "0.1"]),
+            )
+            .unwrap(),
+            merge(
+                ResolvedConfig::default(),
+                &parse_convert(&["--reconstruction", "simple"]),
+            )
+            .unwrap(),
+        ] {
+            let json = serde_json::to_string(&cfg).unwrap();
+            assert_eq!(serde_json::from_str::<ResolvedConfig>(&json).unwrap(), cfg);
+        }
+    }
+
+    #[test]
+    fn resolved_recipe_emits_the_documented_reconstruction_schema() {
+        // Schema fixtures (design-spec §8): every resolved recipe emits
+        // `reconstruction.schema_version = 1` and exactly one tagged curve — an
+        // omitted input curve never survives normalization.
+        let v = serde_json::to_value(ResolvedConfig::default()).unwrap();
+        assert_eq!(v["reconstruction"]["schema_version"], 1);
+        assert_eq!(v["reconstruction"]["type"], "density");
+        assert_eq!(v["reconstruction"]["curve"]["type"], "exponential");
+        assert_eq!(v["reconstruction"]["curve"]["dmax"], "fixed");
+        assert_eq!(
+            v["reconstruction"]["density"]["scale"],
+            serde_json::json!([1.0, 1.0, 1.0])
+        );
+
+        // Partial input: omitted curve normalizes to tagged exponential defaults.
+        let cfg: ResolvedConfig =
+            serde_json::from_str(r#"{"reconstruction":{"schema_version":1,"type":"density"}}"#)
+                .unwrap();
+        assert_eq!(*curve_of(&cfg), DensityCurve::default());
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["reconstruction"]["curve"]["type"], "exponential");
+
+        // Simple emits schema_version + type and nothing else.
+        let v = serde_json::to_value(simple_cfg()).unwrap();
+        assert_eq!(
+            v["reconstruction"],
+            serde_json::json!({"schema_version": 1, "type": "simple"})
+        );
+
+        // An unsupported schema_version is rejected loudly through the recipe.
+        assert!(
+            serde_json::from_str::<ResolvedConfig>(r#"{"reconstruction":{"schema_version":2}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn reconstruction_result_serializes_the_documented_shapes() {
+        // The report's resolution diagnostics (design-spec §8): simple is exactly
+        // {"type":"simple"}; density carries curve type + the resolved dmax
+        // triple, with `value` always present (null for `none`).
+        let v = serde_json::to_value(reconstruction_result(
+            &Reconstruction::Simple,
+            None,
+            DmaxSetting::Default,
+        ))
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"type": "simple"}));
+
+        let v = serde_json::to_value(reconstruction_result(
+            &Reconstruction::default(),
+            Some(2.0),
+            DmaxSetting::Default,
+        ))
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "density",
+                "curve": {
+                    "type": "exponential",
+                    "dmax": {"policy": "fixed", "value": 2.0, "provenance": "default"}
+                }
+            })
+        );
+
+        // `none` reports a null value; the recipe provenance rides through.
+        let cfg = exponential_cfg(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::None,
+        });
+        let v = serde_json::to_value(reconstruction_result(
+            &cfg.reconstruction,
+            None,
+            DmaxSetting::Recipe,
+        ))
+        .unwrap();
+        assert_eq!(
+            v["curve"]["dmax"],
+            serde_json::json!({"policy": "none", "value": null, "provenance": "recipe"})
+        );
+
+        // The auto policy always reports `auto-frame` — the value is a per-frame
+        // measurement regardless of who selected the policy (this is the marker
+        // that makes it master-incompatible).
+        let cfg = sigmoid_cfg(SigmoidParams {
+            dmax: DmaxSource::Auto,
+            ..SigmoidParams::default()
+        });
+        for setting in [DmaxSetting::Default, DmaxSetting::Recipe, DmaxSetting::Cli] {
+            let v = serde_json::to_value(reconstruction_result(
+                &cfg.reconstruction,
+                Some(1.37),
+                setting,
+            ))
+            .unwrap();
+            assert_eq!(v["curve"]["type"], "sigmoid");
+            assert_eq!(v["curve"]["dmax"]["policy"], "auto");
+            assert_eq!(
+                v["curve"]["dmax"]["provenance"], "auto-frame",
+                "{setting:?}"
+            );
+        }
+
+        // A reference-measured scalar frozen into a recipe: explicit / recipe.
+        let cfg = exponential_cfg(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::Explicit(1.64),
+        });
+        let v = serde_json::to_value(reconstruction_result(
+            &cfg.reconstruction,
+            Some(1.64),
+            DmaxSetting::Recipe,
+        ))
+        .unwrap();
+        assert_eq!(v["curve"]["dmax"]["policy"], "explicit");
+        assert_eq!(v["curve"]["dmax"]["provenance"], "recipe");
+        // ...and a CLI-passed one reports `cli`.
+        let v = serde_json::to_value(reconstruction_result(
+            &cfg.reconstruction,
+            Some(1.64),
+            DmaxSetting::Cli,
+        ))
+        .unwrap();
+        assert_eq!(v["curve"]["dmax"]["provenance"], "cli");
+    }
+
+    #[test]
+    fn report_recipe_echo_carries_the_tagged_reconstruction() {
+        // The convert report's `recipe` is the effective config, so
+        // `recipe.reconstruction` is the exact tagged schema (design-spec §8).
+        let report = Report {
+            recipe: Some(ResolvedConfig::default()),
+            ..Report::default()
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["recipe"]["reconstruction"]["schema_version"], 1);
+        assert_eq!(v["recipe"]["reconstruction"]["type"], "density");
+        // Absent for non-convert reports.
+        let v = serde_json::to_value(Report::default()).unwrap();
+        assert!(v.get("recipe").is_none());
+        assert!(v.get("reconstruction_result").is_none());
     }
 
     #[test]
     fn merge_output_hdr_flag_sets_but_never_clears() {
         // Flag present → hdr on (a forgotten merge arm would silently make the
         // flag a no-op — the four-spot-wiring trap).
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-hdr"]));
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-hdr"])).unwrap();
         assert!(cfg.output.hdr);
         // No flag → the default stays off.
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[]));
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[])).unwrap();
         assert!(!cfg.output.hdr);
         // An absent (false) presence flag must not clobber a recipe `true`.
         let recipe: ResolvedConfig = serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap();
-        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
         assert!(cfg.output.hdr);
         // `--output-sdr` is the explicit escape hatch: it forces a recipe
         // `hdr: true` back to 16-bit (flags win by presence, not value).
-        let cfg = merge(recipe, &parse_convert(&["--output-sdr"]));
+        let cfg = merge(recipe, &parse_convert(&["--output-sdr"])).unwrap();
         assert!(!cfg.output.hdr);
         // ...and is a no-op on an already-SDR config.
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-sdr"]));
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-sdr"])).unwrap();
         assert!(!cfg.output.hdr);
     }
 
@@ -3665,10 +4588,20 @@ mod tests {
     #[test]
     fn recipe_rejects_unknown_keys() {
         // Unknown top-level section.
-        assert!(serde_json::from_str::<ResolvedConfig>(r#"{"densty":{}}"#).is_err());
-        // Typo'd key inside a known section (the silent-default trap).
+        assert!(serde_json::from_str::<ResolvedConfig>(r#"{"reconstructon":{}}"#).is_err());
+        // Typo'd key inside the reconstruction density block.
         assert!(
-            serde_json::from_str::<ResolvedConfig>(r#"{"density":{"density_gama":1.0}}"#).is_err()
+            serde_json::from_str::<ResolvedConfig>(
+                r#"{"reconstruction":{"density":{"scal":[1,1,1]}}}"#
+            )
+            .is_err()
+        );
+        // Typo'd key inside the tagged curve.
+        assert!(
+            serde_json::from_str::<ResolvedConfig>(
+                r#"{"reconstruction":{"curve":{"type":"exponential","gama":1.0}}}"#
+            )
+            .is_err()
         );
     }
 
@@ -3682,19 +4615,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_params() {
-        let mut cfg = ResolvedConfig::default();
-        cfg.simple.clip_low = 0.9;
-        cfg.simple.clip_high = 0.1;
-        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
-
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.density_gamma = 0.0;
-        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
-
-        // Equal clip endpoints are a zero-width interval → rejected.
-        let mut cfg = ResolvedConfig::default();
-        cfg.simple.clip_low = 0.5;
-        cfg.simple.clip_high = 0.5;
+        // Exponential gamma must be positive.
+        let cfg = exponential_cfg(ExponentialParams {
+            gamma: 0.0,
+            dmax: DmaxSource::Fixed,
+        });
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         let mut cfg = ResolvedConfig::default();
@@ -3707,7 +4632,7 @@ mod tests {
         cfg.print.white_balance = WbSource::Explicit([1.0, 0.0, 1.0]);
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
-        // Negative highlight compression is rejected (the density render silently
+        // Negative highlight compression is rejected (the print render silently
         // treats it as "off", so a wrong-sign value must fail loudly, not no-op).
         let mut cfg = ResolvedConfig::default();
         cfg.print.highlight_compress = -0.3;
@@ -3717,8 +4642,19 @@ mod tests {
         cfg.print.highlight_compress = 0.0;
         validate(&cfg).unwrap();
 
-        // A clean default passes.
+        // Non-positive density scale is rejected.
+        let cfg = density_cfg(
+            DensityParams {
+                scale: [1.0, 0.0, 1.0],
+                ..DensityParams::default()
+            },
+            DensityCurve::default(),
+        );
+        assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
+
+        // A clean default (and the simple config) pass.
         validate(&ResolvedConfig::default()).unwrap();
+        validate(&simple_cfg()).unwrap();
     }
 
     #[test]
@@ -3747,7 +4683,8 @@ mod tests {
         let cfg = merge(
             ResolvedConfig::default(),
             &parse_convert(&["--export-ir", "ir.tiff"]),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.input.export_ir.as_deref(), Some("ir.tiff"));
 
         // The reserved `--seed` flag parses rather than being rejected by clap.
@@ -3760,7 +4697,7 @@ mod tests {
         // No flag → the recipe's mutually-exclusive choice survives.
         let mut recipe = ResolvedConfig::default();
         recipe.film_base.source = FilmBaseSource::Explicit([0.9, 0.5, 0.4]);
-        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
         assert_eq!(
             cfg.film_base.source,
             FilmBaseSource::Explicit([0.9, 0.5, 0.4])
@@ -3768,7 +4705,7 @@ mod tests {
 
         // A flag replaces the whole source — no field is left behind to win on
         // precedence (the #5/#6 fix). `--base-region` beats a recipe explicit base.
-        let cfg = merge(recipe, &parse_convert(&["--base-region", "0,0,100,40"]));
+        let cfg = merge(recipe, &parse_convert(&["--base-region", "0,0,100,40"])).unwrap();
         assert_eq!(
             cfg.film_base.source,
             FilmBaseSource::Region([0, 0, 100, 40])
@@ -3784,7 +4721,7 @@ mod tests {
         recipe.input.meaning = MeaningAssertion::ScannerDevice;
 
         // No flags → both recipe values survive.
-        let cfg = merge(recipe.clone(), &parse_convert(&[]));
+        let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
         assert_eq!(cfg.input.transfer, TransferAssertion::Auto);
         assert_eq!(cfg.input.meaning, MeaningAssertion::ScannerDevice);
 
@@ -3792,12 +4729,13 @@ mod tests {
         let cfg = merge(
             recipe.clone(),
             &parse_convert(&["--input-transfer", "linear"]),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.input.transfer, TransferAssertion::Linear);
         assert_eq!(cfg.input.meaning, MeaningAssertion::ScannerDevice);
 
         // `--input-meaning` replaces only the meaning axis (over a recipe value).
-        let cfg = merge(recipe, &parse_convert(&["--input-meaning", "colorimetric"]));
+        let cfg = merge(recipe, &parse_convert(&["--input-meaning", "colorimetric"])).unwrap();
         assert_eq!(cfg.input.transfer, TransferAssertion::Auto);
         assert_eq!(cfg.input.meaning, MeaningAssertion::Colorimetric);
     }
@@ -3825,18 +4763,15 @@ mod tests {
     fn legacy_input_color_recipe_key_is_a_migration_error() {
         // A recipe carrying the removed combined key fails to load with actionable
         // migration guidance (not an opaque unknown-field message).
-        let err = reject_legacy_input_color(r#"{"input":{"color":"linear"}}"#, Path::new("r.json"))
-            .unwrap_err();
+        let v: serde_json::Value = serde_json::from_str(r#"{"input":{"color":"linear"}}"#).unwrap();
+        let err = reject_legacy_recipe_keys(&v, "recipe r.json").unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("input.transfer"));
         // A recipe using the new keys passes this migration check.
-        assert!(
-            reject_legacy_input_color(
-                r#"{"input":{"transfer":"linear","meaning":"scanner-device"}}"#,
-                Path::new("r.json"),
-            )
-            .is_ok()
-        );
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"input":{"transfer":"linear","meaning":"scanner-device"}}"#)
+                .unwrap();
+        assert!(reject_legacy_recipe_keys(&v, "recipe r.json").is_ok());
     }
 
     #[test]
@@ -3938,24 +4873,30 @@ mod tests {
 
     #[test]
     fn dmax_reuse_fragment_round_trips_as_a_recipe() {
-        // `estimate --d-max-region`'s `d_max_recipe` fragment must serialize as the
-        // documented `{"dmax":{"explicit":<d>}}` and parse back both as the
-        // `density` section value and inside a full recipe — otherwise the
-        // freeze-into-a-roll-recipe workflow is broken. (Mirrors the film-base
-        // fragment round-trip.)
+        // `estimate --d-max-region`'s `d_max_recipe` fragment must serialize as
+        // the documented `{"dmax":{"explicit":<d>}}` and, merged into a recipe's
+        // tagged `reconstruction.curve`, parse back to the frozen anchor —
+        // otherwise the freeze-into-a-roll-recipe workflow is broken. (Mirrors
+        // the film-base fragment round-trip.)
         let fragment = DmaxRecipeFragment {
             dmax: DmaxSource::Explicit(1.2734),
         };
         let json = serde_json::to_string(&fragment).unwrap();
         assert_eq!(json, r#"{"dmax":{"explicit":1.2734}}"#);
-        // Parses as a (partial) `density` section — serde defaults fill the rest.
-        let section: DensityParams = serde_json::from_str(&json).unwrap();
-        assert_eq!(section.dmax, DmaxSource::Explicit(1.2734));
-        // ...and inside a full recipe, which then validates.
-        let recipe: ResolvedConfig =
-            serde_json::from_str(&format!(r#"{{"density":{json}}}"#)).unwrap();
-        assert_eq!(recipe.density.dmax, DmaxSource::Explicit(1.2734));
-        validate(&recipe).unwrap();
+        // Merged into a curve object (the documented destination), it parses on
+        // both variants and validates.
+        for curve_type in ["exponential", "sigmoid"] {
+            let recipe: ResolvedConfig = serde_json::from_str(&format!(
+                r#"{{"reconstruction":{{"curve":{{"type":"{curve_type}","dmax":{{"explicit":1.2734}}}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                curve_of(&recipe).dmax(),
+                DmaxSource::Explicit(1.2734),
+                "{curve_type}"
+            );
+            validate(&recipe).unwrap();
+        }
     }
 
     #[test]
@@ -3984,39 +4925,63 @@ mod tests {
     #[test]
     fn explicit_dmax_domain_warning_fires_on_nonneutral_regional_balance() {
         // Baseline: an explicit anchor with default density correction and neutral
-        // balance is already in the render's domain — no warning.
-        let mut cfg = ResolvedConfig::default();
-        assert_eq!(cfg.algorithm, Algorithm::Density);
-        cfg.density.dmax = DmaxSource::Explicit(2.0);
-        assert!(explicit_dmax_domain_warning(&cfg).is_none());
+        // balance is already in the curve's domain — no warning.
+        let explicit = |density: DensityParams| {
+            density_cfg(
+                density,
+                DensityCurve::Exponential(ExponentialParams {
+                    gamma: 1.0,
+                    dmax: DmaxSource::Explicit(2.0),
+                }),
+            )
+        };
+        assert!(explicit_dmax_domain_warning(&explicit(DensityParams::default())).is_none());
 
         // B1: a non-neutral regional balance shifts D′ (the corrected density the
-        // render subtracts the anchor from: D′_c = B_c + shadow·w_lo + highlight·w_hi),
+        // curve subtracts the anchor from: D′_c = B_c + shadow·w_lo + highlight·w_hi),
         // so a reused explicit anchor mis-anchors even with default scale/offset. Warn,
         // and name regional balance in the message.
-        cfg.density.shadow_balance = [0.05, 0.0, -0.02];
+        let cfg = explicit(DensityParams {
+            shadow_balance: [0.05, 0.0, -0.02],
+            ..DensityParams::default()
+        });
         let msg = explicit_dmax_domain_warning(&cfg).expect("non-neutral shadow balance must warn");
         assert!(
             msg.contains("regional balance"),
             "message must name regional balance: {msg}"
         );
 
-        // A non-neutral highlight balance alone (scale/offset default) also warns.
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.dmax = DmaxSource::Explicit(2.0);
-        cfg.density.highlight_balance = [0.0, 0.01, 0.0];
+        // A non-neutral highlight balance alone (scale/offset default) also warns,
+        // and it warns under the sigmoid curve too (both curves subtract Dmax).
+        let cfg = explicit(DensityParams {
+            highlight_balance: [0.0, 0.01, 0.0],
+            ..DensityParams::default()
+        });
+        assert!(explicit_dmax_domain_warning(&cfg).is_some());
+        let cfg = density_cfg(
+            DensityParams {
+                highlight_balance: [0.0, 0.01, 0.0],
+                ..DensityParams::default()
+            },
+            DensityCurve::Sigmoid(SigmoidParams {
+                dmax: DmaxSource::Explicit(2.0),
+                ..SigmoidParams::default()
+            }),
+        );
         assert!(explicit_dmax_domain_warning(&cfg).is_some());
 
-        // `simple` consumes none of these knobs — no warning despite the non-neutral
-        // balance and explicit anchor.
-        cfg.algorithm = Algorithm::Simple;
-        assert!(explicit_dmax_domain_warning(&cfg).is_none());
+        // `simple` has no density domain — no warning.
+        assert!(explicit_dmax_domain_warning(&simple_cfg()).is_none());
 
-        // A `Fixed`/`Auto` anchor is already in the corrected domain — no warning even
-        // with a non-neutral balance on a density algorithm.
-        let mut cfg = ResolvedConfig::default();
-        cfg.density.shadow_balance = [0.05, 0.0, -0.02];
-        assert!(matches!(cfg.density.dmax, DmaxSource::Fixed));
+        // A `Fixed`/`Auto` anchor is already in the corrected domain — no warning
+        // even with a non-neutral balance on a density reconstruction.
+        let cfg = density_cfg(
+            DensityParams {
+                shadow_balance: [0.05, 0.0, -0.02],
+                ..DensityParams::default()
+            },
+            DensityCurve::default(),
+        );
         assert!(explicit_dmax_domain_warning(&cfg).is_none());
     }
 
@@ -4108,8 +5073,10 @@ mod tests {
 
     #[test]
     fn load_recipe_maps_failures_to_usage() {
-        // No path → defaults, infallibly.
-        assert_eq!(load_recipe(None).unwrap(), ResolvedConfig::default());
+        // No path → defaults, infallibly, with no dmax provenance.
+        let loaded = load_recipe(None).unwrap();
+        assert_eq!(loaded.cfg, ResolvedConfig::default());
+        assert!(!loaded.curve_dmax_present);
 
         // Missing file → Usage (exit 2), not Other.
         let missing = std::env::temp_dir().join("nc-no-such-recipe-xyz.json");
@@ -4121,7 +5088,10 @@ mod tests {
         // Malformed JSON and unknown keys both map to Usage.
         for (tag, body) in [
             ("malformed", "{ not json"),
-            ("unknown-key", r#"{"density":{"density_gama":1.0}}"#),
+            (
+                "unknown-key",
+                r#"{"reconstruction":{"density":{"scal":[1,1,1]}}}"#,
+            ),
         ] {
             let p =
                 std::env::temp_dir().join(format!("nc-recipe-{tag}-{}.json", std::process::id()));
@@ -4134,13 +5104,29 @@ mod tests {
             );
         }
 
-        // A valid partial recipe loads and fills defaults.
+        // A valid partial recipe loads, fills defaults, and records whether the
+        // file set `reconstruction.curve.dmax` (the report's provenance witness).
         let p = std::env::temp_dir().join(format!("nc-recipe-ok-{}.json", std::process::id()));
-        std::fs::write(&p, r#"{"density":{"density_gamma":1.8}}"#).unwrap();
+        std::fs::write(
+            &p,
+            r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.8}}}"#,
+        )
+        .unwrap();
         let got = load_recipe(Some(&p)).unwrap();
         std::fs::remove_file(&p).ok();
-        assert_eq!(got.density.density_gamma, 1.8);
-        assert_eq!(got.print, PrintParams::default());
+        assert_eq!(gamma_of(&got.cfg), 1.8);
+        assert_eq!(got.cfg.print, PrintParams::default());
+        assert!(!got.curve_dmax_present, "gamma alone sets no dmax");
+
+        let p = std::env::temp_dir().join(format!("nc-recipe-dmax-{}.json", std::process::id()));
+        std::fs::write(
+            &p,
+            r#"{"reconstruction":{"curve":{"type":"exponential","dmax":{"explicit":1.6}}}}"#,
+        )
+        .unwrap();
+        let got = load_recipe(Some(&p)).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert!(got.curve_dmax_present);
     }
 
     #[test]
@@ -4228,12 +5214,130 @@ mod tests {
         );
         // The SAME tag on both sides is not a variant switch: recurse into it so a
         // partial override of one sub-field keeps its siblings.
-        let mut base = serde_json::json!({"density": {"dmax": {"auto": {"p": 0.5, "q": 1}}}});
-        let overlay = serde_json::json!({"density": {"dmax": {"auto": {"p": 0.9}}}});
+        let mut base = serde_json::json!({"curve": {"dmax": {"auto": {"p": 0.5, "q": 1}}}});
+        let overlay = serde_json::json!({"curve": {"dmax": {"auto": {"p": 0.9}}}});
         merge_json(&mut base, &overlay);
         assert_eq!(
             base,
-            serde_json::json!({"density": {"dmax": {"auto": {"p": 0.9, "q": 1}}}})
+            serde_json::json!({"curve": {"dmax": {"auto": {"p": 0.9, "q": 1}}}})
+        );
+    }
+
+    #[test]
+    fn merge_json_switches_internally_tagged_type_and_carries_dmax() {
+        // The internally-tagged twins of the externally-tagged rule above: the
+        // `reconstruction` object and its `curve` carry a `type` discriminator
+        // beside variant-specific fields, so a per-frame type switch must
+        // replace those fields (a deep merge would leave a union the fail-loud
+        // deserializer rejects) while carrying the one deliberately-shared
+        // field, the roll-fixed `dmax` — the same semantics the CLI merge gives
+        // `--density-curve`.
+
+        // Curve exponential → sigmoid: `gamma` dropped, `dmax` carried.
+        let mut base = serde_json::json!({"reconstruction": {"curve":
+            {"type": "exponential", "gamma": 1.8, "dmax": {"explicit": 1.6}}}});
+        let overlay =
+            serde_json::json!({"reconstruction": {"curve": {"type": "sigmoid", "contrast": 1.4}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"reconstruction": {"curve":
+                {"type": "sigmoid", "contrast": 1.4, "dmax": {"explicit": 1.6}}}})
+        );
+
+        // An overlay that sets its own `dmax` wins over the carried one.
+        let mut base = serde_json::json!(
+            {"curve": {"type": "sigmoid", "contrast": 2.0, "dmax": {"explicit": 1.6}}});
+        let overlay = serde_json::json!({"curve": {"type": "exponential", "dmax": "auto"}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"curve": {"type": "exponential", "dmax": "auto"}})
+        );
+
+        // A SAME-type curve override is not a switch: deep merge keeps siblings.
+        let mut base = serde_json::json!(
+            {"curve": {"type": "sigmoid", "contrast": 2.0, "toe": 0.05}});
+        let overlay = serde_json::json!({"curve": {"type": "sigmoid", "shoulder": 0.4}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!(
+                {"curve": {"type": "sigmoid", "contrast": 2.0, "toe": 0.05, "shoulder": 0.4}})
+        );
+
+        // Reconstruction density → simple: the stale `density`/`curve` blocks
+        // must not survive (simple takes neither) — and the merged JSON must
+        // deserialize back to a valid config.
+        let mut base = serde_json::to_value(ResolvedConfig::default()).unwrap();
+        let overlay = serde_json::json!({"reconstruction": {"type": "simple"}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base["reconstruction"],
+            serde_json::json!({"type": "simple"})
+        );
+        let cfg: ResolvedConfig = serde_json::from_value(base).unwrap();
+        assert_eq!(cfg.reconstruction, Reconstruction::Simple);
+    }
+
+    #[test]
+    fn per_frame_override_switches_variants_and_keeps_the_roll_fixed_dmax() {
+        // Through `resolve_frames`: a per-frame reconstruction/curve type switch
+        // is a legitimate override — it must APPLY (deserialize cleanly), and a
+        // curve switch must keep the shared recipe's roll-fixed anchor.
+        let dir = std::env::temp_dir().join(format!("nc-roll-typeswitch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("frames.json");
+        std::fs::write(
+            &manifest,
+            r#"{"frames":[
+                 {"input":"a.tif","params":{"reconstruction":{"type":"simple"}}},
+                 {"input":"b.tif",
+                  "params":{"reconstruction":{"curve":{"type":"sigmoid","contrast":1.4}}}}
+               ]}"#,
+        )
+        .unwrap();
+        let args = RollArgs {
+            inputs: vec![],
+            frames: Some(manifest.clone()),
+            out_dir: dir.clone(),
+            recipe_in: None,
+            strict: false,
+            report: ReportArgs::default(),
+        };
+        let mut shared = exponential_cfg(ExponentialParams {
+            gamma: 1.8,
+            dmax: DmaxSource::Explicit(1.6),
+        });
+        shared.film_base.source = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
+        let mut warnings = Vec::new();
+        let log = Log::new(&args.report);
+        let planned = resolve_frames(&args, &shared, true, &mut warnings, &log);
+        std::fs::remove_dir_all(&dir).ok();
+        let planned = planned.expect("per-frame type switches must apply, not error");
+        assert_eq!(planned.len(), 2);
+
+        // Frame 1: density → simple (the stale density/curve blocks are gone).
+        assert_eq!(planned[0].cfg.reconstruction, Reconstruction::Simple);
+
+        // Frame 2: exponential → sigmoid, keeping the roll-fixed dmax exactly as
+        // the CLI's `--density-curve sigmoid` would; the stale `gamma` is gone
+        // and unset sigmoid knobs take their defaults.
+        assert_eq!(
+            planned[1].cfg.reconstruction,
+            Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Sigmoid(SigmoidParams {
+                    contrast: 1.4,
+                    dmax: DmaxSource::Explicit(1.6),
+                    ..SigmoidParams::default()
+                }),
+            }
+        );
+        // No dmax override was written, so no roll-fixed-anchor warning fires.
+        assert!(
+            !warnings.iter().any(|w| w.contains("display-white anchor")),
+            "a curve switch that keeps the shared anchor must not warn: {warnings:?}"
         );
     }
 
@@ -4269,7 +5373,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         let log = Log::new(&args.report);
-        let planned = resolve_frames(&args, &shared, &mut warnings, &log);
+        let planned = resolve_frames(&args, &shared, false, &mut warnings, &log);
         std::fs::remove_dir_all(&dir).ok();
         let planned = planned.expect("region→explicit override should apply, not error");
         assert_eq!(planned.len(), 1);
@@ -4289,16 +5393,11 @@ mod tests {
         // own knob and keeps the shared roll-fixed params (film base, Dmax) — the
         // "frame-local override applies to just that frame" guarantee at the
         // config level. Mirrors `resolve_frames`' merge.
-        let shared = ResolvedConfig {
-            film_base: FilmBaseParams {
-                source: FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
-            },
-            density: DensityParams {
-                dmax: DmaxSource::Explicit(1.6),
-                ..DensityParams::default()
-            },
-            ..ResolvedConfig::default()
-        };
+        let mut shared = exponential_cfg(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::Explicit(1.6),
+        });
+        shared.film_base.source = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
         let mut v = serde_json::to_value(&shared).unwrap();
         let ov: serde_json::Value =
             serde_json::from_str(r#"{"print":{"print_exposure":0.15}}"#).unwrap();
@@ -4309,7 +5408,43 @@ mod tests {
             cfg.film_base.source,
             FilmBaseSource::Explicit([0.9, 0.55, 0.42])
         );
-        assert_eq!(cfg.density.dmax, DmaxSource::Explicit(1.6));
+        assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.6));
+    }
+
+    #[test]
+    fn per_frame_override_rejects_legacy_reconstruction_keys() {
+        // A per-frame `params` override using the removed sibling sections gets
+        // the same migration guidance as a whole recipe, not an opaque
+        // deny-unknown-fields error from the merged deserialize.
+        let dir = std::env::temp_dir().join(format!("nc-roll-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("frames.json");
+        std::fs::write(
+            &manifest,
+            r#"{"frames":[{"input":"a.tif","params":{"density":{"density_gamma":1.8}}}]}"#,
+        )
+        .unwrap();
+        let args = RollArgs {
+            inputs: vec![],
+            frames: Some(manifest.clone()),
+            out_dir: dir.clone(),
+            recipe_in: None,
+            strict: false,
+            report: ReportArgs::default(),
+        };
+        let mut warnings = Vec::new();
+        let log = Log::new(&args.report);
+        let got = resolve_frames(
+            &args,
+            &ResolvedConfig::default(),
+            false,
+            &mut warnings,
+            &log,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        let err = got.expect_err("a legacy per-frame override must be rejected");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("reconstruction"), "{err}");
     }
 
     #[test]
@@ -4453,20 +5588,16 @@ mod tests {
     #[test]
     fn roll_report_puts_the_shared_recipe_once() {
         // The shared recipe *configuration* appears once at the top of the roll
-        // report; each frame additionally echoes the *resolved* base/Dmax it used
-        // (a redundant echo here since the recipe pins an explicit base). The
-        // per-frame entry is the data-carrying `FrameStatus` — an "ok" frame
-        // serializes the flat `"status":"ok"` with its payload as sibling keys.
-        let shared = ResolvedConfig {
-            film_base: FilmBaseParams {
-                source: FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
-            },
-            density: DensityParams {
-                dmax: DmaxSource::Explicit(1.6),
-                ..DensityParams::default()
-            },
-            ..ResolvedConfig::default()
-        };
+        // report — carrying the tagged reconstruction — and each frame
+        // additionally echoes the *resolved* base/Dmax it used (a redundant echo
+        // here since the recipe pins an explicit base). The per-frame entry is
+        // the data-carrying `FrameStatus` — an "ok" frame serializes the flat
+        // `"status":"ok"` with its payload as sibling keys.
+        let mut shared = exponential_cfg(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::Explicit(1.6),
+        });
+        shared.film_base.source = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
         let roll = RollReport {
             command: "roll",
             recipe: shared,
@@ -4507,7 +5638,15 @@ mod tests {
                 && (fb[1] - 0.55).abs() < 1e-6
                 && (fb[2] - 0.42).abs() < 1e-6
         );
-        assert!((v["recipe"]["density"]["dmax"]["explicit"].as_f64().unwrap() - 1.6).abs() < 1e-6);
+        assert_eq!(v["recipe"]["reconstruction"]["schema_version"], 1);
+        assert!(
+            (v["recipe"]["reconstruction"]["curve"]["dmax"]["explicit"]
+                .as_f64()
+                .unwrap()
+                - 1.6)
+                .abs()
+                < 1e-6
+        );
         assert_eq!(v["summary"]["succeeded"], 1);
         // The flattened `FrameStatus::Ok` still serializes the flat `status`
         // discriminator and its payload as sibling keys of the frame entry.
@@ -4532,6 +5671,7 @@ mod tests {
             output: PathBuf::from("out/bad_positive.tiff"),
             cfg: ResolvedConfig::default(),
             overrides: None,
+            dmax_setting: DmaxSetting::Default,
         };
         let warnings = vec!["a warning raised before the failure".to_string()];
         let fr = frame_report_err(&pf, &NcError::Decode("boom".into()), warnings);

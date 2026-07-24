@@ -156,11 +156,11 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   mutually-exclusive knobs as **one enum field** (e.g. `FilmBaseSource`,
   `InputColor`), not parallel `Option`/bool fields: independent fields can encode
   illegal combinations and silently break the flags-win merge.
-  *Carve-out:* §9's reconstruction / density-curve entries show **target** recipe
-  paths (`reconstruction.*`), but the shipped binary still implements the legacy
-  transitional schema (`algorithm` + top-level `density`/`sigmoid`/`simple`, §8).
-  Until the tagged-schema migration lands, keep the structs in sync with that
-  legacy schema, not §9's target paths.
+  The tagged reconstruction schema (§9's `reconstruction.*` paths) is the
+  **shipped** schema: one tagged `reconstruction` object (`schema_version` 1)
+  selects `simple`/`density` and the density curve. The legacy `algorithm` +
+  top-level `density`/`sigmoid`/`simple` forms are **rejected with migration
+  errors** — never re-add them as recipe keys or aliases.
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.

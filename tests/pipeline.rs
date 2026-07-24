@@ -149,7 +149,7 @@ fn convert_simple_writes_tiff_sidecar_and_report() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "simple",
         // Real scans are holder → rebate → picture, so auto-base fails loudly;
         // supply an explicit base (the documented calibrate-once workflow).
@@ -162,11 +162,16 @@ fn convert_simple_writes_tiff_sidecar_and_report() {
     let sidecar = PathBuf::from(format!("{}.json", out.display()));
     let recipe: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
-    assert_eq!(recipe["algorithm"], "simple");
+    assert_eq!(recipe["reconstruction"]["type"], "simple");
+    assert_eq!(recipe["reconstruction"]["schema_version"], 1);
 
     let report = json(&stdout);
     assert_eq!(report["command"], "convert");
-    assert_eq!(report["algorithm"], "simple");
+    assert_eq!(
+        report["reconstruction_result"],
+        serde_json::json!({"type": "simple"})
+    );
+    assert_eq!(report["recipe"]["reconstruction"]["type"], "simple");
     assert_eq!(report["output"], out.to_str().unwrap());
     assert!(report["film_base"].is_object(), "film base reported");
     assert!(report["loss"].is_object(), "encode loss reported");
@@ -185,7 +190,7 @@ fn convert_density_f32_avoids_clipping() {
         fixture("hdri-64bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "density",
         "--output-hdr",
         "--film-base",
@@ -214,7 +219,7 @@ fn u16_clipping_is_reported_and_strict_promotes_it() {
             "__IN__",
             "-o",
             "__OUT__",
-            "--algorithm",
+            "--reconstruction",
             "density",
             "--film-base",
             "0.9,0.55,0.42",
@@ -438,7 +443,7 @@ fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips(
     // `estimate --d-max-region` at a fully-exposed (near-opaque) reference frame,
     // with an explicit `--film-base` (the `Dmin` from the unexposed frame), and it
     // measures a single positive scalar `Dmax`, records the region as provenance,
-    // and emits reuse-ready `--d-max` / `density.dmax` forms. Feeding the frozen
+    // and emits reuse-ready `--d-max` / `reconstruction.curve.dmax` forms. Feeding the frozen
     // scalar back to `convert` reproduces it exactly (deterministic apply).
     //
     // A synthesized near-opaque leader stands in for the real one (no real leader
@@ -499,12 +504,15 @@ fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips(
         "the frozen --d-max scalar must reproduce the measured anchor"
     );
 
-    // Freeze B: the `density` recipe fragment pasted into a roll recipe loads and
-    // reproduces the same anchor (deterministic apply from the frozen recipe).
+    // Freeze B: the curve fragment pasted into a roll recipe's tagged
+    // `reconstruction.curve` loads and reproduces the same anchor (deterministic
+    // apply from the frozen recipe).
     let recipe = tmp.path("roll.json");
     std::fs::write(
         &recipe,
-        serde_json::json!({ "density": report["d_max_recipe"] }).to_string(),
+        serde_json::json!({ "reconstruction": { "curve": {
+            "type": "exponential", "dmax": report["d_max_recipe"]["dmax"] } } })
+        .to_string(),
     )
     .unwrap();
     let out2 = tmp.path("recipe.tiff");
@@ -525,7 +533,7 @@ fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips(
     assert_eq!(
         json(&stdout)["dmax"],
         report["dmax"],
-        "the frozen density.dmax must reproduce the measured anchor"
+        "the frozen reconstruction.curve.dmax must reproduce the measured anchor"
     );
     assert_eq!(
         std::fs::read(&out).unwrap(),
@@ -787,7 +795,7 @@ fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
         fixture("hdri-64bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--film-base",
         "0.9,0.55,0.42",
@@ -807,7 +815,7 @@ fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out_hdr.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--export-ir",
         ir_hdr.to_str().unwrap(),
@@ -824,20 +832,45 @@ fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
 fn bad_params_are_usage_errors() {
     let tmp = TempDir::new("usage");
     let out = tmp.path("out.tiff");
-    // clip_low >= clip_high is rejected at the CLI boundary (exit 2).
+    // An impossible knob value (zero exponential gamma) is rejected at the CLI
+    // boundary (exit 2).
     let (code, _stdout, _err) = run(&[
         "convert",
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--density-gamma",
+        "0",
+    ]);
+    assert_eq!(code, 2, "invalid params must exit 2");
+    assert!(!out.exists(), "no output on a usage error");
+
+    // The removed simple clip controls are migration errors (exit 2), and the
+    // removed --algorithm selector points at --reconstruction/--density-curve.
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--reconstruction",
         "simple",
         "--clip-low",
         "0.9",
-        "--clip-high",
-        "0.1",
     ]);
-    assert_eq!(code, 2, "invalid params must exit 2");
+    assert_eq!(code, 2, "a removed flag must exit 2: {err}");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--algorithm",
+        "density",
+    ]);
+    assert_eq!(code, 2, "--algorithm must be a migration error: {err}");
+    assert!(
+        err.contains("--reconstruction"),
+        "the migration error names the replacement: {err}"
+    );
     assert!(!out.exists(), "no output on a usage error");
 }
 
@@ -852,7 +885,7 @@ fn convert_is_deterministic() {
             fixture("hdri-64bit.tif").to_str().unwrap().to_string(),
             "-o".to_string(),
             out.to_str().unwrap().to_string(),
-            "--algorithm".to_string(),
+            "--reconstruction".to_string(),
             "density".to_string(),
             "--output-hdr".to_string(),
             "--film-base".to_string(),
@@ -890,7 +923,7 @@ fn sidecar_recipe_round_trips_through_recipe_in() {
         fixture("hdri-64bit.tif").to_str().unwrap(),
         "-o",
         out_a.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "density",
         "--output-hdr",
         "--film-base",
@@ -939,7 +972,7 @@ fn sigmoid_sidecar_recipe_round_trips_through_recipe_in() {
         fixture("hdri-64bit.tif").to_str().unwrap(),
         "-o",
         out_a.to_str().unwrap(),
-        "--algorithm",
+        "--density-curve",
         "sigmoid",
         "--film-base",
         "0.9,0.55,0.42",
@@ -957,10 +990,10 @@ fn sigmoid_sidecar_recipe_round_trips_through_recipe_in() {
     // The sidecar carries the sigmoid section verbatim.
     let recipe: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
-    assert_eq!(recipe["algorithm"], "sigmoid");
-    assert_eq!(recipe["sigmoid"]["contrast"], 1.4);
-    assert_eq!(recipe["sigmoid"]["toe"], 0.12);
-    assert_eq!(recipe["sigmoid"]["shoulder"], 0.33);
+    assert_eq!(recipe["reconstruction"]["curve"]["type"], "sigmoid");
+    assert_eq!(recipe["reconstruction"]["curve"]["contrast"], 1.4);
+    assert_eq!(recipe["reconstruction"]["curve"]["toe"], 0.12);
+    assert_eq!(recipe["reconstruction"]["curve"]["shoulder"], 0.33);
 
     let out_b = tmp.path("b.tiff");
     let (cb, _, err) = run(&[
@@ -1000,7 +1033,7 @@ fn unwritable_output_is_write_error_exit_five() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--film-base",
         "0.9,0.55,0.42",
@@ -1022,7 +1055,7 @@ fn verbose_keeps_stdout_clean_json_and_logs_to_stderr() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--film-base",
         "0.9,0.55,0.42",
@@ -1054,7 +1087,7 @@ fn report_file_writes_json_off_stdout() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--film-base",
         "0.9,0.55,0.42",
@@ -1431,7 +1464,7 @@ fn ir_plane_bit_identical_across_input_resolution() {
         out_auto.to_str().unwrap(),
         "--film-base",
         "0.9,0.55,0.42",
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--export-ir",
         ir_auto.to_str().unwrap(),
@@ -1447,7 +1480,7 @@ fn ir_plane_bit_identical_across_input_resolution() {
         out_expl.to_str().unwrap(),
         "--film-base",
         "0.9,0.55,0.42",
-        "--algorithm",
+        "--reconstruction",
         "simple",
         "--export-ir",
         ir_expl.to_str().unwrap(),
@@ -1713,7 +1746,7 @@ fn silverfast_unrecognized_negative_value_still_converts_a_negative() {
 #[test]
 fn telemetry_file_writes_full_record() {
     // `--telemetry-file <path>` writes one valid JSON record with every schema
-    // field populated (schema_version=1, finite timings, correct dims/bytes).
+    // field populated (schema_version=2, finite timings, correct dims/bytes).
     let tmp = TempDir::new("tel-file");
     let out = tmp.path("out.tiff");
     let rec = tmp.path("run.json");
@@ -1735,7 +1768,7 @@ fn telemetry_file_writes_full_record() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
 
-    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["schema_version"], 2);
     assert!(record["timestamp_ms"].as_u64().unwrap() > 0);
     assert!(record["nc_version"].is_string());
     assert!(record["target"].is_string());
@@ -1776,7 +1809,8 @@ fn telemetry_file_writes_full_record() {
     assert!(timing.get("ir_export").is_none() || timing["ir_export"].is_null());
 
     let conv = &record["conversion"];
-    assert_eq!(conv["algorithm"], "density");
+    assert_eq!(conv["reconstruction"], "density");
+    assert_eq!(conv["curve"], "exponential");
     assert!(conv["params_hash"].as_str().unwrap().len() == 16);
     assert_eq!(
         conv["film_base_source"]["explicit"],
@@ -1895,7 +1929,7 @@ fn telemetry_log_appends_one_line_per_run() {
     // Each line is an independent, valid JSON object.
     for line in lines {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
     }
 }
 
@@ -1946,7 +1980,7 @@ fn telemetry_does_not_perturb_output_or_sidecar() {
             fixture("hdri-64bit.tif").to_str().unwrap().to_string(),
             "-o".to_string(),
             out.to_str().unwrap().to_string(),
-            "--algorithm".to_string(),
+            "--reconstruction".to_string(),
             "density".to_string(),
             "--film-base".to_string(),
             "0.9,0.55,0.42".to_string(),
@@ -2003,7 +2037,7 @@ fn telemetry_write_failure_is_fail_soft_even_under_strict() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "density",
         "--output-hdr",
         "--film-base",
@@ -2126,7 +2160,7 @@ fn telemetry_file_dash_writes_json_to_stdout() {
     ]);
     assert_eq!(code, 0, "telemetry to stdout should succeed:\n{err}");
     let record = json(&stdout);
-    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["schema_version"], 2);
     assert_eq!(record["image"]["format"], "hdr");
 }
 
@@ -2223,7 +2257,7 @@ fn telemetry_outcome_reports_clipping_and_warnings() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "density",
         "--film-base",
         "0.9,0.55,0.42",
@@ -2259,7 +2293,7 @@ fn telemetry_outcome_counts_ir_ignored_warning() {
         fixture("hdri-64bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--reconstruction",
         "density",
         "--output-hdr", // f32 never clips, so the IR-ignored warning is isolated
         "--film-base",
@@ -2286,7 +2320,11 @@ fn telemetry_key_in_recipe_is_rejected() {
     // usage), never silently accepted as if telemetry were a conversion knob.
     let tmp = TempDir::new("tel-recipe-key");
     let recipe = tmp.path("recipe.json");
-    std::fs::write(&recipe, r#"{"algorithm":"density","telemetry":true}"#).unwrap();
+    std::fs::write(
+        &recipe,
+        r#"{"reconstruction":{"type":"density"},"telemetry":true}"#,
+    )
+    .unwrap();
     let out = tmp.path("out.tiff");
     let (code, _stdout, err) = run(&[
         "convert",
@@ -2309,10 +2347,11 @@ fn telemetry_key_in_recipe_is_rejected() {
 }
 
 #[test]
-fn telemetry_records_sigmoid_algorithm_and_params_hash() {
-    // The record's conversion summary must handle `--algorithm sigmoid`: the
-    // Algorithm enum serializes "sigmoid", and params_hash (over the effective
-    // recipe JSON) must cover the sigmoid.* keys, so tweaking one changes the hash.
+fn telemetry_records_sigmoid_curve_and_params_hash() {
+    // The record's conversion summary must handle the sigmoid curve: the
+    // reconstruction/curve pair serializes "density"/"sigmoid", and params_hash
+    // (over the effective recipe JSON) must cover the curve keys, so tweaking
+    // one changes the hash.
     let tmp = TempDir::new("tel-sigmoid");
     let fix = fixture("hdr-48bit.tif");
     let convert = |out: &Path, extra: &[&str]| -> serde_json::Value {
@@ -2322,7 +2361,7 @@ fn telemetry_records_sigmoid_algorithm_and_params_hash() {
             fix.to_str().unwrap(),
             "-o",
             out,
-            "--algorithm",
+            "--density-curve",
             "sigmoid",
             "--film-base",
             "0.9,0.55,0.42",
@@ -2342,8 +2381,12 @@ fn telemetry_records_sigmoid_algorithm_and_params_hash() {
     let rb = convert(&b, &["--sigmoid-contrast", "1.5"]);
 
     assert_eq!(
-        ra["conversion"]["algorithm"], "sigmoid",
-        "the record must name the sigmoid algorithm: {ra}"
+        ra["conversion"]["reconstruction"], "density",
+        "the record names the reconstruction type: {ra}"
+    );
+    assert_eq!(
+        ra["conversion"]["curve"], "sigmoid",
+        "the record must name the sigmoid curve: {ra}"
     );
     // sigmoid shares the density anchor, so a resolved dmax still rides along.
     assert!(
@@ -2360,9 +2403,9 @@ fn telemetry_records_sigmoid_algorithm_and_params_hash() {
 
 #[test]
 fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
-    // `--algorithm sigmoid` selects the S-curve converter end to end: the JSON
-    // report names the algorithm, carries the resolved Dmax anchor, and the
-    // sidecar recipe round-trips the sigmoid section.
+    // `--density-curve sigmoid` selects the S-curve end to end: the JSON
+    // report names the resolved curve, carries the resolved Dmax anchor, and the
+    // sidecar recipe round-trips the tagged curve.
     let tmp = TempDir::new("sigmoid");
     let out = tmp.path("out.tiff");
     let (code, stdout, err) = run(&[
@@ -2370,7 +2413,7 @@ fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--density-curve",
         "sigmoid",
         "--film-base",
         "0.9,0.55,0.42",
@@ -2380,7 +2423,16 @@ fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
     assert_eq!(code, 0, "sigmoid convert should succeed: {err}");
     assert!(is_tiff(&out));
     let report = json(&stdout);
-    assert_eq!(report["algorithm"], "sigmoid");
+    assert_eq!(report["reconstruction_result"]["type"], "density");
+    assert_eq!(report["reconstruction_result"]["curve"]["type"], "sigmoid");
+    assert_eq!(
+        report["reconstruction_result"]["curve"]["dmax"]["policy"],
+        "fixed"
+    );
+    assert_eq!(
+        report["reconstruction_result"]["curve"]["dmax"]["provenance"],
+        "default"
+    );
     assert!(
         report["dmax"].as_f64().is_some_and(f64::is_finite),
         "the shared anchor must be reported: {report}"
@@ -2388,8 +2440,8 @@ fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
     let sidecar: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{}.json", out.display())).unwrap())
             .unwrap();
-    assert_eq!(sidecar["algorithm"], "sigmoid");
-    assert_eq!(sidecar["sigmoid"]["contrast"], 1.2);
+    assert_eq!(sidecar["reconstruction"]["curve"]["type"], "sigmoid");
+    assert_eq!(sidecar["reconstruction"]["curve"]["contrast"], 1.2);
 
     // The anchored shoulder keeps every rendered sample at or below display
     // white, so — unlike the straight line — the default u16 encode cannot
@@ -2415,7 +2467,7 @@ fn sigmoid_small_anchor_does_not_clip_highlights() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--density-curve",
         "sigmoid",
         "--film-base",
         "0.9,0.55,0.42",
@@ -2434,75 +2486,51 @@ fn sigmoid_small_anchor_does_not_clip_highlights() {
 }
 
 #[test]
-fn sigmoid_warns_when_density_gamma_is_ignored() {
-    // `--algorithm sigmoid` consumes the density section except density_gamma
-    // (the S-curve replaces the straight line it parameterizes), so a customized
-    // gamma is a silent no-op unless surfaced — run_convert warns, and --strict
-    // promotes that warning to exit 1. The warning must NOT fire at the default
-    // gamma, nor under --algorithm density (where gamma is consumed).
-    let tmp = TempDir::new("gamma-warn");
-    let gamma_warns = |algo: &str, gamma: &str, out: &Path| -> serde_json::Value {
-        let (code, stdout, err) = run(&[
+fn sigmoid_rejects_density_gamma_as_a_usage_error() {
+    // `gamma` exists only in the exponential curve variant, so `--density-gamma`
+    // with a resolved sigmoid curve is an invalid tagged combination — a loud
+    // post-merge usage error (exit 2), never the pre-reconstruction
+    // warned-and-ignored behavior. Flag *presence* is the trigger (even the
+    // default value 1.0 — the flag can only mean the exponential knob).
+    let tmp = TempDir::new("gamma-reject");
+    let fix = fixture("hdr-48bit.tif");
+    let gamma_run = |extra: &[&str], out: &Path| -> (i32, String) {
+        let mut argv = vec![
             "convert",
-            fixture("hdr-48bit.tif").to_str().unwrap(),
+            fix.to_str().unwrap(),
             "-o",
             out.to_str().unwrap(),
-            "--algorithm",
-            algo,
             "--film-base",
             "0.9,0.55,0.42",
-            "--density-gamma",
-            gamma,
-        ]);
-        assert_eq!(code, 0, "{err}");
-        json(&stdout)
-    };
-    // `warnings` is omitted from the report when empty (skip_serializing_if), so
-    // a missing array counts as "no warnings".
-    let has_gamma_warning = |r: &serde_json::Value| {
-        r["warnings"].as_array().is_some_and(|ws| {
-            ws.iter()
-                .any(|w| w.as_str().unwrap().contains("ignores --density-gamma"))
-        })
+        ];
+        argv.extend_from_slice(extra);
+        let (code, _stdout, err) = run(&argv);
+        (code, err)
     };
 
-    // sigmoid + custom gamma → warns.
-    let r = gamma_warns("sigmoid", "1.5", &tmp.path("a.tiff"));
-    assert!(
-        has_gamma_warning(&r),
-        "sigmoid must warn on custom gamma: {r}"
+    // sigmoid + custom gamma → usage error naming the analogue knob, no output.
+    let out = tmp.path("a.tiff");
+    let (code, err) = gamma_run(
+        &["--density-curve", "sigmoid", "--density-gamma", "1.5"],
+        &out,
     );
-    // sigmoid + default gamma (1.0) → no warning.
-    let r = gamma_warns("sigmoid", "1.0", &tmp.path("b.tiff"));
+    assert_eq!(code, 2, "sigmoid + --density-gamma must exit 2: {err}");
     assert!(
-        !has_gamma_warning(&r),
-        "no warning at the default gamma: {r}"
+        err.contains("--sigmoid-contrast"),
+        "the error names the sigmoid analogue: {err}"
     );
-    // density + custom gamma → no warning (gamma is consumed there).
-    let r = gamma_warns("density", "1.5", &tmp.path("c.tiff"));
-    assert!(
-        !has_gamma_warning(&r),
-        "density consumes gamma, must not warn: {r}"
-    );
+    assert!(!out.exists(), "no output on a usage error");
 
-    // --strict promotes the sigmoid warning to a non-zero exit.
-    let (code, _stdout, err) = run(&[
-        "convert",
-        fixture("hdr-48bit.tif").to_str().unwrap(),
-        "-o",
-        tmp.path("d.tiff").to_str().unwrap(),
-        "--algorithm",
-        "sigmoid",
-        "--film-base",
-        "0.9,0.55,0.42",
-        "--density-gamma",
-        "1.5",
-        "--strict",
-    ]);
-    assert_eq!(
-        code, 1,
-        "--strict must fail on the gamma-ignored warning: {err}"
+    // ...even at the default value (the flag is exponential-only).
+    let (code, _err) = gamma_run(
+        &["--density-curve", "sigmoid", "--density-gamma", "1.0"],
+        &tmp.path("b.tiff"),
     );
+    assert_eq!(code, 2, "flag presence is the trigger, not the value");
+
+    // The exponential (default) curve consumes gamma normally.
+    let (code, err) = gamma_run(&["--density-gamma", "1.5"], &tmp.path("c.tiff"));
+    assert_eq!(code, 0, "exponential consumes gamma: {err}");
 }
 
 #[test]
@@ -2515,7 +2543,7 @@ fn sigmoid_rejects_no_d_max() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
-        "--algorithm",
+        "--density-curve",
         "sigmoid",
         "--film-base",
         "0.9,0.55,0.42",
@@ -2787,9 +2815,11 @@ fn write_file(path: &Path, contents: &str) -> PathBuf {
 /// every frame converts deterministically without auto-base (real scans are
 /// holder → rebate → picture, where auto-base fails loudly).
 const ROLL_RECIPE: &str = r#"{
-  "algorithm": "density",
-  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
-  "density":   { "dmax": { "explicit": 1.6 } }
+  "reconstruction": {
+    "type": "density",
+    "curve": { "type": "exponential", "dmax": { "explicit": 1.6 } }
+  },
+  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } }
 }"#;
 
 #[test]
@@ -2831,7 +2861,7 @@ fn roll_converts_a_batch_from_a_shared_frozen_recipe() {
         "recipe film base: {fb:?}"
     );
     assert!(
-        (report["recipe"]["density"]["dmax"]["explicit"]
+        (report["recipe"]["reconstruction"]["curve"]["dmax"]["explicit"]
             .as_f64()
             .unwrap()
             - 1.6)
@@ -3108,7 +3138,7 @@ fn roll_empty_batch_errors_loudly_on_both_paths() {
 /// A shared recipe with a NON-explicit (region) film base — every frame
 /// re-estimates its own Dmin, so the roll is not truly frozen.
 const ROLL_RECIPE_REGION: &str = r#"{
-  "algorithm": "density",
+  "reconstruction": { "type": "density" },
   "film_base": { "source": { "region": [0, 0, 502, 462] } }
 }"#;
 
@@ -3253,7 +3283,7 @@ fn roll_warns_on_per_frame_film_base_override() {
 
 #[test]
 fn roll_warns_on_per_frame_dmax_override() {
-    // density.dmax is a roll-fixed calibration (like film_base) since the
+    // reconstruction.curve.dmax is a roll-fixed calibration (like film_base) since the
     // dmax-reference task, but a per-frame override that sets it is applied (the
     // frame converts with its overridden anchor) with a loud, `--strict`-promotable
     // warning — not rejected. Mirrors `roll_warns_on_per_frame_film_base_override`.
@@ -3263,7 +3293,7 @@ fn roll_warns_on_per_frame_dmax_override() {
     let manifest_txt = format!(
         r#"{{ "frames": [
              {{ "input": {hdr:?},
-                "params": {{ "density": {{ "dmax": {{ "explicit": 2.4 }} }} }} }}
+                "params": {{ "reconstruction": {{ "curve": {{ "dmax": {{ "explicit": 2.4 }} }} }} }} }}
            ] }}"#,
         hdr = hdr.to_str().unwrap(),
     );
@@ -3304,7 +3334,7 @@ fn roll_warns_on_per_frame_dmax_override() {
             .as_str()
             .unwrap()
             .contains("overriding the roll-fixed display-white anchor")),
-        "the per-frame density.dmax override warns loudly: {report}"
+        "the per-frame reconstruction.curve.dmax override warns loudly: {report}"
     );
     assert!(
         err.contains("overriding the roll-fixed display-white anchor"),
@@ -3329,14 +3359,17 @@ fn roll_warns_on_per_frame_dmax_override() {
 
 #[test]
 fn roll_failed_frame_keeps_a_warning_raised_before_the_failure() {
-    // A frame that warns (sigmoid ignores --density-gamma) and *then* fails
+    // A frame that warns (an explicit --d-max combined with non-default
+    // density-scale fires the pre-decode anchor-domain warning) and *then* fails
     // (missing input → decode error) still reports the earlier warning.
     let tmp = TempDir::new("roll-warn-then-fail");
     let recipe = write_file(
-        &tmp.path("sig.json"),
-        r#"{ "algorithm": "sigmoid",
-             "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
-             "density": { "dmax": { "explicit": 1.6 }, "density_gamma": 2.0 } }"#,
+        &tmp.path("dmax-domain.json"),
+        r#"{ "reconstruction": {
+               "type": "density",
+               "density": { "scale": [1.1, 1.0, 0.9] },
+               "curve": { "type": "exponential", "dmax": { "explicit": 1.6 } } },
+             "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } } }"#,
     );
     let missing = tmp.path("does-not-exist.tif");
     let (code, stdout, _err) = run(&[
@@ -3353,10 +3386,11 @@ fn roll_failed_frame_keeps_a_warning_raised_before_the_failure() {
     assert_eq!(f["status"], "failed");
     assert!(f["error"].is_string(), "failed frame carries an error: {f}");
     assert!(
-        f["warnings"].as_array().unwrap().iter().any(|w| w
-            .as_str()
+        f["warnings"]
+            .as_array()
             .unwrap()
-            .contains("sigmoid ignores --density-gamma")),
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("re-measure --d-max")),
         "the warning raised before the failure survives in the report: {f}"
     );
 }

@@ -95,21 +95,25 @@ N runs append N lines. `--telemetry-file <path>` overwrites (a single record).
 Each line is a standalone JSON object with this shape (see `src/telemetry.rs`):
 
 ```json
-{ "schema_version":1, "timestamp_ms":1752566400000,
+{ "schema_version":2, "timestamp_ms":1752566400000,
   "nc_version":"0.1.0", "target":"aarch64-apple-darwin", "cpu_count":14,
   "image":{"format":"hdri","width":502,"height":462,"megapixels":0.231924,
            "bit_depth":16,"channels":3,"ir_present":true,
            "input_bytes":2017230,"output_bytes":1392370},
   "timing_ms":{"total":30.0,"decode":5.0,"film_base":0.0,"algorithm":4.4,
                "color":18.4,"encode":1.0,"ir_export":0.6},
-  "conversion":{"algorithm":"density","params_hash":"92a827ffd2d0aebd",
+  "conversion":{"reconstruction":"density","curve":"exponential",
+                "params_hash":"92a827ffd2d0aebd",
                 "film_base_source":{"explicit":[0.9,0.55,0.42]},
                 "dmax":1.6195,"output_hdr":false},
   "outcome":{"warnings":1,"clipped":3419,"non_finite":0} }
 ```
 
-`timing_ms.ir_export` appears only when `--export-ir` ran; `conversion.dmax` only
-when the density render applied an anchor. `params_hash` is a stable FNV-1a of the
+`timing_ms.ir_export` appears only when `--export-ir` ran; `conversion.curve`
+only for density reconstruction, and `conversion.dmax` only when the curve
+applied an anchor. (Schema v2 replaced v1's `conversion.algorithm` with the
+`reconstruction` + `curve` pair, mirroring the tagged recipe schema.)
+`params_hash` is a stable FNV-1a of the
 effective recipe JSON (the sidecar bytes), so identical conversions share a hash.
 
 `jq` recipes over the JSONL log (`jq -c` reads it line by line):
@@ -121,8 +125,8 @@ LOG="${NC_TELEMETRY_LOG:-${XDG_DATA_HOME:-$HOME/.local/share}/nc/telemetry.jsonl
 jq -c '{ts:.timestamp_ms, total:.timing_ms.total, decode:.timing_ms.decode, \
          algo:.timing_ms.algorithm, color:.timing_ms.color, encode:.timing_ms.encode}' "$LOG"
 
-# Only density runs.
-jq -c 'select(.conversion.algorithm == "density")' "$LOG"
+# Only exponential-curve density runs.
+jq -c 'select(.conversion.reconstruction == "density" and .conversion.curve == "exponential")' "$LOG"
 
 # Megapixels vs total ms (TSV — feed a scatter / spot the slow ones).
 jq -r '[.image.megapixels, .timing_ms.total] | @tsv' "$LOG"
@@ -132,7 +136,7 @@ jq -r '[.image.megapixels, (.image.megapixels / (.timing_ms.total/1000))] | @tsv
 
 # Runs that clipped or hit a non-finite sample.
 jq -c 'select(.outcome.clipped > 0 or .outcome.non_finite > 0) \
-       | {ts:.timestamp_ms, algo:.conversion.algorithm, clipped:.outcome.clipped}' "$LOG"
+       | {ts:.timestamp_ms, recon:.conversion.reconstruction, clipped:.outcome.clipped}' "$LOG"
 
 # Group timing stats by nc_version (across runs).
 jq -s 'group_by(.nc_version)[] | {version: .[0].nc_version, runs: length, \
