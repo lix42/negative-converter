@@ -2992,6 +2992,16 @@ verified findings applied:
   merge_json delta got a targeted re-review (sound). Rebased onto origin/main
   (past #48 HDR, #49 telemetry, #50 display-p3); clean auto-merge, gates green
   (325 unit incl. #50's tests + 86 integration). Shipped via /ship.
+- 2026-07-24: CI (Linux) surfaced a non-portable golden: `tiff_hash` hashed the
+  whole encoded TIFF including the embedded ICC, whose header carries
+  platform-dependent bytes (Little CMS), so the macOS-captured hash failed on CI
+  even though every per-pixel `f32::to_bits` golden passed there (pixels are
+  bit-identical cross-platform). Retargeted it to `tiff_pixels_hash`: decode the
+  written TIFF back and hash only the pixel samples + dimensions, excluding the
+  ICC/container. This matches nc's actual determinism contract (byte-identity is
+  per build/architecture, design-spec §8) while still pinning the encode
+  quantization/layout. Test renamed to
+  `golden_no_preset_encoded_pixels_are_unchanged`.
 
 - 2026-07-23: Defined tagged `simple` and `density` reconstruction. Density owns
   its parameters and a tagged `exponential { gamma }` or

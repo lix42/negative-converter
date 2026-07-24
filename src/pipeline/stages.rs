@@ -684,10 +684,21 @@ mod golden {
         format!("{h:016x}")
     }
 
-    /// Render + encode the synthetic negative and return the output file's
-    /// FNV-1a hash. The ICC profile is deterministic (its `dateTimeNumber` is
-    /// zeroed — see `pipeline::color`), so the whole file hashes stably.
-    fn tiff_hash(label: &str, reconstruction: &Reconstruction, output: &OutputParams) -> String {
+    /// Render + encode the synthetic negative, decode the written TIFF back, and
+    /// hash only its **pixel samples** (prefixed with dimensions + sample depth).
+    /// The embedded ICC profile and TIFF container metadata are deliberately
+    /// excluded: their exact bytes are only guaranteed identical per
+    /// build/architecture (design-spec §8), not across the host that captured
+    /// these hashes and CI — e.g. Little CMS stamps platform-dependent fields into
+    /// the ICC header. The per-pixel `f32::to_bits` goldens pin the reconstruction
+    /// math; this pins the encode path (u16 quantization and channel layout) in a
+    /// host-portable way.
+    fn tiff_pixels_hash(
+        label: &str,
+        reconstruction: &Reconstruction,
+        output: &OutputParams,
+    ) -> String {
+        use tiff::decoder::{Decoder, DecodingResult};
         let img = synthetic(16, 16);
         let base = FilmBase::from([0.9, 0.55, 0.42]);
         let rendered =
@@ -696,38 +707,55 @@ mod golden {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("{label}.tiff"));
         let _ = encode::encode(&rendered.image, output, Some(&rendered.icc), &path).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+
+        let mut dec = Decoder::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let (w, h) = dec.dimensions().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&w.to_le_bytes());
+        bytes.extend_from_slice(&h.to_le_bytes());
+        match dec.read_image().unwrap() {
+            DecodingResult::U16(px) => {
+                bytes.push(16);
+                bytes.extend(px.iter().flat_map(|v| v.to_le_bytes()));
+            }
+            DecodingResult::F32(px) => {
+                bytes.push(32);
+                bytes.extend(px.iter().flat_map(|v| v.to_bits().to_le_bytes()));
+            }
+            _ => panic!("unexpected TIFF sample format for {label}"),
+        }
         fnv(&bytes)
     }
 
     #[test]
-    fn golden_no_preset_tiff_bytes_are_unchanged() {
-        // The legacy no-preset TIFF regression: the full pipeline (reconstruct →
-        // legacy print → output color transform → u16/f32 encode + deterministic
-        // ICC) produces byte-identical files to the pre-refactor binary. Hashes
-        // captured from the pre-split code on the same synthetic input. This is
-        // also the proof this task claims no `pipeline_version` bump: default
-        // pixels did not change.
+    fn golden_no_preset_encoded_pixels_are_unchanged() {
+        // The legacy no-preset regression: the full pipeline (reconstruct → legacy
+        // print → output color transform → u16/f32 encode) produces byte-identical
+        // *pixels* to the pre-refactor binary. Hashes captured from the pre-split
+        // code on the same synthetic input; they cover the encode quantization and
+        // layout (the ICC/container is host-dependent and excluded — see
+        // `tiff_pixels_hash`). This is also the proof this task claims no
+        // `pipeline_version` bump: default pixels did not change.
         let sdr = OutputParams::default();
         assert_eq!(
-            tiff_hash("density-default-u16", &Reconstruction::default(), &sdr),
-            "60944dbb1ea2600e"
+            tiff_pixels_hash("density-default-u16", &Reconstruction::default(), &sdr),
+            "4c7fa2f13e530819"
         );
         assert_eq!(
-            tiff_hash("simple-default-u16", &Reconstruction::Simple, &sdr),
-            "3afd68a372eef92b"
+            tiff_pixels_hash("simple-default-u16", &Reconstruction::Simple, &sdr),
+            "ef7c2a44ab8cdf10"
         );
         assert_eq!(
-            tiff_hash("sigmoid-default-u16", &sigmoid_default_config(), &sdr),
-            "28a5827801675e34"
+            tiff_pixels_hash("sigmoid-default-u16", &sigmoid_default_config(), &sdr),
+            "7515ec0fd7fb81df"
         );
         let hdr = OutputParams {
             hdr: true,
             ..OutputParams::default()
         };
         assert_eq!(
-            tiff_hash("density-default-f32", &Reconstruction::default(), &hdr),
-            "003fee67f70848b8"
+            tiff_pixels_hash("density-default-f32", &Reconstruction::default(), &hdr),
+            "8d1552f86414cd35"
         );
     }
 }
