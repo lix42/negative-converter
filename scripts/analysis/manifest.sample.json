@@ -195,7 +195,7 @@
           "bytes": 111944986,
           "megapixels": 18.66,
           "sha256": "d2d37ccdf4aa564cde4147a3542b7792ad0010f71dae06554f5b2ceceeac9fef",
-          "encoding": "f32-linear"
+          "encoding": "u16-srgb"
         },
         "\u2026 (trimmed)"
       ]

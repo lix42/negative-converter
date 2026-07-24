@@ -46,8 +46,8 @@ Stages (no argument runs `freeze → convert → ir → determinism → resource
 | Var | Default | Meaning |
 |---|---|---|
 | `NC` | `<repo>/target/release/nc` | the binary under test |
-| `A` | `<repo>/../nc-assets` | assets root |
-| `OUTDIR` | `$A/converted/2026-07-22` | converted-image output dir |
+| `A` | `<repo>/../nc-assets` | assets root (rolls live under `$A/rolls/<roll>/`) |
+| `OUTDIR` | `$A/converted/nc/2026-07-22` | converted-image output dir |
 | `ART` | `/private/tmp/rsv-artifacts` | per-run JSON reports (not committed) |
 
 Example — verify a debug build against a scratch output dir:

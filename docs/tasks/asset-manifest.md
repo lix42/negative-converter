@@ -4,7 +4,9 @@
 
 Replace the hard-coded `ROLLS` array in `scripts/real-scan-verify/harness.sh`
 with a tracked, generated **manifest** of the nc-assets folder — the single
-source of truth for every file: which frames exist, their role (unexposed /
+source of truth for every image asset (companion `.json` sidecars / `.jpg`
+previews travel with their image, not as separate entries): which frames exist,
+their role (unexposed /
 leader / real), their derived facts (dimensions, format, `ir_present`, checksum),
 the standalone samples, and the converted outputs (nc versions + NLP).
 Foundational for the whole conversion-analysis toolkit: analysis and comparison

@@ -76,6 +76,11 @@ reused when its byte size is unchanged (so warm updates are fast); pass
   harness reproduces them) except `V0`; `nlp/*` and everything else are hashed.
 - `source_frame` for a converted output is resolved by matching its filename stem
   against the source roll's frames; NLP outputs map to `Portra160-2026-07-22`.
+- The inventory tracks **image artifacts** (`.tif`/`.tiff`). Companion files that
+  share an image's stem — `.json` recipe/report sidecars and `.jpg` previews — are
+  intentionally **not** separate entries; they travel with their image. A future
+  orphan/missing validator must treat a stem-matched `.json`/`.jpg` as a companion
+  of its tracked image, not as an untracked orphan.
 
 ## Metadata source & fallback
 

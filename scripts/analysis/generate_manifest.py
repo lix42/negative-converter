@@ -121,10 +121,13 @@ class Prev:
         self.file: dict[str, dict] = {}
         self.roll: dict[str, dict] = {}
         self.bucket: dict[str, dict] = {}
+        self.frame_by_sha: dict[str, dict] = {}  # for role survival across renames
         for roll, r in data.get("rolls", {}).items():
             self.roll[roll] = r
             for fr in r.get("frames", []):
                 self.file[fr["file"]] = fr
+                if fr.get("sha256"):
+                    self.frame_by_sha[fr["sha256"]] = fr
         for s in data.get("samples", []):
             self.file[s["file"]] = s
         for name, b in data.get("converted", {}).items():
@@ -188,10 +191,13 @@ def main() -> int:
         ap_ = os.path.join(A, relpath)
         e: dict = {}
         e.update(inspect(nc, ap_))
-        # Never let a lower-fidelity source silently overwrite authoritative
-        # nc-derived metadata already recorded for this file (e.g. a run with no
-        # nc binary present). Carry the previous values forward and flag it.
-        if e.get("metadata_source") in ("exiftool", "none"):
+        # Never let a *successful* lower-fidelity read (exiftool) silently
+        # overwrite authoritative nc-derived metadata already recorded for this
+        # file (e.g. a run with no nc binary present). Carry the previous values
+        # forward and flag it. A *total* inspection failure ("none") is NOT
+        # carried — it keeps its `error` so corruption is reported and the run
+        # exits non-zero, never presenting a damaged file as valid.
+        if e.get("metadata_source") == "exiftool":
             pv = prev.file.get(relpath)
             # Preserve only when the prior entry holds richer values than the
             # exiftool placeholders (`tiff`/`false`) — i.e. an authoritative
@@ -214,7 +220,9 @@ def main() -> int:
 
     m: dict = {
         "schema_version": 1,
-        "generated": os.environ.get("NC_MANIFEST_DATE", "auto"),
+        # Explicit env wins; otherwise keep the prior manifest's date so a plain
+        # update stays byte-identical; "auto" only on first generation.
+        "generated": os.environ.get("NC_MANIFEST_DATE") or prev_data.get("generated") or "auto",
         "note": ("Inventory + source-of-truth for nc-assets. Paths are relative to "
                  "this file's directory (the asset root), so the manifest is "
                  "portable across machines / Drive mounts. Metadata from `nc inspect`."),
@@ -231,9 +239,12 @@ def main() -> int:
         for fn in list_imgs(rp):
             stem = os.path.splitext(fn)[0]
             r = rel("rolls", roll, fn)
-            prevf = prev.file.get(r, {})
+            fm = meta(r)  # compute first so the checksum is available for identity
+            # Role preservation: by path, else by checksum (survives a rename —
+            # the skill advertises regeneration after renames), else seed, else real.
+            prevf = prev.file.get(r) or prev.frame_by_sha.get(fm.get("sha256")) or {}
             role = prevf.get("role") or SEED_ROLES.get(roll, {}).get(stem) or "real"
-            frames.append({"file": r, "role": role, **meta(r)})
+            frames.append({"file": r, "role": role, **fm})
         entry = {"stock": prev.roll.get(roll, {}).get("stock")
                  or SEED_STOCK.get(roll, "unknown"), "frames": frames}
         note = prev.roll.get(roll, {}).get("note") or SEED_ROLL_NOTE.get(roll)
@@ -319,15 +330,14 @@ def main() -> int:
                     if prevf.get("note"):
                         o["note"] = prevf["note"]
                     o.update(meta(r, regenerable=regenerable))
-                    # encoding: nc uses the filename convention (hdr/_corr = float
-                    # linear, else 16-bit sRGB); other producers infer from bit depth.
-                    if producer == "nc":
-                        o["encoding"] = ("f32-linear" if ("hdr" in fn or "_corr" in fn)
-                                         else "u16-srgb")
-                    elif o.get("bits") == 32:
-                        o["encoding"] = "f32"
-                    elif o.get("bits") == 16:
-                        o["encoding"] = "u16"
+                    # encoding: infer from inspected bit depth, not filename — a
+                    # V0 `_corr.tif` is a 16-bit sRGB corrected variant, not float.
+                    # nc float outputs are linear; nc 16-bit are sRGB.
+                    bits = o.get("bits")
+                    if bits == 32:
+                        o["encoding"] = "f32-linear" if producer == "nc" else "f32"
+                    elif bits == 16:
+                        o["encoding"] = "u16-srgb" if producer == "nc" else "u16"
                     outputs.append(o)
             bucket["outputs"] = outputs
             m["converted"][name] = bucket
@@ -369,9 +379,13 @@ def main() -> int:
     if args.dry_run:
         print("(dry run — manifest.json not written)")
         return 1 if errs else 0
-    with open(mpath, "w") as f:
+    # Atomic write: serialize to a same-dir temp, then replace — an interrupted or
+    # failed write never truncates the existing source-of-truth manifest.
+    tmp = mpath + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(m, f, indent=2)
         f.write("\n")
+    os.replace(tmp, mpath)
     print("wrote", mpath)
     return 1 if errs else 0
 

@@ -22,7 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"        # repo root (worktree)
 NC=${NC:-$ROOT/target/release/nc}
 A=${A:-$ROOT/../nc-assets}
-OUTDIR=${OUTDIR:-$A/converted/2026-07-22}
+OUTDIR=${OUTDIR:-$A/converted/nc/2026-07-22}
 REC="$HERE/recipes"
 ART=${ART:-/private/tmp/rsv-artifacts}   # per-run report JSON (not committed)
 mkdir -p "$REC" "$ART" "$OUTDIR"
@@ -44,7 +44,7 @@ center_region() { # file -> "X,Y,W,H" for a holder-free center 40% box
 stage_classify() {
   printf "%-24s %-22s %8s %6s  %s\n" FRAME ROLL cLuma agree CLASS
   for row in "${ROLLS[@]}"; do IFS='|' read -r roll uf ff reals <<<"$row"
-    for f in "$A/$roll"/*.tif; do
+    for f in "$A/rolls/$roll"/*.tif; do
       j=$($NC estimate --grid "$f" 2>/dev/null)
       read cr cg cb ag <<<"$(echo "$j" | jq -r '.grid.cells[4].base as $c|"\($c.r) \($c.g) \($c.b) \(.grid.agreement)"')"
       lum=$(python3 -c "print(f'{0.2126*$cr+0.7152*$cg+0.0722*$cb:.4f}')")
@@ -56,7 +56,7 @@ stage_classify() {
 
 stage_freeze() {
   for row in "${ROLLS[@]}"; do IFS='|' read -r roll uf ff reals <<<"$row"
-    U="$A/$roll/$uf"; F="$A/$roll/$ff"
+    U="$A/rolls/$roll/$uf"; F="$A/rolls/$roll/$ff"
     ureg=$(center_region "$U"); freg=$(center_region "$F")
     jmin=$($NC estimate --base-region "$ureg" "$U" 2>"$ART/$roll.dmin.warn")
     dmin=$(echo "$jmin" | jq -c '.film_base'); dflag=$(echo "$jmin" | jq -r '.film_base_flag' | sed 's/--film-base //')
@@ -79,7 +79,7 @@ stage_freeze() {
 
 stage_convert() {
   for row in "${ROLLS[@]}"; do IFS='|' read -r roll uf ff reals <<<"$row"
-    ins=(); for fr in $reals; do ins+=("$A/$roll/$fr"); done
+    ins=(); for fr in $reals; do ins+=("$A/rolls/$roll/$fr"); done
     od="$OUTDIR/$roll"; mkdir -p "$od"
     # 16-bit -> <stem>_positive.tiff (matrix default)
     $NC roll --params "$REC/$roll.json"     --out-dir "$od" "${ins[@]}" --report json > "$ART/$roll.roll16.json"  2>"$ART/$roll.roll16.err"
@@ -99,20 +99,20 @@ stage_ir() {
   # one representative real frame per matrix; export IR + --strict behaviour
   IFS='|' read -r roll uf ff reals <<<"${ROLLS[0]}"; fr=$(echo $reals|awk '{print $1}')
   $NC convert --params "$REC/$roll.json" --export-ir "$ART/ir-$roll.tiff" \
-     -o "$ART/ir-pos-$roll.tiff" "$A/$roll/$fr" --report json > "$ART/ir.json" 2>"$ART/ir.err"
+     -o "$ART/ir-pos-$roll.tiff" "$A/rolls/$roll/$fr" --report json > "$ART/ir.json" 2>"$ART/ir.err"
   echo "IR export ($roll/$fr):"; exiftool -s -s -s -ImageWidth -ImageHeight -BitsPerSample "$ART/ir-$roll.tiff" 2>/dev/null
   echo "--strict on same frame (expect IR-ignored warning -> hard error):"
-  $NC convert --params "$REC/$roll.json" -o "$ART/strict.tiff" "$A/$roll/$fr" --strict >/dev/null 2>"$ART/strict.err"; echo "  exit=$?"; cat "$ART/strict.err"
+  $NC convert --params "$REC/$roll.json" -o "$ART/strict.tiff" "$A/rolls/$roll/$fr" --strict >/dev/null 2>"$ART/strict.err"; echo "  exit=$?"; cat "$ART/strict.err"
 }
 
 stage_determinism() {
   IFS='|' read -r roll uf ff reals <<<"${ROLLS[0]}"; fr=$(echo $reals|awk '{print $1}')
-  $NC convert --params "$REC/$roll.json" -o "$ART/det-a.tiff" "$A/$roll/$fr" --report none 2>/dev/null
-  $NC convert --params "$REC/$roll.json" -o "$ART/det-b.tiff" "$A/$roll/$fr" --report none 2>/dev/null
+  $NC convert --params "$REC/$roll.json" -o "$ART/det-a.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
+  $NC convert --params "$REC/$roll.json" -o "$ART/det-b.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
   cmp -s "$ART/det-a.tiff" "$ART/det-b.tiff" && echo "determinism: re-run BYTE-IDENTICAL" || echo "determinism: DIFFER"
   # dump-params reload
-  $NC convert --params "$REC/$roll.json" --dump-params "$ART/resolved.json" -o "$ART/det-c.tiff" "$A/$roll/$fr" --report none 2>/dev/null
-  $NC convert --params "$ART/resolved.json" -o "$ART/det-d.tiff" "$A/$roll/$fr" --report none 2>/dev/null
+  $NC convert --params "$REC/$roll.json" --dump-params "$ART/resolved.json" -o "$ART/det-c.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
+  $NC convert --params "$ART/resolved.json" -o "$ART/det-d.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
   cmp -s "$ART/det-a.tiff" "$ART/det-d.tiff" && echo "determinism: dump-params reload BYTE-IDENTICAL" || echo "determinism: reload DIFFERS"
 }
 
@@ -120,9 +120,9 @@ stage_resource() {
   # largest scan = a full 5184x3599 frame
   IFS='|' read -r roll uf ff reals <<<"${ROLLS[0]}"; fr=$(echo $reals|awk '{print $1}')
   echo "resource on $roll/$fr (16-bit):"
-  /usr/bin/time -l "$NC" convert --params "$REC/$roll.json" -o "$ART/res16.tiff" "$A/$roll/$fr" --report none 2>&1 | grep -E 'real|maximum resident'
+  /usr/bin/time -l "$NC" convert --params "$REC/$roll.json" -o "$ART/res16.tiff" "$A/rolls/$roll/$fr" --report none 2>&1 | grep -E 'real|maximum resident'
   echo "resource on $roll/$fr (float HDR):"
-  /usr/bin/time -l "$NC" convert --params "$REC/$roll.hdr.json" -o "$ART/reshdr.tiff" "$A/$roll/$fr" --report none 2>&1 | grep -E 'real|maximum resident'
+  /usr/bin/time -l "$NC" convert --params "$REC/$roll.hdr.json" -o "$ART/reshdr.tiff" "$A/rolls/$roll/$fr" --report none 2>&1 | grep -E 'real|maximum resident'
 }
 
 case "${1:-all}" in
