@@ -3051,8 +3051,21 @@ verified findings applied:
   corrected-master reporting.
 
 ## display-p3-output
-**Status:** not started
-**Updated:** 2026-07-21
+**Status:** done
+**Updated:** 2026-07-24
+
+- 2026-07-24: Reviewed via the two-engine review-fix-loop (Codex + pr-review
+  lenses: quality, tests, comments, silent-failure). Six findings, all
+  doc/comment/test (no correctness change): reworded the "already-rendered
+  linear-P3 / only transfer-encodes" framing to describe the shipped Rec.709→P3
+  remap + sRGB TRC (marking linear-P3-in as the `sdr-display-rendering` target);
+  added a production-path pixel assertion (saturated Rec.709 red golden) and a
+  deep-shadow sRGB-toe sample; fixed the `srgb_trc` "shared by sRGB" comment; added
+  `display-p3` to `--output-profile` help; relocated the ICC-registry note. Loop
+  converged; gates green. Rebased onto origin/main (past #48 HDR + #49 telemetry);
+  the merged design-spec is coherent (HDR spike confirms Display P3 as the
+  gain-map SDR base and the display-p3-output ↔ sdr-display-rendering split).
+  Shipped via /ship.
 
 - 2026-07-21: Planned a deterministic synthesized Display P3 profile (D65/P3
   primaries with the piecewise sRGB TRC), avoiding dependence on or redistribution
@@ -3067,6 +3080,90 @@ verified findings applied:
   ACEScg → rendered linear P3. The ICC v4 profile uses D50 PCS/media white,
   Bradford-adapted D65 P3 colorants and the adaptation tag; D65 remains the
   destination encoding white, not the ICC media white.
+
+### Implementation (2026-07-23, uncommitted)
+
+- **Approach.** Added `OutputSpace::DisplayP3` as a new `--output-profile` /
+  `output.output_profile` keyword (`display-p3` / `displayp3`), reusing the
+  existing string knob — no new CLI field, recipe field, or merge arm (the knob
+  already merges at `cli::merge`; verified `display_p3_end_to_end_embeds_p3_icc`
+  drives it through `to_output`). The profile is synthesized with Little CMS from
+  the registered P3 encoding (D65 white 0.3127/0.3290; R 0.680/0.320,
+  G 0.265/0.690, B 0.150/0.060) plus a **parametric** sRGB TRC.
+- **Empirically verified (not assumed) lcms2 6.1.1 behavior** via a throwaway
+  `#[ignore]` probe before writing code: `Profile::new_rgb(D65, P3, srgb_curve)`
+  produces an **ICC v4.4** RGB **Display**-class profile that automatically writes
+  **D50** media white (0.9642/1.0/0.8249), the **`chromaticAdaptationTag`**, and
+  **Bradford D65→D50-adapted colorants** matching the ICC-registry / macOS
+  `Display P3.icc` reference (rXYZ 0.51512/0.24119/-0.00105, etc.). So no manual
+  chad/colorant/white handling is needed — lcms does it. No dependency on or
+  redistribution of the macOS system profile.
+- **TRC.** New `srgb_trc()` helper builds the Little CMS **parametric type-4**
+  (IEC 61966-2.1) curve `[2.4, 1/1.055, 0.055/1.055, 1/12.92, 0.04045]`, not a
+  gamma-2.2 power approximation. `synth` refactored to delegate to a shared
+  `synth_curve(white, primaries, &curve)`; sRGB/ProPhoto/ACEScg paths unchanged.
+- **Encoder semantics.** The "linear P3 → encoded P3" encoder is realized as the
+  lcms working→output transform against the P3 profile. Proven by
+  `linear_p3_samples_encode_with_srgb_trc_and_identity_primaries`: a *linear-P3
+  source* profile → the P3 output profile applies only the sRGB TRC (linear 0.5 →
+  0.735357) and keeps a pure P3 red on the red axis (G,B ≈ 0), i.e. **no gamut
+  mapping and no ACEScg transform** here — those stay with `sdr-display-rendering`.
+- **Determinism.** Reuses the existing `profile_icc` dateTime-zeroing path;
+  `display_p3_icc_is_deterministic_with_zeroed_datetime` asserts byte-identical
+  reruns. Range clamping still happens only at the u16 encode step (unchanged).
+- **Tests added** (`src/pipeline/color.rs`): `display_p3_profile_is_rgb_display_class_with_d50_pcs`,
+  `display_p3_colorants_match_icc_registry_reference`,
+  `display_p3_trc_is_parametric_srgb_not_gamma`,
+  `display_p3_decodes_to_registered_d65_encoding` (transforms encoded P3 → D50
+  XYZ via lcms, un-adapts D50→D65 with the standard Bradford matrix, recovers the
+  registered D65 primaries/white),
+  `linear_p3_samples_encode_with_srgb_trc_and_identity_primaries`,
+  `display_p3_icc_is_deterministic_with_zeroed_datetime`,
+  `display_p3_end_to_end_embeds_p3_icc`; plus `display-p3` cases in
+  `parse_keywords_and_path` and the builtins-validity loop.
+- **Docs.** design-spec §5 output-color bullet and §9 `--output-profile` entry now
+  list `display-p3`. (`docs/design-spec.html` does not exist in this worktree, so
+  nothing to mirror.)
+- **Notes / deferred to `sdr-display-rendering`.** This task does not activate a
+  product path: the current `to_output` working space is still linear Rec.709, so
+  selecting `display-p3` today would colorimetrically remap Rec.709→P3 (a valid
+  conversion, but not the intended SDR render). `sdr-display-rendering` owns the
+  ACEScg→rendered-linear-P3 transform, reference white, SDR tone, and gamut policy;
+  once it produces linear-P3 working values, the same `to_output` transform becomes
+  the pure-TRC P3 encoder these tests exercise. The full `display-p3` *preset*
+  (container/tone/gamut, per `output-presets`) is also still future.
+- **Not done here.** No real-scan visual check in macOS Preview/Photos or on an
+  iPhone (task "How to Verify" item); that needs the activated SDR render and is
+  deferred with the product-activation gate.
+
+### Review-fix pass (2026-07-23, uncommitted)
+
+Six verified doc/comment/test findings (no correctness change), all fixed:
+- Reworded the "already-rendered linear-P3 / only transfer-encodes" framing in
+  three places (`OutputSpace::DisplayP3` doc, design-spec §5, design-spec §9) to
+  describe the *shipped* behavior — sources the linear Rec.709 working profile, so
+  Little CMS does a lossless Rec.709→P3 remap (Rec.709 ⊂ P3, no gamut compression)
+  **plus** the sRGB TRC — and marked the pure linear-P3-in transfer-encode as the
+  future `sdr-display-rendering` state. Also fixed the isolation-test comment to
+  say "here" = the encode step tested in isolation with a synthetic linear-P3
+  source, which does NOT exercise the shipped `to_output` path.
+- New test `to_output_display_p3_remaps_rec709_and_encodes`: drives the real
+  `to_output` path and asserts a saturated Rec.709 red against the expected
+  P3-encoded value derived from the standard Rec.709→P3 matrix + sRGB encode
+  (≈ 0.9175/0.2004/0.1385), plus teeth that G/B lift off zero (contrasting the
+  identity-primaries isolation test). Neutral-only was necessary-not-sufficient.
+- Added a deep-shadow toe sample (lin 0.002 → 0.02584 = 12.92×0.002) to
+  `linear_p3_samples_encode_with_srgb_trc_and_identity_primaries` — exercises the
+  sRGB linear segment that distinguishes the parametric curve from a gamma power
+  (~0.081 there).
+- Fixed the `srgb_trc` comment (it is Display P3's only caller; sRGB output uses
+  `Profile::new_srgb()`).
+- Added `display-p3` to the `--output-profile` CLI help string (`cli.rs`).
+- Moved the "verified against the ICC registry" note off the generic `synth_curve`
+  doc onto the DisplayP3 build arm.
+
+Gate after fixes: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 ## hdr-output-spike
 **Status:** in progress
