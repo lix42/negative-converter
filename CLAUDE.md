@@ -101,6 +101,18 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
 - **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
   `cargo build` → `cargo test`. The gate is strict — warnings fail the build.
+- **Determinism is per build/architecture, not cross-platform — write golden
+  tests accordingly.** Tests run locally (macOS/aarch64) *and* in CI (x86_64
+  Linux), so a green local `cargo test` is not proof CI is green. Reconstruction's
+  transcendental FP (`powf` / `10^` / `log10`) differs by ~1 ULP across libm
+  implementations, and the lcms2 color transform + embedded ICC bytes differ by
+  target — so a checked-in **bit-exact hash of a whole encoded TIFF, or of
+  reconstruct output over a full frame, is green on the capture host and red on the
+  other target** (design-spec §8 scopes byte-identity to a single
+  build/architecture). Pin bit-identity with the small **curated per-pixel**
+  vectors in `pipeline::stages::golden` (captured from the reference code) — those
+  specific values happen to agree across libm; never checksum a full frame, an
+  encoded file, or post-lcms2 (color-transformed) pixels in a cross-platform gate.
 - `Cargo.lock` is committed (binary crate). The crate-level `#![allow(dead_code)]`
   is gone; the only remaining allows are three narrow, documented item-level ones
   (`algo/mod.rs`, `pipeline/color.rs`) for API surface the single Step-1 path
