@@ -89,7 +89,11 @@ graph TD
   pipeline-orchestration --> perf-instrumentation
   pipeline-orchestration --> perf-telemetry
   perf-telemetry --> telemetry-strategy
-  telemetry-strategy --> telemetry-upload
+  telemetry-strategy --> telemetry-schema-v2
+  telemetry-schema-v2 --> telemetry-ingestion-service
+  telemetry-schema-v2 --> telemetry-upload
+  telemetry-ingestion-service --> telemetry-upload
+  telemetry-upload --> telemetry-panic-hook
   dmax-white-anchor --> real-scan-verification
   dmax-reference --> real-scan-verification
   algo-density --> dmax-white-anchor
@@ -172,7 +176,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   real (real-world, not lab) direction
 - `perf-telemetry` (post-MVP): `pipeline-orchestration`
 - `telemetry-strategy` (post-MVP, spike): `perf-telemetry`
-- `telemetry-upload` (post-MVP): `telemetry-strategy`
+- `telemetry-schema-v2` (post-MVP): `telemetry-strategy`
+- `telemetry-ingestion-service` (post-MVP): `telemetry-schema-v2`
+- `telemetry-upload` (post-MVP): `telemetry-schema-v2`, `telemetry-ingestion-service`
+- `telemetry-panic-hook` (post-MVP): `telemetry-upload`
 - `stdout-broken-pipe-safety` (post-MVP, hardening): `cli-framework`
 - `dmax-white-anchor` (post-MVP): `algo-density`
 - `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
@@ -318,14 +325,26 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   real-world successor to `perf-instrumentation`: an opt-in JSON telemetry record
   per `nc convert` run (image + timing + context) to a local JSONL log / one-off
   file, no new entrypoint. Lifts the prototype's per-stage timing.
-- [ ] [Telemetry strategy spike](tasks/telemetry-strategy.md) — investigate +
-  decide the telemetry infra (backend/service, OTel export vs custom ingestion,
-  how the local JSONL queue drains) and the expanded data set (error/failure
-  events, crash/panic hooks, coarse usage events) plus privacy/consent; outputs a
-  design note and concretely-scoped child tasks.
+- [x] [Telemetry strategy spike](tasks/telemetry-strategy.md) — approved
+  [strategy](telemetry-strategy.md): custom JSON to Cloudflare Worker + D1,
+  anonymous schema-minimized upload, persistent explicit consent, crash-safe
+  detached draining, success/failure events, and sanitized panic reporting.
+- [ ] [Telemetry event schema v2](tasks/telemetry-schema-v2.md) — add typed
+  success/failure local events and a separately versioned, privacy-minimized
+  upload projection with random per-event deduplication IDs.
+- [ ] [Telemetry ingestion service](tasks/telemetry-ingestion-service.md) — build
+  the validating Cloudflare Worker + D1 endpoint, exact deduplication, 180-day
+  retention, hard FREE-plan quotas, abuse quarantine/kill switch, and initial
+  advisory performance/failure queries.
 - [ ] [Background telemetry upload](tasks/telemetry-upload.md) — ship the local
-  JSONL queue to a server; strictly opt-in. Scoped/informed by `telemetry-strategy`
-  (design-spec §12).
+  consent-selected active JSONL through generation-bound collection/request
+  leases and its private spool, durable recovery, detached helpers, retries,
+  non-stranding retarget, lock-stable inactive purge, caps, and maintenance
+  commands.
+- [ ] [Sanitized panic telemetry](tasks/telemetry-panic-hook.md) — publish
+  persistent-managed-consent panic events as isolated atomic ready files with
+  only capped, normalized `nc` function/module frames; no per-run hook, shared
+  append stream, payloads, source paths, or native-crash claim.
 - [ ] [Transactional output writes](tasks/transactional-output-writes.md) — from
   the output-atomicity review: write every artifact (primary TIFF, IR, sidecar,
   report-file) to a same-directory temp, fsync, then rename, so a failed/interrupted

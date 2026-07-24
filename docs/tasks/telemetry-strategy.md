@@ -1,5 +1,9 @@
 # Telemetry strategy spike
 
+**Done:** 2026-07-23 — decisions are recorded in
+[`docs/telemetry-strategy.md`](../telemetry-strategy.md); implementation is split
+into the schema, ingestion, uploader, and panic-hook children below.
+
 ## Goal
 
 A single **investigation / spike** that decides the strategy for growing `nc`'s
@@ -60,8 +64,8 @@ build it.
 
 ## Deliverable
 
-- A **design note** (e.g. `docs/telemetry-strategy.md` or a design-spec §12
-  expansion) recording the decisions and their rationale.
+- A **design note** ([`docs/telemetry-strategy.md`](../telemetry-strategy.md))
+  recording the decisions and their rationale.
 - **Concretely-scoped child tasks** filed in `TASKS.md` + `docs/tasks/`. At minimum
   this refines the existing [`telemetry-upload`](telemetry-upload.md) (which is
   already wired as a child of this spike); add others only where they genuinely
