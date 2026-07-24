@@ -82,8 +82,8 @@ current `--output-hdr` float TIFF is already print-rendered and must be document
 as a transitional rendered float TIFF, never as an alias for `film-master`.
 
 The output path remains required and is never silently renamed. Its extension
-must match the preset's resolved container (for example, the spike will pin the
-accepted `.heic`/`.heif` spelling for `gain-map-hdr`); a mismatch is a usage
+must match the preset's resolved container: `gain-map-hdr` accepts `.jpg` and
+`.jpeg`, while `hdr-pq` and `hdr-hlg` accept `.avif`. A mismatch is a usage
 error that reports the expected extensions. Named presets other than `custom`
 are atomic: legacy depth/profile/container controls such as `--output-hdr`,
 `--output-sdr`, `--output-profile`, and `--bigtiff` cannot accompany them, even
@@ -156,5 +156,6 @@ preserve misleading terminology.
 ## Dependencies
 
 - [ISO gain-map HDR output](gain-map-hdr-output.md)
+- [HDR AVIF output](hdr-avif-output.md)
 - [Roll conversion](roll-conversion.md)
 - [Conversion versioning and baseline comparison](conversion-versioning.md)

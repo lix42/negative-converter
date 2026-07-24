@@ -38,7 +38,9 @@ downstream blockers. Today’s `--output-hdr` remains a rendered float TIFF, not
 the future master branch.
 
 - **io/decode** — SilverFast HDR (48-bit RGB) / HDRi (64-bit RGB+IR) → linear `f32` scanner measurements (IR preserved, not consumed); input semantics remain explicit rather than silently assigning Rec.709.
-- **io/encode** — current `LinearImage` → 16-bit or 32-bit float TIFF with ICC; planned display output adds ISO gain-map HDR while retaining linear ACEScg film masters.
+- **io/encode** — current `LinearImage` → 16-bit or 32-bit float TIFF with ICC;
+  planned display output adds ISO gain-map JPEG and PQ/HLG AVIF while retaining
+  linear ACEScg film masters.
 - **pipeline/film_base** — estimate `Dmin` from unexposed border, with CLI override.
 - **pipeline/color** — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
 - **algo** — current `Converter` implementations migrate to tagged `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve.
@@ -130,7 +132,9 @@ graph TD
   hdr-output-spike --> hdr-display-rendering
   sdr-display-rendering --> gain-map-hdr-output
   hdr-display-rendering --> gain-map-hdr-output
+  hdr-display-rendering --> hdr-avif-output
   gain-map-hdr-output --> output-presets
+  hdr-avif-output --> output-presets
   roll-conversion --> output-presets
   conversion-versioning --> output-presets
   output-presets --> display-output-acceptance
@@ -195,7 +199,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `sdr-display-rendering` (post-MVP): `film-master-render-pipeline`, `display-p3-output`, `hdr-output-spike`
 - `hdr-display-rendering` (post-MVP): `film-master-render-pipeline`, `hdr-output-spike`
 - `gain-map-hdr-output` (post-MVP): `sdr-display-rendering`, `hdr-display-rendering`
-- `output-presets` (post-MVP): `gain-map-hdr-output`, `roll-conversion`, `conversion-versioning`
+- `hdr-avif-output` (post-MVP): `hdr-display-rendering`
+- `output-presets` (post-MVP): `gain-map-hdr-output`, `hdr-avif-output`, `roll-conversion`, `conversion-versioning`
 - `display-output-acceptance` (post-MVP): `output-presets`, `real-scan-verification`
 - `transactional-output-writes` (post-MVP, hardening): `pipeline-orchestration`
 - `memory-preflight` (post-MVP, hardening): `pipeline-orchestration`
@@ -282,10 +287,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 > intended product default that Phase 7 verifies.
 
 - [ ] [Display P3 output](tasks/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
-- [ ] [HDR still-output spike](tasks/hdr-output-spike.md) — decide ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy before implementation
+- [~] [HDR still-output spike](tasks/hdr-output-spike.md) — decide ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy before implementation
 - [ ] [SDR display rendering](tasks/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
 - [ ] [Display-HDR rendering](tasks/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
-- [ ] [ISO gain-map HDR output](tasks/gain-map-hdr-output.md) — write a backward-compatible SDR base plus ISO 21496-1 gain map, initially targeting HEIC
+- [ ] [ISO gain-map HDR output](tasks/gain-map-hdr-output.md) — write a backward-compatible Display P3 JPEG base plus ISO 21496-1 and Ultra HDR v1 gain-map metadata
+- [ ] [HDR AVIF output](tasks/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
 - [ ] [Output presets and guidance](tasks/output-presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
 
 ### Phase 7: Acceptance
