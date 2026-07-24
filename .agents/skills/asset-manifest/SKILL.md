@@ -37,15 +37,17 @@ at [`scripts/analysis/manifest.sample.json`](../../../scripts/analysis/manifest.
 Run the committed generator from the repo root:
 
 ```bash
-python3 scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc PATH] [--force-hash] [--dry-run]
+python3 scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc PATH] [--reuse-hash] [--dry-run]
 ```
 
 - `ASSET_ROOT` defaults to `$NC_ASSET_ROOT`, else `../nc-assets` (the machine-local
   symlink to the Drive folder). Point it elsewhere to scan a different copy.
 - The `nc` binary is found via `--nc`, `$NC`, `./target/release/nc`,
-  `./target/debug/nc`, or `nc` on `PATH`. Build it first if missing:
-  `cargo build --release`. Without it, the script falls back to `exiftool` (loses
-  the authoritative `format`/`ir_present`).
+  `./target/debug/nc`, or `nc` on `PATH` — each candidate is **verified** to be
+  this project's CLI (`--version` prints `nc <ver>`), so the system netcat
+  (`/usr/bin/nc`) is never mistaken for it. Build it if missing:
+  `cargo build --release`. Without a valid `nc`, the script falls back to
+  `exiftool` (losing authoritative `format`/`ir_present`) and says so.
 - `NC_MANIFEST_DATE=$(date +%F)` sets the `generated` field; the script leaves it
   stable rather than stamping wall-clock time (so re-runs stay byte-identical) —
   pass it for a real date.
@@ -55,9 +57,12 @@ python3 scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc PATH] [--force-
 The generator is **idempotent and update-aware**: it loads any existing
 `manifest.json` and preserves human-maintained fields — roll frame `role`, roll
 `stock`/`note`, sample `kind`/`note`, per-output `note`, and each converted
-bucket's `regenerable`/`nc_version`/`recipe_dir`/`note`. A file's `sha256` is
-reused when its byte size is unchanged (so warm updates are fast); pass
-`--force-hash` to recompute all.
+bucket's `regenerable`/`nc_version`/`recipe_dir`/`note`. Preserved fields survive
+an asset **rename** by matching sha256 identity — but only when the old path is
+gone (a *copy* keeps its own default, so a calibration role isn't cloned).
+Checksums are **recomputed every run** by default (source-of-truth integrity);
+`--reuse-hash` reuses an existing `sha256` when the byte size is unchanged (faster
+warm updates, but a same-size edit would go undetected).
 
 ## Folder layout the scanner expects
 

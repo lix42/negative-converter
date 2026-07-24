@@ -16,8 +16,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 133579416,
-          "megapixels": 15.55,
-          "sha256": "f0f43b838382f34db5340bc52f42054fd87926af74c39d600770221bb286a013"
+          "sha256": "f0f43b838382f34db5340bc52f42054fd87926af74c39d600770221bb286a013",
+          "megapixels": 15.55
         },
         {
           "file": "rolls/Ektar/20260713-nikon-971.tif",
@@ -29,8 +29,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 158474544,
-          "megapixels": 18.66,
-          "sha256": "5d7ab00ad02251ace6ddbac81f754ff72dc0422792dd19e639d583dcaaa0a5fd"
+          "sha256": "5d7ab00ad02251ace6ddbac81f754ff72dc0422792dd19e639d583dcaaa0a5fd",
+          "megapixels": 18.66
         },
         {
           "file": "rolls/Ektar/20260714-nikon-989.tif",
@@ -42,8 +42,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 158474544,
-          "megapixels": 18.66,
-          "sha256": "8419394d7d7b1b5caea5c6a8e7b0bfbb9744c069afa12d029137e90cf367f74b"
+          "sha256": "8419394d7d7b1b5caea5c6a8e7b0bfbb9744c069afa12d029137e90cf367f74b",
+          "megapixels": 18.66
         },
         {
           "file": "rolls/Ektar/20260714-nikon-991.tif",
@@ -55,8 +55,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 158474544,
-          "megapixels": 18.66,
-          "sha256": "9b114b803a89d058ce821c7f88fe2b0743402687796b6c25f5315e277250e95c"
+          "sha256": "9b114b803a89d058ce821c7f88fe2b0743402687796b6c25f5315e277250e95c",
+          "megapixels": 18.66
         },
         {
           "file": "rolls/Ektar/20260715-nikon-1009.tif",
@@ -68,8 +68,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 158474546,
-          "megapixels": 18.66,
-          "sha256": "2107adc73cc5bcbb5a9dc21f8da8192747422ead852190daac31a7ef1124e3ee"
+          "sha256": "2107adc73cc5bcbb5a9dc21f8da8192747422ead852190daac31a7ef1124e3ee",
+          "megapixels": 18.66
         }
       ]
     },
@@ -87,8 +87,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 158524834,
-          "megapixels": 18.66,
-          "sha256": "bffa51e66db53cd5693667ed7877d40fcbb72861c1c42aeb7cdd9e31234b0859"
+          "sha256": "bffa51e66db53cd5693667ed7877d40fcbb72861c1c42aeb7cdd9e31234b0859",
+          "megapixels": 18.66
         },
         {
           "file": "rolls/Portra160-2026-07-22/20260722-nikon-1097.tif",
@@ -100,8 +100,8 @@
           "format": "hdri",
           "ir_present": true,
           "bytes": 158524834,
-          "megapixels": 18.66,
-          "sha256": "769cc7261f078378f2d833cd4b61a97c0d48abfc8cd091cd09ff6a2e8a3bec48"
+          "sha256": "769cc7261f078378f2d833cd4b61a97c0d48abfc8cd091cd09ff6a2e8a3bec48",
+          "megapixels": 18.66
         },
         "\u2026 (trimmed)"
       ]
@@ -117,8 +117,8 @@
       "format": "hdri",
       "ir_present": true,
       "bytes": 606480032,
-      "megapixels": 74.65,
       "sha256": "3e6027d47fa0e09c2d7171c9c97f4d1dc75fac4a63b91ea6c74d4cfc78ace40e",
+      "megapixels": 74.65,
       "kind": "perf-worst-case",
       "note": "largest/highest-res scan available (~4x a standard 18.7 MP frame); memory-preflight / streaming-tiled-io worst case"
     },
@@ -131,8 +131,8 @@
       "format": "hdri",
       "ir_present": true,
       "bytes": 1233074,
-      "megapixels": 0.13,
       "sha256": "92bfcc89136a8034693ce06cc2f0e0f83bcdb20582bb8f7ecd60499f0ffc9445",
+      "megapixels": 0.13,
       "kind": "icc-embed-test"
     }
   ],
@@ -193,8 +193,8 @@
           "format": "hdr",
           "ir_present": false,
           "bytes": 111944986,
-          "megapixels": 18.66,
           "sha256": "d2d37ccdf4aa564cde4147a3542b7792ad0010f71dae06554f5b2ceceeac9fef",
+          "megapixels": 18.66,
           "encoding": "u16-srgb"
         },
         "\u2026 (trimmed)"
@@ -217,8 +217,8 @@
           "ir_present": false,
           "metadata_source": "exiftool",
           "bytes": 155096060,
-          "megapixels": 12.91,
           "sha256": "b199accc648cdafc6ebfb732f064d287ee63bba84ce893980bde2eefe67bcb83",
+          "megapixels": 12.91,
           "encoding": "f32"
         },
         "\u2026 (trimmed)"

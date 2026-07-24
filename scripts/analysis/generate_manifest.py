@@ -17,13 +17,19 @@ Usage:
 
 ASSET_ROOT defaults to $NC_ASSET_ROOT, else ../nc-assets (the machine-local
 symlink). The `nc` binary is found via --nc, $NC, ./target/release/nc,
-./target/debug/nc, or `nc` on PATH.
+./target/debug/nc, or `nc` on PATH — each candidate is verified to be this
+project's CLI (via `--version`), so the system netcat (`/usr/bin/nc`) is never
+mistaken for it.
 
 Update behavior (idempotent): an existing manifest.json is loaded and its
 **human-maintained** fields are preserved — roll frame `role`, roll `stock`/`note`,
 sample `kind`/`note`, per-output `note`, and each converted bucket's
-`regenerable` / `nc_version` / `recipe_dir` / `note`. A file's `sha256` is reused
-when its byte size is unchanged (pass --force-hash to always recompute).
+`regenerable` / `nc_version` / `recipe_dir` / `note`. Preserved fields survive an
+asset **rename** by matching sha256 identity (only when the old path is gone, so a
+*copy* does not clone a calibration role). Checksums are **recomputed every run**
+by default (the manifest is a source-of-truth); pass --reuse-hash to reuse an
+existing `sha256` when the byte size is unchanged (faster, but a same-size edit
+would go undetected).
 """
 from __future__ import annotations
 
@@ -61,12 +67,25 @@ SEED_SAMPLE = {
 IMG_EXT = (".tif", ".tiff")
 
 
+def is_nc(cand: str) -> bool:
+    """Confirm `cand` is *this* project's `nc` CLI, not something else on PATH.
+    `nc` is also the system netcat (`/usr/bin/nc`), which would be invoked once
+    per image and silently degrade to exiftool. Our CLI prints `nc <version>` to
+    stdout for `--version`; netcat writes its usage/error to stderr (empty stdout)."""
+    try:
+        out = subprocess.run([cand, "--version"], capture_output=True, text=True, timeout=15)
+    except Exception:
+        return False
+    v = out.stdout.strip()
+    return out.returncode == 0 and v.startswith("nc ") and any(c.isdigit() for c in v)
+
+
 def find_nc(explicit: str | None) -> str | None:
     for cand in (explicit, os.environ.get("NC"),
-                 "target/release/nc", "target/debug/nc"):
-        if cand and os.path.exists(cand):
+                 "target/release/nc", "target/debug/nc", shutil.which("nc")):
+        if cand and os.path.exists(cand) and is_nc(cand):
             return os.path.abspath(cand)
-    return shutil.which("nc")
+    return None
 
 
 def sha256(path: str) -> str:
@@ -121,7 +140,8 @@ class Prev:
         self.file: dict[str, dict] = {}
         self.roll: dict[str, dict] = {}
         self.bucket: dict[str, dict] = {}
-        self.frame_by_sha: dict[str, dict] = {}  # for role survival across renames
+        self.frame_by_sha: dict[str, dict] = {}   # role survival across renames
+        self.sample_by_sha: dict[str, dict] = {}  # kind/note survival across renames
         for roll, r in data.get("rolls", {}).items():
             self.roll[roll] = r
             for fr in r.get("frames", []):
@@ -130,6 +150,8 @@ class Prev:
                     self.frame_by_sha[fr["sha256"]] = fr
         for s in data.get("samples", []):
             self.file[s["file"]] = s
+            if s.get("sha256"):
+                self.sample_by_sha[s["sha256"]] = s
         for name, b in data.get("converted", {}).items():
             self.bucket[name] = b
             for o in b.get("outputs", []):
@@ -147,8 +169,9 @@ def main() -> int:
     ap.add_argument("asset_root", nargs="?",
                     default=os.environ.get("NC_ASSET_ROOT", "../nc-assets"))
     ap.add_argument("--nc", help="path to the nc binary")
-    ap.add_argument("--force-hash", action="store_true",
-                    help="recompute every sha256 even if the byte size is unchanged")
+    ap.add_argument("--reuse-hash", action="store_true",
+                    help="reuse an existing sha256 when the byte size is unchanged "
+                         "(faster, but misses same-size edits; default recomputes all)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print summary but do not write manifest.json")
     args = ap.parse_args()
@@ -181,7 +204,9 @@ def main() -> int:
     def hashed(relpath: str, size: int, regenerable: bool) -> str | None:
         if regenerable:
             return None
-        if not args.force_hash:
+        # Recompute by default (source-of-truth integrity); --reuse-hash trusts an
+        # unchanged byte size, which is faster but misses same-size edits.
+        if args.reuse_hash:
             reuse = prev.sha(relpath, size)
             if reuse:
                 return reuse
@@ -191,32 +216,39 @@ def main() -> int:
         ap_ = os.path.join(A, relpath)
         e: dict = {}
         e.update(inspect(nc, ap_))
-        # Never let a *successful* lower-fidelity read (exiftool) silently
-        # overwrite authoritative nc-derived metadata already recorded for this
-        # file (e.g. a run with no nc binary present). Carry the previous values
-        # forward and flag it. A *total* inspection failure ("none") is NOT
-        # carried — it keeps its `error` so corruption is reported and the run
-        # exits non-zero, never presenting a damaged file as valid.
+        size = os.path.getsize(ap_)
+        e["bytes"] = size
+        s = hashed(relpath, size, regenerable)
+        if s:
+            e["sha256"] = s
+        # Carry authoritative nc metadata forward when a *successful* exiftool
+        # fallback would otherwise clobber it (e.g. nc missing on a negative) — but
+        # only when the bytes still identify the same file (checksum match), so a
+        # file replaced at the same path is not paired with the old metadata, and
+        # only when the prior values are richer than the exiftool placeholders. A
+        # *total* failure ("none") is never carried: it keeps its `error` so
+        # corruption is reported and the run exits non-zero.
         if e.get("metadata_source") == "exiftool":
             pv = prev.file.get(relpath)
-            # Preserve only when the prior entry holds richer values than the
-            # exiftool placeholders (`tiff`/`false`) — i.e. an authoritative
-            # nc-derived format or IR that the fallback would otherwise clobber.
-            if pv and (pv.get("format") not in (None, "tiff") or pv.get("ir_present") is True):
+            if (pv and pv.get("sha256") and pv["sha256"] == e.get("sha256")
+                    and (pv.get("format") not in (None, "tiff") or pv.get("ir_present") is True)):
                 for k in ("width", "height", "channels", "bits", "format", "ir_present"):
                     if k in pv:
                         e[k] = pv[k]
                 e.pop("metadata_source", None)
                 e.pop("error", None)
                 carried.append(relpath)
-        size = os.path.getsize(ap_)
-        e["bytes"] = size
         if "width" in e and "height" in e:
             e["megapixels"] = round(e["width"] * e["height"] / 1e6, 2)
-        s = hashed(relpath, size, regenerable)
-        if s:
-            e["sha256"] = s
         return e
+
+    def renamed_prev(by_sha: dict, sha: str | None) -> dict | None:
+        """A prior entry with this checksum whose old path is gone from disk — a
+        rename (preserve fields), not a copy (the original still exists → don't)."""
+        cand = by_sha.get(sha) if sha else None
+        if cand and not os.path.exists(os.path.join(A, cand["file"])):
+            return cand
+        return None
 
     m: dict = {
         "schema_version": 1,
@@ -240,9 +272,9 @@ def main() -> int:
             stem = os.path.splitext(fn)[0]
             r = rel("rolls", roll, fn)
             fm = meta(r)  # compute first so the checksum is available for identity
-            # Role preservation: by path, else by checksum (survives a rename —
-            # the skill advertises regeneration after renames), else seed, else real.
-            prevf = prev.file.get(r) or prev.frame_by_sha.get(fm.get("sha256")) or {}
+            # Role preservation: by path, else by checksum for a genuine rename
+            # (old path gone — not a copy), else seed, else real.
+            prevf = prev.file.get(r) or renamed_prev(prev.frame_by_sha, fm.get("sha256")) or {}
             role = prevf.get("role") or SEED_ROLES.get(roll, {}).get(stem) or "real"
             frames.append({"file": r, "role": role, **fm})
         entry = {"stock": prev.roll.get(roll, {}).get("stock")
@@ -264,13 +296,13 @@ def main() -> int:
                 for fn in list_imgs(sp):
                     sample_files.append(rel("samples", sub, fn))
     for r in sample_files:
-        prevf = prev.file.get(r, {})
         e = {"file": r, **meta(r)}
+        # kind/note preservation: by path, else by checksum for a genuine rename.
+        prevf = prev.file.get(r) or renamed_prev(prev.sample_by_sha, e.get("sha256")) or {}
         base = os.path.basename(r)
         seed = SEED_SAMPLE.get(base, {})
-        kind = prevf.get("kind") or seed.get("kind") or (
+        e["kind"] = prevf.get("kind") or seed.get("kind") or (
             "icc-embed-test" if "/icc/" in r else "sample")
-        e["kind"] = kind
         note = prevf.get("note") or seed.get("note")
         if note:
             e["note"] = note
@@ -366,6 +398,13 @@ def main() -> int:
     print("coverage_gaps:", m["coverage_gaps"] or "none")
     n_ex = sum(1 for e in _iter_meta(m) if e.get("metadata_source") == "exiftool")
     errs = [e for e in _iter_meta(m) if "error" in e]
+    unresolved = [o["file"] for b in m["converted"].values() for o in b["outputs"]
+                  if "source_frame" in o and o["source_frame"] is None]
+    if unresolved:
+        print(f"WARNING: {len(unresolved)} converted output(s) have an unresolved "
+              "source_frame (source renamed? stem mismatch?) — the nc↔NLP↔source "
+              "link is broken for: " + ", ".join(os.path.basename(u) for u in unresolved),
+              file=sys.stderr)
     if carried:
         print(f"note: carried forward authoritative nc metadata for {len(carried)} "
               "file(s) — this run used the exiftool fallback for them (nc missing/failed)",
