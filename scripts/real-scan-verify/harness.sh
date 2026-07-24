@@ -63,9 +63,9 @@ stage_freeze() {
     jmax=$($NC estimate --film-base "$dflag" --d-max-region "$freg" "$F" 2>"$ART/$roll.dmax.warn")
     dmax=$(echo "$jmax" | jq -r '.dmax')
     jq -n --argjson b "$dmin" --argjson d "$dmax" \
-      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},density:{dmax:{explicit:$d}}}' > "$REC/$roll.json"
+      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},reconstruction:{type:"density",curve:{type:"exponential",dmax:{explicit:$d}}}}' > "$REC/$roll.json"
     jq -n --argjson b "$dmin" --argjson d "$dmax" \
-      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},density:{dmax:{explicit:$d}},output:{hdr:true}}' > "$REC/$roll.hdr.json"
+      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},reconstruction:{type:"density",curve:{type:"exponential",dmax:{explicit:$d}}},output:{hdr:true}}' > "$REC/$roll.hdr.json"
     jq -n --arg roll "$roll" --arg uf "$uf" --arg ureg "$ureg" --arg ff "$ff" --arg freg "$freg" \
       --argjson b "$dmin" --argjson d "$dmax" \
       --arg mw "$(tr '\n' ' ' <"$ART/$roll.dmin.warn")" --arg xw "$(tr '\n' ' ' <"$ART/$roll.dmax.warn")" '{

@@ -1,285 +1,293 @@
-//! Pluggable negative→positive converters behind a [`Converter`] trait.
+//! Negative reconstruction and density curves (design-spec §7).
 //!
-//! The trait is finalized by the `algo-interface` task; `simple` and `density`
-//! are the two Step-1 implementations (density is the default), joined post-MVP
-//! by `sigmoid` (the density-domain S-curve, `algo-sigmoid`).
+//! The tagged [`Reconstruction`] config drives one of two paths — `simple`
+//! (direct inversion) or `density` (Dmin-normalized corrected density `D′`
+//! mapped through a tagged exponential or sigmoid curve) — and **every path
+//! returns the typed [`FilmRgbImage`] boundary**:
+//!
+//! ```text
+//! scan → Dmin normalization → corrected density D′   (density reconstruction)
+//!      → exponential | sigmoid density curve          (the curve stage)
+//!      → FilmRgbImage                                  (typed boundary)
+//! ```
+//!
+//! [`FilmRgbImage`]'s fields are private and its only constructor is
+//! `pub(in crate::algo)`, so [`reconstruct`]'s paths inside this module tree
+//! are the only producers — downstream stages that accept a `FilmRgbImage`
+//! (the future NC-film-RGB → ACEScg working-space mapper) can never be handed
+//! a raw scan or density buffer. [`finish_print`] is the **legacy no-preset
+//! bridge**: while the print controls still run before the output color
+//! transform (named presets later move them after the ACEScg boundary), it
+//! applies stage 4 to the film positive and returns the plain [`LinearImage`]
+//! the output transform consumes. The pixel arithmetic of
+//! `reconstruct → finish_print` is bit-identical to the pre-split monolithic
+//! converters (pinned by the golden fixtures in `pipeline::stages`, `mod
+//! golden`).
 
 pub mod density;
 pub mod sigmoid;
 pub mod simple;
 
-use std::str::FromStr;
+use crate::types::{FilmBase, LinearImage, PrintParams, Reconstruction, Result, WbSource};
 
-use crate::algo::density::Density;
-use crate::algo::sigmoid::Sigmoid;
-use crate::algo::simple::Simple;
-use crate::types::{
-    DensityParams, FilmBase, LinearImage, NcError, PrintParams, Result, SigmoidParams, SimpleParams,
-};
-
-/// A negative→positive conversion algorithm. Implementations are pure: given the
-/// decoded image and the estimated film base, they produce a positive image in
-/// the linear working space (print rendering stays a separate sub-stage).
+/// The typed film-rendering RGB boundary every reconstruction path produces:
+/// the unclamped linear positive in NC's film-rendering interpretation, plus
+/// the carried-through IR plane. Fields are **private** and the constructor is
+/// `pub(in crate::algo)`, so only the `algo` module tree's reconstruction
+/// paths can mint one — a raw scan or density buffer cannot impersonate film
+/// RGB downstream (the working-space mapper accepts `FilmRgbImage`, nothing
+/// else).
 ///
-/// The trait is deliberately object-safe (no associated `Params` type, params
-/// live in the implementor) so [`build`] can hand back a `Box<dyn Converter>` and
-/// the rest of the pipeline stays algorithm-agnostic. (The design-spec §7.2
-/// sketch shows an associated-type variant; that is not object-safe and this task
-/// supersedes it.)
-pub trait Converter {
-    /// Convert `image` to a positive, using `base` as the `Dmin` anchor.
-    fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
+/// Values are deliberately unclamped (HDR/scene-headroom preserved; range
+/// clamping happens only at the u16 encode step) and may be non-finite when
+/// the input was (fail-loud propagation to `io::encode`'s counters).
+///
+/// `Debug` prints only the dimensions (never the pixel buffers) — it exists so
+/// `Result<FilmRgbImage, _>` works with `unwrap_err`/`expect` in tests.
+pub struct FilmRgbImage {
+    width: u32,
+    height: u32,
+    /// Interleaved `r,g,b` positive, `len == width * height * 3`.
+    rgb: Vec<f32>,
+    /// Carried-through IR plane (HDRi input), `len == width * height`.
+    ir: Option<Vec<f32>>,
+}
 
-    /// Convert and surface optional per-conversion diagnostics for the JSON report.
-    ///
-    /// This is the value-path a resolved-anchor (`Dmax`) or similar diagnostic
-    /// rides back on — analogous to how `io::encode` returns an `EncodeReport`
-    /// alongside its result: the algorithm *surfaces* values, the orchestrator
-    /// *reports* them. It is a reporting channel, not a new control knob (controls
-    /// still live in the param structs), so widening it doesn't reopen the
-    /// object-safety / associated-`Params` question the trait settled.
-    ///
-    /// The default runs [`Converter::convert`] and reports nothing, so algorithms
-    /// with no diagnostics (e.g. `simple`) need not implement it.
-    fn convert_reported(
-        &self,
-        image: &LinearImage,
-        base: &FilmBase,
-    ) -> Result<(LinearImage, ConvertReport)> {
-        Ok((self.convert(image, base)?, ConvertReport::default()))
+impl FilmRgbImage {
+    /// Sole constructor — restricted to the `algo` module tree (note:
+    /// `pub(super)` would NOT do this: `algo` is a top-level module, so its
+    /// `super` is the crate root and `pub(super)` would be crate-wide), so
+    /// [`reconstruct`]'s paths are the only producers. Takes an
+    /// already-validated [`LinearImage`] so the buffer length invariants hold
+    /// by construction.
+    pub(in crate::algo) fn from_linear(image: LinearImage) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            rgb: image.rgb,
+            ir: image.ir,
+        }
+    }
+
+    // The read accessors below are the boundary's inspection API. `rgb` is
+    // consumed by the legacy print finishing; `width`/`height`/`ir` are only
+    // exercised by tests until the `film-rgb-working-space` mapper (the type's
+    // designed consumer) lands — a narrow documented allow per the house rule.
+    #[allow(dead_code)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[allow(dead_code)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Read-only view of the interleaved film positive.
+    pub fn rgb(&self) -> &[f32] {
+        &self.rgb
+    }
+
+    /// Read-only view of the carried IR plane, when the input had one.
+    #[allow(dead_code)]
+    pub fn ir(&self) -> Option<&[f32]> {
+        self.ir.as_deref()
+    }
+
+    /// Unwrap into the plain working-space image type — the **read** direction
+    /// of the boundary, for the legacy no-preset path (and, later, the
+    /// working-space mapper). Constructing a `FilmRgbImage` stays restricted;
+    /// reading one out is not the invariant the type protects.
+    pub(crate) fn into_linear(self) -> LinearImage {
+        // The fields came from a validated LinearImage and are never resized,
+        // so the invariants hold; route through the validated constructor
+        // anyway (its checks are O(1)) so a future regression fails loudly.
+        LinearImage::new(self.width, self.height, self.rgb, self.ir)
+            .expect("FilmRgbImage preserves the validated buffer-length invariants")
     }
 }
 
-/// Optional per-conversion diagnostics an algorithm may surface for the JSON
-/// report (see [`Converter::convert_reported`]). Empty by default.
+impl std::fmt::Debug for FilmRgbImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilmRgbImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("ir", &self.ir.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Diagnostics the reconstruction stage surfaces for the JSON report — the
+/// resolved values, not new knobs (controls live in [`Reconstruction`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct ConvertReport {
-    /// The resolved display-white anchor density (`Dmax`) the density render used,
-    /// when one was applied. `None` for algorithms/config that don't anchor
-    /// (`simple`, or `density` with `dmax = none`).
+pub struct ReconstructionReport {
+    /// The resolved display-white anchor density (`Dmax`) the curve used.
+    /// `None` for `simple` (no curve stage) and for the exponential curve with
+    /// `dmax = none` (unity placement).
     pub dmax: Option<f32>,
-    /// The resolved stage-4 white-balance gains `[r, g, b]` the density print
-    /// render applied — the explicit gains, or the auto-estimated ones
-    /// (`print.white_balance = gray-world | percentile`). Reported so a roll can
-    /// freeze one frame's estimate into a recipe / `--white-balance` (measure
-    /// once, reuse). `None` for algorithms without the print stage (`simple`).
-    pub white_balance: Option<[f32; 3]>,
     /// The resolved regional-balance tone-ramp range `[lo, hi]` (corrected
-    /// density), when the density algorithm applied a shadow/highlight balance.
-    /// `None` for `simple` or when both balances are the neutral `[0, 0, 0]`.
-    /// Reported so a roll can reuse one frame's measured range via
-    /// `--balance-range` (design-spec §9).
+    /// density), when a shadow/highlight balance was applied. `None` for
+    /// `simple` or when both balances are the neutral `[0, 0, 0]`.
     pub balance_range: Option<[f32; 2]>,
 }
 
-/// The shipped Step-1 algorithms. `density` is the default.
-///
-/// The wired CLI/recipe surface standardized on the identical
-/// [`crate::types::Algorithm`] (a neutral type with no `algo` dependency), so
-/// the Step-1 binary doesn't consume this copy — it survives as the `algo`
-/// module's own selector, exercised by the tests here and by `AlgoParams`.
-/// Unifying the two enums is a follow-up cleanup.
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Algorithm {
-    /// Channel-inversion baseline (debug / B&W).
-    Simple,
-    /// Density-domain inversion (Cineon / negadoctor style). The default.
-    #[default]
-    Density,
-    /// Density-domain S-curve (H&D / paper-response) tone mapping.
-    Sigmoid,
-}
-
-impl FromStr for Algorithm {
-    type Err = NcError;
-
-    /// Parse the `--algorithm` value. Unknown names fail loudly as
-    /// [`NcError::Usage`] (exit 2) rather than silently defaulting.
-    fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "simple" => Ok(Algorithm::Simple),
-            "density" => Ok(Algorithm::Density),
-            "sigmoid" => Ok(Algorithm::Sigmoid),
-            _ => Err(NcError::Usage(format!(
-                "unknown algorithm '{s}' (expected: simple|density|sigmoid)"
-            ))),
+/// Stage 3 — reconstruct the negative into the typed film positive
+/// (design-spec §7): pure `(input, config) -> output`, dispatching on the
+/// tagged [`Reconstruction`]. Every supported path returns [`FilmRgbImage`];
+/// the IR plane is carried through untouched (Step-1 rule: preserve, don't
+/// consume). Total in its inputs: a degenerate film base or an unusable curve
+/// anchor surfaces as an [`NcError`](crate::types::NcError), never a
+/// silently-wrong image.
+pub fn reconstruct(
+    image: &LinearImage,
+    base: &FilmBase,
+    config: &Reconstruction,
+) -> Result<(FilmRgbImage, ReconstructionReport)> {
+    match config {
+        Reconstruction::Simple => Ok((
+            simple::reconstruct(image, base)?,
+            ReconstructionReport::default(),
+        )),
+        Reconstruction::Density { density, curve } => {
+            density::reconstruct(image, base, density, curve)
         }
     }
 }
 
-/// Per-algorithm parameter sets, tagged by the selected algorithm. Each variant
-/// carries exactly the params its converter consumes; `Density` carries both
-/// sub-stages' params (density correction + the separate print render).
-#[derive(Clone, Debug, PartialEq)]
-pub enum AlgoParams {
-    Simple(SimpleParams),
-    Density {
-        density: DensityParams,
-        print: PrintParams,
-    },
-    /// `sigmoid` shares stages 1–2 (`density`, whose `density_gamma` it ignores)
-    /// and stage 4 (`print`) with the density algorithm; `sigmoid` parameterizes
-    /// its replacement stage-3 S-curve.
-    Sigmoid {
-        density: DensityParams,
-        sigmoid: SigmoidParams,
-        print: PrintParams,
-    },
-}
-
-impl AlgoParams {
-    /// The algorithm this parameter set selects. Not consumed by the Step-1
-    /// orchestrator (it derives the report's algorithm from the resolved config
-    /// directly); kept as part of the `AlgoParams` API and exercised by tests.
-    #[allow(dead_code)]
-    pub fn algorithm(&self) -> Algorithm {
-        match self {
-            AlgoParams::Simple(_) => Algorithm::Simple,
-            AlgoParams::Density { .. } => Algorithm::Density,
-            AlgoParams::Sigmoid { .. } => Algorithm::Sigmoid,
+/// Stage 4, legacy placement — resolve the print white-balance gains and run
+/// the print render on the reconstructed film positive; `simple` has no print
+/// stage, so its typed positive passes through unchanged. Returns the finished
+/// linear image plus the resolved gains (`None` when no print stage ran) for
+/// the JSON report.
+///
+/// This is the **no-preset bridge**: the print controls still run here, before
+/// the output color transform, exactly as the pre-split converters ordered
+/// them — named output presets later move these controls after the ACEScg
+/// working-space boundary (`film-master-render-pipeline`), behind a
+/// `pipeline_version` bump owned by `conversion-versioning`.
+///
+/// An auto WB mode ([`WbSource::GrayWorld`]/[`Percentile`](WbSource::Percentile))
+/// is estimated from a deterministic strided sample of the film positive — the
+/// same values the pre-split code produced by toning a strided sample of the
+/// density buffer (a per-sample map commutes with striding) — and applied
+/// through the standard stage-4 slot, so reusing the reported gains via
+/// `--white-balance` reproduces the output bit-for-bit.
+pub fn finish_print(
+    film: FilmRgbImage,
+    config: &Reconstruction,
+    print: &PrintParams,
+) -> Result<(LinearImage, Option<[f32; 3]>)> {
+    match config {
+        // `simple` consumes no print controls (`cli::validate` rejects the auto
+        // WB modes for it, and the explicit controls are inert as before).
+        Reconstruction::Simple => Ok((film.into_linear(), None)),
+        Reconstruction::Density { .. } => {
+            let wb = match print.white_balance {
+                WbSource::Explicit(gains) => gains,
+                auto_mode => {
+                    let sampled = density::sample_positive(film.rgb());
+                    density::estimate_wb_gains(&sampled, auto_mode)?
+                }
+            };
+            Ok((density::render_print(film, wb, print), Some(wb)))
         }
-    }
-}
-
-/// Build a boxed converter from its parameter set.
-///
-/// The `AlgoParams` variant *is* the algorithm selector (see
-/// [`AlgoParams::algorithm`]), so construction is **total** — there is no
-/// separate algorithm argument that could disagree with the params, hence no
-/// failure mode and no `Result`. The CLI resolves `--algorithm` plus the
-/// per-algorithm flags into a single `AlgoParams` (rejecting contradictory flags
-/// there, where the flag context lives for a good error message); everything
-/// below that boundary receives an already-valid value.
-///
-/// Takes `params` **by value** — the converter stores them, so it owns them
-/// outright (no clone). A caller that still needs the params afterward (e.g. to
-/// emit them in the JSON report) should clone at the call site.
-pub fn build(params: AlgoParams) -> Box<dyn Converter> {
-    match params {
-        AlgoParams::Simple(params) => Box::new(Simple { params }),
-        AlgoParams::Density { density, print } => Box::new(Density { density, print }),
-        AlgoParams::Sigmoid {
-            density,
-            sigmoid,
-            print,
-        } => Box::new(Sigmoid {
-            density,
-            sigmoid,
-            print,
-        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{DensityCurve, DensityParams, ExponentialParams, SigmoidParams};
 
-    #[test]
-    fn from_str_parses_known_algorithms() {
-        assert_eq!(Algorithm::from_str("simple").unwrap(), Algorithm::Simple);
-        assert_eq!(Algorithm::from_str("density").unwrap(), Algorithm::Density);
-        assert_eq!(Algorithm::from_str("sigmoid").unwrap(), Algorithm::Sigmoid);
+    fn image() -> LinearImage {
+        LinearImage::new(
+            2,
+            1,
+            vec![0.5, 0.3, 0.2, 0.05, 0.03, 0.02],
+            Some(vec![0.25, 0.75]),
+        )
+        .unwrap()
+    }
+
+    fn base() -> FilmBase {
+        FilmBase::from([0.9, 0.55, 0.42])
+    }
+
+    /// Every supported reconstruction config for exhaustive path checks.
+    fn all_configs() -> [Reconstruction; 3] {
+        [
+            Reconstruction::Simple,
+            Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Exponential(ExponentialParams::default()),
+            },
+            Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Sigmoid(SigmoidParams::default()),
+            },
+        ]
     }
 
     #[test]
-    fn from_str_rejects_unknown_name_as_usage() {
-        let err = Algorithm::from_str("filmic").unwrap_err();
-        assert_eq!(err.exit_code(), 2); // NcError::Usage
+    fn every_path_returns_a_film_rgb_image_and_preserves_ir() {
+        // The type-level boundary: each supported config produces a
+        // `FilmRgbImage` (enforced by `reconstruct`'s signature — this test
+        // exercises all paths) with the dimensions and IR plane intact.
+        for config in all_configs() {
+            let (film, _) = reconstruct(&image(), &base(), &config).unwrap();
+            assert_eq!((film.width(), film.height()), (2, 1), "{config:?}");
+            assert_eq!(film.rgb().len(), 6, "{config:?}");
+            assert_eq!(film.ir(), Some(&[0.25_f32, 0.75][..]), "{config:?}");
+            // The read direction round-trips losslessly.
+            let linear = film.into_linear();
+            assert_eq!((linear.width, linear.height), (2, 1));
+            assert_eq!(linear.ir.as_deref(), Some(&[0.25_f32, 0.75][..]));
+        }
+    }
+
+    // `FilmRgbImage`'s construction privacy is enforced by the compiler:
+    // `from_linear` is `pub(in crate::algo)`, so no code outside the `algo`
+    // module tree can mint one — the working-space mapper can only receive
+    // what `reconstruct` produced. (A compile-fail test would need a
+    // `trybuild` dev-dependency; the privacy annotation is the guarantee.)
+
+    #[test]
+    fn simple_reports_no_curve_diagnostics() {
+        let (_, report) = reconstruct(&image(), &base(), &Reconstruction::Simple).unwrap();
+        assert_eq!(report, ReconstructionReport::default());
     }
 
     #[test]
-    fn default_algorithm_is_density() {
-        assert_eq!(Algorithm::default(), Algorithm::Density);
-    }
-
-    #[test]
-    fn algorithm_serializes_lowercase() {
-        assert_eq!(
-            serde_json::to_string(&Algorithm::Density).unwrap(),
-            "\"density\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Algorithm::Simple).unwrap(),
-            "\"simple\""
-        );
-        assert_eq!(
-            serde_json::to_string(&Algorithm::Sigmoid).unwrap(),
-            "\"sigmoid\""
-        );
-    }
-
-    /// A trivial implementor proving the trait is object-safe and callable
-    /// through `Box<dyn Converter>` (returns the input unchanged).
-    struct Identity;
-    impl Converter for Identity {
-        fn convert(&self, image: &LinearImage, _base: &FilmBase) -> Result<LinearImage> {
-            Ok(image.clone())
+    fn density_paths_report_their_resolved_anchor() {
+        for config in &all_configs()[1..] {
+            let (_, report) = reconstruct(&image(), &base(), config).unwrap();
+            // Both curves default to the fixed nominal anchor.
+            assert_eq!(report.dmax, Some(density::NOMINAL_DMAX), "{config:?}");
+            assert_eq!(report.balance_range, None, "{config:?}");
         }
     }
 
     #[test]
-    fn trait_is_object_safe() {
-        let converter: Box<dyn Converter> = Box::new(Identity);
-        let img = LinearImage::new(1, 1, vec![0.1, 0.2, 0.3], None).unwrap();
-        let base = FilmBase::from([1.0, 1.0, 1.0]);
-        let out = converter.convert(&img, &base).unwrap();
-        assert_eq!(out.rgb, img.rgb);
-    }
+    fn finish_print_passes_simple_through_and_prints_density() {
+        // Simple: no print stage — the positive passes through bit-identically
+        // and no gains are reported, even with non-default print params.
+        let (film, _) = reconstruct(&image(), &base(), &Reconstruction::Simple).unwrap();
+        let expected = film.rgb().to_vec();
+        let print = PrintParams {
+            print_exposure: 1.0,
+            ..PrintParams::default()
+        };
+        let (out, wb) = finish_print(film, &Reconstruction::Simple, &print).unwrap();
+        assert_eq!(out.rgb, expected);
+        assert_eq!(wb, None);
 
-    #[test]
-    fn build_constructs_a_converter_for_each_variant() {
-        // Smoke test: both variants build without panicking. `Converter` isn't
-        // `Debug`, so we just exercise construction (and prove the match is
-        // exhaustive over `AlgoParams`).
-        let _simple = build(AlgoParams::Simple(SimpleParams::default()));
-        let _density = build(AlgoParams::Density {
-            density: DensityParams::default(),
-            print: PrintParams::default(),
-        });
-        let _sigmoid = build(AlgoParams::Sigmoid {
-            density: DensityParams::default(),
-            sigmoid: SigmoidParams::default(),
-            print: PrintParams::default(),
-        });
-    }
-
-    #[test]
-    fn algo_params_reports_its_algorithm() {
-        assert_eq!(
-            AlgoParams::Simple(SimpleParams::default()).algorithm(),
-            Algorithm::Simple
-        );
-        assert_eq!(
-            AlgoParams::Density {
-                density: DensityParams::default(),
-                print: PrintParams::default(),
-            }
-            .algorithm(),
-            Algorithm::Density
-        );
-        assert_eq!(
-            AlgoParams::Sigmoid {
-                density: DensityParams::default(),
-                sigmoid: SigmoidParams::default(),
-                print: PrintParams::default(),
-            }
-            .algorithm(),
-            Algorithm::Sigmoid
-        );
-    }
-
-    #[test]
-    fn from_str_agrees_with_serde_wire_form() {
-        // `FromStr` and serde's `rename_all = "lowercase"` map the same strings to
-        // the same variants, but are written independently — pin them together so
-        // adding a variant can't let the two drift apart.
-        for algo in [Algorithm::Simple, Algorithm::Density, Algorithm::Sigmoid] {
-            let wire = serde_json::to_string(&algo).unwrap(); // e.g. "\"simple\""
-            let name = wire.trim_matches('"');
-            assert_eq!(Algorithm::from_str(name).unwrap(), algo);
-            assert_eq!(serde_json::from_str::<Algorithm>(&wire).unwrap(), algo);
-        }
+        // Density: the print stage runs (2^1 exposure doubles every sample)
+        // and the resolved (explicit, neutral) gains are reported.
+        let config = all_configs()[1].clone();
+        let (film, _) = reconstruct(&image(), &base(), &config).unwrap();
+        let expected: Vec<f32> = film.rgb().iter().map(|v| v * 2.0).collect();
+        let (out, wb) = finish_print(film, &config, &print).unwrap();
+        assert_eq!(out.rgb, expected);
+        assert_eq!(wb, Some([1.0, 1.0, 1.0]));
     }
 }

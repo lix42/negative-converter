@@ -2974,8 +2974,34 @@ verified findings applied:
   rejects any non-default resolved adjustment.
 
 ## negative-reconstruction-density-curves
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** done
+**Updated:** 2026-07-24
+
+- 2026-07-24: Reviewed via the two-engine review-fix-loop (Codex + 5 pr-review
+  lenses: quality, tests, types, silent-failure, comments). Bit-identity was
+  independently proven — a reviewer re-ran the pre-refactor code at HEAD and
+  matched all 9 golden configs + 4 whole-TIFF hashes bit-for-bit. Five findings
+  fixed: `FilmRgbImage::from_linear` `pub(super)`→`pub(in crate::algo)` (the
+  boundary invariant was crate-wide, not module-private) + corrected the
+  overclaiming doc-comments; `merge_json` now handles internally-tagged
+  `reconstruction`/`curve` type switches in roll per-frame overrides
+  (`internally_tagged_switch`), carrying the shared roll-fixed `dmax` — matching
+  the CLI `merge()` semantics; +3 golden fixtures (auto-WB × regional balance,
+  auto-WB × sigmoid, auto balance-range); fixed a golden cross-ref comment; and
+  corrected the stale CLAUDE.md §9 legacy-schema carve-out. Loop converged, the
+  merge_json delta got a targeted re-review (sound). Rebased onto origin/main
+  (past #48 HDR, #49 telemetry, #50 display-p3); clean auto-merge, gates green
+  (325 unit incl. #50's tests + 86 integration). Shipped via /ship.
+- 2026-07-24: CI (Linux) surfaced a non-portable golden: `tiff_hash` hashed the
+  whole encoded TIFF including the embedded ICC, whose header carries
+  platform-dependent bytes (Little CMS), so the macOS-captured hash failed on CI
+  even though every per-pixel `f32::to_bits` golden passed there (pixels are
+  bit-identical cross-platform). Retargeted it to `tiff_pixels_hash`: decode the
+  written TIFF back and hash only the pixel samples + dimensions, excluding the
+  ICC/container. This matches nc's actual determinism contract (byte-identity is
+  per build/architecture, design-spec §8) while still pinning the encode
+  quantization/layout. Test renamed to
+  `golden_no_preset_encoded_pixels_are_unchanged`.
 
 - 2026-07-23: Defined tagged `simple` and `density` reconstruction. Density owns
   its parameters and a tagged `exponential { gamma }` or
@@ -2997,6 +3023,102 @@ verified findings applied:
   The bit-identical refactor/no-preset compatibility does not claim a behavioral
   bump; `conversion-versioning` owns the prospective bump when named-preset
   activation and simple reordering change default pixels.
+- 2026-07-23 (implementation): **Golden-first refactor.** Before touching any
+  code, captured pre-refactor outputs as bit-level fixtures: per-pixel
+  `f32::to_bits` for nine converter configurations (density exponential
+  default/custom/none/auto-dmax, sigmoid default/custom, simple default, and
+  both auto-WB modes) over a 5-pixel shadow/mid/highlight/out-of-range/base
+  vector, plus FNV-1a byte hashes of four whole encoded TIFFs (density/simple/
+  sigmoid u16 + density f32) from a synthetic 16×16 negative. These live as
+  `pipeline::stages::golden` tests (`golden_*`, incl.
+  `golden_no_preset_tiff_bytes_are_unchanged`) and all pass against the split
+  pipeline — the bit-identical default-exponential / numerically-exact-sigmoid
+  acceptance gate, and the proof this task claims no `pipeline_version` bump.
+- 2026-07-23: **Structure shipped.** `types.rs` gained the tagged
+  `Reconstruction` (custom serde: always emits `schema_version: 1` + `type`;
+  wire structs give named cross-variant-key errors and reject unknown fields at
+  every level; omitted curve normalizes to tagged exponential defaults) with
+  `DensityParams {scale, offset, shadow_balance, highlight_balance,
+  balance_range}`, `ExponentialParams {gamma, dmax}`, `SigmoidParams
+  {contrast, toe, shoulder, dmax}` under `DensityCurve`. `algo::` replaced the
+  `Converter` trait / `AlgoParams` with pure `reconstruct(image, base, config)
+  -> (FilmRgbImage, ReconstructionReport)` — `FilmRgbImage` has private fields
+  and a `pub(super)` constructor, so the reconstruction module is its only
+  producer — plus `finish_print` (the legacy stage-4 bridge; simple passes
+  through untouched). The old fused density render was split into `apply_curve`
+  (stage 3, mints the typed boundary) + `render_print` (stage 4); auto-WB now
+  strides the film positive instead of toning a strided density sample
+  (bit-identical: a per-sample map commutes with striding — pinned by
+  `golden_auto_wb_estimation_is_bit_identical`).
+- 2026-07-23: **Simple WB/clip removed from reconstruction.** Interpreting
+  "downstream, named-presets only": simple reconstruction ends at the unclamped
+  `1 − scan/Dmin` (bit-identical to the old default since the removed controls'
+  defaults were the exact identity), and `--invert-white-balance` /
+  `--clip-low` / `--clip-high` plus the `simple.*` recipe keys are **rejected
+  with migration errors** pointing at the future `print.white_balance` /
+  `print.linear_range` homes — an unreleased tool must not keep a control whose
+  placement is about to change. Customized values are inexpressible until
+  preset migration (loud, never silently different pixels).
+- 2026-07-23: **CLI/recipe surface.** `--reconstruction simple|density` +
+  `--density-curve exponential|sigmoid`; every existing flag remapped exactly
+  per the spec (`--density-scale/-offset` ⇒ `reconstruction.density.scale/
+  .offset`, regional-balance flags ⇒ same-named density fields,
+  `--density-gamma` ⇒ `curve.gamma`, sigmoid flags ⇒ `curve.{contrast,toe,
+  shoulder}`, the four Dmax flags ⇒ `curve.dmax`). `merge` became fallible:
+  invalid tagged combinations (density/curve/Dmax flags with simple, sigmoid
+  flags under exponential, `--density-gamma` under sigmoid — flag presence, not
+  value) are post-merge usage errors naming the offending flag; a curve switch
+  via `--density-curve` carries the roll-fixed `dmax` across variants.
+  `--algorithm` and the legacy `algorithm`/`density`/`sigmoid`/`simple` recipe
+  keys are rejected with migration errors (`reject_removed_flags` /
+  `reject_legacy_recipe_keys`, shared with roll per-frame overrides).
+- 2026-07-23: **Report & telemetry.** The convert report gained `recipe` (the
+  effective config — so `recipe.reconstruction` is the exact tagged schema) and
+  `reconstruction_result` (`{"type":"simple"}` or density with `curve.dmax =
+  {policy, value, provenance}`; policy `fixed|explicit|auto|none`, provenance
+  `default|recipe|cli|auto-frame` — `auto` always reports `auto-frame`, the
+  master-incompatibility marker). Recipe-vs-default provenance is witnessed
+  from the raw JSON at load (`LoadedRecipe.curve_dmax_present`), since a recipe
+  that wrote `"fixed"` is indistinguishable post-defaulting. Telemetry
+  `SCHEMA_VERSION` bumped to 2: `conversion.algorithm` → `conversion.
+  reconstruction` + optional `conversion.curve` (skill + design-spec §9 record
+  examples updated). `estimate`'s `d_max_recipe` fragment keeps its
+  `{"dmax":{"explicit":…}}` shape but now documents/tests the
+  `reconstruction.curve` destination.
+- 2026-07-23: **Docs.** design-spec §2/§4/§6/§7/§8/§9/§10/§12 flipped from
+  "current legacy vs target" to shipped-tagged-schema framing (examples, the
+  interface sketch — `reconstruct`/`finish_print` shipped, `map_nc_film_rgb_v1`
+  still target — and the §9 reconstruction-select section; the "Current shipped
+  keys" callout is gone). NOTE for the main-tree merge: `CLAUDE.md`'s
+  architecture section still describes the `Converter` trait and
+  `algo/{simple,density}` two-algorithm framing — update it there (kept
+  untouched here since the main tree owns it).
+- 2026-07-23: **For `film-rgb-working-space`:** the mapper's input contract is
+  ready — `algo::FilmRgbImage` (private fields; read via `width/height/rgb/ir`,
+  consume via `pub(crate) into_linear`; construction only inside `algo`), and
+  `algo::finish_print` is the seam to displace: the mapper slots between
+  `reconstruct` and the print controls once presets move stage 4 after ACEScg.
+  The report's `working_mapping` field (design-spec §8 example) was deliberately
+  left to that task.
+- 2026-07-23 (review fixes): (1) `FilmRgbImage::from_linear` visibility bug —
+  `pub(super)` on a top-level module is crate-wide; now `pub(in crate::algo)`
+  (real construction restriction) with the overclaiming doc-comments corrected.
+  (2) `merge_json` gained `internally_tagged_switch`: a per-frame roll override
+  that changes `reconstruction.type` or `curve.type` now replaces the tagged
+  object instead of deep-merging a rejected union, carrying the base's `dmax`
+  when the overlay doesn't set it — the same roll-fixed-anchor semantics the
+  CLI `merge` gives `--density-curve` (tests:
+  `merge_json_switches_internally_tagged_type_and_carries_dmax`,
+  `per_frame_override_switches_variants_and_keeps_the_roll_fixed_dmax`).
+  (3) Three golden gaps closed (captured from the proven pipeline): auto-WB ×
+  regional balance, auto-WB × sigmoid curve, and `BalanceRange::Auto` with
+  non-zero balances (`golden_auto_wb_with_regional_balance_is_bit_identical`,
+  `golden_auto_wb_with_sigmoid_curve_is_bit_identical`,
+  `golden_auto_measured_balance_range_is_bit_identical`). (4) `algo/mod.rs`
+  module doc now points at `pipeline::stages` `mod golden` for the fixtures.
+  (5) CLAUDE.md's §9 recipe carve-out corrected in place: the tagged schema is
+  shipped and the legacy forms are rejected (flagged for the user's manual
+  review — it edits project instructions).
 
 ## film-rgb-working-space
 **Status:** not started

@@ -90,21 +90,34 @@ impl From<FilmBase> for [f32; 3] {
     }
 }
 
-/// Negative→positive algorithm selector (design-spec §9, `--algorithm`).
+/// Reconstruction-type selector (design-spec §9, `--reconstruction` /
+/// `reconstruction.type`).
 ///
 /// A neutral selector that mirrors the CLI/recipe key, like the param structs —
 /// it does not depend on the `algo` implementations. Serializes lowercase
-/// (`"simple"` / `"density"` / `"sigmoid"`) and parses the same on the CLI via
-/// `ValueEnum`.
+/// (`"simple"` / `"density"`) and parses the same on the CLI via `ValueEnum`.
+/// The full tagged configuration is [`Reconstruction`]; this is only its `type`
+/// discriminator (the wire tag, the CLI value, and the telemetry summary).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
-pub enum Algorithm {
+pub enum ReconstructionType {
     /// Channel-inversion baseline (debug / B&W).
     Simple,
-    /// Density-domain inversion (Cineon / negadoctor) — the default.
+    /// Density-domain reconstruction (Cineon / negadoctor) — the default.
     #[default]
     Density,
-    /// Density-domain S-curve (photographic H&D / paper-response) tone mapping.
+}
+
+/// Density-curve selector (design-spec §9, `--density-curve` /
+/// `reconstruction.curve.type`). Like [`ReconstructionType`], only the `type`
+/// discriminator of the tagged [`DensityCurve`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DensityCurveType {
+    /// The straight-line `10^(gamma·(D′ − Dmax))` curve — the default.
+    #[default]
+    Exponential,
+    /// The S-curve (photographic H&D / paper-response) with toe/shoulder knees.
     Sigmoid,
 }
 
@@ -380,19 +393,17 @@ pub enum BalanceRange {
     Explicit([f32; 2]),
 }
 
-/// Density-domain algorithm knobs (design-spec §9, `algorithm = density`).
+/// Density-reconstruction knobs (design-spec §9, `reconstruction.density`) —
+/// everything that shapes the corrected density `D′` (stages 1–2). The
+/// density→positive curve (gamma / contrast / `Dmax`) is deliberately **not**
+/// here: it belongs to the tagged [`DensityCurve`], the separate curve stage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DensityParams {
     /// Per-channel density gain `[r, g, b]`.
-    pub density_scale: [f32; 3],
+    pub scale: [f32; 3],
     /// Per-channel density offset `[r, g, b]` (orange-mask compensation).
-    pub density_offset: [f32; 3],
-    /// Film/print curve gamma.
-    pub density_gamma: f32,
-    /// Display-white anchor source (default `fixed`). Applied in the render
-    /// sub-stage at the density→linear boundary, beside `density_gamma`.
-    pub dmax: DmaxSource,
+    pub offset: [f32; 3],
     /// Per-channel density offset `[r, g, b]` applied to the **positive's
     /// shadows** (low scalar tone density; the region near the film base).
     /// A positive value brightens that channel there — pushes the region toward
@@ -411,10 +422,8 @@ pub struct DensityParams {
 impl Default for DensityParams {
     fn default() -> Self {
         Self {
-            density_scale: [1.0, 1.0, 1.0],
-            density_offset: [0.0, 0.0, 0.0],
-            density_gamma: 1.0,
-            dmax: DmaxSource::Fixed,
+            scale: [1.0, 1.0, 1.0],
+            offset: [0.0, 0.0, 0.0],
             shadow_balance: [0.0, 0.0, 0.0],
             highlight_balance: [0.0, 0.0, 0.0],
             balance_range: BalanceRange::Auto,
@@ -526,20 +535,42 @@ impl Default for PrintParams {
     }
 }
 
-/// Sigmoid / H&D-curve algorithm knobs (design-spec §7.3/§9,
-/// `algorithm = sigmoid`).
-///
-/// The sigmoid algorithm shares stages 1–2 (and [`DensityParams`]'s
-/// `density_scale` / `density_offset` / `dmax`) and stage 4 ([`PrintParams`])
-/// with `density`; these knobs parameterize only its replacement stage 3, the
-/// S-curve mapping corrected density to positive linear. `density_gamma` is the
-/// straight-line curve's contrast and is **ignored** under `sigmoid` —
-/// `contrast` here is the analogous knob.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Exponential-curve knobs (design-spec §7.2/§9,
+/// `reconstruction.curve.type = "exponential"`): the straight-line
+/// `10^(gamma·(D′ − Dmax))` density→positive mapping. The curve owns the
+/// display-white placement — for the exponential curve `Dmax` is the scalar
+/// exponent placement (`"none"` = unity placement, base → `1.0`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExponentialParams {
+    /// Film/print curve gamma (the straight line's slope).
+    pub gamma: f32,
+    /// Display-white anchor source (default `fixed`). `"none"` (unity
+    /// placement) is valid only for this curve — the sigmoid is anchored on
+    /// `[0, Dmax]` and cannot run without one.
+    pub dmax: DmaxSource,
+}
+
+impl Default for ExponentialParams {
+    fn default() -> Self {
+        Self {
+            gamma: 1.0,
+            dmax: DmaxSource::Fixed,
+        }
+    }
+}
+
+/// Sigmoid-curve knobs (design-spec §7.3/§9,
+/// `reconstruction.curve.type = "sigmoid"`): the S-curve mapping corrected
+/// density to positive linear. It shares the density-reconstruction stage
+/// ([`DensityParams`]) with the exponential curve; `contrast` is the `gamma`
+/// analogue (gamma itself exists only in the exponential variant), and `Dmax`
+/// here is a curve-shaping input — both knees derive from it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SigmoidParams {
-    /// Mid-density slope of the curve in log-output space (the `density_gamma`
-    /// analogue). Must be finite and > 0.
+    /// Mid-density slope of the curve in log-output space (the exponential
+    /// `gamma` analogue). Must be finite and > 0.
     pub contrast: f32,
     /// Toe (shadow) knee width in log10 density units: how softly the curve
     /// approaches paper black. `0` disables the toe (hard straight-line black).
@@ -547,6 +578,9 @@ pub struct SigmoidParams {
     /// Shoulder (highlight) knee width in log10 density units: how softly the
     /// curve approaches display white. `0` disables the shoulder.
     pub shoulder: f32,
+    /// Display-white anchor source (default `fixed`). `"none"` is rejected for
+    /// this curve (`cli::validate`) — the S-curve is anchored on `[0, Dmax]`.
+    pub dmax: DmaxSource,
 }
 
 impl Default for SigmoidParams {
@@ -555,28 +589,310 @@ impl Default for SigmoidParams {
             contrast: 1.0,
             toe: 0.2,
             shoulder: 0.2,
+            dmax: DmaxSource::Fixed,
         }
     }
 }
 
-/// Simple inversion-baseline knobs (design-spec §9, `algorithm = simple`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SimpleParams {
-    /// White-balance gains applied to the inverted result `[r, g, b]`.
-    pub invert_white_balance: [f32; 3],
-    /// Low clip point.
-    pub clip_low: f32,
-    /// High clip point.
-    pub clip_high: f32,
+/// The tagged density→positive curve (design-spec §8/§9,
+/// `reconstruction.curve`): exactly one of the two curve variants, each carrying
+/// its own knobs plus the `Dmax` placement it owns. Serializes internally tagged
+/// (`{"type":"exponential","gamma":…,"dmax":…}`); the custom `Deserialize`
+/// mirrors that while rejecting cross-variant keys **by name** (e.g. `contrast`
+/// under `exponential`) with a loud usage message instead of serde's generic
+/// unknown-field error, and fills each variant's defaults for omitted fields.
+/// The `type` tag is required whenever a `curve` object is present; only a fully
+/// *omitted* `reconstruction.curve` defaults (to this enum's default —
+/// exponential with its defaults).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DensityCurve {
+    Exponential(ExponentialParams),
+    Sigmoid(SigmoidParams),
 }
 
-impl Default for SimpleParams {
+impl Default for DensityCurve {
     fn default() -> Self {
-        Self {
-            invert_white_balance: [1.0, 1.0, 1.0],
-            clip_low: 0.0,
-            clip_high: 1.0,
+        DensityCurve::Exponential(ExponentialParams::default())
+    }
+}
+
+impl DensityCurve {
+    /// This curve's `type` discriminator (wire tag / CLI value).
+    pub fn curve_type(&self) -> DensityCurveType {
+        match self {
+            DensityCurve::Exponential(_) => DensityCurveType::Exponential,
+            DensityCurve::Sigmoid(_) => DensityCurveType::Sigmoid,
+        }
+    }
+
+    /// The display-white anchor source this curve carries. One accessor instead
+    /// of per-variant field reads, so `Dmax` policy code (merge, validate,
+    /// reports) can stay variant-agnostic.
+    pub fn dmax(&self) -> DmaxSource {
+        match self {
+            DensityCurve::Exponential(e) => e.dmax,
+            DensityCurve::Sigmoid(s) => s.dmax,
+        }
+    }
+
+    /// Mutable access to the anchor source — the single write point the merge
+    /// uses for the four `--*d-max` flags, whichever variant is resolved.
+    pub fn dmax_mut(&mut self) -> &mut DmaxSource {
+        match self {
+            DensityCurve::Exponential(e) => &mut e.dmax,
+            DensityCurve::Sigmoid(s) => &mut s.dmax,
+        }
+    }
+}
+
+/// Extract an optional field from a raw recipe object, distinguishing an **absent**
+/// key (`Ok(None)`) from a **present** one (`Ok(Some(v))`) — including a present
+/// explicit `null`, which is not a valid value for any of these typed fields and
+/// so errors loudly rather than reading as "absent". A plain `Option<T>` struct
+/// field cannot make this distinction (serde collapses JSON `null` to `None`), so
+/// the tagged deserializers below capture the raw object and use key *presence* to
+/// reject a cross-variant key or a null discriminator that would otherwise be
+/// silently ignored / defaulted.
+fn take_recipe_field<T: serde::de::DeserializeOwned>(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<Option<T>, String> {
+    match obj.get(key) {
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+impl<'de> Deserialize<'de> for DensityCurve {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // Capture the raw object so a cross-variant key is detected by *presence*,
+        // not by its value: a plain `Option<f32>` field turns an explicit `null`
+        // into `None`, indistinguishable from an absent key, and would silently
+        // accept e.g. `{"type":"exponential","contrast":null}` instead of rejecting
+        // the invalid tagged combination. `type` is still required — a
+        // present-but-untagged curve object must not guess a variant.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("reconstruction.curve must be a JSON object"))?;
+
+        const KNOWN: [&str; 6] = ["type", "gamma", "contrast", "toe", "shoulder", "dmax"];
+        if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+            return Err(D::Error::custom(format!(
+                "unknown field `{k}` in reconstruction.curve"
+            )));
+        }
+
+        let curve_type: DensityCurveType = take_recipe_field(obj, "type")
+            .map_err(D::Error::custom)?
+            .ok_or_else(|| {
+                D::Error::custom(
+                    "reconstruction.curve is missing `type` (\"exponential\" or \"sigmoid\")",
+                )
+            })?;
+        let dmax: Option<DmaxSource> = take_recipe_field(obj, "dmax").map_err(D::Error::custom)?;
+
+        match curve_type {
+            DensityCurveType::Exponential => {
+                if let Some(key) = ["contrast", "toe", "shoulder"]
+                    .into_iter()
+                    .find(|k| obj.contains_key(*k))
+                {
+                    return Err(D::Error::custom(format!(
+                        "`{key}` is a sigmoid-curve key, but the curve type is \
+                         \"exponential\" (its knobs are `gamma` and `dmax`)"
+                    )));
+                }
+                let d = ExponentialParams::default();
+                Ok(DensityCurve::Exponential(ExponentialParams {
+                    gamma: take_recipe_field(obj, "gamma")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.gamma),
+                    dmax: dmax.unwrap_or(d.dmax),
+                }))
+            }
+            DensityCurveType::Sigmoid => {
+                if obj.contains_key("gamma") {
+                    return Err(D::Error::custom(
+                        "`gamma` is an exponential-curve key, but the curve type is \
+                         \"sigmoid\" (the mid-density slope analogue is `contrast`)",
+                    ));
+                }
+                let d = SigmoidParams::default();
+                Ok(DensityCurve::Sigmoid(SigmoidParams {
+                    contrast: take_recipe_field(obj, "contrast")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.contrast),
+                    toe: take_recipe_field(obj, "toe")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.toe),
+                    shoulder: take_recipe_field(obj, "shoulder")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.shoulder),
+                    dmax: dmax.unwrap_or(d.dmax),
+                }))
+            }
+        }
+    }
+}
+
+/// Wire schema version of the tagged `reconstruction` recipe/report object
+/// (design-spec §8). Versions the **schema shape only** — it is not the
+/// behavioral `pipeline_version` (owned by the `conversion-versioning` task,
+/// bumped only when default pixels change). Every resolved recipe/report emits
+/// it; partial input may omit it (defaults to this value); any other value is
+/// rejected loudly.
+pub const RECONSTRUCTION_SCHEMA_VERSION: u32 = 1;
+
+/// The tagged reconstruction configuration (design-spec §8/§9, the recipe's one
+/// `reconstruction` object): `simple` (direct inversion, no further knobs) or
+/// `density` (density correction plus exactly one tagged [`DensityCurve`]).
+///
+/// One enum, not parallel section fields, so an illegal combination (simple
+/// with a curve, two algorithms at once) is unrepresentable — the tagged-enum
+/// convention `FilmBaseSource`/`DmaxSource` established, applied to the
+/// algorithm selection itself. The custom serde keeps the documented wire shape
+/// exactly: `schema_version` + `type` always emitted; `density`/`curve` emitted
+/// for (and accepted only with) `type = "density"`; omitted sections fill their
+/// defaults (an omitted `curve` normalizes to tagged exponential defaults, so
+/// omission never survives into a resolved recipe or report).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Reconstruction {
+    /// Channel-inversion baseline (debug / B&W): the direct unclamped positive
+    /// `1 − scan/Dmin`. No density or curve configuration.
+    Simple,
+    /// Density-domain reconstruction (the default): corrected density `D′`
+    /// (stages 1–2, `density`) mapped through the tagged `curve`.
+    Density {
+        density: DensityParams,
+        curve: DensityCurve,
+    },
+}
+
+impl Default for Reconstruction {
+    fn default() -> Self {
+        Reconstruction::Density {
+            density: DensityParams::default(),
+            curve: DensityCurve::default(),
+        }
+    }
+}
+
+impl Reconstruction {
+    /// This configuration's `type` discriminator (wire tag / CLI value).
+    pub fn reconstruction_type(&self) -> ReconstructionType {
+        match self {
+            Reconstruction::Simple => ReconstructionType::Simple,
+            Reconstruction::Density { .. } => ReconstructionType::Density,
+        }
+    }
+
+    /// The resolved curve's type, when this is a density reconstruction
+    /// (`None` for `simple` — it has no curve stage).
+    pub fn curve_type(&self) -> Option<DensityCurveType> {
+        match self {
+            Reconstruction::Simple => None,
+            Reconstruction::Density { curve, .. } => Some(curve.curve_type()),
+        }
+    }
+}
+
+impl Serialize for Reconstruction {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        match self {
+            Reconstruction::Simple => {
+                let mut st = serializer.serialize_struct("Reconstruction", 2)?;
+                st.serialize_field("schema_version", &RECONSTRUCTION_SCHEMA_VERSION)?;
+                st.serialize_field("type", "simple")?;
+                st.end()
+            }
+            Reconstruction::Density { density, curve } => {
+                let mut st = serializer.serialize_struct("Reconstruction", 4)?;
+                st.serialize_field("schema_version", &RECONSTRUCTION_SCHEMA_VERSION)?;
+                st.serialize_field("type", "density")?;
+                st.serialize_field("density", density)?;
+                st.serialize_field("curve", curve)?;
+                st.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Reconstruction {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        // Capture the raw object so `type` presence is distinguished from a present
+        // explicit `null`: with `Option<ReconstructionType>`, `{"type":null}` would
+        // collapse to `None` and silently default to density, and `type:"simple"`
+        // would accept a null `density`/`curve` section. Presence-checking rejects
+        // those malformed recipes loudly instead.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("reconstruction must be a JSON object"))?;
+
+        const KNOWN: [&str; 4] = ["schema_version", "type", "density", "curve"];
+        if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+            return Err(D::Error::custom(format!(
+                "unknown field `{k}` in reconstruction"
+            )));
+        }
+
+        if let Some(v) =
+            take_recipe_field::<u32>(obj, "schema_version").map_err(D::Error::custom)?
+            && v != RECONSTRUCTION_SCHEMA_VERSION
+        {
+            return Err(D::Error::custom(format!(
+                "unsupported reconstruction.schema_version {v} \
+                 (this build reads schema_version {RECONSTRUCTION_SCHEMA_VERSION})"
+            )));
+        }
+
+        // `type` present-but-null errors here (null is not a valid tag); absent
+        // defaults to density.
+        let reconstruction_type: ReconstructionType = take_recipe_field(obj, "type")
+            .map_err(D::Error::custom)?
+            .unwrap_or_default();
+        match reconstruction_type {
+            ReconstructionType::Simple => {
+                if let Some(key) = ["density", "curve"]
+                    .into_iter()
+                    .find(|k| obj.contains_key(*k))
+                {
+                    return Err(D::Error::custom(format!(
+                        "reconstruction.type = \"simple\" takes no `{key}` section — \
+                         density correction and density curves belong to \
+                         `type = \"density\"`"
+                    )));
+                }
+                Ok(Reconstruction::Simple)
+            }
+            ReconstructionType::Density => Ok(Reconstruction::Density {
+                density: take_recipe_field(obj, "density")
+                    .map_err(D::Error::custom)?
+                    .unwrap_or_default(),
+                // An omitted curve normalizes to tagged exponential defaults —
+                // omission never survives into a resolved recipe.
+                curve: take_recipe_field(obj, "curve")
+                    .map_err(D::Error::custom)?
+                    .unwrap_or_default(),
+            }),
         }
     }
 }
@@ -706,10 +1022,8 @@ mod tests {
     #[test]
     fn density_params_json_round_trip() {
         let params = DensityParams {
-            density_scale: [1.2, 1.0, 0.8],
-            density_offset: [0.1, 0.0, -0.05],
-            density_gamma: 0.6,
-            dmax: DmaxSource::Explicit(1.8),
+            scale: [1.2, 1.0, 0.8],
+            offset: [0.1, 0.0, -0.05],
             shadow_balance: [0.05, 0.0, -0.02],
             highlight_balance: [-0.05, 0.01, 0.0],
             balance_range: BalanceRange::Explicit([0.25, 1.75]),
@@ -769,11 +1083,14 @@ mod tests {
     }
 
     #[test]
-    fn density_params_default_dmax_is_fixed() {
+    fn curve_default_dmax_is_fixed() {
         // The default anchor is the roll-fixed nominal `Fixed`, not the demoted
         // per-frame `Auto` (dmax-reference): the faithful-conversion default must
-        // not normalize exposure per frame.
-        assert_eq!(DensityParams::default().dmax, DmaxSource::Fixed);
+        // not normalize exposure per frame. Both curve variants own a `dmax` and
+        // both default it to `Fixed`.
+        assert_eq!(ExponentialParams::default().dmax, DmaxSource::Fixed);
+        assert_eq!(SigmoidParams::default().dmax, DmaxSource::Fixed);
+        assert_eq!(DensityCurve::default().dmax(), DmaxSource::Fixed);
     }
 
     #[test]
@@ -787,34 +1104,161 @@ mod tests {
     }
 
     #[test]
-    fn sigmoid_params_json_round_trip_and_partial_defaults() {
-        let params = SigmoidParams {
+    fn curve_json_round_trips_both_tagged_variants() {
+        let exponential = DensityCurve::Exponential(ExponentialParams {
+            gamma: 1.4,
+            dmax: DmaxSource::Explicit(1.8),
+        });
+        let sigmoid = DensityCurve::Sigmoid(SigmoidParams {
             contrast: 1.3,
             toe: 0.1,
             shoulder: 0.4,
-        };
-        let json = serde_json::to_string(&params).unwrap();
+            dmax: DmaxSource::Auto,
+        });
+        for curve in [exponential, sigmoid] {
+            let json = serde_json::to_string(&curve).unwrap();
+            assert_eq!(serde_json::from_str::<DensityCurve>(&json).unwrap(), curve);
+        }
+        // The wire form is internally tagged with the documented key names.
         assert_eq!(
-            serde_json::from_str::<SigmoidParams>(&json).unwrap(),
-            params
+            serde_json::to_string(&DensityCurve::default()).unwrap(),
+            r#"{"type":"exponential","gamma":1.0,"dmax":"fixed"}"#
         );
-        // A partial section fills the remaining defaults.
-        let p: SigmoidParams = serde_json::from_str(r#"{"contrast":2.0}"#).unwrap();
-        assert_eq!(p.contrast, 2.0);
-        assert_eq!(p.toe, SigmoidParams::default().toe);
-        assert_eq!(p.shoulder, SigmoidParams::default().shoulder);
     }
 
     #[test]
-    fn algorithm_serializes_sigmoid_lowercase() {
+    fn curve_partial_input_fills_variant_defaults_but_requires_the_tag() {
+        // A tagged-but-partial curve fills that variant's defaults.
+        let c: DensityCurve = serde_json::from_str(r#"{"type":"sigmoid","contrast":2.0}"#).unwrap();
         assert_eq!(
-            serde_json::to_string(&Algorithm::Sigmoid).unwrap(),
-            "\"sigmoid\""
+            c,
+            DensityCurve::Sigmoid(SigmoidParams {
+                contrast: 2.0,
+                ..SigmoidParams::default()
+            })
         );
+        let c: DensityCurve = serde_json::from_str(r#"{"type":"exponential"}"#).unwrap();
+        assert_eq!(c, DensityCurve::default());
+        // A present-but-untagged curve object must not guess a variant.
+        assert!(serde_json::from_str::<DensityCurve>(r#"{"gamma":1.2}"#).is_err());
+    }
+
+    #[test]
+    fn curve_rejects_cross_variant_keys_by_name() {
+        // Sigmoid-only keys under exponential are named in the error, not
+        // silently ignored and not a generic unknown-field message.
+        for json in [
+            r#"{"type":"exponential","contrast":2.0}"#,
+            r#"{"type":"exponential","toe":0.1}"#,
+            r#"{"type":"exponential","shoulder":0.1}"#,
+        ] {
+            let err = serde_json::from_str::<DensityCurve>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("sigmoid-curve key"),
+                "unexpected error for {json}: {err}"
+            );
+        }
+        // …and gamma under sigmoid points at `contrast`.
+        let err =
+            serde_json::from_str::<DensityCurve>(r#"{"type":"sigmoid","gamma":1.2}"#).unwrap_err();
+        assert!(err.to_string().contains("contrast"), "{err}");
+        // A key belonging to neither variant is still an unknown field.
+        assert!(
+            serde_json::from_str::<DensityCurve>(r#"{"type":"exponential","gama":1.2}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn tagged_recipes_reject_null_valued_cross_variant_and_tag_keys() {
+        // A present-but-null cross-variant key must be rejected by *presence*, not
+        // silently read as absent (the trap a plain `Option<f32>`/`Option<T>` field
+        // would fall into: serde collapses JSON `null` to `None`).
+        let err = serde_json::from_str::<DensityCurve>(r#"{"type":"exponential","contrast":null}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("sigmoid-curve key"), "{err}");
+        assert!(
+            serde_json::from_str::<DensityCurve>(r#"{"type":"sigmoid","gamma":null}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("exponential-curve key")
+        );
+        // A null discriminator must not silently default to density…
+        assert!(serde_json::from_str::<Reconstruction>(r#"{"type":null}"#).is_err());
+        // …and a null forbidden section under `simple` must still be rejected.
+        let err = serde_json::from_str::<Reconstruction>(r#"{"type":"simple","density":null}"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("takes no `density`"), "{err}");
+        assert!(
+            serde_json::from_str::<Reconstruction>(r#"{"type":"simple","curve":null}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn reconstruction_serializes_the_documented_tagged_shapes() {
+        // `schema_version` + `type` always emitted; simple carries nothing else.
         assert_eq!(
-            serde_json::from_str::<Algorithm>("\"sigmoid\"").unwrap(),
-            Algorithm::Sigmoid
+            serde_json::to_string(&Reconstruction::Simple).unwrap(),
+            r#"{"schema_version":1,"type":"simple"}"#
         );
+        // Density always emits its blocks and exactly one tagged curve — an
+        // omitted input curve never survives normalization.
+        let json = serde_json::to_value(Reconstruction::default()).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["type"], "density");
+        assert_eq!(json["density"]["scale"], serde_json::json!([1.0, 1.0, 1.0]));
+        assert_eq!(json["curve"]["type"], "exponential");
+    }
+
+    #[test]
+    fn reconstruction_partial_input_normalizes() {
+        // Empty object = all defaults: density with exponential defaults.
+        let r: Reconstruction = serde_json::from_str("{}").unwrap();
+        assert_eq!(r, Reconstruction::default());
+        // Omitted schema_version defaults to 1; an explicit 1 also parses.
+        let r: Reconstruction = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
+        assert_eq!(r, Reconstruction::default());
+        // Omitted curve under density normalizes to tagged exponential defaults.
+        let r: Reconstruction =
+            serde_json::from_str(r#"{"type":"density","density":{"scale":[1.1,1.0,0.9]}}"#)
+                .unwrap();
+        assert_eq!(
+            r,
+            Reconstruction::Density {
+                density: DensityParams {
+                    scale: [1.1, 1.0, 0.9],
+                    ..DensityParams::default()
+                },
+                curve: DensityCurve::default(),
+            }
+        );
+        // Round trip: resolved → JSON → resolved is identity for both types.
+        for r in [
+            Reconstruction::Simple,
+            Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Sigmoid(SigmoidParams::default()),
+            },
+        ] {
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(serde_json::from_str::<Reconstruction>(&json).unwrap(), r);
+        }
+    }
+
+    #[test]
+    fn reconstruction_rejects_bad_schema_version_and_illegal_combinations() {
+        // Any schema_version other than 1 is rejected loudly.
+        let err = serde_json::from_str::<Reconstruction>(r#"{"schema_version":2}"#).unwrap_err();
+        assert!(err.to_string().contains("schema_version"), "{err}");
+        // Simple takes no density/curve section.
+        for json in [
+            r#"{"type":"simple","density":{}}"#,
+            r#"{"type":"simple","curve":{"type":"exponential"}}"#,
+        ] {
+            let err = serde_json::from_str::<Reconstruction>(json).unwrap_err();
+            assert!(err.to_string().contains("simple"), "{json}: {err}");
+        }
+        // Unknown fields are rejected at the reconstruction level too.
+        assert!(serde_json::from_str::<Reconstruction>(r#"{"algorithm":"density"}"#).is_err());
     }
 
     #[test]

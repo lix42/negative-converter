@@ -34,10 +34,10 @@ and hardening work tracked in the task roadmap.
 
 ```sh
 # Convert a negative scan to a positive 16-bit TIFF.
-nc convert in.tiff -o out.tiff --algorithm density
+nc convert in.tiff -o out.tiff --reconstruction density
 
 # Full HDR float output with explicit controls.
-nc convert in.tiff -o out.tiff --algorithm density --output-hdr \
+nc convert in.tiff -o out.tiff --reconstruction density --output-hdr \
   --film-base 0.92,0.55,0.42 --density-gamma 1.8 --print-exposure 0.0
 
 # Inspect a scan and emit machine-readable JSON.

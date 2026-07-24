@@ -1,16 +1,15 @@
-//! `sigmoid` — density-domain S-curve (photographic H&D / paper-response) tone
-//! mapping, the roadmap's third converter (design-spec §7.3).
+//! `sigmoid` — the density-domain S-curve (photographic H&D / paper-response)
+//! density curve (design-spec §7.3).
 //!
-//! Shares stages 1–2 ([`to_density`] + the [`regional_balance`] shadow/highlight
-//! color balance) and stage 4 (the [`render_print`] print render,
-//! [`PrintParams`]) with `density`; only stage 3 — the corrected-density
-//! → positive-linear curve — is replaced: the straight line `10^(γ·(D'−Dmax))`
-//! becomes an S-curve with toe/shoulder control. Density conversion and print
-//! rendering stay **separate** sub-stages (core fidelity rule). Because regional
-//! balance is a stage-2 operation on the corrected density, the
-//! `density.shadow_balance`/`highlight_balance` knobs apply under `sigmoid`
-//! exactly as under `density` (its `Auto` `Dmax` anchor is likewise measured
-//! from the *post-balance* densities).
+//! One of the two tagged [`DensityCurve`](crate::types::DensityCurve) variants:
+//! it shares density reconstruction (stages 1–2, [`super::density::to_density`]
+//! plus the regional balance) and the legacy stage-4 print render with the
+//! exponential curve; only stage 3 — the corrected-density → positive-linear
+//! curve — differs: the straight line `10^(contrast·(D'−Dmax))` becomes an
+//! S-curve with toe/shoulder control. Because regional balance is a stage-2
+//! operation on the corrected density, the `shadow_balance`/`highlight_balance`
+//! knobs apply under the sigmoid curve exactly as under exponential (an `Auto`
+//! `Dmax` anchor is likewise measured from the *post-balance* densities).
 //!
 //! ## Curve (per channel, in log₁₀-output space)
 //!
@@ -22,7 +21,7 @@
 //! lin = 10^v
 //! ```
 //!
-//! i.e. the `density` algorithm's straight line passed through two soft knees —
+//! i.e. the exponential curve's straight line passed through two soft knees —
 //! a **toe** compressing the approach to paper black, then a **shoulder**
 //! compressing the approach to display white.
 //!
@@ -38,8 +37,9 @@
 //! actually clips for a small anchor, e.g. `Dmax = 0.1`, default `toe = 0.2` →
 //! ≈ `1.056`; the reorder is the fix. `toe`/`shoulder` are the knee widths in log₁₀ density
 //! units; `contrast` is the mid-density slope in log-output space (the
-//! `density_gamma` analogue — `density_gamma` itself is **ignored** here; the
-//! orchestrator warns when it was customized).
+//! exponential `gamma` analogue — `gamma` itself exists only in the exponential
+//! variant, and supplying `--density-gamma` with a resolved sigmoid curve is a
+//! merge-time usage error, never ignored).
 //!
 //! Properties (pinned by tests):
 //! - **White (highlights):** with `shoulder > 0`, `lin` approaches display white
@@ -47,28 +47,29 @@
 //!   finite density — so the default u16 encode cannot clip highlights, for *any*
 //!   valid params (including a small `Dmax` or a low-contrast auto anchor). With
 //!   `shoulder = 0` there is no roll-off and highlights follow the (toe-shaped)
-//!   line, which *can* exceed `1.0` (like `density`).
+//!   line, which *can* exceed `1.0` (like the exponential curve).
 //! - **Black (shadows):** with `toe > 0`, `lin` approaches the paper-black floor
 //!   `10^(−contrast·Dmax)` as `D' → −∞` (the shoulder's effect on the floor is
 //!   negligible for realistic params; the floor is exactly `10^(−contrast·Dmax)`
 //!   when `shoulder = 0`).
-//! - **Reduction:** `toe = shoulder = 0` skips both knees and reproduces
-//!   `density`'s stage 3 **bit-for-bit** (`10^(contrast·(D'−Dmax))`), so `density`
-//!   stays the debuggable straight-line reference.
+//! - **Reduction:** `toe = shoulder = 0` skips both knees and reproduces the
+//!   exponential curve **bit-for-bit** (`10^(contrast·(D'−Dmax))`), so the
+//!   exponential stays the debuggable straight-line reference.
 //! - **Monotonic:** a composition of two monotone-increasing soft knees.
 //!
 //! **A positive anchor is required.** The S-curve is anchored on `[0, Dmax]` —
 //! both the white knee and the black floor (`F = −contrast·Dmax`) derive from a
-//! *positive* `Dmax` — so `density.dmax = none` (scene-referred, no anchor) and a
+//! *positive* `Dmax` — so `curve.dmax = none` (unity placement, no anchor) and a
 //! degenerate non-positive `Auto` anchor (an all-non-finite buffer, or a wrong
 //! film base that pushes most corrected densities negative) are both unusable:
 //! with `anchor ≤ 0` the floor sits at or above display white and every sample
 //! renders above `1.0` (a quietly-wrong all-white image). The CLI rejects the
-//! `none` case at `validate` (exit 2); [`Sigmoid::convert_reported`] guards the
-//! resolved anchor finite-and-positive and fails loudly (exit 1) for the `none`
+//! `none` case at `validate` (exit 2); [`apply_curve`] guards the resolved
+//! anchor finite-and-positive and fails loudly (exit 1) for the `none`
 //! programmatic path *and* the degenerate-`Auto` case (the CLAUDE.md film-base
-//! gotcha pattern). The anchor is resolved by the same [`resolve_dmax`] (`Auto`
-//! percentile / `Explicit`) as `density` — one measurement, not a second one.
+//! gotcha pattern). The anchor is resolved by the same
+//! [`resolve_dmax`](super::density::resolve_dmax) (`Auto` percentile /
+//! `Explicit`) as the exponential curve — one measurement, not a second one.
 //!
 //! **Interaction with `--highlight-compress`:** the print render's soft-clip
 //! also compresses highlights, but in linear space *after* exposure/WB; the
@@ -87,40 +88,21 @@
 //! overflowing `to_density`) is returned as-is *before* the knees, and a finite
 //! density whose knee math overflows to a non-finite `p` is surfaced too — because
 //! the bounded shoulder would otherwise map `+inf` to a clean `10^v = 1.0` and
-//! hide the fault from `io::encode`'s non-finite counter. `density` surfaces such
-//! blow-ups as `+inf`; `sigmoid` must not be quieter (pinned by tests). This means
-//! `10^v ≤ 1.0` is guaranteed only for *finite* stage-3 output — a non-finite
-//! sample rides through to the counter instead.
+//! hide the fault from `io::encode`'s non-finite counter. The exponential curve
+//! surfaces such blow-ups as `+inf`; the sigmoid must not be quieter (pinned by
+//! tests). This means `10^v ≤ 1.0` is guaranteed only for *finite* stage-3
+//! output — a non-finite sample rides through to the counter instead.
 
-use crate::algo::density::{
-    check_base, estimate_wb_gains, regional_balance, render_print, resolve_dmax,
-    sample_toned_positive, to_density,
-};
-use crate::algo::{ConvertReport, Converter};
-use crate::types::{
-    DensityParams, DmaxSource, FilmBase, LinearImage, NcError, PrintParams, Result, SigmoidParams,
-    WbSource,
-};
+use crate::algo::FilmRgbImage;
+use crate::algo::density::{DensityImage, resolve_dmax};
+use crate::types::{DmaxSource, NcError, Result, SigmoidParams};
 
-/// Sigmoid / H&D-curve converter.
-///
-/// Holds all three sub-stages' params: `density` (shared stages 1–2 plus the
-/// `dmax` anchor source; its `density_gamma` is ignored — `sigmoid.contrast` is
-/// the analogue), `sigmoid` (the stage-3 S-curve), and `print` (the separate
-/// stage-4 print render). Keeping them distinct fields preserves the
-/// density/print separation.
-pub struct Sigmoid {
-    pub density: DensityParams,
-    pub sigmoid: SigmoidParams,
-    pub print: PrintParams,
-}
-
-/// Upper bound on `sigmoid.contrast` (mid-density slope), enforced by the CLI
+/// Upper bound on `curve.contrast` (mid-density slope), enforced by the CLI
 /// `validate`. Beyond this the S-curve degenerates into a near-vertical hard
 /// black/white threshold whose knees launder the blow-out into a finite two-level
 /// image that trips neither the clip nor the non-finite counter — a silent
 /// destruction. `50` is far past any photographic H&D gamma (real curves are
-/// ~0.5–3); anyone wanting extreme contrast should use `--algorithm density`,
+/// ~0.5–3); anyone wanting extreme contrast should use the `exponential` curve,
 /// which surfaces the blow-out as `+inf`.
 ///
 /// **Scope of the cap (accepted tradeoff).** This and [`SIGMOID_KNEE_MAX`] reject
@@ -133,7 +115,7 @@ pub struct Sigmoid {
 /// false-positive on legitimate high-contrast conversions, so there isn't one.
 pub(crate) const SIGMOID_CONTRAST_MAX: f32 = 50.0;
 
-/// Upper bound on the knee widths `sigmoid.toe` / `sigmoid.shoulder` (log₁₀
+/// Upper bound on the knee widths `curve.toe` / `curve.shoulder` (log₁₀
 /// density units), enforced by the CLI `validate`. A huge *finite* width flattens
 /// the whole density range into a near-uniform tone — a giant shoulder crushes
 /// everything toward black, a giant toe lifts everything toward the floor — and,
@@ -158,7 +140,7 @@ fn log10_1p_pow10(y: f32) -> f32 {
 /// Stage 3 — the S-curve: corrected density `d` → positive linear, anchored on
 /// `[0, anchor]`. See the module doc for the formula and its properties. Pure and
 /// deterministic; `toe = 0` / `shoulder = 0` skip their knee exactly, so with
-/// both zero this is bit-identical to `density`'s `10^(contrast·(d − anchor))`.
+/// both zero this is bit-identical to the exponential `10^(contrast·(d − anchor))`.
 ///
 /// The knees are applied **toe then shoulder** so the shoulder — the soft-min
 /// with the white ceiling — runs last and the ceiling can't be lifted afterward
@@ -177,7 +159,8 @@ fn s_curve(d: f32, contrast: f32, toe: f32, shoulder: f32, anchor: f32) -> f32 {
     // huge `--density-scale`/`--density-offset` overflowing `to_density`) must
     // *propagate* — the bounded knees would otherwise launder `+inf` into a clean
     // `10^v = 1.0`, hiding the numerical fault from `io::encode`'s non-finite
-    // counter. `density` surfaces this as `+inf`; `sigmoid` must not be quieter.
+    // counter. The exponential curve surfaces this as `+inf`; the sigmoid must not
+    // be quieter.
     if !d.is_finite() {
         return d;
     }
@@ -214,7 +197,7 @@ fn s_curve(d: f32, contrast: f32, toe: f32, shoulder: f32, anchor: f32) -> f32 {
 /// Actionable message for a missing / non-positive resolved anchor, pointing at
 /// the *actual* cause. Distinguishable cases (only reached on the error path, so
 /// the extra finite-scan is fine):
-/// - `None` → the anchor is disabled (`density.dmax = none` / `--no-d-max`).
+/// - `None` → the anchor is disabled (`curve.dmax = none` / `--no-d-max`).
 /// - `Some(≤0)` with **no finite densities** → corrupt / all-non-finite input
 ///   made `Auto` fall back to `0.0`; the base is a red herring.
 /// - `Some(≤0)`, `Explicit` source → a non-positive explicit `--d-max` (only
@@ -224,7 +207,7 @@ fn s_curve(d: f32, contrast: f32, toe: f32, shoulder: f32, anchor: f32) -> f32 {
 fn anchor_error(resolved: Option<f32>, source: DmaxSource, densities: &[f32]) -> String {
     match resolved {
         None => {
-            // The `None` message names `density.dmax = none`, which is sound only
+            // The `None` message names `curve.dmax = none`, which is sound only
             // because `resolve_dmax` returns `None` *iff* the source is `None`
             // (`Auto`/`Explicit` always return `Some`). Pin that so a future
             // `resolve_dmax` change can't silently misattribute this arm.
@@ -232,116 +215,82 @@ fn anchor_error(resolved: Option<f32>, source: DmaxSource, densities: &[f32]) ->
                 matches!(source, DmaxSource::None),
                 "anchor_error None arm assumes source == None, got {source:?}"
             );
-            "the sigmoid algorithm needs a display-white anchor (its tone curve is \
-             anchored on [0, Dmax]) but density.dmax is `none`; use --auto-d-max / \
-             --d-max <d>, or --algorithm density for scene-referred output"
+            "the sigmoid curve needs a display-white anchor (it is anchored on \
+             [0, Dmax]) but curve.dmax is `none`; use --auto-d-max / --d-max <d>, \
+             or --density-curve exponential for scene-referred output"
                 .to_string()
         }
         Some(a) if matches!(source, DmaxSource::Explicit(_)) => format!(
-            "the sigmoid algorithm needs a positive display-white anchor (its tone curve \
-             is anchored on [0, Dmax]) but the explicit --d-max is {a}; pass a finite \
-             positive density"
+            "the sigmoid curve needs a positive display-white anchor (it is anchored \
+             on [0, Dmax]) but the explicit --d-max is {a}; pass a finite positive \
+             density"
         ),
         Some(_) if !densities.iter().any(|d| d.is_finite()) => {
-            "the sigmoid algorithm needs a positive display-white anchor but no finite \
+            "the sigmoid curve needs a positive display-white anchor but no finite \
              corrected densities were found (the auto anchor fell back to 0.0) — the \
              input is likely corrupt or all-non-finite; check the scan"
                 .to_string()
         }
         Some(a) => format!(
-            "the sigmoid algorithm needs a positive display-white anchor (its tone curve \
-             is anchored on [0, Dmax]) but the auto-measured anchor is {a} — the film \
-             base is likely wrong (scene densities sit at/below it); measure a valid Dmin \
-             and pass --film-base / --base-region, or set --d-max <d>"
+            "the sigmoid curve needs a positive display-white anchor (it is anchored \
+             on [0, Dmax]) but the auto-measured anchor is {a} — the film base is \
+             likely wrong (scene densities sit at/below it); measure a valid Dmin and \
+             pass --film-base / --base-region, or set --d-max <d>"
         ),
     }
 }
 
-impl Converter for Sigmoid {
-    fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage> {
-        Ok(self.convert_reported(image, base)?.0)
-    }
-
-    fn convert_reported(
-        &self,
-        image: &LinearImage,
-        base: &FilmBase,
-    ) -> Result<(LinearImage, ConvertReport)> {
-        // Same precondition as `density`: `to_density` divides by the base.
-        // `contrast <= 0` has no runtime backstop here (unlike the anchor): it is
-        // a config-only value, fully validated at the CLI boundary (`validate`
-        // requires finite `0 < contrast <= SIGMOID_CONTRAST_MAX`), so a stage that
-        // trusts its inputs needs no re-check — the `s_curve` debug assert catches
-        // a programmatic caller that skipped `validate`.
-        check_base(base)?;
-        let mut density = to_density(image, base, &self.density);
-        // Regional balance completes stage 2 (shared with `density`) *before* the
-        // anchor is resolved, so an `Auto` `Dmax` is measured from the
-        // post-balance densities — the same ordering contract as `density`.
-        let balance_range = regional_balance(&mut density, &self.density)?;
-        // One anchor measurement, shared with `density`'s semantics. The S-curve
-        // is anchored on `[0, Dmax]` — its white knee and its black floor
-        // (`F = −contrast·anchor`) both derive from a *positive* anchor — so an
-        // absent, zero, or negative anchor is unusable: with `anchor ≤ 0` the
-        // floor sits at or above display white and every sample renders at/above
-        // `1.0`, a quietly-wrong all-white image. Guard finite-and-positive and
-        // fail loudly (the CLAUDE.md film-base gotcha pattern, mirroring
-        // `simple.rs`). `Explicit` is CLI-validated positive, so this only fires
-        // on `none` (config/programmatic) or a degenerate `Auto` measurement.
-        let resolved = resolve_dmax(&density.density, self.density.dmax);
-        let Some(anchor) = resolved.filter(|a| a.is_finite() && *a > 0.0) else {
-            return Err(NcError::Other(anchor_error(
-                resolved,
-                self.density.dmax,
-                &density.density,
-            )));
-        };
-        let SigmoidParams {
-            contrast,
-            toe,
-            shoulder,
-        } = self.sigmoid;
-        // Stage-3 S-curve. A `move` closure over the `Copy` curve params, so it is
-        // itself `Copy` and can be passed by value to both the WB sampling and the
-        // final render.
-        let tone = move |d: f32| s_curve(d, contrast, toe, shoulder, anchor);
-
-        // White balance: explicit gains apply directly; an auto mode is estimated
-        // from a neutral positive (unit gains, default print — no exposure / black
-        // point / soft-clip), which with those neutral params reduces stage 4 to
-        // the identity, so the neutral positive is just the stage-3 `tone`. We
-        // apply `tone` to only the strided sample of the density buffer (no
-        // full-image render, no clone) and hand that small buffer to the estimator,
-        // which no longer strides — bit-identical to rendering the whole neutral
-        // positive and striding it. The gains still apply through the *same*
-        // stage-4 slot in the final render, so reusing the reported gains via
-        // `--white-balance` is bit-identical (measure once, reuse for the roll).
-        // Shared with `density` via `sample_toned_positive` / `estimate_wb_gains`.
-        // (Regional balance already ran on `density` above, before the anchor.)
-        let wb = match self.print.white_balance {
-            WbSource::Explicit(gains) => gains,
-            auto_mode => {
-                let sampled = sample_toned_positive(&density.density, tone);
-                estimate_wb_gains(&sampled, auto_mode)?
-            }
-        };
-        let image = render_print(density, tone, wb, &self.print);
-        Ok((
-            image,
-            ConvertReport {
-                dmax: resolved,
-                white_balance: Some(wb),
-                balance_range,
-            },
-        ))
-    }
+/// Apply the sigmoid curve to a corrected-density image (stage 3): resolve the
+/// display-white anchor, guard it usable, and map every density through
+/// [`s_curve`] into the typed [`FilmRgbImage`]. Returns the resolved anchor for
+/// the report alongside the image.
+///
+/// `contrast <= 0` has no runtime backstop here (unlike the anchor): it is a
+/// config-only value, fully validated at the CLI boundary (`validate` requires
+/// finite `0 < contrast <= SIGMOID_CONTRAST_MAX`), so a stage that trusts its
+/// inputs needs no re-check — the `s_curve` debug assert catches a programmatic
+/// caller that skipped `validate`.
+pub(super) fn apply_curve(
+    density: DensityImage,
+    params: &SigmoidParams,
+) -> Result<(FilmRgbImage, Option<f32>)> {
+    // One anchor measurement, shared semantics with the exponential curve. The
+    // S-curve is anchored on `[0, Dmax]` — its white knee and its black floor
+    // (`F = −contrast·anchor`) both derive from a *positive* anchor — so an
+    // absent, zero, or negative anchor is unusable: with `anchor ≤ 0` the
+    // floor sits at or above display white and every sample renders at/above
+    // `1.0`, a quietly-wrong all-white image. Guard finite-and-positive and
+    // fail loudly (the CLAUDE.md film-base gotcha pattern, mirroring
+    // `simple.rs`). `Explicit` is CLI-validated positive, so this only fires
+    // on `none` (config/programmatic) or a degenerate `Auto` measurement.
+    let resolved = resolve_dmax(&density.density, params.dmax);
+    let Some(anchor) = resolved.filter(|a| a.is_finite() && *a > 0.0) else {
+        return Err(NcError::Other(anchor_error(
+            resolved,
+            params.dmax,
+            &density.density,
+        )));
+    };
+    let SigmoidParams {
+        contrast,
+        toe,
+        shoulder,
+        dmax: _,
+    } = *params;
+    let film = super::density::apply_curve(density, move |d| {
+        s_curve(d, contrast, toe, shoulder, anchor)
+    });
+    Ok((film, resolved))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::algo::density::Density;
-    use crate::types::BalanceRange;
+    use crate::algo::{finish_print, reconstruct};
+    use crate::types::{
+        BalanceRange, DensityCurve, DensityParams, ExponentialParams, FilmBase, LinearImage,
+        PrintParams, Reconstruction, WbSource,
+    };
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
         (a - b).abs() <= eps
@@ -357,12 +306,46 @@ mod tests {
         10f32.powf(contrast * (d - anchor))
     }
 
+    /// The result of a full sigmoid-path conversion.
+    #[derive(Debug)]
+    struct Converted {
+        out: LinearImage,
+        dmax: Option<f32>,
+        white_balance: Option<[f32; 3]>,
+        balance_range: Option<[f32; 2]>,
+    }
+
+    /// Run the full density path with a given curve (reconstruct + legacy print).
+    fn run(
+        img: &LinearImage,
+        base: &FilmBase,
+        density: DensityParams,
+        curve: DensityCurve,
+        print: PrintParams,
+    ) -> crate::types::Result<Converted> {
+        let config = Reconstruction::Density { density, curve };
+        let (film, rep) = reconstruct(img, base, &config)?;
+        let (out, white_balance) = finish_print(film, &config, &print)?;
+        Ok(Converted {
+            out,
+            dmax: rep.dmax,
+            white_balance,
+            balance_range: rep.balance_range,
+        })
+    }
+
+    /// The sigmoid curve with the given anchor source and knobs.
+    fn sigmoid_curve(dmax: DmaxSource, params: SigmoidParams) -> DensityCurve {
+        DensityCurve::Sigmoid(SigmoidParams { dmax, ..params })
+    }
+
     // --- the curve ---------------------------------------------------------
 
     #[test]
     fn s_curve_reduces_bit_exactly_to_the_straight_line_when_knees_off() {
         // toe = shoulder = 0 must be the identical expression, not merely close —
-        // `density` stays the debuggable reference (assert_eq on f32 bits).
+        // the exponential curve stays the debuggable reference (assert_eq on f32
+        // bits).
         for d in [-0.7, 0.0, 0.31, 1.0, 1.9, 3.5] {
             for (c, a) in [(1.0, 1.1), (1.7, 0.9), (0.6, 2.0)] {
                 assert_eq!(
@@ -468,7 +451,7 @@ mod tests {
     fn s_curve_shoulder_off_lets_highlights_exceed_white() {
         // The documented complement of the white-ceiling guarantee: with
         // `shoulder = 0` there is no roll-off, so a highlight above the anchor
-        // follows the (toe-shaped) line and *can* exceed 1.0 — like `density`.
+        // follows the (toe-shaped) line and *can* exceed 1.0 — like exponential.
         let (c, toe, a) = (1.2, 0.2, 1.1);
         let bright = s_curve(a + 1.0, c, toe, 0.0, a);
         assert!(
@@ -521,8 +504,8 @@ mod tests {
     fn s_curve_propagates_non_finite() {
         // A non-finite corrected density must come out non-finite (not laundered by
         // the bounded knees into a clean in-range sample) so io::encode's
-        // non-finite counter can surface it — `density` surfaces +inf, sigmoid must
-        // not be quieter. Covers NaN and BOTH infinities, knees on and off.
+        // non-finite counter can surface it — exponential surfaces +inf, sigmoid
+        // must not be quieter. Covers NaN and BOTH infinities, knees on and off.
         for (toe, sh) in [(0.2, 0.2), (0.0, 0.0)] {
             assert!(s_curve(f32::NAN, 1.2, toe, sh, 1.1).is_nan());
             assert!(!s_curve(f32::INFINITY, 1.2, toe, sh, 1.1).is_finite());
@@ -546,22 +529,11 @@ mod tests {
         assert!(approx(log10_1p_pow10(0.0), std::f32::consts::LOG10_2, 1e-6));
     }
 
-    // --- Converter ----------------------------------------------------------
-
-    fn sigmoid(dmax: DmaxSource, params: SigmoidParams) -> Sigmoid {
-        Sigmoid {
-            density: DensityParams {
-                dmax,
-                ..DensityParams::default()
-            },
-            sigmoid: params,
-            print: PrintParams::default(),
-        }
-    }
+    // --- the full reconstruction path --------------------------------------
 
     #[test]
-    fn convert_with_knees_off_matches_density_bit_exactly() {
-        // End-to-end reduction: contrast = density_gamma, toe = shoulder = 0, same
+    fn convert_with_knees_off_matches_exponential_bit_exactly() {
+        // End-to-end reduction: contrast = gamma, toe = shoulder = 0, same
         // explicit anchor ⇒ identical output bits (the whole shared path plus the
         // reduced stage 3 must line up, not just the curve in isolation).
         let base = FilmBase::from([0.6, 0.3, 0.18]);
@@ -574,32 +546,32 @@ mod tests {
         .unwrap();
         let gamma = 1.4;
         let dmax = DmaxSource::Explicit(1.2);
-        let sig = Sigmoid {
-            density: DensityParams {
-                density_gamma: 99.0, // must be ignored — contrast drives the curve
-                dmax,
-                ..DensityParams::default()
-            },
-            sigmoid: SigmoidParams {
+        let a = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            DensityCurve::Sigmoid(SigmoidParams {
                 contrast: gamma,
                 toe: 0.0,
                 shoulder: 0.0,
-            },
-            print: PrintParams::default(),
-        };
-        let den = Density {
-            density: DensityParams {
-                density_gamma: gamma,
                 dmax,
-                ..DensityParams::default()
-            },
-            print: PrintParams::default(),
-        };
-        let a = sig.convert(&img, &base).unwrap();
-        let b = den.convert(&img, &base).unwrap();
+            }),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
+        let b = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            DensityCurve::Exponential(ExponentialParams { gamma, dmax }),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
         assert_eq!(
             a.rgb, b.rgb,
-            "reduced sigmoid must equal density bit-for-bit"
+            "reduced sigmoid must equal exponential bit-for-bit"
         );
         assert_eq!(a.ir, b.ir);
     }
@@ -607,8 +579,8 @@ mod tests {
     #[test]
     fn regional_balance_applies_under_sigmoid() {
         // Regional balance is a shared stage-2 operation, so `--shadow-balance`
-        // etc. must take effect under `sigmoid` (not be a silent no-op) and must
-        // be reported. A crossover-injected shadow gets a non-zero shadow
+        // etc. must take effect under the sigmoid curve (not be a silent no-op)
+        // and must be reported. A crossover-injected shadow gets a non-zero shadow
         // balance; the output must differ from the neutral-balance sigmoid run,
         // and the reported range must be present.
         let base = FilmBase::from([0.6, 0.3, 0.18]);
@@ -618,70 +590,79 @@ mod tests {
             contrast: 1.4,
             toe: 0.1,
             shoulder: 0.2,
+            ..SigmoidParams::default()
         };
-        let neutral = sigmoid(dmax, params.clone());
-        let balanced = Sigmoid {
-            density: DensityParams {
-                dmax,
+        let neutral = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(dmax, params),
+            PrintParams::default(),
+        )
+        .unwrap();
+        let balanced = run(
+            &img,
+            &base,
+            DensityParams {
                 shadow_balance: [0.2, 0.0, -0.1],
                 highlight_balance: [-0.1, 0.05, 0.0],
                 ..DensityParams::default()
             },
-            sigmoid: params,
-            print: PrintParams::default(),
-        };
-        let (out_neutral, rep_neutral) = neutral.convert_reported(&img, &base).unwrap();
-        let (out_balanced, rep_balanced) = balanced.convert_reported(&img, &base).unwrap();
-        assert_eq!(
-            rep_neutral.balance_range, None,
-            "neutral: no range reported"
-        );
+            sigmoid_curve(dmax, params),
+            PrintParams::default(),
+        )
+        .unwrap();
+        assert_eq!(neutral.balance_range, None, "neutral: no range reported");
         assert!(
-            rep_balanced.balance_range.is_some(),
+            balanced.balance_range.is_some(),
             "balanced: range must be reported under sigmoid"
         );
         assert_ne!(
-            out_neutral.rgb, out_balanced.rgb,
+            neutral.out.rgb, balanced.out.rgb,
             "regional balance must change sigmoid output, not no-op"
         );
     }
 
     #[test]
-    fn regional_balance_composes_the_same_in_sigmoid_and_density() {
-        // With knees off, sigmoid reduces to density's straight line — and the
-        // shared regional-balance sub-stage must apply identically in both, so
+    fn regional_balance_composes_the_same_in_sigmoid_and_exponential() {
+        // With knees off, sigmoid reduces to the exponential straight line — and
+        // the shared regional-balance sub-stage must apply identically in both, so
         // the two produce bit-identical output for the same balance params. Pins
-        // that sigmoid reuses `regional_balance` rather than a divergent copy.
+        // that both curves share one `regional_balance` rather than a divergent
+        // copy.
         let base = FilmBase::from([0.6, 0.3, 0.18]);
         let img = LinearImage::new(2, 1, vec![0.5, 0.25, 0.15, 0.06, 0.03, 0.02], None).unwrap();
         let gamma = 1.4;
         let dmax = DmaxSource::Explicit(1.2);
         let density = DensityParams {
-            density_gamma: gamma,
-            dmax,
             shadow_balance: [0.15, 0.0, -0.05],
             highlight_balance: [-0.05, 0.02, 0.0],
             balance_range: BalanceRange::Explicit([0.2, 1.8]),
             ..DensityParams::default()
         };
-        let sig = Sigmoid {
-            density: DensityParams {
-                density_gamma: 99.0, // ignored — contrast drives the curve
-                ..density.clone()
-            },
-            sigmoid: SigmoidParams {
+        let a = run(
+            &img,
+            &base,
+            density.clone(),
+            DensityCurve::Sigmoid(SigmoidParams {
                 contrast: gamma,
                 toe: 0.0,
                 shoulder: 0.0,
-            },
-            print: PrintParams::default(),
-        };
-        let den = Density {
+                dmax,
+            }),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
+        let b = run(
+            &img,
+            &base,
             density,
-            print: PrintParams::default(),
-        };
-        let a = sig.convert(&img, &base).unwrap();
-        let b = den.convert(&img, &base).unwrap();
+            DensityCurve::Exponential(ExponentialParams { gamma, dmax }),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
         assert_eq!(
             a.rgb, b.rgb,
             "shared regional balance must match bit-for-bit"
@@ -692,19 +673,20 @@ mod tests {
     fn convert_requires_a_dmax_anchor() {
         // `dmax = none` cannot drive the S-curve: fail loudly (the CLI validate
         // rejects it earlier; this is the programmatic backstop).
-        let conv = sigmoid(DmaxSource::None, SigmoidParams::default());
-        let err = conv
-            .convert(
-                &pixel([0.2, 0.2, 0.2], None),
-                &FilmBase::from([0.6, 0.6, 0.6]),
-            )
-            .unwrap_err();
+        let err = run(
+            &pixel([0.2, 0.2, 0.2], None),
+            &FilmBase::from([0.6, 0.6, 0.6]),
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::None, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1);
         // Assert a `None`-branch-specific token (all three anchor_error messages
         // contain "anchor", so that alone wouldn't pin the None branch).
         assert!(
             err.to_string().contains("scene-referred"),
-            "None branch should point at scene-referred / density: {err}"
+            "None branch should point at scene-referred / exponential: {err}"
         );
     }
 
@@ -716,8 +698,14 @@ mod tests {
         // Guards the CLAUDE.md film-base gotcha for the anchor path.
         let base = FilmBase::from([0.2, 0.2, 0.2]);
         let img = LinearImage::new(2, 1, vec![0.8, 0.8, 0.8, 0.7, 0.7, 0.7], None).unwrap();
-        let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
-        let err = conv.convert(&img, &base).unwrap_err();
+        let err = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1);
         // Finite-but-wrong-base case → the message points at the film base.
         assert!(
@@ -727,14 +715,15 @@ mod tests {
         // A negative explicit anchor smuggled past the CLI (programmatic) also
         // fails, and the message blames the *explicit* value — not the film base
         // (LOW-7: the wrong-base wording would misattribute this).
-        let conv = sigmoid(DmaxSource::Explicit(-0.5), SigmoidParams::default());
-        let err = conv
-            .convert(
-                &pixel([0.2, 0.2, 0.2], None),
-                &FilmBase::from([0.6, 0.6, 0.6]),
-            )
-            .unwrap_err()
-            .to_string();
+        let err = run(
+            &pixel([0.2, 0.2, 0.2], None),
+            &FilmBase::from([0.6, 0.6, 0.6]),
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Explicit(-0.5), SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("explicit") && !err.contains("film base"),
             "explicit-anchor message should blame --d-max, not the base: {err}"
@@ -748,9 +737,18 @@ mod tests {
         // (valid) base (LOW-4: a misleading "measure a valid Dmin" would misdirect).
         let base = FilmBase::from([0.6, 0.6, 0.6]);
         let img = pixel([f32::NAN, f32::NAN, f32::NAN], None);
-        let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
-        let err = conv.convert(&img, &base).unwrap_err().to_string();
-        assert_eq!(conv.convert(&img, &base).unwrap_err().exit_code(), 1);
+        let run_it = || {
+            run(
+                &img,
+                &base,
+                DensityParams::default(),
+                sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+                PrintParams::default(),
+            )
+        };
+        let err = run_it().unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let err = err.to_string();
         assert!(
             err.contains("corrupt") || err.contains("non-finite"),
             "corrupt-input message should not blame the base: {err}"
@@ -763,7 +761,7 @@ mod tests {
 
     #[test]
     fn convert_propagates_non_finite_scan_to_output() {
-        // End-to-end through the converter: a non-finite scan sample → NaN
+        // End-to-end through the reconstruction: a non-finite scan sample → NaN
         // corrected density (to_density) → the curve must propagate it (not launder
         // it via the bounded shoulder) so it reaches the output for io::encode's
         // non-finite counter to surface. A CLI-driven overflow isn't constructible
@@ -773,8 +771,15 @@ mod tests {
         let base = FilmBase::from([0.6, 0.6, 0.6]);
         let img =
             LinearImage::new(2, 1, vec![0.2, 0.2, 0.2, f32::INFINITY, 0.2, 0.2], None).unwrap();
-        let conv = sigmoid(DmaxSource::Explicit(1.2), SigmoidParams::default());
-        let out = conv.convert(&img, &base).unwrap();
+        let out = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Explicit(1.2), SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
         assert!(
             !out.rgb[3].is_finite(),
             "non-finite scan must ride through to output, not be laundered: {}",
@@ -785,28 +790,39 @@ mod tests {
     }
 
     #[test]
-    fn convert_reported_surfaces_the_resolved_anchor() {
+    fn reconstruct_surfaces_the_resolved_anchor() {
         let base = FilmBase::from([0.6, 0.6, 0.6]);
         let img = pixel([0.2, 0.2, 0.2], None);
 
-        let conv = sigmoid(DmaxSource::Explicit(1.25), SigmoidParams::default());
-        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        let rep = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Explicit(1.25), SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap();
         assert_eq!(rep.dmax, Some(1.25));
         // The default (neutral) print reports its resolved gains too.
         assert_eq!(rep.white_balance, Some([1.0, 1.0, 1.0]));
 
-        let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
-        let (_, rep) = conv.convert_reported(&img, &base).unwrap();
+        let rep = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap();
         assert!(rep.dmax.is_some_and(f32::is_finite));
     }
 
     #[test]
     fn auto_wb_convert_neutralizes_a_cast_end_to_end() {
-        // Mirror of the density end-to-end test for the sigmoid path: a wrong
+        // Mirror of the exponential end-to-end test for the sigmoid curve: a wrong
         // (neutral) base leaves a constant per-channel cast in the positive, and
-        // both auto modes must estimate gains that equalize the channels. Exercises
-        // the sigmoid-owned estimate→apply orchestration (its own analysis pass).
-        // Knees off (toe = shoulder = 0) so stage 3 is the straight-line power form
+        // both auto modes must estimate gains that equalize the channels. Knees
+        // off (toe = shoulder = 0) so stage 3 is the straight-line power form
         // (which preserves the constant per-channel density offset across both
         // tones); with the S-curve's non-linear knees on, the two tones would map
         // by different channel ratios and per-pixel equalization wouldn't hold —
@@ -825,18 +841,20 @@ mod tests {
             ..SigmoidParams::default()
         };
         for mode in [WbSource::GrayWorld, WbSource::Percentile] {
-            let conv = Sigmoid {
-                density: DensityParams::default(),
-                sigmoid: straight.clone(),
-                print: PrintParams {
+            let converted = run(
+                &img,
+                &base,
+                DensityParams::default(),
+                DensityCurve::Sigmoid(straight),
+                PrintParams {
                     white_balance: mode,
                     ..PrintParams::default()
                 },
-            };
-            let (out, rep) = conv.convert_reported(&img, &base).unwrap();
-            let gains = rep.white_balance.expect("gains reported");
+            )
+            .unwrap();
+            let gains = converted.white_balance.expect("gains reported");
             assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
-            for px in out.rgb.chunks_exact(3) {
+            for px in converted.out.rgb.chunks_exact(3) {
                 assert!(approx(px[0], px[1], 1e-4), "{mode:?}: {px:?}");
                 assert!(approx(px[1], px[2], 1e-4), "{mode:?}: {px:?}");
             }
@@ -867,64 +885,74 @@ mod tests {
             white_balance: WbSource::Percentile,
             highlight_compress: 0.4,
         };
-        let curve = SigmoidParams {
+        let curve = DensityCurve::Sigmoid(SigmoidParams {
             contrast: 1.4,
             toe: 0.15,
             shoulder: 0.3,
-        };
-        let auto = Sigmoid {
-            density: DensityParams::default(),
-            sigmoid: curve.clone(),
-            print: print.clone(),
-        };
-        let (out_auto, rep) = auto.convert_reported(&img, &base).unwrap();
-        let gains = rep.white_balance.expect("auto gains reported");
+            ..SigmoidParams::default()
+        });
+        let auto = run(&img, &base, DensityParams::default(), curve, print.clone()).unwrap();
+        let gains = auto.white_balance.expect("auto gains reported");
 
-        let explicit = Sigmoid {
-            density: DensityParams::default(),
-            sigmoid: curve,
-            print: PrintParams {
+        let explicit = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            curve,
+            PrintParams {
                 white_balance: WbSource::Explicit(gains),
                 ..print
             },
-        };
-        let (out_explicit, rep2) = explicit.convert_reported(&img, &base).unwrap();
-        assert_eq!(out_auto.rgb, out_explicit.rgb, "reuse must be bit-exact");
-        assert_eq!(rep2.white_balance, Some(gains));
-        assert_eq!(rep.dmax, rep2.dmax, "shared anchor");
+        )
+        .unwrap();
+        assert_eq!(auto.out.rgb, explicit.out.rgb, "reuse must be bit-exact");
+        assert_eq!(explicit.white_balance, Some(gains));
+        assert_eq!(auto.dmax, explicit.dmax, "shared anchor");
     }
 
     #[test]
     fn auto_wb_carries_ir_through_the_final_output() {
-        // The auto-WB analysis pass renders on an IR-dropped copy (perf: no
-        // image-sized IR clone), but the *final* render must still consume the
-        // original density with its IR plane intact — assert the IR rides through.
+        // The auto-WB analysis samples the film positive's RGB only; the final
+        // render must still carry the original IR plane through untouched.
         let base = FilmBase::from([0.6, 0.6, 0.6]);
         let img = pixel([0.2, 0.2, 0.2], Some(0.42));
-        let conv = Sigmoid {
-            density: DensityParams::default(),
-            sigmoid: SigmoidParams::default(),
-            print: PrintParams {
+        let out = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            DensityCurve::Sigmoid(SigmoidParams::default()),
+            PrintParams {
                 white_balance: WbSource::Percentile,
                 ..PrintParams::default()
             },
-        };
-        let out = conv.convert(&img, &base).unwrap();
+        )
+        .unwrap()
+        .out;
         assert_eq!(out.ir.as_deref(), Some(&[0.42_f32][..]));
     }
 
     #[test]
     fn convert_carries_ir_untouched_and_rejects_bad_base() {
-        let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
         let img = pixel([0.2, 0.2, 0.2], Some(0.33));
-        let out = conv
-            .convert(&img, &FilmBase::from([0.6, 0.6, 0.6]))
-            .unwrap();
+        let out = run(
+            &img,
+            &FilmBase::from([0.6, 0.6, 0.6]),
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
         assert_eq!(out.ir.as_deref(), Some(&[0.33_f32][..]));
-        // Same base guard as density (shared check_base).
-        let err = conv
-            .convert(&img, &FilmBase::from([0.6, 0.0, 0.6]))
-            .unwrap_err();
+        // Same base guard as exponential (shared check_base).
+        let err = run(
+            &img,
+            &FilmBase::from([0.6, 0.0, 0.6]),
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap_err();
         assert_eq!(err.exit_code(), 1);
     }
 
@@ -934,8 +962,15 @@ mod tests {
         // area (scene highlight) renders brighter than a thin one.
         let base = FilmBase::from([0.6, 0.6, 0.6]);
         let img = LinearImage::new(2, 1, vec![0.55, 0.55, 0.55, 0.05, 0.05, 0.05], None).unwrap();
-        let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
-        let out = conv.convert(&img, &base).unwrap();
+        let out = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
         for c in 0..3 {
             assert!(
                 out.rgb[3 + c] > out.rgb[c],
@@ -957,8 +992,15 @@ mod tests {
             None,
         )
         .unwrap();
-        let conv = sigmoid(DmaxSource::Auto, SigmoidParams::default());
-        let out = conv.convert(&img, &base).unwrap();
+        let out = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            sigmoid_curve(DmaxSource::Auto, SigmoidParams::default()),
+            PrintParams::default(),
+        )
+        .unwrap()
+        .out;
         for (i, v) in out.rgb.iter().enumerate() {
             assert!(v.is_finite() && *v > 0.0 && *v <= 1.0, "sample {i}: {v}");
         }
@@ -966,13 +1008,12 @@ mod tests {
 
     #[test]
     fn auto_wb_measures_post_regional_balance_density() {
-        // Sigmoid analogue of the density ordering guard: its own
-        // `convert_reported` also runs `regional_balance` before estimating the
-        // auto-WB gains, so the gains must reflect the post-balance density. No
-        // other sigmoid test runs both features at once, so a refactor moving the
-        // WB estimate ahead of the balance would go unnoticed here too. Knees off
-        // (toe = shoulder = 0) so the analysis positive stays the straight-line
-        // power form, matching the other sigmoid auto-WB tests.
+        // Sigmoid analogue of the exponential ordering guard: the auto-WB gains
+        // are estimated on the *post-balance* film positive under the sigmoid
+        // curve too. No other sigmoid test runs both features at once, so a
+        // refactor moving the WB estimate ahead of the balance would go unnoticed
+        // here too. Knees off (toe = shoulder = 0) so the analysis positive stays
+        // the straight-line power form, matching the other sigmoid auto-WB tests.
         let base = FilmBase::from([0.6, 0.35, 0.2]);
         let img = LinearImage::new(
             3,
@@ -984,36 +1025,31 @@ mod tests {
             None,
         )
         .unwrap();
-        let straight = SigmoidParams {
+        let straight = DensityCurve::Sigmoid(SigmoidParams {
             toe: 0.0,
             shoulder: 0.0,
             ..SigmoidParams::default()
-        };
+        });
         // Tone-dependent crossover cast; green untouched so it stays the anchor.
         let balance = DensityParams {
             shadow_balance: [-0.15, 0.0, 0.08],
             highlight_balance: [0.15, 0.0, -0.08],
             ..DensityParams::default()
         };
+        let print = PrintParams {
+            white_balance: WbSource::Percentile,
+            ..PrintParams::default()
+        };
 
-        let neutral = Sigmoid {
-            density: DensityParams::default(),
-            sigmoid: straight.clone(),
-            print: PrintParams {
-                white_balance: WbSource::Percentile,
-                ..PrintParams::default()
-            },
-        };
-        let balanced = Sigmoid {
-            density: balance,
-            sigmoid: straight,
-            print: PrintParams {
-                white_balance: WbSource::Percentile,
-                ..PrintParams::default()
-            },
-        };
-        let (_, rep_neutral) = neutral.convert_reported(&img, &base).unwrap();
-        let (_, rep_balanced) = balanced.convert_reported(&img, &base).unwrap();
+        let rep_neutral = run(
+            &img,
+            &base,
+            DensityParams::default(),
+            straight,
+            print.clone(),
+        )
+        .unwrap();
+        let rep_balanced = run(&img, &base, balance, straight, print).unwrap();
 
         // (a) WB measured post-balance differs from WB with no balance applied.
         let wb_neutral = rep_neutral.white_balance.expect("neutral gains reported");

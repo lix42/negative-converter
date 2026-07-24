@@ -40,15 +40,11 @@ The deterministic core owns the image science. Any future ML assistance (see
   keeping the domains explicit: scanner measurement RGB through Dmin/density,
   typed `FilmRgbImage` after inversion/the selected density curve, then typed
   linear ACEScg after NC film RGB v1 mapping.
-- **Current shipped pluggable algorithm** architecture, shipping **three**
-  algorithm selections:
-  1. `simple` — channel inversion + white balance (baseline / debug / B&W).
-  2. `density` — density-domain inversion (Kodak Cineon / darktable `negadoctor`
-     style) — the real default for color negatives.
-  3. `sigmoid` — the same density reconstruction with an H&D-style S-curve.
-  The target architecture replaces these top-level choices with tagged `simple`
-  or `density` reconstruction; density owns a tagged exponential or sigmoid
-  curve.
+- **Tagged reconstruction** architecture (shipped): `simple` (channel
+  inversion — baseline / debug / B&W) or `density` (density-domain
+  reconstruction, Kodak Cineon / darktable `negadoctor` style — the default),
+  where density owns a tagged **exponential** (default) or **sigmoid**
+  (H&D-style S-curve) density curve.
 - All conversion parameters controllable via CLI flags and/or a JSON recipe file.
 - Write **TIFF** output, selectable as **16-bit integer** or transitional
   **32-bit rendered float** via a flag.
@@ -59,9 +55,8 @@ The deterministic core owns the image science. Any future ML assistance (see
 
 - IR-based dust/scratch removal (follow-up task).
 - Additional reconstruction/curve models beyond those listed above (follow-up
-  tasks; the sigmoid /
-  explicit H&D curve has since shipped post-MVP in the legacy
-  `--algorithm sigmoid` schema, §7.3).
+  tasks; the sigmoid / explicit H&D curve has since shipped post-MVP as the
+  tagged `sigmoid` density curve, §7.3).
 - Black & white film support, incl. plain 16-bit RAW scans (follow-up task).
 - Camera RAW (Bayer/X-Trans) input, DNG processing.
 - ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).
@@ -154,8 +149,8 @@ plane is a separate single channel, carried but not consumed (§6.1).
 | **transmission** (raw scan value) | fraction of light the film passes | more transparent film, thinner negative, brighter pixel *in the raw scan* — a **darker** scene | `[0, 1]` (= `u16`/65535) | `io::decode`, `LinearImage.rgb` |
 | **film base / `Dmin`** | the unexposed rebate's transmission — the per-channel *relative* maximum transmission | (the ceiling of transmission) | `(0, 1]` | `FilmBase`, `film_base::estimate` |
 | **density `D` / `B` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `B = density_scale·D + density_offset` (per-channel corrected density); `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)` (after regional balance, §7.2) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `B`/`D′` shifted by the offset (and, for `D′`, the regional balance) | `density::to_density`, `density::regional_balance`, `DensityImage.density` |
-| **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | replacement reconstruction/curve boundary |
-| **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | algorithm-defined and unclamped `f32` | planned typed reconstruction output |
+| **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | reconstruction→curve handoff inside `density::reconstruct` |
+| **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | curve-defined and unclamped `f32` | `algo::FilmRgbImage`, `algo::reconstruct` (shipped typed reconstruction output) |
 | **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | planned working-space mapper |
 | **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
 | **output sample** (terminal) | the written image value | brighter | preset/container-defined integer or float encoding | `io::encode` and planned HDR encoders |
@@ -296,10 +291,12 @@ own parameter struct and can be unit-tested in isolation.
 The diagram below depicts the **target / replacement** architecture (tagged
 reconstruction, NC film RGB v1 working-space mapping, and the film-master /
 display-render split). The **current shipped** pipeline implements: decode +
-input-semantics resolution, film-base / `Dmin` estimation, an `Algorithm` +
-`Converter` render with print controls applied *inside* it, a working→output ICC
-transform, and TIFF encode. See the "Architecture" section of `CLAUDE.md` for the
-current-vs-target framing.
+input-semantics resolution, film-base / `Dmin` estimation, the tagged
+reconstruction to typed `FilmRgbImage` (`algo::reconstruct`), the legacy print
+render applied *after* the typed boundary but before the working→output ICC
+transform (`algo::finish_print` — named presets later move it after the ACEScg
+boundary), and TIFF encode. See the "Architecture" section of `CLAUDE.md` for
+the current-vs-target framing.
 
 ```
                  ┌──────────────────────────────────────────────┐
@@ -395,12 +392,14 @@ later.
 
 ## 7. Reconstruction and density curves
 
-The currently shipped implementation selects a boxed `Converter` with
-`--algorithm simple|density|sigmoid` and returns an untyped `LinearImage`. That
-is the **legacy, transitional implementation**, not the target interface. The
-replacement accepts `--reconstruction simple|density`; density then selects
-`--density-curve exponential|sigmoid`. Every target path returns
-`FilmRgbImage`, so only the working-space mapper can construct `AcesCgImage`.
+The shipped implementation selects the tagged reconstruction with
+`--reconstruction simple|density`; density then selects
+`--density-curve exponential|sigmoid`. Every reconstruction path returns the
+typed `FilmRgbImage` boundary (`algo::reconstruct`), so only the future
+working-space mapper can construct `AcesCgImage`. The pre-reconstruction
+`--algorithm simple|density|sigmoid` selector (a boxed `Converter` returning an
+untyped `LinearImage`) is **removed** — the flag and the old recipe forms are
+rejected with a migration error (nc is unreleased; no aliases).
 
 ### 7.1 `simple` — inversion baseline
 
@@ -408,13 +407,16 @@ Channel inversion plus white balance / border neutralization. Cheap, predictable
 useful for B&W negatives and as a debugging reference. Not a strong endpoint for
 color negatives (ignores density behavior and the orange mask).
 
-The currently shipped stages are `positive = 1 - scan/Dmin` →
+The pre-reconstruction converter ran `positive = 1 - scan/Dmin` →
 `invert_white_balance` gain per channel → the `clip_low`/`clip_high` affine
-black/white remap. In the replacement pipeline, stage 3 ends at unclamped
+black/white remap. In the shipped pipeline, stage 3 ends at unclamped
 `U_c = 1 - scan_c/Dmin_c` and returns `FilmRgbImage`. `simple` has no Dmax.
 Inversion WB and clip remapping move after the ACEScg boundary to the downstream
-shared WB/black/range-placement contract. The old flags/`simple.*` recipe keys use a warned
-migration: target presets resolve `--invert-white-balance` to explicit
+shared WB/black/range-placement contract; until named presets land they are
+simply **not expressible** — the old flags and `simple.*` recipe keys are
+rejected with a migration error (their defaults were the exact identity, so the
+default simple output is unchanged). Preset migration then resolves
+`--invert-white-balance` to explicit
 `print.white_balance` and clip endpoints to
 `print.linear_range = [low, high]` / atomic `--linear-range LOW,HIGH`. Range
 merge starts from the recipe pair or `[0,1]`; the atomic flag replaces both
@@ -461,15 +463,15 @@ dense negative area (a scene highlight) at large `D`. A positive must brighten a
 reproduce the negative). This matches darktable `negadoctor` (denser negative →
 brighter print).
 
-**Legacy display-white anchor; curve-stage Dmax.** In the currently shipped
-density renderer, `Dmax` is the corrected density
-of scene white and the expression `10^(gamma·(D'−Dmax))` guarantees that
-`D' = Dmax` maps to `1.0`. The base maps to `10^(−gamma·Dmax) ≈ 0`; with `none`,
-the current renderer reproduces its pre-anchor output bit-for-bit (base `1.0`,
-detail above). Current `--output-hdr` is still a rendered float TIFF, not the
-target `film-master` branch.
+**Curve-stage Dmax.** In the shipped curve stage, `Dmax` is the corrected
+density of scene white and the exponential expression `10^(gamma·(D'−Dmax))`
+guarantees that `D' = Dmax` maps to `1.0`. The base maps to
+`10^(−gamma·Dmax) ≈ 0`; with `none`, the exponential curve reproduces its
+unanchored output bit-for-bit (base `1.0`, detail above). Current
+`--output-hdr` is still a rendered float TIFF, not the target `film-master`
+branch.
 
-In the replacement schema, exponential retains Dmax as scalar placement and
+In the shipped schema, exponential retains Dmax as scalar placement and
 sigmoid retains it as a nonlinear curve-shaping input. Display reference white
 belongs to the later SDR/HDR render. Fixed/roll Dmax preserves cross-frame
 exposure; frame-local auto Dmax is exposure normalization and is rejected for
@@ -480,8 +482,7 @@ the roll, like the `Dmin` base — **not** a per-frame measurement. Anchoring ea
 frame's densest pixel to display white *normalizes exposure per frame* (it
 brightens underexposed frames and forces an overcast scene's grey to white), which
 conflicts with NC's "convert faithfully, grade in Lightroom" purpose. The
-current `density.dmax = fixed` (target
-`reconstruction.curve.dmax = "fixed"`) therefore resolves a **fixed** anchor in the order
+default `reconstruction.curve.dmax = "fixed"` therefore resolves a **fixed** anchor in the order
 **measured reference → per-stock constant → nominal**: a value measured once from
 a fully-exposed reference frame (§8, `estimate --d-max-region`) or a known
 per-stock constant is carried as `{ "explicit": <d> }`; with no calibration a
@@ -511,8 +512,8 @@ another receives the highlight one, misfiring on exactly the pixels this control
 exists to fix. Naming is from the **positive's** point of view: low density
 (near base) is a *shadow*, high density a *highlight*, and (by the polarity
 above) a positive balance value brightens that channel in its region. The range
-anchors come from target `reconstruction.density.balance_range` (current
-`density.balance_range`): `auto` (default) measures robust
+anchors come from `reconstruction.density.balance_range`: `auto` (default)
+measures robust
 percentiles (0.5 % / 99.5 %, nearest-rank over a deterministic sample) of the
 per-pixel tone in a two-pass within step 2 — it cannot anchor on the `auto`
 `Dmax`, which is measured *after* step 2 (circular) — while an explicit
@@ -582,39 +583,43 @@ extreme slope would collapse the curve into a hard threshold that silently
 destroys tonal detail.
 
 Because both the white knee and the black floor derive from the anchor, the
-S-curve is anchored on `[0, Dmax]` and **requires** one. In the target schema,
-`curve.dmax = "none"` with `curve.type = "sigmoid"` is a usage error (exit 2);
-unity placement is supported only by the exponential curve. The anchor uses the
-same fixed, explicit/reference-derived, or opt-in auto resolution policy as the
+S-curve is anchored on `[0, Dmax]` and **requires** one: `curve.dmax = "none"`
+with `curve.type = "sigmoid"` is a usage error (exit 2); unity placement is
+supported only by the exponential curve. The anchor uses the same fixed,
+explicit/reference-derived, or opt-in auto resolution policy as the
 exponential curve. Gamma exists only in the exponential variant. Supplying
 `--density-gamma` while the resolved curve is sigmoid is an invalid combination
-after merge (exit 2), never a warning or ignored value. The currently shipped
-legacy implementation instead reads sibling `density.density_gamma` and
-`sigmoid.*`; its historical ignored-gamma warning disappears at migration.
+after merge (exit 2), never a warning or ignored value (the pre-reconstruction
+implementation's ignored-gamma warning is gone).
 `--highlight-compress` (a linear-space soft-clip after exposure/WB) composes
 with the shoulder rather than being disabled — with the shoulder on and neutral
 print params it simply never engages, since nothing exceeds `1.0`.
 
-### Current and target interfaces (sketch)
+### Shipped and target interfaces (sketch)
 
 ```rust
-// Current shipped, transitional interface.
-pub trait Converter {
-    fn convert(&self, image: &LinearImage, base: &FilmBase) -> Result<LinearImage>;
-    fn convert_reported(&self, image: &LinearImage, base: &FilmBase)
-        -> Result<(LinearImage, ConvertReport)> { /* default provided */ }
-}
-
-// Target stage boundaries. Fields are private; only the owning stage constructs
-// each value, and named output code accepts AcesCgImage rather than FilmRgbImage.
+// Shipped stage boundary. Fields are private; only the reconstruction stage
+// constructs a FilmRgbImage, so no raw scan/density buffer can impersonate
+// film RGB downstream.
 pub struct FilmRgbImage { /* private */ }
-pub struct AcesCgImage { /* private */ }
 
 pub fn reconstruct(
     image: &LinearImage,
     base: &FilmBase,
     config: &Reconstruction,
 ) -> Result<(FilmRgbImage, ReconstructionReport)>;
+
+// Shipped legacy bridge: applies the stage-4 print controls before the output
+// color transform (named presets later move them after the ACEScg boundary).
+pub fn finish_print(
+    film: FilmRgbImage,
+    config: &Reconstruction,
+    print: &PrintParams,
+) -> Result<(LinearImage, Option<[f32; 3]>)>;
+
+// Target working-space boundary (film-rgb-working-space): named output code
+// accepts AcesCgImage rather than FilmRgbImage.
+pub struct AcesCgImage { /* private */ }
 
 pub fn map_nc_film_rgb_v1(image: FilmRgbImage) -> Result<AcesCgImage>;
 ```
@@ -632,7 +637,7 @@ no interactive prompts.
 | `nc convert` | The main pipeline: negative file → positive TIFF. |
 | `nc roll` | Convert a batch of frames from one shared, frozen recipe (the batch-**apply** scaffold). Per-frame outputs into `--out-dir` + a roll-level JSON report. Single-frame `convert` is unchanged; roll is additive. |
 | `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
-| `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. `--d-max-region` additionally measures the roll-fixed display-white anchor `Dmax` from a fully-exposed reference frame, emitting reuse-ready `--d-max` / `density.dmax` forms. |
+| `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. `--d-max-region` additionally measures the roll-fixed display-white anchor `Dmax` from a fully-exposed reference frame, emitting reuse-ready `--d-max` / `reconstruction.curve.dmax` forms. |
 | `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). |
 
 ### Recipes (JSON in/out)
@@ -642,23 +647,12 @@ no interactive prompts.
   to JSON. Individual `--flag` overrides take precedence over the loaded recipe,
   so an agent can load a roll recipe and tweak one value per frame.
 
-The currently shipped recipe is grouped into `input`, `film_base`, `density`,
-`sigmoid`, `print`, `simple`, and `output`, plus top-level `algorithm`. This is
-the **legacy transitional schema** implemented today:
-
-```json
-{
-  "algorithm": "density",
-  "density": { "density_gamma": 1.8 },
-  "print":   { "print_exposure": 0.0, "black_point": 0.002 },
-  "output":  { "hdr": true }
-}
-```
-
-The target recipe replaces all top-level `algorithm`, `density`, `sigmoid`, and
-`simple` selection forms with exactly one tagged `reconstruction` object.
-These are the complete target reconstruction shapes (other stage objects are
-omitted here):
+The shipped recipe is grouped into `reconstruction`, `input`, `film_base`,
+`print`, and `output`. The algorithm selection is exactly one tagged
+`reconstruction` object; the removed legacy forms (top-level `algorithm` and the
+sibling `density`/`sigmoid`/`simple` sections) are rejected at recipe load with
+a migration error — they are not aliases. These are the complete reconstruction
+shapes (other stage objects are omitted here):
 
 ```json
 {
@@ -720,15 +714,14 @@ defaults to 1; resolved recipes always emit it. `curve.dmax` accepts
 density fields take the displayed defaults. Partial input may omit
 `reconstruction.curve`, which selects exponential with its defaults; every
 resolved recipe/report emits exactly one tagged curve. Partial objects are
-otherwise permitted. Unknown fields are rejected at every level. The legacy
-top-level forms are rejected with a migration error once this schema activates;
-they are not aliases.
+otherwise permitted. Unknown fields are rejected at every level.
 
-Target preset migration also adds `print.linear_range` and emits simple
+Target preset migration later adds `print.linear_range` and emits simple
 WB/range adjustments only under `print`. Legacy
 `simple.invert_white_balance`, `simple.clip_low`, and `simple.clip_high` are
 accepted solely as warned input aliases during the preset migration described in
-§9; they are not part of `reconstruction`. Legacy no-preset TIFF calls retain
+§9; they are not part of `reconstruction` and are currently rejected with a
+migration error (as are the flags). Legacy no-preset TIFF calls retain
 their current pixel ordering until migration.
 
 ### Reports & determinism
@@ -738,9 +731,11 @@ their current pixel ordering until migration.
 - `--seed <n>` — fix any stochastic step (none in Step 1, reserved).
 - Stable, documented **exit codes** (see §11).
 
-At target-schema activation, the report's effective `recipe.reconstruction` is
-the exact tagged object above. Resolution diagnostics use this exact additional
-shape (unrelated report fields omitted):
+The convert report's `recipe` echoes the effective (resolved) config — the
+sidecar's exact object — so `recipe.reconstruction` is the exact tagged object
+above. Resolution diagnostics use this exact additional shape (unrelated report
+fields omitted; `working_mapping` lands with the `film-rgb-working-space`
+task):
 
 ```json
 {
@@ -793,19 +788,17 @@ round trips, fixtures, and migration errors pin the reconstruction schema.
 ### Example invocations
 
 ```bash
-# Current shipped default density conversion: auto Dmin, fixed/roll nominal Dmax,
-# 16-bit TIFF, JSON report. This uses the transitional CLI.
-nc convert in.tiff -o out.tiff --algorithm density --report json
-
-# Target equivalent after reconstruction-schema migration.
+# Default density conversion: auto Dmin, fixed/roll nominal Dmax, 16-bit TIFF,
+# JSON report. The two selector flags are optional (both are the defaults).
 nc convert in.tiff -o out.tiff --reconstruction density \
   --density-curve exponential --report json
 
-# Transitional rendered float TIFF: --no-d-max disables the current legacy Dmax factor
-# (base → 1.0, detail above), then the current print controls still run and the
-# depth-aware default profile (acescg for HDR) applies. This is NOT film-master.
+# Transitional rendered float TIFF: --no-d-max selects the exponential curve's
+# unity placement (base → 1.0, detail above), then the current print controls
+# still run and the depth-aware default profile (acescg for HDR) applies. This
+# is NOT film-master.
 nc convert in.tiff -o out.tiff \
-  --algorithm density --output-hdr --no-d-max \
+  --output-hdr --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
   --highlight-compress 0.3
@@ -863,8 +856,8 @@ nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159
 # light-struck roll leader — with the roll's Dmin as --film-base. `estimate`
 # reduces that region's per-channel base-relative density D (= corrected density
 # under default density-scale/offset) to one scalar (a gray-density
-# reduction) and reports it in reusable forms: a --d-max flag and a `density`
-# recipe fragment. The region is recorded as provenance (dmax_region), NOT as a
+# reduction) and reports it in reusable forms: a --d-max flag and a
+# `reconstruction.curve` recipe fragment. The region is recorded as provenance (dmax_region), NOT as a
 # re-read directive — the frozen recipe carries the scalar so the apply phase is
 # deterministic. `Dmax` is roll-fixed like `Dmin` (see §7.2/§9).
 nc estimate leader.tiff --film-base 0.553,0.271,0.159 --d-max-region 200,0,300,3600 --report json
@@ -873,9 +866,10 @@ nc estimate leader.tiff --film-base 0.553,0.271,0.159 --d-max-region 200,0,300,3
 #     "d_max_flag": "--d-max 1.6428",
 #     "d_max_recipe": { "dmax": { "explicit": 1.6428 } }, … }
 nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.553,0.271,0.159 --d-max 1.6428
-# …or paste d_max_recipe into roll-A.json's "density" section. With no reference
-# frame, omit it: the default `density.dmax = fixed` nominal anchor still renders a
-# viewable positive (darker frames stay faithfully darker).
+# …or paste d_max_recipe's "dmax" key into roll-A.json's tagged
+# "reconstruction"."curve" object. With no reference frame, omit it: the default
+# `reconstruction.curve.dmax = fixed` nominal anchor still renders a viewable
+# positive (darker frames stay faithfully darker).
 
 # On a dedicated blank frame, `estimate --grid` samples a fixed 5-cell grid
 # (corners + center) over the frame (or over --base-region) instead of a single
@@ -910,11 +904,10 @@ nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941
 
 ## 9. Parameter reference (grouped by stage)
 
-Every conversion flag has a recipe key. Unchanged shipped stages use the paths
-shown below (for example, `--output-hdr` ⇒ `output.hdr`). Reconstruction entries
-show their **target** paths under the tagged `reconstruction` object; §8
-separately records the currently shipped legacy `algorithm`/sibling-section
-shape. Names are binding and unknown keys are rejected (`deny_unknown_fields`).
+Every conversion flag has a recipe key (for example, `--output-hdr` ⇒
+`output.hdr`); reconstruction entries live under the tagged `reconstruction`
+object (§8). Names are binding and unknown keys are rejected
+(`deny_unknown_fields`).
 
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
@@ -1095,24 +1088,16 @@ downstream (`density_offset`, white balance) — never a shadow/highlight
 crossover.
 
 ### Reconstruction and density-curve select
-- Target CLI: `--reconstruction simple|density` (default `density`).
+- CLI: `--reconstruction simple|density` (default `density`).
 - With density: `--density-curve exponential|sigmoid` (default `exponential`).
-- Target recipe: `reconstruction.type`, then for density
+  `--density-curve` with `simple` is a usage error (no curve stage).
+- Recipe: `reconstruction.type`, then for density
   `reconstruction.density` and tagged `reconstruction.curve`, exactly as shown
   in §8. There are no sibling top-level density or curve sections.
-- When the tagged reconstruction schema activates, the `--algorithm` flag and old
-  `algorithm` recipe form will be rejected with a migration error rather than
-  retained as aliases, and the old top-level `density`, `sigmoid`, and `simple`
-  forms will be rejected at the same boundary. (Today's shipped CLI still
-  **accepts** `--algorithm`; see §8 and the current-keys note below.)
-
-> **Current shipped keys.** The released binary implements the legacy transitional
-> schema (§8), **not** the target `reconstruction.*` paths in this section. Today a
-> recipe selects the algorithm with a top-level `algorithm` key and configures it
-> via top-level `density.{density_scale, density_gamma, dmax, shadow_balance,
-> highlight_balance, balance_range}` and `sigmoid.{contrast, toe, shoulder}` (plus
-> `simple`). Write recipes for today's binary against §8's legacy schema; the
-> `reconstruction.*` paths below are the target migration.
+- The removed `--algorithm` flag and old `algorithm` recipe form are rejected
+  with a migration error rather than retained as aliases, and the old top-level
+  `density`, `sigmoid`, and `simple` forms are rejected at the same boundary
+  (nc is unreleased).
 
 ### Density stage (`reconstruction = density`)
 - `--density-scale R,G,B` ⇒ `reconstruction.density.scale` — per-channel
@@ -1236,9 +1221,9 @@ false-positive on legitimate high-contrast conversions).
     colors. The resolved gains land in the convert report (`white_balance`,
     green-anchored) ready to freeze into `--white-balance` / a roll recipe (§8).
 
-  Current auto estimation requires `--algorithm density` or `--algorithm
-  sigmoid`; `--auto-wb` with `simple` remains a usage error (exit 2). The target
-  refactor gives simple the same **explicit** downstream WB slot, but does not
+  Auto estimation requires `--reconstruction density` (either curve);
+  `--auto-wb` with `simple` remains a usage error (exit 2). The preset
+  migration gives simple the same **explicit** downstream WB slot, but does not
   imply that density-based auto estimators support simple without a separately
   specified generalization.
 - `--highlight-compress <f>` — highlight roll-off amount.
@@ -1361,11 +1346,11 @@ affect the output bytes (telemetry on or off ⇒ byte-identical TIFF + sidecar).
   input/output/sidecar/report-file is still a loud usage error (a config mistake,
   caught up front — an odd log path must never silently append into the scan).
 
-**Telemetry record shape (`schema_version` 1, serialize-only JSON).** Designed for
+**Telemetry record shape (`schema_version` 2, serialize-only JSON).** Designed for
 a future background uploader (§12, `telemetry-upload`) to drain and ship:
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "timestamp_ms": 1752566400000,
   "nc_version": "0.1.0",
   "target": "aarch64-apple-darwin",
@@ -1380,15 +1365,19 @@ a future background uploader (§12, `telemetry-upload`) to drain and ship:
     "color": 18.4, "encode": 1.0, "ir_export": 0.6
   },
   "conversion": {
-    "algorithm": "density", "params_hash": "92a827ffd2d0aebd",
+    "reconstruction": "density", "curve": "exponential",
+    "params_hash": "92a827ffd2d0aebd",
     "film_base_source": { "explicit": [0.9, 0.55, 0.42] },
     "dmax": 1.6195, "output_hdr": false
   },
   "outcome": { "warnings": 1, "clipped": 3419, "non_finite": 0 }
 }
 ```
-`timing_ms.ir_export` is present only when `--export-ir` ran; `conversion.dmax` only
-when the density render applied an anchor. `params_hash` is a stable hash of the
+`timing_ms.ir_export` is present only when `--export-ir` ran; `conversion.curve`
+only for density reconstruction (`simple` has no curve stage) and
+`conversion.dmax` only when the curve applied an anchor (schema v2 replaced
+v1's `conversion.algorithm` with the `reconstruction` + `curve` pair).
+`params_hash` is a stable hash of the
 effective recipe JSON (the same bytes as the sidecar), so identical conversions
 share a hash without the record carrying the whole recipe.
 
@@ -1410,10 +1399,11 @@ nc/
     │   ├── color.rs      # working/output color transforms (lcms2)
     │   └── stages.rs     # stage wiring as pure functions
     ├── algo/
-    │   ├── mod.rs        # Converter trait
+    │   ├── mod.rs        # FilmRgbImage + reconstruct/finish_print
     │   ├── simple.rs     # baseline inversion
-    │   └── density.rs    # density-domain inversion
-    └── types.rs          # LinearImage, FilmBase, params, errors
+    │   ├── density.rs    # density reconstruction + exponential curve
+    │   └── sigmoid.rs    # sigmoid density curve
+    └── types.rs          # LinearImage, FilmBase, Reconstruction, params, errors
 ```
 
 ### Candidate crates
@@ -1475,11 +1465,11 @@ the NLP feature comparison, Phase 6).
    threshold, mask dilation/morphology, inpainting method/strength. Must handle
    the known limits — disable/guard for silver B&W film and Kodachrome. New
    stages: `defect_mask`, `inpaint`. New flags under an `--ir-*` namespace.
-2. **Additional algorithms.** The **sigmoid / explicit H&D-curve** model has
-   since **shipped** as `--algorithm sigmoid` (§7.3, task `algo-sigmoid`);
-   still open: possibly a power-law/exponent model (RawTherapee-style) for
-   camera-scanned negatives. Added via the existing `Converter` trait,
-   selectable with `--algorithm`.
+2. **Additional curve/reconstruction models.** The **sigmoid / explicit
+   H&D-curve** model has since **shipped** as the tagged sigmoid density curve
+   (§7.3, task `algo-sigmoid`); still open: possibly a power-law/exponent model
+   (RawTherapee-style) for camera-scanned negatives. Added as a new tagged
+   `reconstruction.curve` variant.
 3. **Black & white film support.** The *rendering* half has graduated into the
    tracked `bw-support` task (Phase 6): B&W film is still a density medium, so
    the `density` algorithm is the B&W renderer, plus a mono color model that
