@@ -3288,8 +3288,8 @@ Gate after fixes: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D
 warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 ## hdr-output-spike
-**Status:** in progress
-**Updated:** 2026-07-23
+**Status:** done
+**Updated:** 2026-07-24
 
 - 2026-07-21: Added a decision gate for ISO HDR versus ISO 21496-1 gain-map HDR,
   HEIC/JPEG containers, encoder/licensing constraints, metadata, reference white,
@@ -3320,6 +3320,18 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   decode, physical Android/iPhone/browser viewing, and legal review remain
   downstream pre-shipping gates; only licensed normative-text review remains a
   prerequisite for completing the spike itself.
+- 2026-07-24: **Closed.** Decided to proceed *without* the licensed
+  ISO 22028-5:2026 / ISO 21496-1:2025 text — completion gate 1 is waived at the
+  spike level and re-homed to the encoder tasks as a pre-merge conformance gate
+  (`gain-map-hdr-output` owns JPEG serialization/dual-dialect reconstruction,
+  `hdr-avif-output` owns AVIF brands/limits/codec bounds, `display-output-acceptance`
+  owns device evidence). Gates 2 and 3 satisfied: the container/profile/encoder,
+  203-nit reference-white / 1000-nit peak, gain-map formula, and rendering
+  contract (spike note §"Rendering contract") are final as written and give
+  `sdr-display-rendering` / `hdr-display-rendering` everything they need. Those
+  renderers may not change reference white, target peak, the common gain-map
+  domain, or the RGB-map decision without reopening the note. Spike note status
+  line + completion-gates section updated to match.
 
 ## hdr-display-rendering
 **Status:** not started
