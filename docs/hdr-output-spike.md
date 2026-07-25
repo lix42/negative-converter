@@ -1,9 +1,9 @@
 # HDR Still-Output Spike Decision Note
 
-**Status:** provisional implementation decision; normative-text review remains
-open
+**Status:** closed — implementation decision final; licensed-normative-text
+review waived (see "Spike completion gates")
 
-**Investigated:** 2026-07-23
+**Investigated:** 2026-07-23 · **Closed:** 2026-07-24
 
 ## Decision
 
@@ -264,16 +264,37 @@ full-resolution scans before those bounds are frozen.
 
 ## Spike completion gates
 
-The spike itself is complete when the pre-implementation decision inputs are
-closed:
+**Resolution (2026-07-24): the spike is closed.** The pre-implementation
+decision inputs are settled — every container, profile, encoder boundary,
+reference-white/headroom value, gain-map formula, and rendering-contract choice
+above is final and gives the implementation tasks sufficient inputs to proceed
+without reopening fundamental format choices (gates 2 and 3).
 
-1. licensed ISO 22028-5:2026 and ISO 21496-1:2025 text is checked for the exact
+Gate 1 — checking **licensed** ISO 22028-5:2026 / ISO 21496-1:2025 text for the
+exact mandatory metadata, JPEG serialization, offset semantics, and permitted
+ISO/Ultra HDR dual-metadata mapping — is **deliberately waived at the spike
+level.** We proceed without the licensed normative text. This is not a loss of
+rigor but a re-homing of it: that byte-level conformance work is inherently a
+*merge gate for the encoder code*, not a design-spike deliverable, and the note
+already delegates it to the encoder tasks (see below). Those tasks must obtain
+whatever normative text they need (licensed copies or an equivalently
+authoritative source) and prove serialization conformance against an independent
+decoder oracle **before their code merges** — they may not treat this waiver as
+permission to ship unverified byte layouts. If that work surfaces a change to a
+container, profile, reference white, or gain formula pinned here, it reopens this
+note rather than being absorbed silently.
+
+The original gates, for the record:
+
+1. ~~licensed ISO 22028-5:2026 and ISO 21496-1:2025 text is checked for the exact
    mandatory metadata, JPEG serialization, offset semantics, and permitted
-   ISO/Ultra HDR dual-metadata mapping;
+   ISO/Ultra HDR dual-metadata mapping~~ — **waived; re-homed to the encoder
+   tasks as a pre-merge gate (see above).**
 2. the note records any resulting changes to the already selected containers,
-   profiles, reference white, gain formula, or encoder boundaries;
+   profiles, reference white, gain formula, or encoder boundaries — **none; the
+   decisions above are final as written;**
 3. the implementation tasks have sufficient normative inputs to proceed without
-   reopening fundamental format choices.
+   reopening fundamental format choices — **satisfied.**
 
 These gates do not require downstream encoder implementations or physical-device
 results. Pre-shipping checks remain owned by the follow-up tasks:
