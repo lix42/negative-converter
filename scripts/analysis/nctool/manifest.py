@@ -309,6 +309,17 @@ def load_manifest(mpath: str) -> tuple[dict, str | None]:
     if ver is not None and ver != 1:
         return {}, (f"{mpath} has unsupported schema_version {ver} "
                     "(this tool writes v1)")
+    # The top-level object can still carry malformed nested collections (e.g.
+    # `"rolls": []`); consumers iterate `rolls`/`converted` as dicts and `samples`
+    # as a list, so a wrong-typed collection would raise mid-iteration (AttributeError
+    # → traceback + exit 1) instead of the documented operational exit 2. Reject here.
+    for key in ("rolls", "converted"):
+        if key in data and not isinstance(data[key], dict):
+            return {}, (f"{mpath} has malformed {key!r} "
+                        f"(expected a JSON object, got {type(data[key]).__name__})")
+    if "samples" in data and not isinstance(data["samples"], list):
+        return {}, (f"{mpath} has malformed 'samples' "
+                    f"(expected a JSON array, got {type(data['samples']).__name__})")
     return data, None
 
 
@@ -751,7 +762,13 @@ def cmd_roles(args) -> int:
         print(f"error: no manifest.json at {A}; run `nctool manifest generate` first",
               file=sys.stderr)
         return 2
-    emitted = 0
+    # Buffer emitted rows split by IR capability: the harness's `stage_ir` uses
+    # ROLLS[0], so a roll that has an IR-capable real frame must sort before one
+    # that has none (finding 4 — the per-roll IR-first sort below doesn't help
+    # cross-roll if a non-IR roll sorts alphabetically first). Rows are appended in
+    # alphabetical roll order, so each group stays alphabetically stable.
+    ir_rows: list[str] = []
+    non_ir_rows: list[str] = []
     for roll, r in sorted(data.get("rolls", {}).items()):
         by_role: dict[str, list[dict]] = {"unexposed": [], "leader": [], "real": []}
         for fr in r.get("frames", []):
@@ -785,11 +802,25 @@ def cmd_roles(args) -> int:
         # is stable, so a roll whose real frames all share `ir_present` (the common
         # case) keeps its manifest order unchanged.
         reals.sort(key=lambda f: not f.get("ir_present", False))
-        real_names = " ".join(os.path.basename(f["file"]) for f in reals)
         un_name, ld_name = os.path.basename(un[0]["file"]), os.path.basename(ld[0]["file"])
-        print(f"{roll}|{un_name}|{ld_name}|{real_names}")
-        emitted += 1
-    if emitted == 0:
+        real_basenames = [os.path.basename(f["file"]) for f in reals]
+        # The output row is `|`-joined with a space-delimited real-frame field by
+        # design; a basename containing whitespace would make that field ambiguous
+        # (the harness splits it with `for fr in $reals`). The current naming has no
+        # spaces, so rather than re-architect the contract, fail loudly.
+        bad = [n for n in (un_name, ld_name, *real_basenames)
+               if any(c.isspace() for c in n)]
+        if bad:
+            print(f"error: roll {roll!r} has frame name(s) containing whitespace, which "
+                  f"would make the space-delimited roles output ambiguous: "
+                  f"{', '.join(repr(n) for n in bad)}. Rename the file(s) in the assets "
+                  "and regenerate the manifest.", file=sys.stderr)
+            return 2
+        row = f"{roll}|{un_name}|{ld_name}|{' '.join(real_basenames)}"
+        (ir_rows if reals[0].get("ir_present", False) else non_ir_rows).append(row)
+    for row in ir_rows + non_ir_rows:
+        print(row)
+    if not ir_rows and not non_ir_rows:
         print("error: no roll had a complete unexposed+leader calibration pair",
               file=sys.stderr)
         return 1

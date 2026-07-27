@@ -69,7 +69,11 @@ center_region() { # file -> "X,Y,W,H" for a holder-free center 40% box
 stage_classify() {
   printf "%-24s %-22s %8s %6s  %s\n" FRAME ROLL cLuma agree CLASS
   for row in "${ROLLS[@]}"; do IFS='|' read -r roll uf ff reals <<<"$row"
-    for f in "$A/rolls/$roll"/*.tif; do
+    # Match both .tif and .tiff (list_imgs / the manifest accept either); the
+    # `-e` guard is nullglob-safe on bash 3.2 (an unmatched glob stays literal, so
+    # skip it rather than passing a bogus path to `nc estimate`).
+    for f in "$A/rolls/$roll"/*.tif "$A/rolls/$roll"/*.tiff; do
+      [ -e "$f" ] || continue
       j=$($NC estimate --grid "$f" 2>/dev/null)
       read cr cg cb ag <<<"$(echo "$j" | jq -r '.grid.cells[4].base as $c|"\($c.r) \($c.g) \($c.b) \(.grid.agreement)"')"
       lum=$(python3 -c "print(f'{0.2126*$cr+0.7152*$cg+0.0722*$cb:.4f}')")

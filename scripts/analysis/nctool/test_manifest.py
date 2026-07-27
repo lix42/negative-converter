@@ -146,6 +146,51 @@ class TestRoles(Base):
         self.assertEqual(rc, 2)
         self.assertIn("no manifest.json", err)
 
+    def test_malformed_rolls_is_operational_error(self):
+        # `rolls` as a list would raise AttributeError at `.items()` — must be a
+        # clean exit 2 instead of a traceback.
+        self.write_manifest({"schema_version": 1, "rolls": []})
+        rc, out, err = self.roles()
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.strip(), "")
+        self.assertIn("malformed 'rolls'", err)
+
+    def test_whitespace_frame_name_is_operational_error(self):
+        # A space in a real-frame basename would make the space-delimited row
+        # ambiguous → fail loudly (exit 2), naming the file.
+        self.write_manifest({"schema_version": 1, "rolls": {"RollA": {"frames": [
+            {"file": "rolls/RollA/u.tif", "role": "unexposed"},
+            {"file": "rolls/RollA/l.tif", "role": "leader"},
+            {"file": "rolls/RollA/scan 01.tif", "role": "real"},
+        ]}}})
+        rc, out, err = self.roles()
+        self.assertEqual(rc, 2)
+        self.assertEqual(out.strip(), "")
+        self.assertIn("whitespace", err)
+        self.assertIn("scan 01.tif", err)
+
+    def test_cross_roll_ir_ordering(self):
+        # An IR-capable roll must be emitted before a non-IR roll even when it
+        # sorts alphabetically later, so the harness's ROLLS[0] is IR-capable.
+        self.write_manifest({"schema_version": 1, "rolls": {
+            "Aaa": {"frames": [  # no IR real frame; sorts first alphabetically
+                {"file": "rolls/Aaa/u.tif", "role": "unexposed"},
+                {"file": "rolls/Aaa/l.tif", "role": "leader"},
+                {"file": "rolls/Aaa/r.tif", "role": "real", "ir_present": False},
+            ]},
+            "Zzz": {"frames": [  # IR real frame; sorts last alphabetically
+                {"file": "rolls/Zzz/u.tif", "role": "unexposed"},
+                {"file": "rolls/Zzz/l.tif", "role": "leader"},
+                {"file": "rolls/Zzz/r.tif", "role": "real", "ir_present": True},
+            ]},
+        }})
+        rc, out, _ = self.roles()
+        self.assertEqual(rc, 0)
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("Zzz|"), lines)  # IR roll first
+        self.assertTrue(lines[1].startswith("Aaa|"), lines)
+
     def test_pair_with_no_real_frames_skipped(self):
         # A complete unexposed+leader pair but no `real` frames must NOT emit
         # `RollA|u|l|` (empty 4th field) — the harness convert/ir stages would run
@@ -218,6 +263,21 @@ class TestLoadManifest(Base):
         self.write_manifest({"rolls": {}})
         data, err = manifest.load_manifest(p)
         self.assertIsNone(err)
+
+    def test_malformed_nested_collections_rejected(self):
+        # A v1 object with wrong-typed collections must be a clean operational
+        # error, not an AttributeError mid-iteration downstream.
+        p = os.path.join(self.A, "manifest.json")
+        for payload, needle in (
+            ({"schema_version": 1, "rolls": []}, "malformed 'rolls'"),
+            ({"schema_version": 1, "converted": []}, "malformed 'converted'"),
+            ({"schema_version": 1, "samples": {}}, "malformed 'samples'"),
+        ):
+            self.write_manifest(payload)
+            data, err = manifest.load_manifest(p)
+            self.assertEqual(data, {})
+            self.assertIsNotNone(err)
+            self.assertIn(needle, err)
 
 
 # --------------------------------------------------------------- build_manifest
@@ -473,6 +533,14 @@ class TestValidate(Base):
         rc, _, err = self.validate()
         self.assertEqual(rc, 2)
         self.assertIn("unsupported schema_version", err)
+
+    def test_malformed_nested_collection_is_exit2(self):
+        # `rolls` as a list would raise AttributeError at `.items()` in validate —
+        # must be a clean operational exit 2, not a traceback.
+        self.write_manifest({"schema_version": 1, "rolls": []})
+        rc, _, err = self.validate()
+        self.assertEqual(rc, 2)
+        self.assertIn("malformed 'rolls'", err)
 
 
 class TestWriteManifest(Base):
