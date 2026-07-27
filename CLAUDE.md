@@ -68,9 +68,12 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
 - The current algorithms remain pluggable behind `Converter`. The replacement
   roadmap adopts tagged `simple` or `density` reconstruction, with density
   selecting an `exponential` (default) or `sigmoid` curve.
-- The **IR channel** (HDRi 64-bit input) is decoded and **preserved but not acted
-  on** in Step 1; IR-based dust removal is a roadmap follow-up. Carry it through,
-  don't consume it.
+- The **IR channel** (HDRi 64-bit input) is decoded and, by default, **preserved
+  but not acted on**; carry it through, don't consume it. The one exception is
+  **IR-assisted film-holder detection** (`ir-holder-detection`): under an explicit
+  `--film-type chromogenic` declaration on an IR scan, `film_base::estimate`
+  consumes the IR plane to mask the opaque holder before the auto rebate search.
+  IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`,
   `pipeline/{film_base,color,stages,input_semantics,working_space}.rs`

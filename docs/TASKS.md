@@ -267,7 +267,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Light film holder support](tasks/white-holder-support.md)
 - [x] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
 - [ ] [Grid agreement verdict enum](tasks/grid-verdict-enum.md)
-- [ ] [IR-assisted film-holder detection](tasks/ir-holder-detection.md)
+- [x] [IR-assisted film-holder detection](tasks/ir-holder-detection.md)
 - [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base-content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `auto-base-redesign` (tell that task's owner)
 - [ ] [Neutral-base robustness for auto film-base detection](tasks/auto-base-neutral-stock.md)
 

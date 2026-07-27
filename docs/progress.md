@@ -3726,3 +3726,125 @@ rerunnable harness + frozen recipes under `scripts/real-scan-verify/` (see its `
 - The live `manifest.json` stays in the Drive folder (not committed). `asset-manifest`
   task doc updated to point at these precursors; remaining task work = fold into
   `nctool` + add `validate` (orphans/missing/drift).
+
+## ir-holder-detection
+
+### 2026-07-24 — IR-assisted film-holder mask + `--film-type` knob
+
+Implemented the first real consumer of the decoded IR channel: a pure,
+segmented IR film-holder mask that feeds the existing RGB rebate/base search,
+gated on an explicit `--film-type` declaration.
+
+**The `--film-type (silver | chromogenic | unknown)` knob (I own it).** A new
+shared input-medium declaration, wired across all four coupled spots:
+- CLI `*Overrides`: `InputOverrides.film_type: Option<FilmType>` (`--film-type`
+  on `convert`); the flag is also added to `inspect` (`IoArgs`) and `estimate`
+  (`EstimateArgs`) so those commands' auto-base/inspect paths can use IR too.
+- Recipe `*Params`: `InputParams.film_type: FilmType` (recipe key
+  `input.film_type`, design-spec §9 Input/decode section — it describes the input
+  medium, parallel to `input.transfer`/`input.meaning`; deliberately **not** under
+  `film_base`, because `bw-support` IR dust removal will reuse the same key).
+- `merge` arm: flags-win over the recipe; absence never clobbers a recipe value.
+- `validate`: nothing to check — the enum has no invalid states; the gate is a
+  runtime `ir_transparent()` + IR-plane check, plus a `convert` warning when
+  `chromogenic` is declared on a scan with no IR plane.
+- Modeled as **one enum** (`FilmType`), not parallel bools. Default `Unknown`
+  (off). The gate is `FilmType::ir_transparent()` (true only for `Chromogenic`) —
+  silver blocks IR (dense silver → dark → misreads as holder) and unknown is the
+  safe default off. HDR 48-bit (no IR plane) always falls back to RGB-only.
+  A `// bw-support reuses this` note is on `FilmType` / `InputParams.film_type`.
+
+**Segmented-threshold mask (`pipeline/film_base.rs`).** `ir_holder_mask(image,
+film_type) -> Option<Vec<EdgeHolderMask>>` returns `Some` only for chromogenic +
+an IR plane. Per edge, the along-edge extent is split into `IR_HOLDER_SEGMENTS`
+(24) segments; each segment's **shallow** near-edge probe band (depth
+`IR_HOLDER_PROBE_FRAC` = 0.5% of the short dim, floored at 2px) is reduced to its
+median IR and classified holder (≤ `IR_HOLDER_MAX_TRANSMISSION` = 0.1) or film.
+Segmenting *along* the edge (not one per-edge mean) lets a partially-covered edge
+split into holder vs film runs; a whole-edge label is the degenerate
+all-segments-agree case. `rebate_candidates(image, film_type)` then runs the
+existing inward-scan **once per contiguous film run** (holder runs excluded), so
+holder pixels never enter the rebate search; with no mask it is the single
+full-extent scan per edge, byte-identical to before. `estimate` takes `film_type`
+and threads it through the `Auto` branch.
+
+**Probe-depth finding (important).** The classifier's probe depth was the one
+real design decision. The rebate *scan* window is ~10% of the short dim (≈342px on
+a 4666×3423 scan); probing that deep for the holder washes a real holder band out
+with the bright film sitting behind it (the whole-window median reads film). A
+**shallow** near-edge probe (~0.5%) is correct: the opaque holder occludes from
+the very edge inward, so its darkness lives in a shallow band. Verified on real
+scans (below).
+
+**Verification (real scans, via a throwaway `#[ignore]` test — now removed;
+derived numbers only, never pixels).**
+- IR cleanly separates holder from film on both HDRi scans: holder/occluded
+  segments read IR median ≈ 0.019–0.084, film segments ≈ 0.65–0.67 — a ~10–25×
+  gap, so the 0.1 threshold sits with wide margin on both sides (matches the
+  task's Phoenix 0.023 / Ektar 0.587 data).
+- **Phoenix `933`** (4666×3423, role=unexposed): Top 25/25 holder (IR
+  0.019–0.025), Bottom 1/25 (film, 0.073–0.666), Left 1/25 (film, 0.036–0.673),
+  Right 25/25 holder (0.027–0.084) → **top & right = holder, bottom & left =
+  film**, matching the task's expected Phoenix pattern (the right edge reads
+  full-holder near the edge on this unexposed frame rather than a partial split;
+  the partial-split *mechanism* is covered by the synthetic
+  `ir_mask_recovers_the_rebate_on_a_partially_occluded_edge` test).
+- **Ektar `1009`** (5184×3599, role=leader): all four edges read holder near the
+  edge (IR 0.018–0.079). This **differs from the task's "classified all-film"
+  expectation** — the real leader frame is genuinely held in a holder on all
+  edges (near-edge IR ≈ 0.02); the bright fully-exposed film is the interior. Any
+  correct opacity-based detector reads those edges as holder. The task's
+  "all-film" most likely described the exposed picture area, not the frame edges.
+- Neither frame yields rebate candidates (rgb-only and chromogenic both empty) —
+  expected: both are *calibration* frames (unexposed / leader) without the
+  `holder → rebate → picture` layered structure the rebate detector needs; you'd
+  use `--base-region`/`--grid` on them, not auto rebate detection. The
+  rebate-recovery integration is exercised by the synthetic partial-edge test.
+
+**Notes for `bw-support`.** (1) `input.film_type` / `FilmType` is the shared knob
+the IR dust-removal guard should key on (film type, not `color_model = mono`) —
+already named consumer-agnostically. (2) The IR holder mask's **second consumer**
+— auto-`Dmax` border exclusion (PR #21 finding 4: the dark holder/dust border can
+capture the 99.5th-percentile anchor and dim the render) — is left as follow-up;
+`ir_holder_mask` / `EdgeHolderMask` are `pub` and ready to reuse for excluding
+holder pixels from the anchor statistics.
+
+**Inspect surface.** `nc inspect --film-type chromogenic` on an HDRi scan now
+reports `holder_mask` (per-edge segments with span/class/IR) in the JSON report.
+
+Left uncommitted; TASKS.md checkbox not flipped.
+
+### 2026-07-24 — Review-fix pass (uncommitted)
+
+Addressed the `ir-holder-detection` review round (docs/comments/warnings/tests
+only; the core mask logic was untouched). **The Codex P1** claiming the IR mask
+excludes the spans the rebate detector needs was reviewed and **rejected as a
+false positive**: `edge_candidate`'s depth-0 "holder run" is a dark *RGB* band
+(can be dense film, IR-bright), while the IR mask excludes only *IR-dark* (opaque
+carrier) spans — `ir_mask_recovers_the_rebate_on_a_partially_occluded_edge` proves
+IR *recovers* a rebate RGB-only misses; no logic changed.
+
+- **Warning scoping.** The chromogenic-without-IR note now fires only when the
+  auto base detector actually runs (`FilmBaseSource::Auto`), so a valid
+  `convert --strict --film-type chromogenic --film-base …` on a non-HDRi scan no
+  longer fails on a path it never takes. The pre-existing "IR preserved but not
+  used in Step 1" note is suppressed when the chromogenic + IR + auto-base path
+  consumes IR for the holder mask (the claim would be false there). Matching
+  chromogenic-on-no-IR notes added to `run_estimate` (auto path) and `run_inspect`
+  for consistency.
+- **Docs.** design-spec §6.1 now records the chromogenic film-base IR consumer
+  (stage 2), and §9 Input/decode documents `--film-type` / `input.film_type` and
+  the `inspect` `holder_mask` report field.
+- **Comment accuracy.** Fixed the `bw-support` mischaracterization (it is the B&W /
+  mono task, roadmap item 3 — *not* the IR dust-removal task, which is item 1;
+  both reuse the shared `FilmType` axis) in `types.rs` / `cli.rs`; corrected the
+  `edge_holder_segments` trailing-segment comment (smaller leftover, not an
+  absorbed-larger one), the fully-occluded test's probe-depth comment (probe = 2 px,
+  not scan_depth 10), and the all-film test's Ektar `1009` framing (synthetic
+  uniformly-IR-bright film; the real leader's edges genuinely read holder).
+- **Tests.** Added five synthetic-fixture tests: threshold boundary pinned to
+  [0.09, 0.11) around `IR_HOLDER_MAX_TRANSMISSION`; thin (2 px) holder over bright
+  film to pin the shallow probe; a film→holder→film bottom edge covering the
+  >1-film-run / mid-loop-flush / >1-candidate-per-edge paths; an all-holder frame
+  driving the loud empty-candidates error; and a `HolderClass`/`HolderSegment`/
+  `EdgeHolderMask` lowercase-serde guard.

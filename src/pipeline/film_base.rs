@@ -45,7 +45,9 @@
 
 use serde::Serialize;
 
-use crate::types::{FilmBase, FilmBaseParams, FilmBaseSource, LinearImage, NcError, Result};
+use crate::types::{
+    FilmBase, FilmBaseParams, FilmBaseSource, FilmType, LinearImage, NcError, Result,
+};
 
 /// Percentile used to summarize a region per channel. A high percentile (rather
 /// than the raw max) resists hot pixels / dust sparkles while still landing on
@@ -93,6 +95,36 @@ const INTERIOR_BRIGHTNESS_MARGIN: f32 = 1.05;
 /// warning — the highest-transmission candidate still wins, but the ambiguity is surfaced and
 /// `--strict` can refuse it).
 const CROSS_EDGE_AGREE_TOL: f32 = 0.15;
+
+/// IR transmission at or below which a near-edge segment reads as the opaque film
+/// holder. Chromogenic film (base, rebate, picture, even fully-exposed leader) is
+/// IR-transparent and reads bright — measured ≈ 0.6–0.7 on real HDRi scans — while
+/// the holder blocks IR and reads dark (≈ 0.02), a ~25× separation, so 0.1 splits
+/// them with wide margin on both sides (`ir-holder-detection` verification data:
+/// Phoenix holder IR 0.023, Ektar fully-exposed film IR 0.587).
+const IR_HOLDER_MAX_TRANSMISSION: f32 = 0.1;
+
+/// Number of along-edge segments the IR holder mask splits each edge into. A
+/// holder can occlude only *part* of an edge (a partially-covered edge splits into
+/// holder vs film runs — e.g. Phoenix `933` right), so a single per-edge mean is
+/// too coarse. ~24 segments give enough resolution to isolate a partial holder
+/// while staying cheap and noise-robust (each segment pools many pixels).
+const IR_HOLDER_SEGMENTS: u32 = 24;
+
+/// Depth (perpendicular to the edge) the holder classifier probes inward, as a
+/// fraction of the short dimension. The opaque holder occludes the film **from the
+/// very edge inward**, so its darkness shows in a *shallow* near-edge band; probing
+/// the whole rebate-scan window ([`REBATE_SCAN_FRAC`], ~10%) instead would dilute a
+/// real holder band with the bright film sitting behind it and misread the edge as
+/// film. On real HDRi scans (`ir-holder-detection` verification) a ~0.5% band
+/// cleanly reads Phoenix `933` top/right as holder (near-edge IR ≈ 0.02) and
+/// bottom/left as film (≈ 0.65), while the whole-window median washed the holder
+/// out. Floored at a few pixels so tiny synthetic frames still probe a real band.
+const IR_HOLDER_PROBE_FRAC: f32 = 0.005;
+
+/// Minimum holder probe depth in pixels — floors [`IR_HOLDER_PROBE_FRAC`] so a
+/// small image still samples more than a single noisy row.
+const IR_HOLDER_PROBE_MIN: u32 = 2;
 
 /// Shared recovery advice appended to every auto-detection refusal, naming the
 /// fallback options. Kept in one place so the too-small and no-band errors stay
@@ -182,12 +214,16 @@ pub struct RebateCandidate {
 /// the user bakes into a recipe). This is the "reject degenerate bases at birth"
 /// guard the film-base gotcha in `CLAUDE.md` called for; the per-algo guards in
 /// `algo/*` remain as defense-in-depth.
-pub fn estimate(image: &LinearImage, params: &FilmBaseParams) -> Result<BaseEstimate> {
+pub fn estimate(
+    image: &LinearImage,
+    params: &FilmBaseParams,
+    film_type: FilmType,
+) -> Result<BaseEstimate> {
     let est = match params.source {
         FilmBaseSource::Explicit(rgb) => BaseEstimate::clean(FilmBase::from(rgb)),
         FilmBaseSource::Region(rect) => sample_region(image, rect)?,
         FilmBaseSource::Auto => {
-            let candidates = rebate_candidates(image)?;
+            let candidates = rebate_candidates(image, film_type)?;
             select_auto_base(image, &candidates)?
         }
     };
@@ -249,17 +285,30 @@ fn sample_region(image: &LinearImage, rect: [u32; 4]) -> Result<BaseEstimate> {
 /// keep the first uniform, value-continuous band that sits **behind** a
 /// contiguous dark-holder run. Strips are trimmed by the scan depth at both
 /// ends so the perpendicular edges' holder margins can't contaminate them.
-/// Returns one candidate per edge at most; an empty result means no confident
-/// band exists anywhere. Candidates are **not** transmission-gated here — that is
+/// Returns at most one candidate per edge (or per contiguous IR film run when the
+/// edge is masked); an empty result means no confident band exists anywhere.
+/// Candidates are **not** transmission-gated here — that is
 /// [`select_auto_base`]'s job, which must be called on the **same image** these
 /// candidates came from (it recomputes the scan depth and interior median from
 /// it). Errors only when the image is too small to scan.
-pub fn rebate_candidates(image: &LinearImage) -> Result<Vec<RebateCandidate>> {
+///
+/// When the film is chromogenic and the scan carries an IR plane, each edge's
+/// inward scan is restricted to its **film** segments (the IR holder mask) — the
+/// opaque holder's segments are excluded so their pixels never contaminate the
+/// rebate search (`ir-holder-detection`), and a partially-covered edge contributes
+/// one candidate per contiguous film run. With no usable IR mask (silver /
+/// `unknown` film, or no IR plane) every edge is scanned over its full trimmed
+/// extent exactly as before (byte-identical). [`select_auto_base`] ranks whatever
+/// candidates result.
+pub fn rebate_candidates(image: &LinearImage, film_type: FilmType) -> Result<Vec<RebateCandidate>> {
     let cap = scan_depth(image)?;
+    let mask = ir_holder_mask(image, film_type)?;
     let mut found = Vec::new();
     for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
-        if let Some(c) = edge_candidate(image, edge, cap)? {
-            found.push(c);
+        for (lo, hi) in film_along_ranges(mask.as_deref(), edge, image, cap) {
+            if let Some(c) = edge_candidate(image, edge, cap, lo, hi)? {
+                found.push(c);
+            }
         }
     }
     Ok(found)
@@ -374,33 +423,58 @@ enum StripClass {
     Other,
 }
 
-/// The 1-px strip rectangle at `depth` pixels in from `edge`, trimmed by `cap`
-/// at both ends (the corners belong to the perpendicular edges' holder).
-fn strip_rect(image: &LinearImage, edge: Edge, depth: u32, cap: u32) -> [u32; 4] {
+/// The 1-px strip rectangle at `depth` pixels in from `edge`, spanning the
+/// along-edge range `[along_lo, along_hi)`. The range is trimmed by `cap` at both
+/// ends for the full-edge scan (the corners belong to the perpendicular edges'
+/// holder), or narrowed to one IR film run for a partially-occluded edge.
+fn strip_rect(
+    image: &LinearImage,
+    edge: Edge,
+    depth: u32,
+    along_lo: u32,
+    along_hi: u32,
+) -> [u32; 4] {
     let (w, h) = (image.width, image.height);
+    let along = along_hi - along_lo;
     match edge {
-        Edge::Top => [cap, depth, w - 2 * cap, 1],
-        Edge::Bottom => [cap, h - 1 - depth, w - 2 * cap, 1],
-        Edge::Left => [depth, cap, 1, h - 2 * cap],
-        Edge::Right => [w - 1 - depth, cap, 1, h - 2 * cap],
+        Edge::Top => [along_lo, depth, along, 1],
+        Edge::Bottom => [along_lo, h - 1 - depth, along, 1],
+        Edge::Left => [depth, along_lo, 1, along],
+        Edge::Right => [w - 1 - depth, along_lo, 1, along],
     }
 }
 
-/// The band rectangle covering strip depths `[start, end)` on `edge`.
-fn band_rect(image: &LinearImage, edge: Edge, start: u32, end: u32, cap: u32) -> [u32; 4] {
+/// The band rectangle covering strip depths `[start, end)` on `edge`, spanning
+/// the along-edge range `[along_lo, along_hi)`.
+fn band_rect(
+    image: &LinearImage,
+    edge: Edge,
+    start: u32,
+    end: u32,
+    along_lo: u32,
+    along_hi: u32,
+) -> [u32; 4] {
     let (w, h) = (image.width, image.height);
+    let along = along_hi - along_lo;
     let thick = end - start;
     match edge {
-        Edge::Top => [cap, start, w - 2 * cap, thick],
-        Edge::Bottom => [cap, h - end, w - 2 * cap, thick],
-        Edge::Left => [start, cap, thick, h - 2 * cap],
-        Edge::Right => [w - end, cap, thick, h - 2 * cap],
+        Edge::Top => [along_lo, start, along, thick],
+        Edge::Bottom => [along_lo, h - end, along, thick],
+        Edge::Left => [start, along_lo, thick, along],
+        Edge::Right => [w - end, along_lo, thick, along],
     }
 }
 
-/// Classify the strip at `depth` in from `edge`.
-fn classify_strip(image: &LinearImage, edge: Edge, depth: u32, cap: u32) -> Result<StripClass> {
-    let mut chans = region_channels(image, strip_rect(image, edge, depth, cap))?;
+/// Classify the strip at `depth` in from `edge` over the along-edge range
+/// `[along_lo, along_hi)`.
+fn classify_strip(
+    image: &LinearImage,
+    edge: Edge,
+    depth: u32,
+    along_lo: u32,
+    along_hi: u32,
+) -> Result<StripClass> {
+    let mut chans = region_channels(image, strip_rect(image, edge, depth, along_lo, along_hi))?;
     let (hi, spread) = channel_stats(&mut chans);
     if hi.iter().all(|&v| v < HOLDER_MAX_TRANSMISSION) {
         Ok(StripClass::Holder)
@@ -411,17 +485,28 @@ fn classify_strip(image: &LinearImage, edge: Edge, depth: u32, cap: u32) -> Resu
     }
 }
 
-/// Find the rebate candidate on one edge, if any: a contiguous holder run at
-/// the very edge, then a run of uniform, value-continuous strips at least
-/// [`MIN_BAND_STRIPS`] thick. The whole band is then re-measured as one region
-/// and must itself pass the uniformity gate (defense against a slow drift the
-/// per-strip checks can't see). A high-transmission band **at** the edge (no holder
-/// outside it) is rejected — that is the bright-surround false positive, or a
-/// crop with no holder, and both belong to `--base-region`, not auto.
-fn edge_candidate(image: &LinearImage, edge: Edge, cap: u32) -> Result<Option<RebateCandidate>> {
+/// Find the rebate candidate on one edge over the along-edge range
+/// `[along_lo, along_hi)`, if any: a contiguous holder run at the very edge, then
+/// a run of uniform, value-continuous strips at least [`MIN_BAND_STRIPS`] thick.
+/// The whole band is then re-measured as one region and must itself pass the
+/// uniformity gate (defense against a slow drift the per-strip checks can't see).
+/// A high-transmission band **at** the edge (no holder outside it) is rejected —
+/// that is the bright-surround false positive, or a crop with no holder, and both
+/// belong to `--base-region`, not auto. The along-edge range is the full trimmed
+/// extent for an ordinary scan, or one IR film run when the holder occludes only
+/// part of the edge.
+fn edge_candidate(
+    image: &LinearImage,
+    edge: Edge,
+    cap: u32,
+    along_lo: u32,
+    along_hi: u32,
+) -> Result<Option<RebateCandidate>> {
     // Contiguous holder run from depth 0.
     let mut depth = 0;
-    while depth < cap && classify_strip(image, edge, depth, cap)? == StripClass::Holder {
+    while depth < cap
+        && classify_strip(image, edge, depth, along_lo, along_hi)? == StripClass::Holder
+    {
         depth += 1;
     }
     if depth == 0 || depth >= cap {
@@ -432,7 +517,8 @@ fn edge_candidate(image: &LinearImage, edge: Edge, cap: u32) -> Result<Option<Re
     let start = depth;
     let mut prev: Option<[f32; 3]> = None;
     while depth < cap {
-        let StripClass::Uniform(hi) = classify_strip(image, edge, depth, cap)? else {
+        let StripClass::Uniform(hi) = classify_strip(image, edge, depth, along_lo, along_hi)?
+        else {
             break;
         };
         if let Some(p) = prev {
@@ -461,7 +547,7 @@ fn edge_candidate(image: &LinearImage, edge: Edge, cap: u32) -> Result<Option<Re
     }
 
     // Re-measure the band as one region; the whole band must be uniform too.
-    let region = band_rect(image, edge, start, depth, cap);
+    let region = band_rect(image, edge, start, depth, along_lo, along_hi);
     let mut chans = region_channels(image, region)?;
     let (base, spread) = channel_stats(&mut chans);
     if spread > MAX_RELATIVE_SPREAD {
@@ -473,6 +559,227 @@ fn edge_candidate(image: &LinearImage, edge: Edge, cap: u32) -> Result<Option<Re
         base,
         spread,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// IR film-holder mask (chromogenic only) — the `ir-holder-detection` masking
+// pre-step that feeds the RGB rebate search above.
+// ---------------------------------------------------------------------------
+//
+// Chromogenic dye film is transparent to infrared, so all film (base, rebate,
+// picture, even fully-exposed leader) reads bright in IR while the opaque scanner
+// holder reads dark — a content-independent holder signal RGB cannot produce
+// (holder and dense film are both dark in RGB). This mask classifies each edge's
+// along-edge segments as holder vs film from the IR plane, and `rebate_candidates`
+// runs the RGB inward scan only over the film runs, so a partially-occluded edge
+// contributes only its film part and holder pixels never enter the rebate search.
+//
+// **Second consumer (follow-up, not wired here):** the same mask is what
+// `bw-support` (PR #21, finding 4) needs to exclude the dark holder/dust border
+// from the auto-`Dmax` anchor statistics (an uncropped holder can capture the
+// 99.5th-percentile anchor and dim the render). That reuse is left for the
+// auto-`Dmax` work; here the mask only feeds the film-base search.
+
+/// IR-based holder classification of one along-edge segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HolderClass {
+    /// Opaque scanner holder (dark in IR) — occludes the film; excluded from the
+    /// rebate search.
+    Holder,
+    /// Actual film (bright in IR: base, rebate, picture, or leader) — searched for
+    /// the unexposed rebate.
+    Film,
+}
+
+/// One along-edge segment of the IR holder mask: the along-edge pixel span it
+/// covers, its holder/film class, and the representative IR transmission behind
+/// the class. Serialized into `nc inspect` so a user can see which parts of which
+/// edges the holder occludes.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct HolderSegment {
+    /// Along-edge pixel range `[start, end)` — columns for top/bottom, rows for
+    /// left/right.
+    pub span: [u32; 2],
+    /// Holder (dark IR) or film (bright IR).
+    pub class: HolderClass,
+    /// Median IR transmission over the segment's near-edge probe band — the value
+    /// classified against [`IR_HOLDER_MAX_TRANSMISSION`].
+    pub ir: f32,
+}
+
+/// The IR film-holder classification of one edge: its along-edge segments in
+/// order. A fully-film or fully-holder edge is the degenerate all-segments-agree
+/// case (every segment the same class).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct EdgeHolderMask {
+    pub edge: Edge,
+    pub segments: Vec<HolderSegment>,
+}
+
+/// Build the IR film-holder mask, or `None` when the IR path does not apply.
+///
+/// Produced **only** when the film is chromogenic ([`FilmType::ir_transparent`] —
+/// silver B&W blocks IR and would misread dense silver as holder) **and** the scan
+/// actually carries an IR plane (HDR 48-bit has none); both gate the path per
+/// design-spec §6.1 and the `ir-holder-detection` task. Every other input returns
+/// `None` and the caller falls back to the RGB-only rebate search. Pure over the
+/// decoded IR plane.
+///
+/// Per edge, the along-edge extent is split into [`IR_HOLDER_SEGMENTS`] segments;
+/// each segment's **shallow** near-edge probe band (depth
+/// `0..holder_probe_depth`, [`IR_HOLDER_PROBE_FRAC`]) is reduced to its median IR
+/// transmission and classified holder (dark) or film (bright) against
+/// [`IR_HOLDER_MAX_TRANSMISSION`]. Segmenting *along* the edge — not one per-edge
+/// mean — is what lets a partially-covered edge split into holder vs film runs.
+/// (`scan_depth` is still consulted so the feature refuses too-small images the
+/// same way the rebate search does.)
+pub fn ir_holder_mask(
+    image: &LinearImage,
+    film_type: FilmType,
+) -> Result<Option<Vec<EdgeHolderMask>>> {
+    let Some(ir) = image.ir.as_deref() else {
+        return Ok(None);
+    };
+    if !film_type.ir_transparent() {
+        return Ok(None);
+    }
+    scan_depth(image)?; // same too-small guard as the rebate search
+    let probe = holder_probe_depth(image);
+    let mut masks = Vec::with_capacity(4);
+    for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+        masks.push(EdgeHolderMask {
+            edge,
+            segments: edge_holder_segments(image, ir, edge, probe),
+        });
+    }
+    Ok(Some(masks))
+}
+
+/// The shallow near-edge depth the holder classifier probes:
+/// [`IR_HOLDER_PROBE_FRAC`] of the short dimension, floored at
+/// [`IR_HOLDER_PROBE_MIN`]. Shallow on purpose — see [`IR_HOLDER_PROBE_FRAC`].
+fn holder_probe_depth(image: &LinearImage) -> u32 {
+    ((image.width.min(image.height) as f32 * IR_HOLDER_PROBE_FRAC).round() as u32)
+        .max(IR_HOLDER_PROBE_MIN)
+}
+
+/// The along-edge length of `edge` (columns for top/bottom, rows for left/right).
+fn along_len(image: &LinearImage, edge: Edge) -> u32 {
+    match edge {
+        Edge::Top | Edge::Bottom => image.width,
+        Edge::Left | Edge::Right => image.height,
+    }
+}
+
+/// Classify each along-edge segment of `edge` as holder or film from the IR plane.
+/// The along-edge extent is divided into [`IR_HOLDER_SEGMENTS`] roughly-equal
+/// segments; each is classified by the median IR over its shallow near-edge probe
+/// band (depth `0..probe`).
+fn edge_holder_segments(
+    image: &LinearImage,
+    ir: &[f32],
+    edge: Edge,
+    probe: u32,
+) -> Vec<HolderSegment> {
+    let along = along_len(image, edge);
+    // Segment width rounds down but is at least 1 px; because the width is floored,
+    // an edge whose length isn't a multiple of it ends in a smaller leftover
+    // segment (`[start, along)`, narrower than the rest) rather than the last one
+    // growing — so the whole edge is still covered.
+    let seg = (along / IR_HOLDER_SEGMENTS).max(1);
+    let mut segments = Vec::new();
+    let mut start = 0u32;
+    while start < along {
+        let end = (start + seg).min(along);
+        let ir_med = median_ir_probe(image, ir, edge, start, end, probe);
+        let class = if ir_med <= IR_HOLDER_MAX_TRANSMISSION {
+            HolderClass::Holder
+        } else {
+            HolderClass::Film
+        };
+        segments.push(HolderSegment {
+            span: [start, end],
+            class,
+            ir: ir_med,
+        });
+        start = end;
+    }
+    segments
+}
+
+/// Median IR transmission over the near-edge probe band of one along-edge segment:
+/// the `probe`-deep strip from `edge` inward, spanning along-edge `[along_lo,
+/// along_hi)`. The median resists dust sparkles / hot IR pixels while cleanly
+/// separating the uniformly dark holder from bright film.
+fn median_ir_probe(
+    image: &LinearImage,
+    ir: &[f32],
+    edge: Edge,
+    along_lo: u32,
+    along_hi: u32,
+    probe: u32,
+) -> f32 {
+    let (w, h) = (image.width, image.height);
+    // The probe band: `probe` deep from the edge, spanning the segment along-edge.
+    let [x, y, rw, rh] = match edge {
+        Edge::Top => [along_lo, 0, along_hi - along_lo, probe],
+        Edge::Bottom => [along_lo, h - probe, along_hi - along_lo, probe],
+        Edge::Left => [0, along_lo, probe, along_hi - along_lo],
+        Edge::Right => [w - probe, along_lo, probe, along_hi - along_lo],
+    };
+    let mut vals = Vec::with_capacity((rw as usize) * (rh as usize));
+    for row in y..y + rh {
+        let row_start = row as usize * w as usize;
+        for col in x..x + rw {
+            vals.push(ir[row_start + col as usize]);
+        }
+    }
+    percentile(&mut vals, 0.5)
+}
+
+/// The along-edge pixel ranges to run the rebate inward-scan over on `edge`,
+/// trimmed to the scan window's along-edge extent `[cap, along-cap)`. Without a
+/// holder mask this is the single full trimmed extent (the RGB-only path,
+/// unchanged); with a mask it is one range per contiguous run of **film**
+/// segments — holder runs are excluded so their pixels never enter the rebate
+/// search, and a partially-covered edge contributes only its film runs.
+fn film_along_ranges(
+    mask: Option<&[EdgeHolderMask]>,
+    edge: Edge,
+    image: &LinearImage,
+    cap: u32,
+) -> Vec<(u32, u32)> {
+    // `scan_depth` guarantees `along > 2*cap`, so the trimmed extent is non-empty.
+    let (trim_lo, trim_hi) = (cap, along_len(image, edge) - cap);
+    let Some(edge_mask) = mask.and_then(|m| m.iter().find(|m| m.edge == edge)) else {
+        return vec![(trim_lo, trim_hi)];
+    };
+
+    // Merge contiguous film segments into runs, then clip each to the trimmed
+    // extent. A run fully outside `[trim_lo, trim_hi)`, or clipped empty, is
+    // dropped (its along-edge span is entirely in the corner trim).
+    let mut ranges = Vec::new();
+    let mut run: Option<(u32, u32)> = None;
+    let flush = |run: &mut Option<(u32, u32)>, ranges: &mut Vec<(u32, u32)>| {
+        if let Some((lo, hi)) = run.take() {
+            let (lo, hi) = (lo.max(trim_lo), hi.min(trim_hi));
+            if lo < hi {
+                ranges.push((lo, hi));
+            }
+        }
+    };
+    for s in &edge_mask.segments {
+        match s.class {
+            HolderClass::Film => match &mut run {
+                Some((_, end)) => *end = s.span[1],
+                None => run = Some((s.span[0], s.span[1])),
+            },
+            HolderClass::Holder => flush(&mut run, &mut ranges),
+        }
+    }
+    flush(&mut run, &mut ranges);
+    ranges
 }
 
 /// Per-channel high percentile and the worst per-channel relative spread
@@ -778,7 +1085,12 @@ mod tests {
         // A tiny dark image that auto-detection would reject still resolves,
         // because the explicit value is returned verbatim without sampling.
         let img = solid(4, 4, [0.1, 0.1, 0.1]);
-        let est = estimate(&img, &params(FilmBaseSource::Explicit([0.9, 0.55, 0.42]))).unwrap();
+        let est = estimate(
+            &img,
+            &params(FilmBaseSource::Explicit([0.9, 0.55, 0.42])),
+            FilmType::Unknown,
+        )
+        .unwrap();
         assert_eq!(est.base, FilmBase::from([0.9, 0.55, 0.42]));
         assert!(est.warnings.is_empty());
     }
@@ -789,7 +1101,12 @@ mod tests {
         // region's value rather than the surrounding frame.
         let mut img = solid(10, 10, [0.2, 0.2, 0.2]);
         fill_rect(&mut img, [4, 4, 2, 2], [0.8, 0.6, 0.5]);
-        let est = estimate(&img, &params(FilmBaseSource::Region([4, 4, 2, 2]))).unwrap();
+        let est = estimate(
+            &img,
+            &params(FilmBaseSource::Region([4, 4, 2, 2])),
+            FilmType::Unknown,
+        )
+        .unwrap();
         assert_close(est.base, [0.8, 0.6, 0.5], 1e-6);
         // A flat rectangle raises no uniformity warning.
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
@@ -802,7 +1119,12 @@ mod tests {
         // not be silently altered by the check.
         let mut img = solid(20, 20, [0.2, 0.1, 0.05]);
         fill_rect(&mut img, [0, 0, 20, 6], REBATE); // top: fake rebate
-        let mixed = estimate(&img, &params(FilmBaseSource::Region([0, 0, 20, 12]))).unwrap();
+        let mixed = estimate(
+            &img,
+            &params(FilmBaseSource::Region([0, 0, 20, 12])),
+            FilmType::Unknown,
+        )
+        .unwrap();
         assert!(
             mixed.warnings.iter().any(|w| w.contains("not uniform")),
             "mixed rectangle must warn: {:?}",
@@ -810,7 +1132,12 @@ mod tests {
         );
         assert_close(mixed.base, REBATE, 1e-6); // p97 lands on the bright part, unchanged
         // The clean sub-rectangle does not warn.
-        let clean = estimate(&img, &params(FilmBaseSource::Region([0, 0, 20, 6]))).unwrap();
+        let clean = estimate(
+            &img,
+            &params(FilmBaseSource::Region([0, 0, 20, 6])),
+            FilmType::Unknown,
+        )
+        .unwrap();
         assert!(clean.warnings.is_empty(), "{:?}", clean.warnings);
     }
 
@@ -818,7 +1145,7 @@ mod tests {
     fn auto_detects_rebate_behind_holder_on_one_edge() {
         // The real layout: holder → thin rebate (bottom edge only) → picture.
         let img = scan_with_rebate(&[Edge::Bottom]);
-        let est = estimate(&img, &params(FilmBaseSource::Auto)).unwrap();
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
     }
@@ -826,7 +1153,7 @@ mod tests {
     #[test]
     fn auto_detects_agreeing_rebate_on_two_edges() {
         let img = scan_with_rebate(&[Edge::Bottom, Edge::Left]);
-        let est = estimate(&img, &params(FilmBaseSource::Auto)).unwrap();
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
         // Same stock on both edges → no cross-edge disagreement warning.
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
@@ -843,7 +1170,7 @@ mod tests {
         fill_rect(&mut img, [0, 94, 100, 6], [0.92, 0.55, 0.42]);
         fill_rect(&mut img, [0, 0, 6, 100], [0.92, 0.55, 0.42]);
         fill_rect(&mut img, [94, 0, 6, 100], [0.92, 0.55, 0.42]);
-        let err = estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err();
+        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
         assert!(matches!(err, NcError::Other(_)));
         let msg = err.to_string();
         for flag in ["--film-base", "--base-region", "--base-content"] {
@@ -868,7 +1195,7 @@ mod tests {
         let mut img = LinearImage::new(w, h, buf, None).unwrap();
         fill_rect(&mut img, [0, 0, w, 3], HOLDER); // top holder, 3 px
         fill_rect(&mut img, [0, 3, w, 7], REBATE); // uniform rows 3..10 → reaches cap
-        let cands = rebate_candidates(&img).unwrap();
+        let cands = rebate_candidates(&img, FilmType::Unknown).unwrap();
         assert!(
             !cands.iter().any(|c| c.edge == Edge::Top),
             "a cap-spanning uniform band must not be a candidate: {cands:?}"
@@ -881,7 +1208,7 @@ mod tests {
         // region) must not out-rank the genuine, brighter rebate on another.
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         fill_rect(&mut img, [0, 3, 100, 4], [0.20, 0.10, 0.05]); // top: flat dark band
-        let est = estimate(&img, &params(FilmBaseSource::Auto)).unwrap();
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
     }
 
@@ -891,7 +1218,7 @@ mod tests {
         // actionable message naming the recovery flags, never return a silent
         // wrong base.
         let img = scan_with_rebate(&[]);
-        let err = estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err();
+        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
         assert!(matches!(err, NcError::Other(_)));
         let msg = err.to_string();
         for flag in ["--film-base", "--base-region", "--base-content"] {
@@ -904,7 +1231,7 @@ mod tests {
         // A flat image has no holder run, hence no candidate.
         let img = solid(100, 100, [0.5, 0.5, 0.5]);
         assert!(matches!(
-            estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err(),
+            estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err(),
             NcError::Other(_)
         ));
     }
@@ -917,7 +1244,7 @@ mod tests {
         let mut img = solid(100, 100, [0.6, 0.6, 0.6]);
         fill_rect(&mut img, [0, 0, 100, 3], HOLDER);
         fill_rect(&mut img, [0, 3, 100, 4], [0.30, 0.30, 0.30]); // dark band
-        let err = estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err();
+        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
         assert!(
             err.to_string().contains("higher transmission"),
             "should fail the transmission gate: {err}"
@@ -931,7 +1258,7 @@ mod tests {
         // surfaced as a warning (--strict can then refuse it).
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         fill_rect(&mut img, [0, 3, 100, 4], [0.30, 0.20, 0.12]); // top: bright but different
-        let est = estimate(&img, &params(FilmBaseSource::Auto)).unwrap();
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02); // highest-transmission (the rebate) still wins
         assert!(
             est.warnings.iter().any(|w| w.contains("disagree")),
@@ -948,7 +1275,7 @@ mod tests {
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         // Top band ~8% brighter than REBATE per channel — inside the 15% tol.
         fill_rect(&mut img, [0, 3, 100, 4], [0.573, 0.281, 0.173]);
-        let est = estimate(&img, &params(FilmBaseSource::Auto)).unwrap();
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
         assert!(
             est.warnings.is_empty(),
             "edges within tolerance must not warn: {:?}",
@@ -960,7 +1287,7 @@ mod tests {
     fn auto_is_too_small_error_on_sliver_images() {
         // 6x6 with the minimum scan depth of 3 leaves no interior at all.
         let img = solid(6, 6, [0.5, 0.5, 0.5]);
-        let err = estimate(&img, &params(FilmBaseSource::Auto)).unwrap_err();
+        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
         assert!(err.to_string().contains("too small"), "{err}");
     }
 
@@ -969,7 +1296,7 @@ mod tests {
         // The inspect surface: candidates carry the edge, a rectangle usable as
         // --base-region, the proposed base, and the spread (confidence).
         let img = scan_with_rebate(&[Edge::Left]);
-        let cands = rebate_candidates(&img).unwrap();
+        let cands = rebate_candidates(&img, FilmType::Unknown).unwrap();
         assert_eq!(cands.len(), 1);
         let c = &cands[0];
         assert_eq!(c.edge, Edge::Left);
@@ -980,7 +1307,12 @@ mod tests {
             assert!((got - want).abs() < 0.02, "candidate base {:?}", c.base);
         }
         // The reported region re-samples to the same base it proposed.
-        let est = estimate(&img, &params(FilmBaseSource::Region(c.region))).unwrap();
+        let est = estimate(
+            &img,
+            &params(FilmBaseSource::Region(c.region)),
+            FilmType::Unknown,
+        )
+        .unwrap();
         assert_close(est.base, c.base, 1e-6);
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
 
@@ -988,10 +1320,15 @@ mod tests {
         // above only covers the `start`-relative form): rebate depths 3..7 →
         // rows 93..97, so the band rect is [cap, h-end, w-2cap, thick].
         let img = scan_with_rebate(&[Edge::Bottom]);
-        let cands = rebate_candidates(&img).unwrap();
+        let cands = rebate_candidates(&img, FilmType::Unknown).unwrap();
         let c = cands.iter().find(|c| c.edge == Edge::Bottom).unwrap();
         assert_eq!(c.region, [10, 93, 80, 4]);
-        let est = estimate(&img, &params(FilmBaseSource::Region(c.region))).unwrap();
+        let est = estimate(
+            &img,
+            &params(FilmBaseSource::Region(c.region)),
+            FilmType::Unknown,
+        )
+        .unwrap();
         assert_close(est.base, c.base, 1e-6);
     }
 
@@ -1011,11 +1348,21 @@ mod tests {
     #[test]
     fn out_of_bounds_region_is_usage_error() {
         let img = solid(8, 8, [0.5, 0.5, 0.5]);
-        let err = estimate(&img, &params(FilmBaseSource::Region([4, 4, 8, 8]))).unwrap_err();
+        let err = estimate(
+            &img,
+            &params(FilmBaseSource::Region([4, 4, 8, 8])),
+            FilmType::Unknown,
+        )
+        .unwrap_err();
         assert!(matches!(err, NcError::Usage(_)));
         // Empty region is also rejected (defense-in-depth; cli.rs rejects it too).
         assert!(matches!(
-            estimate(&img, &params(FilmBaseSource::Region([0, 0, 0, 4]))).unwrap_err(),
+            estimate(
+                &img,
+                &params(FilmBaseSource::Region([0, 0, 0, 4])),
+                FilmType::Unknown
+            )
+            .unwrap_err(),
             NcError::Usage(_)
         ));
     }
@@ -1184,7 +1531,12 @@ mod tests {
         // as the base (a NaN/inf Dmin would poison the density divide downstream).
         let mut img = solid(10, 10, [0.5, 0.5, 0.5]);
         set_px(&mut img, 0, 0, [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
-        let est = estimate(&img, &params(FilmBaseSource::Region([0, 0, 10, 10]))).unwrap();
+        let est = estimate(
+            &img,
+            &params(FilmBaseSource::Region([0, 0, 10, 10])),
+            FilmType::Unknown,
+        )
+        .unwrap();
         let base = est.base;
         assert!(base.r.is_finite() && base.g.is_finite() && base.b.is_finite());
         assert_close(base, [0.5, 0.5, 0.5], 1e-6);
@@ -1265,11 +1617,354 @@ mod tests {
         // echo back), naming a recovery flag.
         let mut img = solid(50, 50, [0.4, 0.3, 0.2]);
         fill_rect(&mut img, [0, 0, 10, 10], [0.0, 0.0, 0.0]);
-        let err = estimate(&img, &params(FilmBaseSource::Region([0, 0, 10, 10]))).unwrap_err();
+        let err = estimate(
+            &img,
+            &params(FilmBaseSource::Region([0, 0, 10, 10])),
+            FilmType::Unknown,
+        )
+        .unwrap_err();
         assert!(matches!(err, NcError::Other(_)), "got {err:?}");
         assert!(
             err.to_string().contains("--film-base"),
             "degenerate-base error must name a recovery flag: {err}"
         );
+    }
+
+    // --- IR film-holder mask (`ir-holder-detection`) -------------------------
+
+    /// Attach a flat IR plane of value `v` to an image (helper for the mask tests).
+    fn with_uniform_ir(mut img: LinearImage, v: f32) -> LinearImage {
+        img.ir = Some(vec![v; (img.width * img.height) as usize]);
+        img
+    }
+
+    /// Set one IR pixel in place (the image must already carry an IR plane).
+    fn set_ir(img: &mut LinearImage, x: u32, y: u32, v: f32) {
+        let i = (y * img.width + x) as usize;
+        img.ir.as_mut().expect("image has an IR plane")[i] = v;
+    }
+
+    /// Fill a rectangle of the IR plane with `v`.
+    fn fill_ir_rect(img: &mut LinearImage, [x, y, w, h]: [u32; 4], v: f32) {
+        for yy in y..y + h {
+            for xx in x..x + w {
+                set_ir(img, xx, yy, v);
+            }
+        }
+    }
+
+    /// IR transmission of film vs the opaque holder on a chromogenic scan
+    /// (measured ≈ 0.6 vs ≈ 0.02 — see [`IR_HOLDER_MAX_TRANSMISSION`]).
+    const IR_FILM: f32 = 0.6;
+    const IR_HOLDER: f32 = 0.02;
+
+    #[test]
+    fn ir_holder_mask_only_for_chromogenic_with_an_ir_plane() {
+        // The gate is film chemistry AND IR presence, per design-spec §6.1.
+        // Chromogenic but no IR plane (HDR 48-bit) → None (RGB-only fallback).
+        let no_ir = scan_with_rebate(&[Edge::Bottom]);
+        assert!(no_ir.ir.is_none());
+        assert!(
+            ir_holder_mask(&no_ir, FilmType::Chromogenic)
+                .unwrap()
+                .is_none()
+        );
+        // IR present but silver / unknown → None (silver blocks IR and would
+        // misread dense silver as holder; unknown is the safe default off).
+        let with_ir = with_uniform_ir(scan_with_rebate(&[Edge::Bottom]), IR_FILM);
+        assert!(
+            ir_holder_mask(&with_ir, FilmType::Silver)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            ir_holder_mask(&with_ir, FilmType::Unknown)
+                .unwrap()
+                .is_none()
+        );
+        // Chromogenic + an IR plane → the mask is built.
+        assert!(
+            ir_holder_mask(&with_ir, FilmType::Chromogenic)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ir_holder_mask_labels_a_fully_occluded_and_a_fully_film_edge() {
+        // A whole-edge label is the degenerate all-segments-agree case: the top
+        // edge is entirely holder (dark in IR), the bottom entirely film (bright).
+        let mut img = with_uniform_ir(solid(100, 100, [0.2, 0.1, 0.05]), IR_FILM);
+        // holder_probe_depth(100x100) = 2, so the classifier probes a shallow 2 px
+        // near-edge band; occlude the top 10 px to cover it with margin.
+        fill_ir_rect(&mut img, [0, 0, 100, 10], IR_HOLDER);
+        let mask = ir_holder_mask(&img, FilmType::Chromogenic)
+            .unwrap()
+            .unwrap();
+
+        let top = mask.iter().find(|m| m.edge == Edge::Top).unwrap();
+        assert!(
+            top.segments.iter().all(|s| s.class == HolderClass::Holder),
+            "fully-occluded top edge must read all-holder: {top:?}"
+        );
+        let bottom = mask.iter().find(|m| m.edge == Edge::Bottom).unwrap();
+        assert!(
+            bottom.segments.iter().all(|s| s.class == HolderClass::Film),
+            "clear bottom edge must read all-film: {bottom:?}"
+        );
+        // Segments tile the whole edge in order (no gaps).
+        assert_eq!(top.segments.first().unwrap().span[0], 0);
+        assert_eq!(top.segments.last().unwrap().span[1], 100);
+    }
+
+    #[test]
+    fn ir_mask_recovers_the_rebate_on_a_partially_occluded_edge() {
+        // The Phoenix `933` right-edge case: a holder covers only part of the edge.
+        // The near-edge full-width RGB strip would mix the top-half holder border
+        // with the bottom-half rebate (high spread → no candidate), but IR splits
+        // the edge so only the film run is scanned and the rebate is recovered.
+        let (w, h) = (100u32, 100u32); // scan_depth = 10, segment = 4 px
+        let split = 48u32; // a segment boundary, so the split is clean
+        let mut buf = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let t = (x + y) as f32 / (w + h) as f32; // varied (high-spread) picture
+                buf.extend_from_slice(&[0.05 + 0.35 * t, 0.03 + 0.20 * t, 0.02 + 0.10 * t]);
+            }
+        }
+        let mut img = LinearImage::new(w, h, buf, None).unwrap();
+        // A dark RGB border down the whole right edge, and a rebate behind it only
+        // on the bottom half — RGB alone can't tell the top-half border (holder)
+        // from the bottom-half border (dense film in front of the rebate).
+        fill_rect(&mut img, [w - 3, 0, 3, h], HOLDER);
+        fill_rect(&mut img, [w - 7, split, 4, h - split], REBATE);
+        // IR: film-bright everywhere except the opaque holder occluding the
+        // top-right (dark IR over the near-edge probe band).
+        img = with_uniform_ir(img, IR_FILM);
+        fill_ir_rect(&mut img, [w - 10, 0, 10, split], IR_HOLDER);
+
+        // The mask splits the right edge into a holder run (top) and a film run.
+        let mask = ir_holder_mask(&img, FilmType::Chromogenic)
+            .unwrap()
+            .unwrap();
+        let right = mask.iter().find(|m| m.edge == Edge::Right).unwrap();
+        assert!(
+            right
+                .segments
+                .iter()
+                .any(|s| s.class == HolderClass::Holder)
+                && right.segments.iter().any(|s| s.class == HolderClass::Film),
+            "the partially-occluded right edge must split into holder and film \
+             segments: {right:?}"
+        );
+
+        // RGB-only: the mixed full-width strip yields no clean right-edge candidate.
+        let rgb_only = rebate_candidates(&img, FilmType::Unknown).unwrap();
+        assert!(
+            !rgb_only.iter().any(|c| c.edge == Edge::Right),
+            "RGB-only must not find a right-edge candidate on the mixed edge: {rgb_only:?}"
+        );
+
+        // With the IR mask the film run is scanned on its own and finds the rebate.
+        let with_ir = rebate_candidates(&img, FilmType::Chromogenic).unwrap();
+        let c = with_ir
+            .iter()
+            .find(|c| c.edge == Edge::Right)
+            .expect("IR mask must recover the right-edge rebate");
+        for (got, want) in c.base.iter().zip(REBATE) {
+            assert!(
+                (got - want).abs() < 0.03,
+                "recovered rebate base {:?}",
+                c.base
+            );
+        }
+        // And the full estimate resolves to that rebate under the chromogenic path,
+        // while the RGB-only path fails loudly (no candidate anywhere).
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
+        assert_close(est.base, REBATE, 0.03);
+        assert!(estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).is_err());
+    }
+
+    #[test]
+    fn chromogenic_without_ir_matches_the_rgb_only_path() {
+        // An HDR 48-bit scan (no IR plane) declared chromogenic must behave exactly
+        // like the RGB-only path — the mask never applies, so the base is identical.
+        let img = scan_with_rebate(&[Edge::Bottom, Edge::Left]);
+        let rgb = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let chromo = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
+        assert_eq!(rgb.base, chromo.base);
+    }
+
+    #[test]
+    fn ir_mask_all_film_edge_matches_the_rgb_only_candidate() {
+        // A synthetic uniformly-IR-bright film (no holder anywhere): every edge
+        // reads all-film, so the chromogenic scan is scanned over the same full
+        // extent as RGB-only and yields the same rebate candidate. (This models the
+        // exposed picture area, not real-scan frame edges: the real Ektar `1009`
+        // leader genuinely sits in a holder on all its edges — near-edge IR ≈ 0.02,
+        // see the ir-holder-detection progress notes — so any correct opacity
+        // detector reads those edges as holder, not film.)
+        let img = with_uniform_ir(scan_with_rebate(&[Edge::Bottom]), IR_FILM);
+        let mask = ir_holder_mask(&img, FilmType::Chromogenic)
+            .unwrap()
+            .unwrap();
+        assert!(
+            mask.iter()
+                .all(|m| m.segments.iter().all(|s| s.class == HolderClass::Film)),
+            "an all-film scan must read every segment as film: {mask:?}"
+        );
+        let rgb = rebate_candidates(&img, FilmType::Unknown).unwrap();
+        let chromo = rebate_candidates(&img, FilmType::Chromogenic).unwrap();
+        assert_eq!(rgb, chromo);
+    }
+
+    #[test]
+    fn ir_holder_classification_pins_the_threshold_boundary() {
+        // The classifier splits holder from film at IR_HOLDER_MAX_TRANSMISSION
+        // (0.1): `ir_med <= 0.1` is holder. Probe uniform IR just either side of it
+        // so a regression that moves the constant out of [0.09, 0.11) flips the
+        // label and fails — a far tighter pin than the coarse 0.02 / 0.6 the other
+        // tests sit at.
+        let just_below = with_uniform_ir(solid(100, 100, [0.2, 0.1, 0.05]), 0.09);
+        let mask = ir_holder_mask(&just_below, FilmType::Chromogenic)
+            .unwrap()
+            .unwrap();
+        assert!(
+            mask.iter()
+                .all(|m| m.segments.iter().all(|s| s.class == HolderClass::Holder)),
+            "IR median 0.09 (≤ 0.1) must classify as holder: {mask:?}"
+        );
+
+        let just_above = with_uniform_ir(solid(100, 100, [0.2, 0.1, 0.05]), 0.11);
+        let mask = ir_holder_mask(&just_above, FilmType::Chromogenic)
+            .unwrap()
+            .unwrap();
+        assert!(
+            mask.iter()
+                .all(|m| m.segments.iter().all(|s| s.class == HolderClass::Film)),
+            "IR median 0.11 (> 0.1) must classify as film: {mask:?}"
+        );
+    }
+
+    #[test]
+    fn shallow_probe_reads_a_thin_holder_over_bright_film() {
+        // holder_probe_depth(100x100) = 2, so the classifier probes a shallow 2 px
+        // near-edge band. A 2 px IR-dark holder band with IR-bright film directly
+        // behind it must still read holder — this pins the shallow-probe rationale:
+        // a deep probe (e.g. the ~10 px rebate-scan window) would average in the
+        // bright film behind the thin band and misread the edge as film.
+        let mut img = with_uniform_ir(solid(100, 100, [0.2, 0.1, 0.05]), IR_FILM);
+        fill_ir_rect(&mut img, [0, 0, 100, 2], IR_HOLDER); // 2 px dark band, top edge
+        let mask = ir_holder_mask(&img, FilmType::Chromogenic)
+            .unwrap()
+            .unwrap();
+        let top = mask.iter().find(|m| m.edge == Edge::Top).unwrap();
+        assert!(
+            top.segments.iter().all(|s| s.class == HolderClass::Holder),
+            "the thin holder band over bright film must read all-holder: {top:?}"
+        );
+        // It samples the dark band's value (≈ IR_HOLDER), not the bright film behind
+        // it — proof the probe stayed shallow.
+        assert!(
+            top.segments
+                .iter()
+                .all(|s| s.ir <= IR_HOLDER_MAX_TRANSMISSION),
+            "probe must sample the dark band, not the film behind it: {top:?}"
+        );
+    }
+
+    #[test]
+    fn a_film_holder_film_edge_yields_two_film_runs_and_two_candidates() {
+        // The bottom edge carries the rebate full-width, but an opaque holder
+        // occludes its along-edge middle (IR-dark), splitting it into two film runs.
+        // This exercises `film_along_ranges` emitting >1 range (the mid-loop
+        // holder-flush branch) and `rebate_candidates` producing >1 candidate on a
+        // single edge.
+        let mut img = with_uniform_ir(scan_with_rebate(&[Edge::Bottom]), IR_FILM);
+        // Bottom-edge probe band is the bottom holder_probe_depth = 2 rows (y 98..100);
+        // occlude the along-edge middle [40, 60). The 24-way split of 100 gives 4 px
+        // segments, so 40 and 60 are clean segment boundaries.
+        fill_ir_rect(&mut img, [40, 98, 20, 2], IR_HOLDER);
+
+        // Two contiguous film runs on the bottom edge (holder middle excluded), each
+        // clipped to the corner-trimmed [cap, along-cap) = [10, 90) extent.
+        let cap = scan_depth(&img).unwrap();
+        let mask = ir_holder_mask(&img, FilmType::Chromogenic).unwrap();
+        let runs = film_along_ranges(mask.as_deref(), Edge::Bottom, &img, cap);
+        assert_eq!(
+            runs,
+            vec![(10, 40), (60, 90)],
+            "expected two film runs on the split bottom edge: {runs:?}"
+        );
+
+        // Each film run finds the rebate → two bottom-edge candidates.
+        let candidates = rebate_candidates(&img, FilmType::Chromogenic).unwrap();
+        let bottom: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.edge == Edge::Bottom)
+            .collect();
+        assert_eq!(
+            bottom.len(),
+            2,
+            "the split bottom edge must yield one candidate per film run: {candidates:?}"
+        );
+        for c in &bottom {
+            for (got, want) in c.base.iter().zip(REBATE) {
+                assert!((got - want).abs() < 0.02, "candidate base {:?}", c.base);
+            }
+        }
+        // And the estimate resolves to the rebate under the chromogenic path.
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
+        assert_close(est.base, REBATE, 0.02);
+    }
+
+    #[test]
+    fn all_holder_frame_drives_the_loud_empty_candidates_error() {
+        // Every edge reads holder in IR (an all-opaque-carrier frame), so every edge
+        // has no film run, `rebate_candidates` is empty, and both `select_auto_base`
+        // and the `auto` `estimate` fail loudly rather than inventing a base.
+        let img = with_uniform_ir(solid(100, 100, [0.2, 0.1, 0.05]), IR_HOLDER);
+        let candidates = rebate_candidates(&img, FilmType::Chromogenic).unwrap();
+        assert!(
+            candidates.is_empty(),
+            "an all-holder frame yields no candidates: {candidates:?}"
+        );
+        let err = select_auto_base(&img, &candidates).unwrap_err();
+        assert!(matches!(err, NcError::Other(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("no uniform unexposed rebate band"),
+            "empty-candidates error must be the loud no-band message: {err}"
+        );
+        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap_err();
+        assert!(matches!(err, NcError::Other(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn holder_mask_serializes_with_lowercase_class() {
+        // The `nc inspect` holder output is a machine contract: `class` must be a
+        // bare lowercase string and the segment fields stable, so a lost
+        // `#[serde(rename_all)]` on `HolderClass` (or a field rename) can't ship
+        // Capitalized JSON silently — the mirror of the `RebateCandidate` guard.
+        let mask = EdgeHolderMask {
+            edge: Edge::Right,
+            segments: vec![
+                HolderSegment {
+                    span: [0, 24],
+                    class: HolderClass::Holder,
+                    ir: 0.02,
+                },
+                HolderSegment {
+                    span: [24, 48],
+                    class: HolderClass::Film,
+                    ir: 0.6,
+                },
+            ],
+        };
+        let v = serde_json::to_value(&mask).unwrap();
+        assert_eq!(v["edge"], "right");
+        assert_eq!(v["segments"][0]["class"], "holder");
+        assert_eq!(v["segments"][1]["class"], "film");
+        assert_eq!(v["segments"][0]["span"], serde_json::json!([0, 24]));
+        assert!(v["segments"][0]["ir"].is_number());
     }
 }
