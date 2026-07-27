@@ -30,7 +30,7 @@ mkdir -p "$REC" "$ART" "$OUTDIR"
 # roll | unexposed(Dmin) | fully-exposed(Dmax) | real frames (space sep)
 #
 # These calibration triples now come from the asset manifest via `nctool`, not a
-# hard-coded list — one source of truth (docs/tasks/asset-manifest.md). `nctool`
+# hard-coded list — one source of truth (docs/tasks/analysis/asset-manifest.md). `nctool`
 # emits a triple only for rolls with a complete unexposed+leader pair, so the
 # NLP-source roll (all `real`) is skipped and the original five-roll set is
 # reproduced. Because frozen recipes depend only on the Dmin/Dmax frames, the

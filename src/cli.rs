@@ -2345,7 +2345,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
 
     // `--strict` promotes any present warning to a non-zero exit. Decide it here,
     // *before* telemetry: a telemetry record's existence is the success signal
-    // (there is no `outcome.success` field — see telemetry-strategy), so a run
+    // (there is no `outcome.success` field — see telemetry/strategy), so a run
     // that is about to exit non-zero must not leave a record that would read as a
     // successful run. The report emitted above already carries the warning detail
     // either way.
@@ -3250,7 +3250,7 @@ fn run_inspect(args: IoArgs) -> Result<()> {
                 }
                 // The selection error already carries actionable advice (pass
                 // --base-region/--film-base, or --base-content per the
-                // film-base-content-fallback task); short lead-in only.
+                // film-base/content-fallback task); short lead-in only.
                 Err(e) => push_warning(
                     &mut report,
                     &log,

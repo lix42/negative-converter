@@ -122,7 +122,7 @@ impl AcesCgImage {
     }
 
     // Read accessors — the boundary's inspection API. Exercised by tests until
-    // the named-output presets (`film-master-render-pipeline` / `output-presets`,
+    // the named-output presets (`film-master-render-pipeline` / `output/presets`,
     // the type's designed consumers) land; narrow documented allows per the house
     // rule (`CLAUDE.md`).
     #[allow(dead_code)]
@@ -181,7 +181,7 @@ impl std::fmt::Debug for AcesCgImage {
 /// no clamp or gamut limit, and carries the IR plane through untouched. Any
 /// non-finite input channel propagates as non-finite (counted downstream at
 /// encode, never swallowed here).
-#[allow(dead_code)] // wired in by `film-master-render-pipeline` / `output-presets`.
+#[allow(dead_code)] // wired in by `film-master-render-pipeline` / `output/presets`.
 pub fn map_nc_film_rgb_v1(film: FilmRgbImage) -> AcesCgImage {
     // Consume the typed film boundary into its validated buffers.
     let mut image = film.into_linear();

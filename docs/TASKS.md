@@ -3,10 +3,12 @@
 Step-1 (MVP) plan for the `nc` CLI negative→positive converter. See
 [design-spec.md](design-spec.md) for the full design.
 
-> **Progress log:** [progress.md](progress.md) records *how* each task is carried
-> out — what was done, decisions made, what works, what doesn't. **Read it before
-> starting a task**, and keep your task's section updated as you work, so the next
-> task can build on what you learned.
+> **Progress log:** one file per epic under [progress/](progress/) records *how*
+> each task is carried out — what was done, decisions made, what works, what
+> doesn't. **Before starting a task, read your epic's progress file in full, plus
+> the `Epic summary` section of every epic you depend on** — then keep your own
+> task's section updated as you work, so the next task can build on what you
+> learned.
 
 ## Design
 
@@ -37,364 +39,499 @@ physical scene recovery. Optional measured correction profiles have no
 downstream blockers. Today’s `--output-hdr` remains a rendered float TIFF, not
 the future master branch.
 
-- **io/decode** — SilverFast HDR (48-bit RGB) / HDRi (64-bit RGB+IR) → linear `f32` scanner measurements (IR preserved, not consumed); input semantics remain explicit rather than silently assigning Rec.709.
-- **io/encode** — current `LinearImage` → 16-bit or 32-bit float TIFF with ICC;
-  planned display output adds ISO gain-map JPEG and PQ/HLG AVIF while retaining
-  linear ACEScg film masters.
-- **pipeline/film_base** — estimate `Dmin` from unexposed border, with CLI override.
-- **pipeline/color** — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
-- **algo** — current `Converter` implementations migrate to tagged `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve.
-- **cli + main** — clap subcommands (`convert`/`inspect`/`estimate`/`params`/`roll`), recipe load/merge, JSON report, exit codes.
+One bullet per epic below — the name is the epic id the task list is grouped
+under, and the parenthesized paths are the modules it owns.
+
+- **io** (`io/decode.rs`, `io/encode.rs`, `pipeline/input_semantics.rs`) — SilverFast HDR (48-bit RGB) / HDRi (64-bit RGB+IR) → linear `f32` scanner measurements (IR carried through, consumed only by `film-base/ir-holder-detection`); input semantics remain explicit rather than silently assigning Rec.709. On the way out, `LinearImage` → 16-bit or 32-bit float TIFF with ICC, retaining linear ACEScg film masters; the planned display-output encoders are the `output` epic's. Buffer strategy (preflight, streaming) lives here too.
+- **film-base** (`pipeline/film_base.rs`) — estimate `Dmin` from unexposed border,
+  with CLI override, and measure the roll-fixed `Dmax` anchor from a reference
+  frame. The two are *different quantities* (see design-spec §4) that share this
+  measurement surface.
+- **color** (`pipeline/color.rs`, `pipeline/working_space.rs`) — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
+- **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged `reconstruction` recipe object into `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve; `algo::finish_print` is the stage-4 print bridge. Tone, white balance, and color-model variants are parameters of this stage.
+- **output** (the encoders downstream of `color`) — the display renditions:
+  Display P3 / SDR, BT.2020 PQ/HLG, ISO gain-map JPEG, AVIF, and the presets that
+  resolve them together.
+- **core** (`cli.rs`, `main.rs`, `types.rs`, `pipeline/stages.rs`) — clap subcommands (`convert`/`inspect`/`estimate`/`params`/`roll`), recipe load/merge, JSON report, exit codes, the roll/batch workflow, the shared types, and the pure algorithm→output-color render core the CLI drives.
+- **telemetry** (`src/telemetry.rs`) — that module and the opt-in upload stack. Operational, never a conversion knob.
+- **analysis** (`scripts/`) — the real-scan verification harness, the `nctool` Python toolkit, the asset manifest, and NLP comparison. Verifies the pipeline; is not part of it.
 
 ### Key choices
 - **Rust**, single static binary. Pure functions per stage; CLI is the only orchestrator.
 - **Normally 32-bit float linear image buffers:** scanner measurement coordinates before reconstruction, typed NC film RGB after the density curve, and linear ACEScg after the versioned working-space mapping; bit-depth reduction only at encode.
-- **Pluggable algorithms** via a `Converter` trait so more can be added later.
+- **Pluggable algorithms** behind the tagged `reconstruction` recipe object, resolved by `algo::reconstruct` / `algo::finish_print`, so more can be added later.
 - Density conversion and print rendering are **separate sub-stages** (core fidelity rule).
-- IR channel is **preserved but not acted on** in Step 1 (dust removal is a roadmap follow-up).
+- IR channel is **preserved and not acted on by the conversion path**, with one exception: under an explicit `--film-type chromogenic` on a marker-verified IR plane, `film_base::estimate` consumes IR to mask the opaque holder before the auto rebate search (`film-base/ir-holder-detection`). IR dust removal remains a roadmap follow-up.
 
 ## Dependencies
 
+Epic rollup (derived from the task graph — do not author epic-level edges here;
+regenerate this whenever the task edges change). Cycles below are legitimate
+projections of an acyclic task graph, not defects.
+
 ```mermaid
 graph TD
-  project-foundation --> silverfast-decode
-  project-foundation --> tiff-encode
-  project-foundation --> color-management
-  project-foundation --> film-base-estimation
-  project-foundation --> algo-interface
-  project-foundation --> cli-framework
-  algo-interface --> algo-simple
-  algo-interface --> algo-density
-  silverfast-decode --> pipeline-orchestration
-  tiff-encode --> pipeline-orchestration
-  color-management --> pipeline-orchestration
-  film-base-estimation --> pipeline-orchestration
-  algo-simple --> pipeline-orchestration
-  algo-density --> pipeline-orchestration
-  cli-framework --> pipeline-orchestration
-  cli-framework --> stdout-broken-pipe-safety
-  pipeline-orchestration --> transactional-output-writes
-  pipeline-orchestration --> memory-preflight
-  pipeline-orchestration --> dependency-hygiene
-  pipeline-orchestration --> release-readiness
-  pipeline-orchestration --> value-domain-terminology
-  memory-preflight --> streaming-tiled-io
-  real-scan-verification --> streaming-tiled-io
-  film-base-estimation --> auto-base-redesign
-  ir-holder-detection --> white-holder-support
-  pipeline-orchestration --> estimate-reuse-output
-  estimate-reuse-output --> grid-verdict-enum
-  film-base-estimation --> grid-verdict-enum
-  pipeline-orchestration --> real-scan-verification
-  pipeline-orchestration --> perf-instrumentation
-  pipeline-orchestration --> perf-telemetry
-  perf-telemetry --> telemetry-strategy
-  telemetry-strategy --> telemetry-schema-v2
-  telemetry-schema-v2 --> telemetry-ingestion-service
-  telemetry-schema-v2 --> telemetry-upload
-  telemetry-ingestion-service --> telemetry-upload
-  telemetry-upload --> telemetry-panic-hook
-  dmax-white-anchor --> real-scan-verification
-  dmax-reference --> real-scan-verification
-  algo-density --> dmax-white-anchor
-  algo-interface --> algo-sigmoid
-  dmax-white-anchor --> algo-sigmoid
-  algo-density --> auto-neutral-wb
-  pipeline-orchestration --> auto-neutral-wb
-  algo-density --> regional-color-balance
-  algo-density --> density-safety-bounds
-  pipeline-orchestration --> density-safety-bounds
-  algo-density --> bw-support
-  pipeline-orchestration --> bw-support
-  dmax-white-anchor --> bw-support
-  film-base-estimation --> film-base-content-fallback
-  auto-base-redesign --> ir-holder-detection
-  auto-base-redesign --> auto-base-neutral-stock
-  dmax-white-anchor --> dmax-reference
-  dmax-reference --> dense-base-dmax-plausibility
-  pipeline-orchestration --> roll-conversion
-  dmax-white-anchor --> roll-conversion
-  pipeline-orchestration --> conversion-versioning
-  pipeline-orchestration --> input-data-semantics
-  input-data-semantics --> scanner-profile-before-density-experiment
-  color-management --> scanner-profile-before-density-experiment
-  input-data-semantics --> negative-reconstruction-density-curves
-  dmax-reference --> negative-reconstruction-density-curves
-  algo-sigmoid --> negative-reconstruction-density-curves
-  negative-reconstruction-density-curves --> film-rgb-working-space
-  color-management --> film-rgb-working-space
-  film-rgb-working-space --> film-master-render-pipeline
-  dmax-reference --> film-master-render-pipeline
-  film-rgb-working-space --> optional-color-correction-profiles
-  film-master-render-pipeline --> optional-color-correction-profiles
-  color-management --> display-p3-output
-  color-management --> hdr-output-spike
-  film-master-render-pipeline --> sdr-display-rendering
-  display-p3-output --> sdr-display-rendering
-  hdr-output-spike --> sdr-display-rendering
-  film-master-render-pipeline --> hdr-display-rendering
-  hdr-output-spike --> hdr-display-rendering
-  sdr-display-rendering --> gain-map-hdr-output
-  hdr-display-rendering --> gain-map-hdr-output
-  hdr-display-rendering --> hdr-avif-output
-  gain-map-hdr-output --> output-presets
-  hdr-avif-output --> output-presets
-  roll-conversion --> output-presets
-  conversion-versioning --> output-presets
-  output-presets --> display-output-acceptance
-  real-scan-verification --> display-output-acceptance
-  real-scan-verification --> conversion-analysis-tooling
-  conversion-analysis-tooling --> asset-manifest
-  asset-manifest --> conversion-metrics
-  conversion-metrics --> nlp-comparison
-  asset-manifest --> drive-asset-migration
-  roll-conversion --> base-acquisition-planner
-  auto-base-redesign --> base-acquisition-planner
-  ir-holder-detection --> base-acquisition-planner
-  film-base-content-fallback --> base-acquisition-planner
-  dmax-reference --> base-acquisition-planner
+  core
+  io
+  film-base
+  algo
+  color
+  output
+  telemetry
+  analysis
+  core --> io
+  core --> color
+  core --> film-base
+  core --> algo
+  io --> core
+  color --> core
+  film-base --> core
+  algo --> core
+  analysis --> io
+  core --> analysis
+  core --> telemetry
+  algo --> analysis
+  film-base --> analysis
+  algo --> film-base
+  io --> color
+  io --> algo
+  film-base --> algo
+  algo --> color
+  film-base --> color
+  color --> output
+  core --> output
+  output --> analysis
+```
+
+```mermaid
+graph TD
+  subgraph core
+    core/project-foundation
+    core/cli-framework
+    core/pipeline-orchestration
+    core/conversion-versioning
+    core/stdout-broken-pipe-safety
+    core/value-domain-terminology
+    core/dependency-hygiene
+    core/release-readiness
+    core/roll-conversion
+    core/base-acquisition-planner
+  end
+  subgraph io
+    io/silverfast-decode
+    io/tiff-encode
+    io/input-data-semantics
+    io/transactional-output-writes
+    io/memory-preflight
+    io/streaming-tiled-io
+  end
+  subgraph film-base
+    film-base/estimation
+    film-base/auto-base-redesign
+    film-base/auto-base-neutral-stock
+    film-base/ir-holder-detection
+    film-base/white-holder-support
+    film-base/content-fallback
+    film-base/estimate-reuse-output
+    film-base/grid-verdict-enum
+    film-base/dmax-reference
+    film-base/dense-base-dmax-plausibility
+  end
+  subgraph algo
+    algo/interface
+    algo/simple
+    algo/density
+    algo/sigmoid
+    algo/negative-reconstruction-density-curves
+    algo/dmax-white-anchor
+    algo/density-safety-bounds
+    algo/auto-neutral-wb
+    algo/regional-color-balance
+    algo/bw-support
+  end
+  subgraph color
+    color/management
+    color/film-rgb-working-space
+    color/film-master-render-pipeline
+    color/post-reconstruction-color-characterization
+    color/optional-color-correction-profiles
+    color/scanner-profile-before-density-experiment
+  end
+  subgraph output
+    output/display-p3-output
+    output/hdr-output-spike
+    output/sdr-display-rendering
+    output/hdr-display-rendering
+    output/gain-map-hdr-output
+    output/hdr-avif-output
+    output/presets
+  end
+  subgraph telemetry
+    telemetry/perf-instrumentation
+    telemetry/perf-telemetry
+    telemetry/strategy
+    telemetry/schema-v2
+    telemetry/ingestion-service
+    telemetry/upload
+    telemetry/panic-hook
+  end
+  subgraph analysis
+    analysis/real-scan-verification
+    analysis/display-output-acceptance
+    analysis/conversion-analysis-tooling
+    analysis/asset-manifest
+    analysis/conversion-metrics
+    analysis/nlp-comparison
+    analysis/drive-asset-migration
+  end
+  core/project-foundation --> io/silverfast-decode
+  core/project-foundation --> io/tiff-encode
+  core/project-foundation --> color/management
+  core/project-foundation --> film-base/estimation
+  core/project-foundation --> algo/interface
+  core/project-foundation --> core/cli-framework
+  algo/interface --> algo/simple
+  algo/interface --> algo/density
+  io/silverfast-decode --> core/pipeline-orchestration
+  io/tiff-encode --> core/pipeline-orchestration
+  color/management --> core/pipeline-orchestration
+  film-base/estimation --> core/pipeline-orchestration
+  algo/simple --> core/pipeline-orchestration
+  algo/density --> core/pipeline-orchestration
+  core/cli-framework --> core/pipeline-orchestration
+  core/cli-framework --> core/stdout-broken-pipe-safety
+  core/pipeline-orchestration --> io/transactional-output-writes
+  core/pipeline-orchestration --> io/memory-preflight
+  core/pipeline-orchestration --> core/dependency-hygiene
+  core/pipeline-orchestration --> core/release-readiness
+  core/pipeline-orchestration --> core/value-domain-terminology
+  io/memory-preflight --> io/streaming-tiled-io
+  analysis/real-scan-verification --> io/streaming-tiled-io
+  film-base/estimation --> film-base/auto-base-redesign
+  film-base/ir-holder-detection --> film-base/white-holder-support
+  core/pipeline-orchestration --> film-base/estimate-reuse-output
+  film-base/estimate-reuse-output --> film-base/grid-verdict-enum
+  film-base/estimation --> film-base/grid-verdict-enum
+  core/pipeline-orchestration --> analysis/real-scan-verification
+  core/pipeline-orchestration --> telemetry/perf-instrumentation
+  core/pipeline-orchestration --> telemetry/perf-telemetry
+  telemetry/perf-telemetry --> telemetry/strategy
+  telemetry/strategy --> telemetry/schema-v2
+  telemetry/schema-v2 --> telemetry/ingestion-service
+  telemetry/schema-v2 --> telemetry/upload
+  telemetry/ingestion-service --> telemetry/upload
+  telemetry/upload --> telemetry/panic-hook
+  algo/dmax-white-anchor --> analysis/real-scan-verification
+  film-base/dmax-reference --> analysis/real-scan-verification
+  algo/density --> algo/dmax-white-anchor
+  algo/interface --> algo/sigmoid
+  algo/dmax-white-anchor --> algo/sigmoid
+  algo/density --> algo/auto-neutral-wb
+  core/pipeline-orchestration --> algo/auto-neutral-wb
+  algo/density --> algo/regional-color-balance
+  algo/density --> algo/density-safety-bounds
+  core/pipeline-orchestration --> algo/density-safety-bounds
+  algo/density --> algo/bw-support
+  core/pipeline-orchestration --> algo/bw-support
+  algo/dmax-white-anchor --> algo/bw-support
+  film-base/estimation --> film-base/content-fallback
+  film-base/auto-base-redesign --> film-base/ir-holder-detection
+  film-base/auto-base-redesign --> film-base/auto-base-neutral-stock
+  algo/dmax-white-anchor --> film-base/dmax-reference
+  film-base/dmax-reference --> film-base/dense-base-dmax-plausibility
+  core/pipeline-orchestration --> core/roll-conversion
+  algo/dmax-white-anchor --> core/roll-conversion
+  core/pipeline-orchestration --> core/conversion-versioning
+  core/pipeline-orchestration --> io/input-data-semantics
+  io/input-data-semantics --> color/scanner-profile-before-density-experiment
+  color/management --> color/scanner-profile-before-density-experiment
+  io/input-data-semantics --> algo/negative-reconstruction-density-curves
+  film-base/dmax-reference --> algo/negative-reconstruction-density-curves
+  algo/sigmoid --> algo/negative-reconstruction-density-curves
+  algo/negative-reconstruction-density-curves --> color/film-rgb-working-space
+  color/management --> color/film-rgb-working-space
+  color/film-rgb-working-space --> color/film-master-render-pipeline
+  film-base/dmax-reference --> color/film-master-render-pipeline
+  color/film-rgb-working-space --> color/optional-color-correction-profiles
+  color/film-master-render-pipeline --> color/optional-color-correction-profiles
+  io/input-data-semantics --> color/post-reconstruction-color-characterization
+  color/management --> color/post-reconstruction-color-characterization
+  film-base/dmax-reference --> color/post-reconstruction-color-characterization
+  color/management --> output/display-p3-output
+  color/management --> output/hdr-output-spike
+  color/film-master-render-pipeline --> output/sdr-display-rendering
+  output/display-p3-output --> output/sdr-display-rendering
+  output/hdr-output-spike --> output/sdr-display-rendering
+  color/film-master-render-pipeline --> output/hdr-display-rendering
+  output/hdr-output-spike --> output/hdr-display-rendering
+  output/sdr-display-rendering --> output/gain-map-hdr-output
+  output/hdr-display-rendering --> output/gain-map-hdr-output
+  output/hdr-display-rendering --> output/hdr-avif-output
+  output/gain-map-hdr-output --> output/presets
+  output/hdr-avif-output --> output/presets
+  core/roll-conversion --> output/presets
+  core/conversion-versioning --> output/presets
+  output/presets --> analysis/display-output-acceptance
+  analysis/real-scan-verification --> analysis/display-output-acceptance
+  analysis/real-scan-verification --> analysis/conversion-analysis-tooling
+  analysis/conversion-analysis-tooling --> analysis/asset-manifest
+  analysis/asset-manifest --> analysis/conversion-metrics
+  analysis/conversion-metrics --> analysis/nlp-comparison
+  analysis/asset-manifest --> analysis/drive-asset-migration
+  core/roll-conversion --> core/base-acquisition-planner
+  film-base/auto-base-redesign --> core/base-acquisition-planner
+  film-base/ir-holder-detection --> core/base-acquisition-planner
+  film-base/content-fallback --> core/base-acquisition-planner
+  film-base/dmax-reference --> core/base-acquisition-planner
 ```
 
 Dependency list (a task is executable when all its deps are `[x]` done):
 
-- `project-foundation`: (none)
-- `silverfast-decode`: `project-foundation`
-- `tiff-encode`: `project-foundation`
-- `color-management`: `project-foundation`
-- `film-base-estimation`: `project-foundation`
-- `algo-interface`: `project-foundation`
-- `cli-framework`: `project-foundation`
-- `algo-simple`: `algo-interface`
-- `algo-density`: `algo-interface`
-- `pipeline-orchestration`: `silverfast-decode`, `tiff-encode`, `color-management`, `film-base-estimation`, `algo-simple`, `algo-density`, `cli-framework`
-- `auto-base-redesign` (post-MVP): `film-base-estimation`
-- `white-holder-support` (post-MVP, the RGB-only fallback for the no-IR path):
-  `ir-holder-detection` (`auto-base-redesign` is now transitive via `ir-holder-detection`)
-- `estimate-reuse-output` (post-MVP): `pipeline-orchestration`
-- `grid-verdict-enum` (post-MVP): `estimate-reuse-output`, `film-base-estimation`
-- `real-scan-verification` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`, `dmax-reference`
-- `conversion-analysis-tooling` (post-MVP, spike): `real-scan-verification`
-- `asset-manifest` (post-MVP): `conversion-analysis-tooling`
-- `conversion-metrics` (post-MVP): `asset-manifest`
-- `nlp-comparison` (post-MVP): `conversion-metrics`
-- `drive-asset-migration` (post-MVP, in progress — move+reorg+manifest done): `asset-manifest`
-- `perf-instrumentation` (post-MVP, **parked**): `pipeline-orchestration` — LAB
-  criterion benches; prototyped and parked on branch
-  `prototype/perf-bench-instrumentation`, superseded by `perf-telemetry` as the
-  real (real-world, not lab) direction
-- `perf-telemetry` (post-MVP): `pipeline-orchestration`
-- `telemetry-strategy` (post-MVP, spike): `perf-telemetry`
-- `telemetry-schema-v2` (post-MVP): `telemetry-strategy`
-- `telemetry-ingestion-service` (post-MVP): `telemetry-schema-v2`
-- `telemetry-upload` (post-MVP): `telemetry-schema-v2`, `telemetry-ingestion-service`
-- `telemetry-panic-hook` (post-MVP): `telemetry-upload`
-- `stdout-broken-pipe-safety` (post-MVP, hardening): `cli-framework`
-- `dmax-white-anchor` (post-MVP): `algo-density`
-- `algo-sigmoid` (post-MVP): `algo-interface`, `dmax-white-anchor`
-- `auto-neutral-wb` (post-MVP): `algo-density`, `pipeline-orchestration`
-- `regional-color-balance` (post-MVP): `algo-density`
-- `density-safety-bounds` (post-MVP): `algo-density`, `pipeline-orchestration`
-- `bw-support` (post-MVP): `algo-density`, `pipeline-orchestration`, `dmax-white-anchor`
-- `film-base-content-fallback` (post-MVP): `film-base-estimation`
-- `ir-holder-detection` (post-MVP): `auto-base-redesign`
-- `auto-base-neutral-stock` (post-MVP): `auto-base-redesign`
-- `dmax-reference` (post-MVP): `dmax-white-anchor`
-- `dense-base-dmax-plausibility` (post-MVP): `dmax-reference`
-- `roll-conversion` (post-MVP): `pipeline-orchestration`, `dmax-white-anchor`
-- `base-acquisition-planner` (post-MVP): `roll-conversion`, `auto-base-redesign`, `ir-holder-detection`, `film-base-content-fallback`, `dmax-reference`
-- `conversion-versioning` (post-MVP): `pipeline-orchestration`
-- `input-data-semantics` (post-MVP): `pipeline-orchestration`
-- `scanner-profile-before-density-experiment` (post-MVP, **deferred experiment**): `input-data-semantics`, `color-management`
-- `negative-reconstruction-density-curves` (post-MVP): `input-data-semantics`, `dmax-reference`, `algo-sigmoid`
-- `film-rgb-working-space` (post-MVP): `negative-reconstruction-density-curves`, `color-management`
-- `film-master-render-pipeline` (post-MVP): `film-rgb-working-space`, `dmax-reference`
-- `optional-color-correction-profiles` (post-MVP, **optional / deferred**): `film-rgb-working-space`, `film-master-render-pipeline`; no downstream blockers
-- `display-p3-output` (post-MVP): `color-management`
-- `hdr-output-spike` (post-MVP, spike): `color-management`
-- `sdr-display-rendering` (post-MVP): `film-master-render-pipeline`, `display-p3-output`, `hdr-output-spike`
-- `hdr-display-rendering` (post-MVP): `film-master-render-pipeline`, `hdr-output-spike`
-- `gain-map-hdr-output` (post-MVP): `sdr-display-rendering`, `hdr-display-rendering`
-- `hdr-avif-output` (post-MVP): `hdr-display-rendering`
-- `output-presets` (post-MVP): `gain-map-hdr-output`, `hdr-avif-output`, `roll-conversion`, `conversion-versioning`
-- `display-output-acceptance` (post-MVP): `output-presets`, `real-scan-verification`
-- `transactional-output-writes` (post-MVP, hardening): `pipeline-orchestration`
-- `memory-preflight` (post-MVP, hardening): `pipeline-orchestration`
-- `value-domain-terminology` (post-MVP, cleanup, **preserves data flow**): `pipeline-orchestration`
-- `dependency-hygiene` (post-MVP, cleanup): `pipeline-orchestration` (dep removal is standalone)
-- `release-readiness` (post-MVP, productization): `pipeline-orchestration` (doc fixes now; packaging best after `display-output-acceptance`)
-- `streaming-tiled-io` (post-MVP, **evaluate-first**): `memory-preflight`, `real-scan-verification`
+- `core/project-foundation`: (none)
+- `core/cli-framework`: `core/project-foundation`
+- `core/pipeline-orchestration`: `io/silverfast-decode`, `io/tiff-encode`, `color/management`, `film-base/estimation`, `algo/simple`, `algo/density`, `core/cli-framework`
+- `core/conversion-versioning` (post-MVP): `core/pipeline-orchestration`
+- `core/stdout-broken-pipe-safety` (post-MVP, hardening): `core/cli-framework`
+- `core/value-domain-terminology` (post-MVP, cleanup, **preserves data flow**): `core/pipeline-orchestration`
+- `core/dependency-hygiene` (post-MVP, cleanup): `core/pipeline-orchestration` (dep removal is standalone)
+- `core/release-readiness` (post-MVP, productization): `core/pipeline-orchestration`
+  — doc fixes now; packaging best sequenced after analysis/display-output-acceptance
+- `core/roll-conversion` (post-MVP): `core/pipeline-orchestration`, `algo/dmax-white-anchor`
+- `core/base-acquisition-planner` (post-MVP): `core/roll-conversion`, `film-base/auto-base-redesign`, `film-base/ir-holder-detection`, `film-base/content-fallback`, `film-base/dmax-reference`
+- `io/silverfast-decode`: `core/project-foundation`
+- `io/tiff-encode`: `core/project-foundation`
+- `io/input-data-semantics` (post-MVP): `core/pipeline-orchestration`
+- `io/transactional-output-writes` (post-MVP, hardening): `core/pipeline-orchestration`
+- `io/memory-preflight` (post-MVP, hardening): `core/pipeline-orchestration`
+- `io/streaming-tiled-io` (post-MVP, **evaluate-first**): `io/memory-preflight`, `analysis/real-scan-verification`
+- `film-base/estimation`: `core/project-foundation`
+- `film-base/auto-base-redesign` (post-MVP): `film-base/estimation`
+- `film-base/auto-base-neutral-stock` (post-MVP): `film-base/auto-base-redesign`
+- `film-base/ir-holder-detection` (post-MVP): `film-base/auto-base-redesign`
+- `film-base/white-holder-support` (post-MVP, the RGB-only fallback for the no-IR path):
+  `film-base/ir-holder-detection`
+  — film-base/auto-base-redesign is now transitive via film-base/ir-holder-detection
+- `film-base/content-fallback` (post-MVP): `film-base/estimation`
+- `film-base/estimate-reuse-output` (post-MVP): `core/pipeline-orchestration`
+- `film-base/grid-verdict-enum` (post-MVP): `film-base/estimate-reuse-output`, `film-base/estimation`
+- `film-base/dmax-reference` (post-MVP): `algo/dmax-white-anchor`
+- `film-base/dense-base-dmax-plausibility` (post-MVP): `film-base/dmax-reference`
+- `algo/interface`: `core/project-foundation`
+- `algo/simple`: `algo/interface`
+- `algo/density`: `algo/interface`
+- `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
+- `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
+- `algo/dmax-white-anchor` (post-MVP): `algo/density`
+- `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
+- `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
+- `algo/regional-color-balance` (post-MVP): `algo/density`
+- `algo/bw-support` (post-MVP): `algo/density`, `core/pipeline-orchestration`, `algo/dmax-white-anchor`
+- `color/management`: `core/project-foundation`
+- `color/film-rgb-working-space` (post-MVP): `algo/negative-reconstruction-density-curves`, `color/management`
+- `color/film-master-render-pipeline` (post-MVP): `color/film-rgb-working-space`, `film-base/dmax-reference`
+- `color/post-reconstruction-color-characterization` (post-MVP, **closed—superseded**; the deps below are decision history, not a live prerequisite set): `io/input-data-semantics`, `color/management`, `film-base/dmax-reference`
+- `color/optional-color-correction-profiles` (post-MVP, **optional / deferred**): `color/film-rgb-working-space`, `color/film-master-render-pipeline`; no downstream blockers
+- `color/scanner-profile-before-density-experiment` (post-MVP, **deferred experiment**): `io/input-data-semantics`, `color/management`
+- `output/display-p3-output` (post-MVP): `color/management`
+- `output/hdr-output-spike` (post-MVP, spike): `color/management`
+- `output/sdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/display-p3-output`, `output/hdr-output-spike`
+- `output/hdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/hdr-output-spike`
+- `output/gain-map-hdr-output` (post-MVP): `output/sdr-display-rendering`, `output/hdr-display-rendering`
+- `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
+- `output/presets` (post-MVP): `output/gain-map-hdr-output`, `output/hdr-avif-output`, `core/roll-conversion`, `core/conversion-versioning`
+- `telemetry/perf-instrumentation` (post-MVP, **parked**): `core/pipeline-orchestration`
+  — LAB criterion benches; prototyped and parked on git branch
+  prototype/perf-bench-instrumentation, superseded by telemetry/perf-telemetry as
+  the real (real-world, not lab) direction
+- `telemetry/perf-telemetry` (post-MVP): `core/pipeline-orchestration`
+- `telemetry/strategy` (post-MVP, spike): `telemetry/perf-telemetry`
+- `telemetry/schema-v2` (post-MVP): `telemetry/strategy`
+- `telemetry/ingestion-service` (post-MVP): `telemetry/schema-v2`
+- `telemetry/upload` (post-MVP): `telemetry/schema-v2`, `telemetry/ingestion-service`
+- `telemetry/panic-hook` (post-MVP): `telemetry/upload`
+- `analysis/real-scan-verification` (post-MVP): `core/pipeline-orchestration`, `algo/dmax-white-anchor`, `film-base/dmax-reference`
+- `analysis/display-output-acceptance` (post-MVP): `output/presets`, `analysis/real-scan-verification`
+- `analysis/conversion-analysis-tooling` (post-MVP, spike): `analysis/real-scan-verification`
+- `analysis/asset-manifest` (post-MVP): `analysis/conversion-analysis-tooling`
+- `analysis/conversion-metrics` (post-MVP): `analysis/asset-manifest`
+- `analysis/nlp-comparison` (post-MVP): `analysis/conversion-metrics`
+- `analysis/drive-asset-migration` (post-MVP, in progress — move+reorg+manifest done): `analysis/asset-manifest`
 
-> **Post-MVP follow-ups** (Phases 5–6) are recorded for continuity and are **not**
-> blockers of `pipeline-orchestration` / the Step-1 MVP. Phase 5 came out of
-> real-scan verification of `film-base-estimation`; Phase 6 out of the PR #12
-> review and the Negative Lab Pro feature comparison (see `progress.md`).
+> **Post-MVP follow-ups** are recorded for continuity and are **not** blockers of
+> `core/pipeline-orchestration` / the Step-1 MVP. The `film-base` follow-ups came
+> out of real-scan verification of `film-base/estimation`; the conversion-quality
+> ones out of the PR #12 review and the Negative Lab Pro feature comparison (see
+> [progress/](progress/)). Design-spec §12 is the roadmap these follow-ups sit
+> against.
 
 ## Tasks
 
 **Legend:** `[ ]` not started · `[~]` in progress · `[x]` done
+**Epic status** is derived from its tasks — don't record it separately.
 
-### Phase 1: Foundation
-> Goal: a building Cargo project with the core types every stage shares.
+### core — [progress](progress/core.md)
+> Project skeleton, shared types (`types.rs`), the clap command surface
+> (`cli.rs` / `main.rs`), end-to-end orchestration — including
+> `pipeline/stages.rs`, the pure algorithm→output-color render core the CLI
+> drives — the roll/batch workflow, and the cross-cutting cleanup and release
+> work that lands in those files.
 
-- [x] [Project foundation and core types](tasks/project-foundation.md)
+- [x] [Project foundation and core types](tasks/core/project-foundation.md)
+- [x] [CLI framework](tasks/core/cli-framework.md)
+- [x] [Pipeline orchestration](tasks/core/pipeline-orchestration.md)
+- [x] [Roll conversion (batch + frozen recipe)](tasks/core/roll-conversion.md)
+- [ ] [Base-acquisition planner (the cascade)](tasks/core/base-acquisition-planner.md) — the roll-level `Dmin`/`Dmax` acquisition cascade: frozen recipe with provenance + confidence, and the roll→single fallback decision
+- [ ] [Conversion versioning & baseline comparison](tasks/core/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
+- [ ] [Stdout broken-pipe safety](tasks/core/stdout-broken-pipe-safety.md) — make every
+  stdout JSON write (the report via `emit_report`, `nc params`) tolerate a closed
+  pipe (e.g. `nc … | head`) without a panic/backtrace. Pre-existing on `main`, not
+  caused by the telemetry work.
+- [ ] [Value-domain terminology & Dmin/Dmax clarity](tasks/core/value-domain-terminology.md) — extract design-spec §4 terminology into a standalone doc + an agent skill, and make `Dmin`/`Dmax` human-clear. Preserves the data flow; details at execution.
+- [ ] [Dependency & module hygiene](tasks/core/dependency-hygiene.md) — from the
+  hygiene review: drop three unused crates (`image`, `kamadak-exif`, `palette` —
+  verified builds without them; `image` pulls a large codec tree) and unify the two
+  `Algorithm` enums onto `types::Algorithm`, removing the dead copy and its
+  `#[allow(dead_code)]`. Pure cleanup, byte-identical output.
+- [ ] [Release readiness](tasks/core/release-readiness.md) — from the release-readiness
+  review: (1) correct public docs that misstate the product (README "pre-implementation"
+  + "planned", TASKS.md "two algorithms" omitting sigmoid, obsolete `--out-depth` in
+  `core/pipeline-orchestration`, PUA-wrapped `citeturn` tokens in the research report); (2) license (user
+  decision), Cargo release metadata, supported platforms (lcms2-sys C FFI constraint),
+  and binary packaging.
 
-### Phase 2: Building blocks
-> Goal: each pipeline stage built and unit-tested in isolation. All parallelizable.
+### io — [progress](progress/io.md)
+> Reading scans and writing artifacts: `io/decode.rs`, `io/encode.rs`,
+> `pipeline/input_semantics.rs` (the resolver that interprets the SilverFast XMP
+> packet), and the buffer/atomicity strategy for whole-image and streamed I/O.
 
-- [x] [SilverFast HDR/HDRi decode](tasks/silverfast-decode.md)
-- [x] [TIFF encode and output](tasks/tiff-encode.md)
-- [x] [Color management](tasks/color-management.md)
-- [x] [Film-base / Dmin estimation](tasks/film-base-estimation.md)
-- [x] [Algorithm interface](tasks/algo-interface.md)
-- [x] [CLI framework](tasks/cli-framework.md)
-
-### Phase 3: Algorithms
-> Goal: the two negative→positive converters, both selectable.
-
-- [x] [Simple inversion algorithm](tasks/algo-simple.md)
-- [x] [Density-domain algorithm](tasks/algo-density.md)
-
-### Phase 4: Integration
-> Goal: the full CLI works end to end on a real scan.
-
-- [x] [Pipeline orchestration](tasks/pipeline-orchestration.md)
-
-### Phase 5: Follow-ups (post-Step-1)
-> Deferred improvements from real-scan verification; not blockers of the MVP.
-> See design-spec §12 (roadmap) and the `film-base-estimation` progress notes.
-
-- [x] [Robust auto film-base detection](tasks/auto-base-redesign.md)
-- [ ] [Light film holder support](tasks/white-holder-support.md)
-- [x] [Reuse-ready `nc estimate` output](tasks/estimate-reuse-output.md)
-- [ ] [Grid agreement verdict enum](tasks/grid-verdict-enum.md)
-- [x] [IR-assisted film-holder detection](tasks/ir-holder-detection.md)
-- [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base-content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `auto-base-redesign` (tell that task's owner)
-- [ ] [Neutral-base robustness for auto film-base detection](tasks/auto-base-neutral-stock.md)
-
-### Phase 6: Conversion quality (NLP-parity follow-ups)
-> Default-output quality gaps identified by the PR #12 review and the Negative
-> Lab Pro comparison (2026-07-13, see `progress.md`). Deterministic statistics
-> only — no ML (the "AI-friendly ≠ ML" rule holds).
-
-- [x] [Display-range white anchor (Dmax)](tasks/dmax-white-anchor.md) — shipped legacy semantics; the replacement density-curve stage owns its curve-specific placement/shape meaning
-- [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the replacement density-curve stage preserves scalar exponential placement and sigmoid curve shaping
-- [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
-- [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo-sigmoid.md)
-- [x] [Auto neutral white balance](tasks/auto-neutral-wb.md)
-- [x] [Regional (shadow/highlight) color balance](tasks/regional-color-balance.md)
-- [ ] [Black & white negative support (mono color model)](tasks/bw-support.md)
-- [ ] [Density safety bounds](tasks/density-safety-bounds.md) — from the
-  density-safety review: physical bounds on `density_scale`/`offset`/`gamma` (the
-  sigmoid-bounds analogue density lacks) + a degenerate-output (histogram/dynamic-
-  range collapse) warning catching the finite-all-black underflow the loss counters
-  miss, with a false-positive guard validated on real scans.
-- [x] [Input data semantics and validation](tasks/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
-- [x] [Post-reconstruction characterization runtime](tasks/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `negative-reconstruction-density-curves`, `film-rgb-working-space`, `film-master-render-pipeline`, and `optional-color-correction-profiles`
-- [x] [Negative reconstruction and density curves](tasks/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
-- [x] [NC Film RGB working-space mapping](tasks/film-rgb-working-space.md) — map every film rendering through versioned NC film RGB v1 into typed linear ACEScg/D60
-- [ ] [Film-master and shared display pipeline](tasks/film-master-render-pipeline.md) — route intentional ACEScg film rendering to `film-master` or shared WB → exposure → black/range adjustments before SDR/HDR
-- [ ] [Optional color-correction profiles](tasks/optional-color-correction-profiles.md) — **optional / deferred** measured neutralization with explicit selection and provenance; blocks no output task
-- [ ] [Scanner ICC before-density experiment](tasks/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of the superseded characterization proposal and the normal NC film RGB mapping
-
-### Phase 6B: Color-defined display outputs
-> Establish the color-accurate SDR path first, then add standards-based HDR
-> rendering and a backward-compatible gain-map output. These tasks define the
-> intended product default that Phase 7 verifies.
-
-- [x] [Display P3 output](tasks/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
-- [x] [HDR still-output spike](tasks/hdr-output-spike.md) — decided ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy; licensed-normative-text check waived at spike level and re-homed to the encoder tasks as a pre-merge gate (2026-07-24)
-- [ ] [SDR display rendering](tasks/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
-- [ ] [Display-HDR rendering](tasks/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
-- [ ] [ISO gain-map HDR output](tasks/gain-map-hdr-output.md) — write a backward-compatible Display P3 JPEG base plus ISO 21496-1 and Ultra HDR v1 gain-map metadata
-- [ ] [HDR AVIF output](tasks/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
-- [ ] [Output presets and guidance](tasks/output-presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
-
-### Phase 7: Acceptance
-> Core full-size verification runs as soon as the existing TIFF pipeline and
-> Dmax anchor are ready, so it can inform memory/streaming work. Final display
-> acceptance separately waits for the new presets and HDR encoders. Optional
-> measured correction profiles do not block it.
-
-- [x] [Real-scan core verification](tasks/real-scan-verification.md) — exercise decoding, Dmin/Dmax, current TIFF conversion, IR, determinism, and resource use on full-size scans without waiting for the display-output roadmap. **Done 2026-07-23** (see `docs/reports/real-scan-verification.md`): all rows pass on 5 real rolls; measured peak ~930 MiB @ 18.7 MP feeds `streaming-tiled-io` STEP 0; frozen recipes + harness feed `display-output-acceptance`; follow-up `dense-base-dmax-plausibility` filed; default-SDR paleness routes to the display-output roadmap
-- [ ] [Display-output acceptance](tasks/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans
-- [x] [Conversion-analysis tooling (spike)](tasks/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. **Done 2026-07-23** (spike): scope decided (Python `nctool` toolkit, JSON manifest of rolls+converted, configurable-but-local asset root, NLP global-metrics comparison without registration); split into the four child tasks below; see the task file's "Spike outcome" section.
-- [x] [Asset manifest](tasks/asset-manifest.md) — tracked JSON manifest of `../nc-assets` (roll frames + roles + derived facts + converted outputs); `generate`/`validate`; retires the hard-coded `ROLLS` array
-- [ ] [Conversion metrics & thumbnails](tasks/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
-- [ ] [NLP vs nc comparison](tasks/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
-- [ ] [Drive asset migration](tasks/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
-
-### Phase 8: Pre-release productization
-> Measurement and hardening before releasing to users (2026-07-14 telemetry
-> discussion). Local-only instrumentation first; remote telemetry stays a
-> deliberately separate, opt-in roadmap item (design-spec §12).
-
-- [~] [Performance instrumentation](tasks/perf-instrumentation.md) — **parked**:
-  the LAB criterion-benchmark approach was prototyped and parked on branch
-  `prototype/perf-bench-instrumentation` (not merged; see its
-  `docs/prototypes/perf-bench-instrumentation.md`). The real, real-world direction
-  shipped as `perf-telemetry` below.
-- [x] [Embedded performance + context telemetry](tasks/perf-telemetry.md) — the
-  real-world successor to `perf-instrumentation`: an opt-in JSON telemetry record
-  per `nc convert` run (image + timing + context) to a local JSONL log / one-off
-  file, no new entrypoint. Lifts the prototype's per-stage timing.
-- [x] [Telemetry strategy spike](tasks/telemetry-strategy.md) — approved
-  [strategy](telemetry-strategy.md): custom JSON to Cloudflare Worker + D1,
-  anonymous schema-minimized upload, persistent explicit consent, crash-safe
-  detached draining, success/failure events, and sanitized panic reporting.
-- [ ] [Telemetry event schema v2](tasks/telemetry-schema-v2.md) — add typed
-  success/failure local events and a separately versioned, privacy-minimized
-  upload projection with random per-event deduplication IDs.
-- [ ] [Telemetry ingestion service](tasks/telemetry-ingestion-service.md) — build
-  the validating Cloudflare Worker + D1 endpoint, exact deduplication, 180-day
-  retention, hard FREE-plan quotas, abuse quarantine/kill switch, and initial
-  advisory performance/failure queries.
-- [ ] [Background telemetry upload](tasks/telemetry-upload.md) — ship the local
-  consent-selected active JSONL through generation-bound collection/request
-  leases and its private spool, durable recovery, detached helpers, retries,
-  non-stranding retarget, lock-stable inactive purge, caps, and maintenance
-  commands.
-- [ ] [Sanitized panic telemetry](tasks/telemetry-panic-hook.md) — publish
-  persistent-managed-consent panic events as isolated atomic ready files with
-  only capped, normalized `nc` function/module frames; no per-run hook, shared
-  append stream, payloads, source paths, or native-crash claim.
-- [ ] [Transactional output writes](tasks/transactional-output-writes.md) — from
+- [x] [SilverFast HDR/HDRi decode](tasks/io/silverfast-decode.md)
+- [x] [TIFF encode and output](tasks/io/tiff-encode.md)
+- [x] [Input data semantics and validation](tasks/io/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
+- [ ] [Transactional output writes](tasks/io/transactional-output-writes.md) — from
   the output-atomicity review: write every artifact (primary TIFF, IR, sidecar,
   report-file) to a same-directory temp, fsync, then rename, so a failed/interrupted
   run never leaves a truncated final file. Honest guarantee: no partial files +
   minimized inconsistency window, not literal multi-file atomicity (a crash between
   renames can still mix old/new artifacts).
-- [ ] [Memory preflight & in-place transform](tasks/memory-preflight.md) — from the
+- [ ] [Memory preflight & in-place transform](tasks/io/memory-preflight.md) — from the
   memory-safety review (Phase A, cheap): predict peak allocation and fail loudly
   over a budget before allocating (reconciling the dishonest 4 GiB input limit),
   and drop the whole-image clone in `to_output` (transform in place, skip IR).
-- [ ] [Streaming / tiled I/O](tasks/streaming-tiled-io.md) — memory-safety review
+- [ ] [Streaming / tiled I/O](tasks/io/streaming-tiled-io.md) — memory-safety review
   Phase B (expensive, **evaluate-first**): strip/tile decode + streaming encode.
   STEP 0 gate — evaluate from measured peak whether this is needed at all; if data
   is insufficient, collect it first; proceed only if real scans exceed the budget.
-- [ ] [Value-domain terminology & Dmin/Dmax clarity](tasks/value-domain-terminology.md) — extract design-spec §4 terminology into a standalone doc + an agent skill, and make `Dmin`/`Dmax` human-clear. Preserves the data flow; details at execution.
-- [ ] [Dependency & module hygiene](tasks/dependency-hygiene.md) — from the
-  hygiene review: drop three unused crates (`image`, `kamadak-exif`, `palette` —
-  verified builds without them; `image` pulls a large codec tree) and unify the two
-  `Algorithm` enums onto `types::Algorithm`, removing the dead copy and its
-  `#[allow(dead_code)]`. Pure cleanup, byte-identical output.
-- [ ] [Stdout broken-pipe safety](tasks/stdout-broken-pipe-safety.md) — make every
-  stdout JSON write (the report via `emit_report`, `nc params`) tolerate a closed
-  pipe (e.g. `nc … | head`) without a panic/backtrace. Pre-existing on `main`, not
-  caused by the telemetry work.
-- [ ] [Conversion versioning & baseline comparison](tasks/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
-- [ ] [Release readiness](tasks/release-readiness.md) — from the release-readiness
-  review: (1) correct public docs that misstate the product (README "pre-implementation"
-  + "planned", TASKS.md "two algorithms" omitting sigmoid, obsolete `--out-depth` in
-  `pipeline-orchestration`, PUA-wrapped `citeturn` tokens in the research report); (2) license (user
-  decision), Cargo release metadata, supported platforms (lcms2-sys C FFI constraint),
-  and binary packaging.
 
-### Phase 9: Roll workflow (batch conversion)
-> Two conversion workflows established in the 2026-07 design discussion: **roll**
-> (detect the base + Dmax once, convert the whole roll with a frozen recipe —
-> strongly preferred) and **single** (per-frame best-effort). "Auto mode" is just
-> roll conversion's default behavior on a batch. Roll-fixed `Dmin` / `Dmax`
-> depend on `dmax-reference`; the cascade depends on the detectors above.
+### film-base — [progress](progress/film-base.md)
+> `pipeline/film_base.rs` and the `nc estimate` measurement surface: locating
+> unexposed film, deriving the `Dmin` transmission anchor, and measuring the
+> roll-fixed `Dmax` density anchor. `Dmin` and `Dmax` are **different quantities**
+> (design-spec §4) that happen to share this code.
 
-- [x] [Roll conversion (batch + frozen recipe)](tasks/roll-conversion.md)
-- [ ] [Base-acquisition planner (the cascade)](tasks/base-acquisition-planner.md)
+- [x] [Film-base / Dmin estimation](tasks/film-base/estimation.md)
+- [x] [Robust auto film-base detection](tasks/film-base/auto-base-redesign.md)
+- [ ] [Neutral-base robustness for auto film-base detection](tasks/film-base/auto-base-neutral-stock.md)
+- [x] [IR-assisted film-holder detection](tasks/film-base/ir-holder-detection.md)
+- [ ] [Light film holder support](tasks/film-base/white-holder-support.md)
+- [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base/content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `film-base/auto-base-redesign` (tell that task's owner)
+- [x] [Reuse-ready `nc estimate` output](tasks/film-base/estimate-reuse-output.md)
+- [ ] [Grid agreement verdict enum](tasks/film-base/grid-verdict-enum.md)
+- [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/film-base/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the replacement density-curve stage preserves scalar exponential placement and sigmoid curve shaping
+- [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/film-base/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
+
+### algo — [progress](progress/algo.md)
+> `src/algo/`: the `reconstruct` / `finish_print` surface, negative
+> reconstruction, the density curves (exponential / sigmoid), and the tone,
+> white-balance, and color-model parameters of that stage. Deterministic
+> statistics only — no ML.
+
+- [x] [Algorithm interface](tasks/algo/interface.md)
+- [x] [Simple inversion algorithm](tasks/algo/simple.md)
+- [x] [Density-domain algorithm](tasks/algo/density.md)
+- [x] [Display-range white anchor (Dmax)](tasks/algo/dmax-white-anchor.md) — shipped legacy semantics; the replacement density-curve stage owns its curve-specific placement/shape meaning
+- [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo/sigmoid.md)
+- [x] [Negative reconstruction and density curves](tasks/algo/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
+- [x] [Auto neutral white balance](tasks/algo/auto-neutral-wb.md)
+- [x] [Regional (shadow/highlight) color balance](tasks/algo/regional-color-balance.md)
+- [ ] [Black & white negative support (mono color model)](tasks/algo/bw-support.md)
+- [ ] [Density safety bounds](tasks/algo/density-safety-bounds.md) — from the
+  density-safety review: physical bounds on `density_scale`/`offset`/`gamma` (the
+  sigmoid-bounds analogue density lacks) + a degenerate-output (histogram/dynamic-
+  range collapse) warning catching the finite-all-black underflow the loss counters
+  miss, with a false-positive guard validated on real scans.
+
+### color — [progress](progress/color.md)
+> `pipeline/color.rs` and `pipeline/working_space.rs`: ICC transforms, the
+> versioned NC film RGB v1 → linear ACEScg mapping, the film-master branch, and
+> the optional measured-correction work.
+
+- [x] [Color management](tasks/color/management.md)
+- [x] [NC Film RGB working-space mapping](tasks/color/film-rgb-working-space.md) — map every film rendering through versioned NC film RGB v1 into typed linear ACEScg/D60
+- [ ] [Film-master and shared display pipeline](tasks/color/film-master-render-pipeline.md) — route intentional ACEScg film rendering to `film-master` or shared WB → exposure → black/range adjustments before SDR/HDR
+- [x] [Post-reconstruction characterization runtime](tasks/color/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `algo/negative-reconstruction-density-curves`, `color/film-rgb-working-space`, `color/film-master-render-pipeline`, and `color/optional-color-correction-profiles`
+- [ ] [Optional color-correction profiles](tasks/color/optional-color-correction-profiles.md) — **optional / deferred** measured neutralization with explicit selection and provenance; blocks no output task
+- [ ] [Scanner ICC before-density experiment](tasks/color/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of the superseded characterization proposal and the normal NC film RGB mapping
+
+### output — [progress](progress/output.md)
+> The display renditions and encoders downstream of `color`: the color-accurate
+> SDR path first, then standards-based HDR rendering, a backward-compatible
+> gain-map output, and the presets that resolve them together. These define the
+> intended product default that `analysis` verifies.
+
+- [x] [Display P3 output](tasks/output/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
+- [x] [HDR still-output spike](tasks/output/hdr-output-spike.md) — decided ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy; licensed-normative-text check waived at spike level and re-homed to the encoder tasks as a pre-merge gate (2026-07-24)
+- [ ] [SDR display rendering](tasks/output/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
+- [ ] [Display-HDR rendering](tasks/output/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
+- [ ] [ISO gain-map HDR output](tasks/output/gain-map-hdr-output.md) — write a backward-compatible Display P3 JPEG base plus ISO 21496-1 and Ultra HDR v1 gain-map metadata
+- [ ] [HDR AVIF output](tasks/output/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
+- [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
+
+### telemetry — [progress](progress/telemetry.md)
+> `src/telemetry.rs` and the opt-in upload stack (schema, ingestion service,
+> uploader, panic hook), from the 2026-07-14 telemetry discussion: local-only
+> instrumentation first, remote telemetry a deliberately separate opt-in roadmap
+> item (design-spec §12). **Operational, never a conversion knob** — nothing here
+> may perturb deterministic image output.
+
+- [~] [Performance instrumentation](tasks/telemetry/perf-instrumentation.md) — **parked**:
+  the LAB criterion-benchmark approach was prototyped and parked on branch
+  `prototype/perf-bench-instrumentation` (not merged; see its
+  `docs/prototypes/perf-bench-instrumentation.md`). The real, real-world direction
+  shipped as `telemetry/perf-telemetry` below.
+- [x] [Embedded performance + context telemetry](tasks/telemetry/perf-telemetry.md) — the
+  real-world successor to `telemetry/perf-instrumentation`: an opt-in JSON telemetry record
+  per `nc convert` run (image + timing + context) to a local JSONL log / one-off
+  file, no new entrypoint. Lifts the prototype's per-stage timing.
+- [x] [Telemetry strategy spike](tasks/telemetry/strategy.md) — approved
+  [strategy](telemetry-strategy.md): custom JSON to Cloudflare Worker + D1,
+  anonymous schema-minimized upload, persistent explicit consent, crash-safe
+  detached draining, success/failure events, and sanitized panic reporting.
+- [ ] [Telemetry event schema v2](tasks/telemetry/schema-v2.md) — add typed
+  success/failure local events and a separately versioned, privacy-minimized
+  upload projection with random per-event deduplication IDs.
+- [ ] [Telemetry ingestion service](tasks/telemetry/ingestion-service.md) — build
+  the validating Cloudflare Worker + D1 endpoint, exact deduplication, 180-day
+  retention, hard FREE-plan quotas, abuse quarantine/kill switch, and initial
+  advisory performance/failure queries.
+- [ ] [Background telemetry upload](tasks/telemetry/upload.md) — ship the local
+  consent-selected active JSONL through generation-bound collection/request
+  leases and its private spool, durable recovery, detached helpers, retries,
+  non-stranding retarget, lock-stable inactive purge, caps, and maintenance
+  commands.
+- [ ] [Sanitized panic telemetry](tasks/telemetry/panic-hook.md) — publish
+  persistent-managed-consent panic events as isolated atomic ready files with
+  only capped, normalized `nc` function/module frames; no per-run hook, shared
+  append stream, payloads, source paths, or native-crash claim.
+
+### analysis — [progress](progress/analysis.md)
+> `scripts/`: the real-scan verification harness, the `nctool` Python toolkit,
+> the nc-assets manifest, and NLP comparison. This epic *verifies* the pipeline;
+> it is not part of it.
+
+- [x] [Real-scan core verification](tasks/analysis/real-scan-verification.md) — exercise decoding, Dmin/Dmax, current TIFF conversion, IR, determinism, and resource use on full-size scans without waiting for the display-output roadmap. **Done 2026-07-23** (see [reports/real-scan-verification.md](reports/real-scan-verification.md)): all rows pass on 5 real rolls; measured peak ~930 MiB @ 18.7 MP feeds `io/streaming-tiled-io` STEP 0; frozen recipes + harness feed `analysis/display-output-acceptance`; follow-up `film-base/dense-base-dmax-plausibility` filed; default-SDR paleness routes to the display-output roadmap
+- [ ] [Display-output acceptance](tasks/analysis/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans
+- [x] [Conversion-analysis tooling (spike)](tasks/analysis/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. **Done 2026-07-23** (spike): scope decided (Python `nctool` toolkit, JSON manifest of rolls+converted, configurable-but-local asset root, NLP global-metrics comparison without registration); split into the four child tasks below; see the task file's "Spike outcome" section.
+- [x] [Asset manifest](tasks/analysis/asset-manifest.md) — tracked JSON manifest of `../nc-assets` (roll frames + roles + derived facts + converted outputs); `generate`/`validate`; retires the hard-coded `ROLLS` array
+- [ ] [Conversion metrics & thumbnails](tasks/analysis/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
+- [ ] [NLP vs nc comparison](tasks/analysis/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
+- [ ] [Drive asset migration](tasks/analysis/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene

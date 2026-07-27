@@ -4,7 +4,7 @@
 
 This note decides how `nc` grows the shipped local-only performance record into
 anonymous, explicitly consented remote telemetry. It is the output of the
-[`telemetry-strategy`](tasks/telemetry-strategy.md) spike and scopes its
+[`telemetry/strategy`](tasks/telemetry/strategy.md) spike and scopes its
 implementation children.
 
 ## Decision summary
@@ -36,7 +36,7 @@ implementation children.
 
 ## Fixed invariants
 
-The shipped [`perf-telemetry`](tasks/perf-telemetry.md) boundaries remain
+The shipped [`perf-telemetry`](tasks/telemetry/perf-telemetry.md) boundaries remain
 non-negotiable:
 
 1. **Deterministic conversion:** telemetry never enters a recipe, sidecar, stage
@@ -670,20 +670,20 @@ rates are intentionally unavailable.
 
 ```mermaid
 graph TD
-  telemetry-strategy --> telemetry-schema-v2
-  telemetry-schema-v2 --> telemetry-ingestion-service
-  telemetry-schema-v2 --> telemetry-upload
-  telemetry-ingestion-service --> telemetry-upload
-  telemetry-upload --> telemetry-panic-hook
+  telemetry/strategy --> telemetry/schema-v2
+  telemetry/schema-v2 --> telemetry/ingestion-service
+  telemetry/schema-v2 --> telemetry/upload
+  telemetry/ingestion-service --> telemetry/upload
+  telemetry/upload --> telemetry/panic-hook
 ```
 
-- [`telemetry-schema-v2`](tasks/telemetry-schema-v2.md) owns typed success/failure
+- [`telemetry/schema-v2`](tasks/telemetry/schema-v2.md) owns typed success/failure
   events and the privacy projection.
-- [`telemetry-ingestion-service`](tasks/telemetry-ingestion-service.md) owns the
+- [`telemetry/ingestion-service`](tasks/telemetry/ingestion-service.md) owns the
   Worker, D1 schema, validation, retention, and initial queries.
-- [`telemetry-upload`](tasks/telemetry-upload.md) owns persistent consent,
+- [`telemetry/upload`](tasks/telemetry/upload.md) owns persistent consent,
   crash-safe draining, detached upload, and maintenance commands.
-- [`telemetry-panic-hook`](tasks/telemetry-panic-hook.md) owns sanitized panic
+- [`telemetry/panic-hook`](tasks/telemetry/panic-hook.md) owns sanitized panic
   capture after the uploader supplies managed consent generations, collection
   leases, spool lifecycle, and purge synchronization.
 

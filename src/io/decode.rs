@@ -1,7 +1,7 @@
 //! SilverFast HDR (48-bit RGB) / HDRi (64-bit RGB+IR) → [`LinearImage`].
 //!
 //! On-disk layout, reverse-engineered from real sample scans (no published spec —
-//! see `docs/tasks/silverfast-decode.md`):
+//! see `docs/tasks/io/silverfast-decode.md`):
 //!
 //! - **HDR**: a single TIFF IFD — 3-sample chunky RGB, 16-bit unsigned, no IR.
 //! - **HDRi**: the RGB image in IFD0 (as HDR) plus a full-resolution IR plane

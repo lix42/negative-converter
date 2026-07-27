@@ -4,7 +4,7 @@
 //! record — image facts, per-stage timings, a compact conversion summary, and the
 //! outcome — and emits it as JSON to a persistent append-only JSONL log and/or a
 //! one-off file (design-spec §8/§9). The record is designed for a future
-//! background uploader (the separate `telemetry-upload` task) to drain the JSONL
+//! background uploader (the separate `telemetry/upload` task) to drain the JSONL
 //! queue and ship to a server; this module only *produces* the record and writes
 //! the local sink(s).
 //!
@@ -207,7 +207,7 @@ pub struct ConversionInfo {
 /// record is emitted only after a conversion succeeds, so there is no explicit
 /// `success` flag: a constant `true` would carry no information and could even
 /// contradict `non_finite > 0`. A `success`/`status` field returns with the
-/// failure-path record in the `telemetry-strategy`/`telemetry-upload` follow-up,
+/// failure-path record in the `telemetry/strategy`/`telemetry/upload` follow-up,
 /// where it actually varies.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct OutcomeInfo {

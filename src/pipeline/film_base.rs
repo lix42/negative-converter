@@ -11,7 +11,7 @@
 //! per-channel override, a user-supplied region to sample, or auto-detection of
 //! the unexposed rebate. This stage just honors whichever the caller selected.
 //! (The opt-in content-based source, ladder tier 3, lives in the separate
-//! `film-base-content-fallback` task — auto only *suggests* it on refusal.)
+//! `film-base/content-fallback` task — auto only *suggests* it on refusal.)
 //!
 //! Auto detection models the real scan layout — `dark film holder → thin
 //! unexposed rebate → exposed picture` — by marching 1-px strips inward from
@@ -148,12 +148,12 @@ const IR_HOLDER_PROBE_MIN: u32 = 2;
 /// Shared recovery advice appended to every auto-detection refusal, naming the
 /// fallback options. Kept in one place so the too-small and no-band errors stay
 /// consistent. Content-based estimation (`--base-content`) is only *suggested*
-/// here — it is owned by the separate `film-base-content-fallback` task and is
+/// here — it is owned by the separate `film-base/content-fallback` task and is
 /// never a silent fallback (design-spec §9 ladder tier 3).
 const RECOVERY_ADVICE: &str = "pass --film-base or --base-region (design-spec §9: measure once \
      from an unexposed reference and reuse it). For a cropped scan with no unexposed \
      film visible, content-based estimation is planned but not yet available (the \
-     --base-content flag is owned by the film-base-content-fallback task); until it \
+     --base-content flag is owned by the film-base/content-fallback task); until it \
      ships, use --film-base or --base-region";
 
 /// Fraction of the grid rectangle's width/height used for each grid cell, so the

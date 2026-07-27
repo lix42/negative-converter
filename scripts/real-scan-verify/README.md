@@ -1,6 +1,6 @@
 # real-scan-verify
 
-Tooling for the [`real-scan-verification`](../../docs/tasks/real-scan-verification.md)
+Tooling for the [`real-scan-verification`](../../docs/tasks/analysis/real-scan-verification.md)
 task: drive the compiled `nc` binary over the user's full-size real scans and
 record **derived numbers only** (JSON reports, `exiftool` structure, RSS). It
 **never reads sample pixels into an agent context**. Rerun it whenever the assets
@@ -64,7 +64,7 @@ NC=target/debug/nc OUTDIR=/tmp/out bash scripts/real-scan-verify/harness.sh conv
 - The roll → {unexposed, fully-exposed, real frames} mapping now comes from the
   asset **manifest** (`$A/manifest.json`), not a hard-coded array: `harness.sh`
   fills `ROLLS` from `python3 -m nctool manifest roles` (the
-  [`asset-manifest`](../../docs/tasks/asset-manifest.md) task). To change what the
+  [`asset-manifest`](../../docs/tasks/analysis/asset-manifest.md) task). To change what the
   harness converts, edit the frame `role`s in the manifest and regenerate — only
   rolls with a complete unexposed+leader pair are emitted. If the manifest is
   missing, the harness fails loudly (exit 2) with the generate command to run.

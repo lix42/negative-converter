@@ -2,7 +2,7 @@
 
 Guidance on what the white-balance correction is, and how to get a **consistent
 look across a roll** (frames shot on the same stock, developed together, scanned
-in one session). Companion to the [`auto-neutral-wb`](tasks/auto-neutral-wb.md)
+in one session). Companion to the [`auto-neutral-wb`](tasks/algo/auto-neutral-wb.md)
 task and design-spec §8/§9.
 
 ## There are two corrections, at two stages
@@ -76,7 +76,7 @@ uniform roll.
 
 ## See also
 
-- [`auto-neutral-wb`](tasks/auto-neutral-wb.md) — the feature spec (modes,
+- [`auto-neutral-wb`](tasks/algo/auto-neutral-wb.md) — the feature spec (modes,
   report round-trip, four-coupled-spots wiring).
 - design-spec §8 (film base) and §9 (`--white-balance` / `--auto-wb` flags +
   recipe key).

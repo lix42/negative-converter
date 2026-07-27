@@ -1,6 +1,6 @@
 # Real-scan core verification
 
-Task: [`real-scan-verification`](../tasks/real-scan-verification.md). Executed
+Task: [`real-scan-verification`](../tasks/analysis/real-scan-verification.md). Executed
 2026-07-22 against the user's full-size real scans. **No sample pixels were read
 into an agent context** — every number below is derived (JSON reports, exiftool
 IFD structure, `/usr/bin/time` RSS). Rerunnable via
@@ -117,7 +117,7 @@ transform to shed the clone), re-measure post-fix, then re-evaluate this gate. D
    land above display white and the u16 encode clips them. Likely *expected*
    (HDR retains them; SDR is a display choice), but the magnitude is well beyond
    "spot highlights." Belongs to the display-output roadmap
-   (`output-presets` / `sdr-display-rendering` / `--highlight-compress`) rather
+   (`output/presets` / `sdr-display-rendering` / `--highlight-compress`) rather
    than a new task — flag for that gate, and verify a highlight roll-off tames it.
 2. **Harman Phoenix breaks two estimator heuristics** (new, untracked): its dense
    bluish base gives Dmax 0.898 (< the ≳1.0 plausibility floor) and a

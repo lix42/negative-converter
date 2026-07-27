@@ -119,7 +119,7 @@ Both projects use permissive licenses and support static builds. The AOM patent
 license grants participating licensors' royalty-free rights, but normal legal
 review remains appropriate.
 
-The dedicated [`hdr-avif-output`](tasks/hdr-avif-output.md) task owns this
+The dedicated [`hdr-avif-output`](tasks/output/hdr-avif-output.md) task owns this
 encoder/container boundary. Pin these encoder settings for the first
 implementation:
 
