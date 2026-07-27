@@ -12,14 +12,25 @@ use serde::{Deserialize, Serialize};
 ///
 /// Values are in a linear working space, range ~`[0, 1]`. `rgb` is interleaved
 /// (`r,g,b, r,g,b, …`) with `len == width * height * 3`. The IR plane, when
-/// present (HDRi input), is `len == width * height` and is **carried through but
-/// not consumed** in Step 1 (design-spec §6.1).
+/// present (HDRi input), is `len == width * height`. It is exported verbatim
+/// (`--export-ir`) and, since `ir-holder-detection`, consumed by the chromogenic
+/// film-base holder mask — but **only when [`ir_verified`](Self::ir_verified) is
+/// true** (design-spec §6.1).
 #[derive(Clone, Debug)]
 pub struct LinearImage {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<f32>,
     pub ir: Option<Vec<f32>>,
+    /// Whether the IR plane's provenance is **marker-verified** — the decoder
+    /// found the SilverFast IR IFD's `NewSubfileType=4` marker, not merely a
+    /// same-dimension 16-bit grayscale page identified by shape alone. A
+    /// shape-only IR plane is still carried and exportable, but it must **not** be
+    /// trusted by a conversion consumer (a stray grayscale page could otherwise be
+    /// thresholded as IR and corrupt the film base), so the holder mask is skipped
+    /// for it. Meaningful only when `ir.is_some()`; [`new`](Self::new) defaults it
+    /// `false` and `io::decode` sets it from the marker.
+    pub ir_verified: bool,
 }
 
 impl LinearImage {
@@ -63,6 +74,10 @@ impl LinearImage {
             height,
             rgb,
             ir,
+            // Provenance is not known at this boundary; `io::decode` sets it from
+            // the IR IFD's `NewSubfileType=4` marker. A shape-only IR plane stays
+            // `false` (carried/exportable but not trusted by consumers).
+            ir_verified: false,
         })
     }
 }

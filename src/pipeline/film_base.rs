@@ -42,6 +42,25 @@
 //! per-channel cast* (design-spec §8), never a crossover, and pinning via
 //! `--base-region` / `--film-base` avoids it — which is the recommended path for
 //! work you're keeping.
+//!
+//! **Known limitation — shallow-holder rebate exclusion (IR mask, deferred).** The
+//! chromogenic IR holder mask classifies each along-edge segment from a *shallow*
+//! near-edge probe band ([`holder_probe_depth`] / [`median_ir_probe`]) and excludes
+//! every IR-dark segment from the rebate search ([`film_along_ranges`]). So a thin
+//! opaque holder margin at the very edge — IR-dark only within that shallow probe —
+//! with a genuine rebate sitting *directly behind* it is excluded along with the
+//! holder, and auto-base can miss a rebate the RGB-only path (which scans the full
+//! depth over the whole edge) would have found. This is a **deliberate,
+//! user-accepted trade-off**, not a bug: the shallow probe is exactly what lets the
+//! mask separate a thin holder from the bright film behind it in the common case
+//! (see [`ir_holder_mask`] and the `shallow_probe_reads_a_thin_holder_over_bright_film`
+//! test). The failure is bounded the same way as above — auto either refuses loudly
+//! (no surviving candidate) or, if it anchors on another band, yields a correctable
+//! global per-channel cast, never a crossover (design-spec §8) — and
+//! `--base-region` / `--film-base` is the workaround. The roadmap fix is a
+//! **depth-aware occlusion classification**: exclude a span only when it reads
+//! IR-dark through the full scan depth, not merely the shallow probe (an
+//! `ir-holder-detection` follow-up).
 
 use serde::Serialize;
 
@@ -319,9 +338,10 @@ pub fn rebate_candidates(image: &LinearImage, film_type: FilmType) -> Result<Vec
 /// [`INTERIOR_BRIGHTNESS_MARGIN`] on **every** channel (the rebate is per-channel
 /// `Dmin` = maximum transmission), then take the highest-transmission survivor
 /// — nothing genuine can out-transmit clean base, so a uniform low-transmission
-/// picture band can never out-rank a real rebate. Disagreement between surviving edges
-/// (beyond [`CROSS_EDGE_AGREE_TOL`]) is surfaced as a warning rather than
-/// silently ignored. Fails loudly, naming every recovery flag, when no candidate
+/// picture band can never out-rank a real rebate. Disagreement between any two
+/// surviving candidates — across *or* within an edge (one edge can yield several,
+/// one per IR film run) — beyond [`CROSS_EDGE_AGREE_TOL`] is surfaced as a warning
+/// rather than silently ignored. Fails loudly, naming every recovery flag, when no candidate
 /// survives.
 ///
 /// `candidates` **must** have been produced by [`rebate_candidates`] on this
@@ -371,7 +391,13 @@ pub fn select_auto_base(
     };
 
     let mut est = BaseEstimate::clean(FilmBase::from(best.base));
-    for other in survivors.iter().filter(|c| c.edge != best.edge) {
+    // Compare the chosen base against every *other* surviving candidate — excluded
+    // by identity (pointer), not by edge. Since `ir-holder-detection` a single edge
+    // can now yield multiple candidates (one per IR film run), and two materially
+    // different bases from the same edge's runs are just as ambiguous as a
+    // cross-edge disagreement; the old `other.edge != best.edge` filter silently
+    // dropped them. Skipping only `best` itself keeps same-edge siblings in view.
+    for &other in survivors.iter().filter(|&&c| !std::ptr::eq(c, best)) {
         let diff = best
             .base
             .iter()
@@ -380,10 +406,10 @@ pub fn select_auto_base(
             .fold(0.0f32, f32::max);
         if diff > CROSS_EDGE_AGREE_TOL {
             est.warnings.push(format!(
-                "auto film-base candidates disagree across edges: chose {:?} {:?} but \
-                 {:?} reads {:?} (relative difference {diff:.2} > \
-                 {CROSS_EDGE_AGREE_TOL:.2}); verify with `nc inspect` / --base-region",
-                best.edge, best.base, other.edge, other.base
+                "auto film-base candidates disagree: chose {:?} {:?} (region {:?}) but \
+                 {:?} {:?} (region {:?}) reads a relative difference {diff:.2} > \
+                 {CROSS_EDGE_AGREE_TOL:.2}; verify with `nc inspect` / --base-region",
+                best.edge, best.base, best.region, other.edge, other.base, other.region
             ));
         }
     }
@@ -620,11 +646,13 @@ pub struct EdgeHolderMask {
 /// Build the IR film-holder mask, or `None` when the IR path does not apply.
 ///
 /// Produced **only** when the film is chromogenic ([`FilmType::ir_transparent`] —
-/// silver B&W blocks IR and would misread dense silver as holder) **and** the scan
-/// actually carries an IR plane (HDR 48-bit has none); both gate the path per
-/// design-spec §6.1 and the `ir-holder-detection` task. Every other input returns
-/// `None` and the caller falls back to the RGB-only rebate search. Pure over the
-/// decoded IR plane.
+/// silver B&W blocks IR and would misread dense silver as holder), the scan
+/// actually carries an IR plane (HDR 48-bit has none), **and** that IR plane is
+/// marker-verified ([`LinearImage::ir_verified`] — a shape-only grayscale page must
+/// not be thresholded as IR, or a stray page could corrupt the base). All three
+/// gate the path per design-spec §6.1 and the `ir-holder-detection` task. Every
+/// other input returns `None` and the caller falls back to the RGB-only rebate
+/// search. Pure over the decoded IR plane.
 ///
 /// Per edge, the along-edge extent is split into [`IR_HOLDER_SEGMENTS`] segments;
 /// each segment's **shallow** near-edge probe band (depth
@@ -642,6 +670,13 @@ pub fn ir_holder_mask(
         return Ok(None);
     };
     if !film_type.ir_transparent() {
+        return Ok(None);
+    }
+    // Trust the IR plane only when its provenance is marker-verified. A shape-only
+    // grayscale page (accepted by the decoder as IR by shape, with a warning) must
+    // not be thresholded as IR — that could corrupt the film base — so fall back to
+    // the RGB-only search. The orchestrator emits the user-facing note.
+    if !image.ir_verified {
         return Ok(None);
     }
     scan_depth(image)?; // same too-small guard as the rebate search
@@ -1292,6 +1327,40 @@ mod tests {
     }
 
     #[test]
+    fn auto_warns_on_two_disagreeing_runs_on_one_edge() {
+        // Since `ir-holder-detection` a single edge can yield multiple candidates
+        // (one per IR film run), so two materially different bases from the SAME
+        // edge must still surface as a disagreement — the old `other.edge !=
+        // best.edge` filter silently dropped them.
+        let mut img = scan_with_rebate(&[Edge::Bottom]);
+        // Give the bottom rebate two clearly different values along the edge (> the
+        // 15% CROSS_EDGE_AGREE_TOL apart). Rebate rows behind the bottom holder are
+        // 93..97; the right half reads a brighter band.
+        const REBATE2: [f32; 3] = [0.70, 0.36, 0.24];
+        fill_rect(&mut img, [50, 93, 50, 4], REBATE2);
+        // Split the bottom edge into two film runs with an IR-dark holder gap in the
+        // middle (bottom probe band = 2 rows; 4 px segments, so [40, 60) is clean).
+        let mut img = with_uniform_ir(img, IR_FILM);
+        fill_ir_rect(&mut img, [40, 98, 20, 2], IR_HOLDER);
+
+        // Two candidates on the one (bottom) edge, one per film run.
+        let candidates = rebate_candidates(&img, FilmType::Chromogenic).unwrap();
+        assert_eq!(
+            candidates.iter().filter(|c| c.edge == Edge::Bottom).count(),
+            2,
+            "two film runs must yield two bottom candidates: {candidates:?}"
+        );
+        // The brighter run wins, and the same-edge ambiguity is surfaced.
+        let est = select_auto_base(&img, &candidates).unwrap();
+        assert_close(est.base, REBATE2, 0.02);
+        assert!(
+            est.warnings.iter().any(|w| w.contains("disagree")),
+            "expected a same-edge disagreement warning: {:?}",
+            est.warnings
+        );
+    }
+
+    #[test]
     fn rebate_candidates_report_region_and_confidence() {
         // The inspect surface: candidates carry the edge, a rectangle usable as
         // --base-region, the proposed base, and the spread (confidence).
@@ -1632,9 +1701,12 @@ mod tests {
 
     // --- IR film-holder mask (`ir-holder-detection`) -------------------------
 
-    /// Attach a flat IR plane of value `v` to an image (helper for the mask tests).
+    /// Attach a flat, **marker-verified** IR plane of value `v` (helper for the mask
+    /// tests — the mask only consumes a verified plane; shape-only is covered
+    /// explicitly by `ir_holder_mask_requires_a_marker_verified_ir_plane`).
     fn with_uniform_ir(mut img: LinearImage, v: f32) -> LinearImage {
         img.ir = Some(vec![v; (img.width * img.height) as usize]);
+        img.ir_verified = true;
         img
     }
 
@@ -1682,11 +1754,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // Chromogenic + an IR plane → the mask is built.
+        // Chromogenic + a (verified) IR plane → the mask is built.
         assert!(
             ir_holder_mask(&with_ir, FilmType::Chromogenic)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn ir_holder_mask_requires_a_marker_verified_ir_plane() {
+        // The decoder accepts a same-dimension 16-bit grayscale page as IR by shape
+        // alone (NewSubfileType=4 marker absent) and flags it `ir_verified = false`.
+        // Such a plane must NOT be thresholded as IR — a stray grayscale page could
+        // corrupt the base — so a chromogenic scan carrying only a shape-only plane
+        // falls back to the RGB-only search (mask None). A marker-verified plane of
+        // the same pixels builds the mask.
+        let mut shape_only = scan_with_rebate(&[Edge::Bottom]);
+        shape_only.ir = Some(vec![
+            IR_FILM;
+            (shape_only.width * shape_only.height) as usize
+        ]);
+        shape_only.ir_verified = false; // shape-only provenance
+        assert!(
+            ir_holder_mask(&shape_only, FilmType::Chromogenic)
+                .unwrap()
+                .is_none(),
+            "a shape-only IR plane must not be trusted for the holder mask"
+        );
+
+        let mut verified = shape_only.clone();
+        verified.ir_verified = true; // same pixels, marker-verified
+        assert!(
+            ir_holder_mask(&verified, FilmType::Chromogenic)
+                .unwrap()
+                .is_some(),
+            "a marker-verified IR plane must build the mask"
         );
     }
 

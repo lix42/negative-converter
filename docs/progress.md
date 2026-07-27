@@ -3848,3 +3848,42 @@ IR *recovers* a rebate RGB-only misses; no logic changed.
   >1-film-run / mid-loop-flush / >1-candidate-per-edge paths; an all-holder frame
   driving the loud empty-candidates error; and a `HolderClass`/`HolderSegment`/
   `EdgeHolderMask` lowercase-serde guard.
+
+### 2026-07-26 — PR #56 Codex review-fix pass (uncommitted)
+
+Four real findings on PR #56, plus one document-only deferral.
+
+- **[P1] IR provenance gate.** The holder mask consumed any populated `image.ir`,
+  but the decoder accepts a same-dimension 16-bit grayscale IFD as IR by **shape
+  alone** when the `NewSubfileType=4` marker is absent (it only warned). Safe when
+  IR was merely carried; unsafe now that stage 2 consumes it. Threaded the
+  provenance: new `LinearImage::ir_verified` (set by `io::decode` from the marker,
+  `false` for a shape-only plane), and `ir_holder_mask` now returns `None` unless
+  the plane is verified → RGB-only fallback. Orchestrators (`convert`/`estimate`/
+  `inspect`) emit a `--strict`-promotable warning for the shape-only+chromogenic
+  case. Tests: `ir_holder_mask_requires_a_marker_verified_ir_plane` (shape-only →
+  None, verified → built) + decode-boundary assertions on both provenance states.
+- **[P2] Same-edge disagreement.** `select_auto_base` filtered other candidates by
+  `other.edge != best.edge`; since one edge can now yield multiple candidates
+  (multiple film runs), two differing bases from the same edge were silently
+  ignored. Now excludes only `best` itself by pointer identity, so same-edge
+  disagreement surfaces (and `--strict` can reject it). Test:
+  `auto_warns_on_two_disagreeing_runs_on_one_edge`.
+- **[P2] Inspect IR-note contradiction.** `run_inspect` fired the unconditional "IR
+  carried but not used" note even under `--film-type chromogenic` on an HDRi scan
+  where it now builds+uses the mask. Gated the same way `convert_frame` does
+  (no-IR / shape-only / consumed cases each get the right note or none).
+- **[P2] Inspect best-effort mask.** `ir_holder_mask(...)?` made `inspect` abort on
+  a too-small chromogenic image; now caught and reported as a diagnostic warning,
+  matching the candidate search, so `inspect` stays informational.
+- **[P1 — document-only, deferred by user] Shallow-holder rebate exclusion.** Added
+  a "Known limitation" note to the `film_base.rs` module doc (and here): a thin
+  opaque holder margin IR-dark only in the shallow near-edge probe, with a rebate
+  directly behind it, is excluded by the along-edge mask, so auto-base can miss a
+  rebate RGB-only would find. Deliberate, accepted trade-off (the shallow probe is
+  what separates a thin holder from bright film); failure is bounded (loud refusal
+  or a correctable global cast, never a crossover — §8); workaround is
+  `--base-region`/`--film-base`; roadmap fix is depth-aware occlusion (exclude a
+  span only if IR-dark through the full scan depth). Mask logic, `film_along_ranges`,
+  `median_ir_probe`, probe depth, and the `shallow_probe_…` test were left
+  unchanged per the user's decision.

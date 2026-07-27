@@ -1965,21 +1965,40 @@ fn convert_frame(
         ));
     }
     // Whether film-base estimation will actually consume the IR plane for holder
-    // detection: only under the chromogenic gate, on a scan that carries an IR
-    // plane, and only when the base is being auto-detected (an explicit
-    // `--film-base` / `--base-region` runs no detection at all). Governs both the
-    // "IR carried but unused" note (false when we do consume it) and the
-    // chromogenic-without-IR note below.
+    // detection: only under the chromogenic gate, on a scan that carries a
+    // **marker-verified** IR plane, and only when the base is being auto-detected
+    // (an explicit `--film-base` / `--base-region` runs no detection at all). A
+    // shape-only IR plane (unverified provenance) is not trusted, so it degrades to
+    // RGB-only. Governs the "IR carried but unused" note (false when we consume it)
+    // and the chromogenic-without-IR note below.
     let auto_base = matches!(cfg.film_base.source, FilmBaseSource::Auto);
-    let ir_used_for_holder = cfg.input.film_type.ir_transparent() && info.ir_present && auto_base;
+    let chromogenic = cfg.input.film_type.ir_transparent();
+    let ir_shape_only = info.ir_present && !image.ir_verified;
+    let ir_used_for_holder = chromogenic && info.ir_present && image.ir_verified && auto_base;
+
+    // When the auto chromogenic path wanted the IR mask but the plane is shape-only,
+    // it silently degraded to RGB-only — say so (a `--strict`-promotable warning,
+    // like the no-IR note). Emitting it here means the generic "carried but unused"
+    // note below is skipped for the same plane, so only one IR note fires.
+    let shape_only_holder_note = auto_base && chromogenic && ir_shape_only;
+    if shape_only_holder_note {
+        push_warning_buf(
+            warnings,
+            log,
+            "--film-type chromogenic declared and an IR plane is present, but it is \
+             identified by shape alone (no NewSubfileType=4 marker) and not trusted \
+             for holder detection; using RGB-only film-holder detection for the film base"
+                .into(),
+        );
+    }
 
     // Note an IR plane that's carried but not consumed — but not when it's being
     // exported (`--export-ir` is the user handling it, so warning — and failing
     // under `--strict` — would be wrong; keeps `--strict --export-ir` usable on the
-    // primary HDRi format), and not when the chromogenic film-base path is
-    // consuming it for holder detection (the "not used in Step 1" claim is then
-    // false).
-    if info.ir_present && export_ir.is_none() && !ir_used_for_holder {
+    // primary HDRi format), not when the chromogenic film-base path is consuming it
+    // for holder detection (the "not used in Step 1" claim is then false), and not
+    // when the shape-only note above already covered this plane.
+    if info.ir_present && export_ir.is_none() && !ir_used_for_holder && !shape_only_holder_note {
         push_warning_buf(
             warnings,
             log,
@@ -3162,7 +3181,38 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     }
     report.input_color = Some(input_report);
 
-    if info.ir_present {
+    // IR film-holder mask (only with `--film-type chromogenic` on a scan carrying a
+    // *marker-verified* IR plane). Diagnostic on `inspect`: it shows which along-edge
+    // segments the opaque holder occludes, and drives the film-segment restriction
+    // the candidate search below uses.
+    let film_type = args.film_type.unwrap_or_default();
+    let chromogenic = film_type.ir_transparent();
+    // Whether the holder mask actually consumes the IR plane here — the one Step-1
+    // consumer. Tailor the IR-status note to what happens so it never contradicts
+    // the `holder_mask` output below (the old unconditional "preserved but not
+    // used" note fired even when the mask was using it).
+    let ir_consumed = chromogenic && info.ir_present && image.ir_verified;
+    if chromogenic && !info.ir_present {
+        // Mirror `convert`'s note: chromogenic declared but nothing to mask with.
+        push_warning(
+            &mut report,
+            &log,
+            "--film-type chromogenic declared but the scan has no IR plane; \
+             film-holder detection is RGB-only"
+                .into(),
+        );
+    } else if chromogenic && info.ir_present && !image.ir_verified {
+        // Shape-only IR plane: carried/exportable but not trusted for detection.
+        push_warning(
+            &mut report,
+            &log,
+            "--film-type chromogenic declared and an IR plane is present, but it is \
+             identified by shape alone (no NewSubfileType=4 marker) and not trusted \
+             for holder detection; film-holder detection is RGB-only"
+                .into(),
+        );
+    } else if info.ir_present && !ir_consumed {
+        // IR present but no consumer engaged it (non-chromogenic, or unknown/silver).
         push_warning(
             &mut report,
             &log,
@@ -3171,27 +3221,17 @@ fn run_inspect(args: IoArgs) -> Result<()> {
                 .into(),
         );
     }
-
-    // IR film-holder mask (only with `--film-type chromogenic` on a scan that
-    // carries an IR plane). Diagnostic on `inspect`: it shows which along-edge
-    // segments the opaque holder occludes, and drives the film-segment restriction
-    // the candidate search below uses. Non-chromogenic / no-IR yields `None`.
-    let film_type = args.film_type.unwrap_or_default();
-    // Mirror `convert`'s note: a chromogenic declaration on a scan with no IR plane
-    // yields a `None` mask and falls back to RGB-only detection — say so rather than
-    // silently ignoring the declaration.
-    if film_type == FilmType::Chromogenic && !info.ir_present {
-        push_warning(
+    // Best-effort, like the candidate search below: a too-small chromogenic image
+    // makes `ir_holder_mask` error on `scan_depth`, but `inspect` is informational
+    // and must not abort only because `--film-type` was passed — report it as a note.
+    match film_base::ir_holder_mask(&image, film_type) {
+        Ok(Some(mask)) => report.holder_mask = Some(mask),
+        Ok(None) => {}
+        Err(e) => push_warning(
             &mut report,
             &log,
-            "--film-type chromogenic declared but the scan has no IR plane; \
-             film-holder detection is RGB-only"
-                .into(),
-        );
-    }
-    let holder_mask = film_base::ir_holder_mask(&image, film_type)?;
-    if holder_mask.is_some() {
-        report.holder_mask = holder_mask;
+            format!("holder-mask detection skipped — {e}"),
+        ),
     }
 
     // Candidate rebate bands + suggested Dmin via the inward-scan detector. For
@@ -3294,22 +3334,33 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         push_warning(&mut report, &log, w.clone());
     }
 
-    // Mirror `convert`'s note: only the `auto` single-measurement path consults the
-    // IR holder mask, so a chromogenic declaration on a no-IR scan there falls back
-    // to RGB-only detection. The `--grid` and explicit/region paths never touch IR,
-    // so the declaration is a genuine no-op for them and needs no note.
+    // Mirror `convert`'s notes: only the `auto` single-measurement path consults the
+    // IR holder mask, so a chromogenic declaration there degrades to RGB-only when
+    // there is no IR plane, or when the IR plane is shape-only (unverified
+    // provenance). The `--grid` and explicit/region paths never touch IR, so the
+    // declaration is a genuine no-op for them and needs no note.
     if !args.grid
         && matches!(source, FilmBaseSource::Auto)
-        && args.film_type.unwrap_or_default() == FilmType::Chromogenic
-        && !info.ir_present
+        && args.film_type.unwrap_or_default().ir_transparent()
     {
-        push_warning(
-            &mut report,
-            &log,
-            "--film-type chromogenic declared but the scan has no IR plane; \
-             using RGB-only film-holder detection for the film base"
-                .into(),
-        );
+        if !info.ir_present {
+            push_warning(
+                &mut report,
+                &log,
+                "--film-type chromogenic declared but the scan has no IR plane; \
+                 using RGB-only film-holder detection for the film base"
+                    .into(),
+            );
+        } else if !image.ir_verified {
+            push_warning(
+                &mut report,
+                &log,
+                "--film-type chromogenic declared and an IR plane is present, but it is \
+                 identified by shape alone (no NewSubfileType=4 marker) and not trusted \
+                 for holder detection; using RGB-only film-holder detection for the film base"
+                    .into(),
+            );
+        }
     }
 
     let base = if args.grid {
