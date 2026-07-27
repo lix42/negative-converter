@@ -26,7 +26,7 @@ use crate::io::encode;
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
-use crate::pipeline::{film_base, stages};
+use crate::pipeline::{film_base, stages, working_space};
 use crate::telemetry;
 use crate::types::{
     BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams, DmaxSource, EncodeReport,
@@ -699,6 +699,15 @@ pub struct Report {
     /// type and its `dmax = {policy, value, provenance}` (design-spec §8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reconstruction_result: Option<ReconstructionResult>,
+    /// The pinned working-space mapping this conversion interprets the
+    /// reconstructed film RGB under (`convert`): always `"nc-film-rgb-v1"`
+    /// (linear Rec.709/D65 → linear ACEScg/D60; see
+    /// `pipeline::working_space`). Provenance only — the mapping is a fixed
+    /// constant, not a tunable knob, so it has no CLI flag / recipe key
+    /// (design-spec §8). A future mapping is a *new* identifier under
+    /// `conversion-versioning`, never a silent change to v1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_mapping: Option<&'static str>,
     /// What the decoder found (`inspect`): format, dimensions, channels, bit
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1974,6 +1983,11 @@ fn convert_frame(
         rendered.convert.dmax,
         dmax_setting,
     ));
+    // Stamp the pinned working-space interpretation (design-spec §8). NC film RGB
+    // v1 is the fixed rule "reconstructed film RGB is linear Rec.709/D65", applied
+    // on every path (`pipeline::working_space::WORKING_MAPPING_ID`); the typed
+    // ACEScg mapper realizes it for the named presets that consume `AcesCgImage`.
+    report.working_mapping = Some(working_space::WORKING_MAPPING_ID);
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).

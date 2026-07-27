@@ -5,3 +5,4 @@ pub mod color;
 pub mod film_base;
 pub mod input_semantics;
 pub mod stages;
+pub mod working_space;

@@ -3121,8 +3121,95 @@ verified findings applied:
   review — it edits project instructions).
 
 ## film-rgb-working-space
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** implemented (uncommitted in worktree; not shipped)
+**Updated:** 2026-07-24
+
+- 2026-07-24 (implementation): **Shipped the NC film RGB v1 mapper** in a new
+  pure module `src/pipeline/working_space.rs`:
+  `map_nc_film_rgb_v1(FilmRgbImage) -> AcesCgImage`. The mapping is a single
+  pinned 3×3 matrix `M = NPM_AP1⁻¹ · Bradford(D65→ACES) · NPM_Rec709` applied per
+  pixel in **binary64**, stored `f32`, unclamped, IR carried through. The **same**
+  mapper serves simple, density/exponential, and density/sigmoid (no fitted
+  curves/matrices — film/lens/development/scanner/curve differences are
+  preserved).
+  - **Pinned matrix** (const `NC_FILM_RGB_V1_TO_ACESCG`, f64), from Rec.709
+    primaries + D65 `(0.3127,0.3290)` → AP1 primaries + ACES white
+    `(0.32168,0.33767)`, **Bradford** CAT (Lindbloom cone matrix), operation order
+    `AP1⁻¹ · CAT · Rec709`. Rows:
+    `[0.6130974, 0.3395231, 0.0473795]`,
+    `[0.0701937, 0.9163540, 0.0134523]`,
+    `[0.0206156, 0.1095697, 0.8698146]`. Row sums = 1 (neutral→neutral, so the
+    white point is correctly adapted); coincides with the published
+    sRGB-linear→ACEScg Bradford matrix (colour-science/OCIO) as an external check.
+    Derived and cross-checked with a standalone f64 program before pinning.
+  - **Typed boundary:** `AcesCgImage` has private fields and a **module-private**
+    constructor `new`, so `map_nc_film_rgb_v1` (same module) is the *only*
+    producer — nothing outside can mint one, and a named output that accepts an
+    `AcesCgImage` therefore can't be handed a value that skipped the mapper. Its
+    only input is a `FilmRgbImage` (itself only mintable by `algo::reconstruct`),
+    so "cannot attach a named profile directly to `FilmRgbImage`" is
+    compiler-enforced. Following the `algo/mod.rs` precedent, no `trybuild`
+    dev-dep was added; the privacy annotations are the guarantee (documented in a
+    test comment). Read side: `width/height/rgb/ir` accessors + `pub(crate)
+    into_linear` for the future named-output/film-master encode.
+  - **Report identity:** added top-level report field `working_mapping`
+    (`Option<&'static str>`), stamped `"nc-film-rgb-v1"` on every convert
+    (`working_space::WORKING_MAPPING_ID`), matching design-spec §8. It is a fixed
+    constant, **not** a tunable knob, so it is deliberately *not* a CLI flag /
+    recipe key (§9 assigns it no recipe home) — provenance only. A future mapping
+    is a new identifier under `conversion-versioning`.
+  - **Legacy path untouched:** the mapper is defined + tested but **not yet wired**
+    into `stages::render` — the legacy no-preset path still goes
+    `reconstruct → finish_print → color::to_output` and its pixels are unchanged
+    (all `pipeline::stages::golden` fixtures still green). Wiring happens in
+    `film-master-render-pipeline` / `output-presets` when named presets move stage
+    4 after the ACEScg boundary. The stamped `working_mapping` is still accurate:
+    the "interpret film RGB as linear Rec.709/D65" rule *is* what every path
+    already applies; the typed mapper is its realization for the preset consumers.
+  - **Tests** (7 unit in `working_space` + 2 integration assertions):
+    `matrix_matches_independent_bradford_derivation` (const == in-test
+    from-primaries f64 derivation, <1e-12); `neutral_maps_to_neutral_rows_sum_to_one`
+    (external ground truth for the adaptation); `pinned_vectors_match_binary64
+    _reference_within_2e_minus_6` (primary/neutral/saturated/negative/above-one vs
+    independent f64 `matvec`, ≤2e-6, no named renderer/profile invoked);
+    `every_reconstruction_path_uses_the_same_mapper...`;
+    `mapping_is_deterministic_across_repeat_runs_and_configs` (per-pixel bits, no
+    full-frame/post-lcms2 checksum per the cross-platform caveat);
+    `nonfinite_and_out_of_range_pass_through_unclamped`; `ir_absent_stays_absent`.
+    Integration: `convert_simple_...` and `convert_sigmoid_...` pin
+    `report["working_mapping"] == "nc-film-rgb-v1"` on both paths.
+  - **API-signature note for dependents:** `map_nc_film_rgb_v1` returns
+    `AcesCgImage` directly, **not** `Result` — the mapping is total (pure matrix
+    multiply; non-finite passes through and is counted at encode, never errored
+    here). Updated the design-spec §7 sketch (was `Result<AcesCgImage>`,
+    "target") to match the shipped total signature.
+  - Gate green in the worktree: `cargo fmt --all --check`, `clippy --all-targets
+    -D warnings`, `cargo test` = **332 unit + 86 integration, 0 failed**. Left
+    uncommitted per instructions; `TASKS.md` checkbox not flipped.
+
+- 2026-07-24 (review fixes): Addressed the `film-rgb-working-space` review round.
+  (1) **Doc ship-state reconciled** — the type + mapper are implemented but
+  uncommitted and **not yet wired into the render path** (no non-test callers of
+  `map_nc_film_rgb_v1`; only the `working_mapping` report field is wired, via the
+  `WORKING_MAPPING_ID` constant). Reworded the design-spec §7 interface sketch
+  comment away from "Shipped", made the §4 table row (was "planned working-space
+  mapper") and the §7 prose (was "future working-space mapper") consistent, and
+  changed the §9 note "`working_mapping` lands with…" to present tense. Reworded
+  `working_space.rs` "the only error…is the final f32 rounding" → "only
+  *significant* error", noting the <1e-12 pinned-vs-derived delta.
+  (2) **External cross-check now test-enforced** — added
+  `matrix_matches_published_srgb_to_acescg`: a hardcoded published sRGB-linear →
+  ACEScg Bradford matrix (colour-science / OCIO ACES, 4-dp) asserted against the
+  pinned const within 1e-4 (max observed diff 5.2e-5). A genuinely independent
+  oracle (the existing derivation re-uses the const author's primaries/white).
+  (3) **Multi-pixel value assertion** — added
+  `multi_pixel_values_match_binary64_reference_within_2e_minus_6` (3 distinct
+  pixels vs the binary64 `derived_matrix`/`matvec`, ≤2e-6) to guard chunk-boundary
+  regressions; prior value fixtures were 1×1 only. Out of scope (accepted
+  decisions, untouched): `working_mapping` stays report-only, mapper stays
+  `-> AcesCgImage`. Gate green in the worktree: `cargo fmt --all --check`,
+  `clippy --all-targets -D warnings`, `cargo build`, `cargo test` = **334 unit +
+  86 integration, 0 failed**. Left uncommitted.
 
 - 2026-07-23: Retired `docs/design-spec.html` as a maintained companion. The
   Markdown design spec is now the sole source; HTML may be regenerated after the

@@ -72,11 +72,15 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   on** in Step 1; IR-based dust removal is a roadmap follow-up. Carry it through,
   don't consume it.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
-  `io/{decode,encode}.rs`, `pipeline/{film_base,color,stages,input_semantics}.rs`
+  `io/{decode,encode}.rs`,
+  `pipeline/{film_base,color,stages,input_semantics,working_space}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure algorithm→output-color core, stages 3–4;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
-  keyed on SilverFast XMP mode metadata — see the input-semantics note below),
+  keyed on SilverFast XMP mode metadata — see the input-semantics note below;
+  `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
+  ACEScg mapper, produced-but-not-yet-wired into the render path — the
+  display-output presets are its future consumer),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `cli.rs`, `main.rs`.
   `main`/`cli` are the only orchestrators; stages stay pure. `build.rs` exposes
   the compile target triple as `NC_TARGET` for the telemetry record.
