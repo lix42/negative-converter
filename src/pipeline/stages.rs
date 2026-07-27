@@ -190,9 +190,13 @@ mod tests {
     /// Resolve the film base the way the orchestrator does (stage 2), so the
     /// render tests exercise the same estimate → render sequence as `cli`.
     fn resolve(img: &LinearImage, source: FilmBaseSource) -> FilmBase {
-        film_base::estimate(img, &FilmBaseParams { source })
-            .unwrap()
-            .base
+        film_base::estimate(
+            img,
+            &FilmBaseParams { source },
+            crate::types::FilmType::Unknown,
+        )
+        .unwrap()
+        .base
     }
 
     #[test]

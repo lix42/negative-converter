@@ -377,10 +377,18 @@ operation → `print.linear_range` affine placement → branch-specific work;
 
 ### 6.1 IR channel handling (Step 1)
 
-The IR plane (when present) is decoded and carried alongside RGB but is **not
-consumed** by any conversion stage in Step 1. It can be exported with
-`--export-ir <path>` for inspection or downstream tooling. The dust-removal stage
-that *consumes* the IR mask is a deliberate follow-up (§12).
+The IR plane (when present) is decoded and carried alongside RGB. With one
+exception it is **not consumed** by any conversion stage in Step 1: when the scan
+is declared chromogenic (`--film-type chromogenic`) **and** carries an IR plane,
+**film-base estimation (stage 2) consumes it** — the opaque scanner holder reads
+dark in IR while all film (base, rebate, picture, leader) reads bright, so
+holder-occluded spans are excluded from the auto rebate/`Dmin` search (the
+`ir-holder-detection` feature, adjacent to the roadmap's IR item 1; §9 film base).
+Silver B&W (IR-opaque) and the `unknown` default keep this path off, and a scan
+with no IR plane always falls back to RGB-only detection. Otherwise the IR plane
+is only carried, and can be exported with `--export-ir <path>` for inspection or
+downstream tooling. The broader dust-removal stage that *consumes* the IR mask for
+defect inpainting is a deliberate follow-up (§12).
 
 *Why IR is powerful and why we defer it:* the color dye image is transparent to
 infrared while physical defects (dust, scratches, hair) are opaque to it, so the
@@ -917,6 +925,21 @@ object (§8). Names are binding and unknown keys are rejected
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
   Recipe key `input.export_ir`.
+- `--film-type <silver|chromogenic|unknown>` ⇒ `input.film_type` (default
+  `"unknown"`) — the declared film chemistry. `chromogenic` (C-41 colour or
+  C-41-process B&W) is IR-transparent, so on an HDRi scan that carries an IR plane
+  it enables **IR-assisted film-holder detection** for the film base (§6.1): the
+  opaque scanner holder reads dark in IR while all film reads bright, so
+  holder-occluded spans are excluded from the auto rebate search. `silver`
+  (silver-halide blocks IR) and the `unknown` default keep the IR path off; a scan
+  with no IR plane (HDR 48-bit) always falls back to RGB-only detection. Shared
+  input-medium axis — the deferred IR dust-removal stage (§12 item 1) gates on the
+  same declaration. Accepted on `convert`, `estimate`, and `inspect`; declaring
+  `chromogenic` on a scan with no IR plane (where auto detection runs) is a report
+  warning (RGB-only fallback), promotable under `--strict`. `nc inspect
+  --film-type chromogenic` additionally reports a `holder_mask`: the per-edge
+  along-edge segments, each with its span `[start, end)`, holder/film class, and
+  representative median IR transmission, so the occluded spans are inspectable.
 - Input color is resolved as **two independent axes** before Dmin/density — the
   transfer encoding and the measurement meaning — never a single combined
   assertion. Each is a mutually-exclusive assertion with its own recipe key; the

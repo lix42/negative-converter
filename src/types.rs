@@ -12,14 +12,25 @@ use serde::{Deserialize, Serialize};
 ///
 /// Values are in a linear working space, range ~`[0, 1]`. `rgb` is interleaved
 /// (`r,g,b, r,g,b, …`) with `len == width * height * 3`. The IR plane, when
-/// present (HDRi input), is `len == width * height` and is **carried through but
-/// not consumed** in Step 1 (design-spec §6.1).
+/// present (HDRi input), is `len == width * height`. It is exported verbatim
+/// (`--export-ir`) and, since `ir-holder-detection`, consumed by the chromogenic
+/// film-base holder mask — but **only when [`ir_verified`](Self::ir_verified) is
+/// true** (design-spec §6.1).
 #[derive(Clone, Debug)]
 pub struct LinearImage {
     pub width: u32,
     pub height: u32,
     pub rgb: Vec<f32>,
     pub ir: Option<Vec<f32>>,
+    /// Whether the IR plane's provenance is **marker-verified** — the decoder
+    /// found the SilverFast IR IFD's `NewSubfileType=4` marker, not merely a
+    /// same-dimension 16-bit grayscale page identified by shape alone. A
+    /// shape-only IR plane is still carried and exportable, but it must **not** be
+    /// trusted by a conversion consumer (a stray grayscale page could otherwise be
+    /// thresholded as IR and corrupt the film base), so the holder mask is skipped
+    /// for it. Meaningful only when `ir.is_some()`; [`new`](Self::new) defaults it
+    /// `false` and `io::decode` sets it from the marker.
+    pub ir_verified: bool,
 }
 
 impl LinearImage {
@@ -63,6 +74,10 @@ impl LinearImage {
             height,
             rgb,
             ir,
+            // Provenance is not known at this boundary; `io::decode` sets it from
+            // the IR IFD's `NewSubfileType=4` marker. A shape-only IR plane stays
+            // `false` (carried/exportable but not trusted by consumers).
+            ir_verified: false,
         })
     }
 }
@@ -271,6 +286,51 @@ pub enum GammaFact {
     Malformed(String),
 }
 
+/// Declared film chemistry (design-spec §9 `input.film_type`, §6.1) — the axis
+/// that governs whether the IR plane can be trusted to separate film from the
+/// opaque scanner holder (and, later, dust). **Chromogenic** dyes (C-41 colour
+/// *and* C-41-process B&W) are transparent to infrared, so all film — base,
+/// rebate, picture, even fully-exposed leader — reads bright in IR while the
+/// opaque holder reads dark; the IR-assisted paths work. **Silver** halide B&W
+/// blocks IR (dense silver reads dark, indistinguishable from the holder), so the
+/// IR path must stay off. `Unknown` (default) is also off: the decoded scan
+/// carries no reliable film-chemistry signal, and an IR plane's mere presence does
+/// **not** imply chromogenic (a silver B&W scan can be HDRi with an IR plane) —
+/// declare it explicitly with `--film-type`.
+///
+/// This is a **shared input-medium declaration**, not an `ir-holder-detection`
+/// knob: other roadmap tasks reuse this same film-type axis — the black & white
+/// `bw-support` task (roadmap item 3) for its B&W handling and the auto-`Dmax`
+/// holder-border exclusion, and the separate IR dust-removal task (roadmap item 1)
+/// gates its defect map on it (silver blocks IR like dust). Keep it cleanly named
+/// and consumer-agnostic. Serializes kebab-case (`"unknown"` / `"silver"` /
+/// `"chromogenic"`); parsed the same on the CLI via `ValueEnum`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilmType {
+    /// Film chemistry not declared — the IR-assisted paths stay off (safe default).
+    #[default]
+    Unknown,
+    /// Silver-halide B&W — silver blocks IR, so IR cannot separate holder from
+    /// film; the IR-assisted paths stay off.
+    Silver,
+    /// Chromogenic dye film (C-41 colour or C-41-process B&W) — IR-transparent, so
+    /// the IR-assisted holder mask (and later dust map) is usable.
+    Chromogenic,
+}
+
+impl FilmType {
+    /// Whether the film's dye chemistry is transparent to infrared, i.e. IR can be
+    /// trusted to separate film from the opaque holder. True only for
+    /// [`Chromogenic`](Self::Chromogenic); silver blocks IR and unknown is off by
+    /// default. The IR plane must *also* be present — this is only the
+    /// film-chemistry half of the gate. Shared with later roadmap consumers — the
+    /// `bw-support` B&W task and the separate IR dust-removal task.
+    pub fn ir_transparent(self) -> bool {
+        matches!(self, FilmType::Chromogenic)
+    }
+}
+
 /// Input / decode knobs (design-spec §9, stage 1).
 ///
 /// Transfer and meaning are **two independent axes** (not a single combined
@@ -285,6 +345,12 @@ pub struct InputParams {
     pub transfer: TransferAssertion,
     /// Measurement-meaning assertion (default `auto`).
     pub meaning: MeaningAssertion,
+    /// Declared film chemistry (default `unknown`). Gates the IR-assisted
+    /// film-holder detection (`ir-holder-detection`) and is reused by later roadmap
+    /// tasks (`bw-support` B&W handling; the separate IR dust-removal task): only
+    /// `chromogenic` enables the IR path; `silver` / `unknown` keep it off. See
+    /// [`FilmType`].
+    pub film_type: FilmType,
     /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
     /// An input/decode-domain artifact (design-spec §9, Input/decode) — carried
     /// here so `pipeline-orchestration` can drive the IR exporter.
@@ -1373,6 +1439,34 @@ mod tests {
         let p: InputParams = serde_json::from_str(r#"{"transfer":"linear"}"#).unwrap();
         assert_eq!(p.transfer, TransferAssertion::Linear);
         assert_eq!(p.meaning, MeaningAssertion::Auto);
+    }
+
+    #[test]
+    fn film_type_defaults_to_unknown_and_gates_the_ir_path() {
+        // The default is the safe off state, and only chromogenic reports the film
+        // as IR-transparent (the shared gate `ir-holder-detection` / `bw-support`
+        // key on). Silver and unknown keep the IR path off.
+        assert_eq!(FilmType::default(), FilmType::Unknown);
+        assert_eq!(InputParams::default().film_type, FilmType::Unknown);
+        assert!(FilmType::Chromogenic.ir_transparent());
+        assert!(!FilmType::Silver.ir_transparent());
+        assert!(!FilmType::Unknown.ir_transparent());
+    }
+
+    #[test]
+    fn film_type_round_trips_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&FilmType::Chromogenic).unwrap(),
+            "\"chromogenic\""
+        );
+        for t in [FilmType::Unknown, FilmType::Silver, FilmType::Chromogenic] {
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(serde_json::from_str::<FilmType>(&json).unwrap(), t);
+        }
+        // A partial `input` section fills the untouched film_type with its default.
+        let p: InputParams = serde_json::from_str(r#"{"film_type":"silver"}"#).unwrap();
+        assert_eq!(p.film_type, FilmType::Silver);
+        assert_eq!(p.transfer, TransferAssertion::Auto);
     }
 
     #[test]

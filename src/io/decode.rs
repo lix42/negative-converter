@@ -316,6 +316,10 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
     // second IFD. Scan every remaining page: skip previews, validate the first
     // non-preview page as the IR plane (strictly, as before), and note extras.
     let mut ir = None;
+    // Whether the accepted IR plane carried the `NewSubfileType=4` marker. A
+    // shape-only plane (marker absent) is still carried, but consumers must not
+    // trust it — threaded onto the image as `ir_verified` (see the holder mask).
+    let mut ir_verified = false;
     let mut warned_extra = false;
     while dec.more_images() {
         dec.next_image()
@@ -387,10 +391,12 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         // reverse-engineered, and the IR plane is only carried, not consumed in
         // Step 1), but record a warning so an incidental page isn't reported as IR
         // provenance with no trace.
-        if subfile != Some(4) {
+        ir_verified = subfile == Some(4);
+        if !ir_verified {
             warnings.push(format!(
                 "IR plane has NewSubfileType={subfile:?} (expected 4); \
-                 identified as IR by its full-res 16-bit grayscale shape alone"
+                 identified as IR by its full-res 16-bit grayscale shape alone \
+                 (carried and exportable, but not trusted for holder detection)"
             ));
         }
         ir = Some(read_plane_u16(&mut dec, path, "IR plane")?);
@@ -416,8 +422,11 @@ pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
         warnings,
     };
 
-    // Validated constructor enforces the buffer-length invariants at the boundary.
-    let image = LinearImage::new(width, height, rgb, ir)?;
+    // Validated constructor enforces the buffer-length invariants at the boundary;
+    // stamp the IR provenance the constructor can't know (marker-verified vs
+    // shape-only) so downstream consumers (the holder mask) can gate on it.
+    let mut image = LinearImage::new(width, height, rgb, ir)?;
+    image.ir_verified = ir_verified;
     Ok((image, info))
 }
 
@@ -575,11 +584,16 @@ mod tests {
         assert_eq!(ir_plane[1], 1.0);
         assert_unit_range(&img.rgb);
         // The `tiff` encoder writes no NewSubfileType, so the page is accepted as
-        // IR by shape alone — that must be surfaced as a warning, not silent.
+        // IR by shape alone — that must be surfaced as a warning, not silent, and
+        // the plane flagged unverified so consumers (the holder mask) don't trust it.
         assert!(
             info.warnings.iter().any(|w| w.contains("NewSubfileType")),
             "expected an accepted-by-shape warning, got {:?}",
             info.warnings
+        );
+        assert!(
+            !img.ir_verified,
+            "a shape-only IR plane must not be marker-verified"
         );
     }
 
@@ -721,6 +735,11 @@ mod tests {
         assert_eq!(ir_plane.len(), 2);
         assert_eq!(ir_plane[0], 0.0);
         assert_eq!(ir_plane[1], 1.0);
+        // NewSubfileType=4 marks the plane as genuine IR: verified provenance.
+        assert!(
+            img.ir_verified,
+            "a NewSubfileType=4 IR plane must be marker-verified"
+        );
         // The preview is expected, not an anomaly — no warnings for this layout.
         assert!(
             info.warnings.is_empty(),

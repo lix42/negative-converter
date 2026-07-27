@@ -30,8 +30,9 @@ use crate::pipeline::{film_base, stages, working_space};
 use crate::telemetry;
 use crate::types::{
     BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams, DmaxSource, EncodeReport,
-    FilmBase, FilmBaseParams, FilmBaseSource, InputParams, MeaningAssertion, NcError, OutputParams,
-    PrintParams, Reconstruction, ReconstructionType, Result, TransferAssertion, WbSource,
+    FilmBase, FilmBaseParams, FilmBaseSource, FilmType, InputParams, MeaningAssertion, NcError,
+    OutputParams, PrintParams, Reconstruction, ReconstructionType, Result, TransferAssertion,
+    WbSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +97,12 @@ pub struct ReportArgs {
 pub struct IoArgs {
     /// Input negative scan (SilverFast HDR/HDRi TIFF).
     pub input: PathBuf,
+    /// Declared film chemistry (`silver` | `chromogenic`). When `chromogenic` and
+    /// the scan carries an IR plane, `inspect` reports the IR film-holder mask and
+    /// the candidate rebate search runs only on film segments. `silver` / the
+    /// unknown default keep the IR path off. See `convert --film-type`.
+    #[arg(long = "film-type", value_enum, value_name = "TYPE")]
+    pub film_type: Option<FilmType>,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -125,6 +132,13 @@ pub struct EstimateArgs {
     /// region is recorded as provenance only, never re-read at apply time.
     #[arg(long = "d-max-region", value_name = "X,Y,W,H", value_parser = parse_region)]
     pub d_max_region: Option<[u32; 4]>,
+    /// Declared film chemistry (`silver` | `chromogenic`). When `chromogenic` and
+    /// the scan carries an IR plane, auto film-base detection uses the IR holder
+    /// mask to exclude holder-occluded edge segments from the rebate search;
+    /// `silver` / the unknown default keep the IR path off. See
+    /// `convert --film-type`.
+    #[arg(long = "film-type", value_enum, value_name = "TYPE")]
+    pub film_type: Option<FilmType>,
     #[command(flatten)]
     pub film_base: FilmBaseOverrides,
     /// Treat estimation warnings (a non-uniform `--base-region`, grid
@@ -283,6 +297,15 @@ pub struct InputOverrides {
     /// application has no validated placement yet.
     #[arg(long, value_name = "ICC")]
     pub input_profile: Option<String>,
+    /// Declared film chemistry (`silver` | `chromogenic` | `unknown`). Enables
+    /// IR-assisted film-holder detection: chromogenic dyes (C-41 colour and
+    /// C-41-process B&W) are IR-transparent, so the holder is separable from film;
+    /// `silver` (IR-opaque) and the `unknown` default keep the IR path off. Recipe
+    /// key `input.film_type`. This is a shared input-medium declaration — the black
+    /// & white `bw-support` task and the separate IR dust-removal task reuse the
+    /// same knob.
+    #[arg(long = "film-type", value_enum, value_name = "TYPE")]
+    pub film_type: Option<FilmType>,
     /// Write the decoded IR plane to this path (HDRi only).
     #[arg(long, value_name = "PATH")]
     pub export_ir: Option<String>,
@@ -773,6 +796,14 @@ pub struct Report {
     /// and a future UI draws its highlight rectangles from the same data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_candidates: Option<Vec<film_base::RebateCandidate>>,
+    /// IR film-holder classification per edge (`inspect`, only with
+    /// `--film-type chromogenic` on a scan carrying an IR plane): which along-edge
+    /// segments the opaque holder occludes (dark in IR) vs actual film (bright).
+    /// Holder segments are excluded from the rebate search; a fully-film or
+    /// fully-holder edge is the all-segments-agree case. RGB alone cannot make
+    /// this call — holder and dense film are both dark in RGB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub holder_mask: Option<Vec<film_base::EdgeHolderMask>>,
     /// Reuse-ready forms of the measured base (`estimate`): a ready-to-paste
     /// `--film-base R,G,B` flag and the matching `film_base` recipe fragment, so
     /// the calibrate-once → reuse workflow (design-spec §8) is copy-paste smooth.
@@ -1060,6 +1091,9 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
     }
     if let Some(m) = args.input_opts.input_meaning {
         cfg.input.meaning = m;
+    }
+    if let Some(t) = args.input_opts.film_type {
+        cfg.input.film_type = t;
     }
     if let Some(p) = &args.input_opts.export_ir {
         cfg.input.export_ir = Some(p.clone());
@@ -1930,11 +1964,41 @@ fn convert_frame(
             "--export-ir requested but the input has no IR plane (HDRi input only)".into(),
         ));
     }
-    // Note an IR plane that's carried but not consumed — but only when it isn't
-    // being exported: `--export-ir` is the user handling it, so warning (and
-    // failing under `--strict`) would be wrong. This keeps `--strict --export-ir`
-    // a usable workflow on the primary HDRi format.
-    if info.ir_present && export_ir.is_none() {
+    // Whether film-base estimation will actually consume the IR plane for holder
+    // detection: only under the chromogenic gate, on a scan that carries a
+    // **marker-verified** IR plane, and only when the base is being auto-detected
+    // (an explicit `--film-base` / `--base-region` runs no detection at all). A
+    // shape-only IR plane (unverified provenance) is not trusted, so it degrades to
+    // RGB-only. Governs the "IR carried but unused" note (false when we consume it)
+    // and the chromogenic-without-IR note below.
+    let auto_base = matches!(cfg.film_base.source, FilmBaseSource::Auto);
+    let chromogenic = cfg.input.film_type.ir_transparent();
+    let ir_shape_only = info.ir_present && !image.ir_verified;
+    let ir_used_for_holder = chromogenic && info.ir_present && image.ir_verified && auto_base;
+
+    // When the auto chromogenic path wanted the IR mask but the plane is shape-only,
+    // it silently degraded to RGB-only — say so (a `--strict`-promotable warning,
+    // like the no-IR note). Emitting it here means the generic "carried but unused"
+    // note below is skipped for the same plane, so only one IR note fires.
+    let shape_only_holder_note = auto_base && chromogenic && ir_shape_only;
+    if shape_only_holder_note {
+        push_warning_buf(
+            warnings,
+            log,
+            "--film-type chromogenic declared and an IR plane is present, but it is \
+             identified by shape alone (no NewSubfileType=4 marker) and not trusted \
+             for holder detection; using RGB-only film-holder detection for the film base"
+                .into(),
+        );
+    }
+
+    // Note an IR plane that's carried but not consumed — but not when it's being
+    // exported (`--export-ir` is the user handling it, so warning — and failing
+    // under `--strict` — would be wrong; keeps `--strict --export-ir` usable on the
+    // primary HDRi format), not when the chromogenic film-base path is consuming it
+    // for holder detection (the "not used in Step 1" claim is then false), and not
+    // when the shape-only note above already covered this plane.
+    if info.ir_present && export_ir.is_none() && !ir_used_for_holder && !shape_only_holder_note {
         push_warning_buf(
             warnings,
             log,
@@ -1950,8 +2014,24 @@ fn convert_frame(
     // JSON report on a successful run. (A hard render failure propagates its error
     // and exit code like every other error path and emits no report; the stderr
     // warnings still stand.)
+    // A `--film-type chromogenic` declaration only does anything when the auto base
+    // detector runs on a scan that actually carries an IR plane; on an HDR 48-bit
+    // scan there is nothing to mask with. Note only the case where detection *runs*
+    // but has no IR plane (auto base) — an explicit `--film-base`/`--base-region`
+    // takes no detection path, so warning there would fail a valid `--strict` run
+    // over a path it never exercises.
+    if auto_base && cfg.input.film_type == FilmType::Chromogenic && !info.ir_present {
+        push_warning_buf(
+            warnings,
+            log,
+            "--film-type chromogenic declared but the scan has no IR plane; \
+             using RGB-only film-holder detection for the film base"
+                .into(),
+        );
+    }
+
     let stage_started = Instant::now();
-    let base = film_base::estimate(&image, &cfg.film_base)?;
+    let base = film_base::estimate(&image, &cfg.film_base, cfg.input.film_type)?;
     let film_base_ms = elapsed_ms(stage_started);
     report.film_base = Some(base.base);
     for w in base.warnings {
@@ -3101,7 +3181,38 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     }
     report.input_color = Some(input_report);
 
-    if info.ir_present {
+    // IR film-holder mask (only with `--film-type chromogenic` on a scan carrying a
+    // *marker-verified* IR plane). Diagnostic on `inspect`: it shows which along-edge
+    // segments the opaque holder occludes, and drives the film-segment restriction
+    // the candidate search below uses.
+    let film_type = args.film_type.unwrap_or_default();
+    let chromogenic = film_type.ir_transparent();
+    // Whether the holder mask actually consumes the IR plane here — the one Step-1
+    // consumer. Tailor the IR-status note to what happens so it never contradicts
+    // the `holder_mask` output below (the old unconditional "preserved but not
+    // used" note fired even when the mask was using it).
+    let ir_consumed = chromogenic && info.ir_present && image.ir_verified;
+    if chromogenic && !info.ir_present {
+        // Mirror `convert`'s note: chromogenic declared but nothing to mask with.
+        push_warning(
+            &mut report,
+            &log,
+            "--film-type chromogenic declared but the scan has no IR plane; \
+             film-holder detection is RGB-only"
+                .into(),
+        );
+    } else if chromogenic && info.ir_present && !image.ir_verified {
+        // Shape-only IR plane: carried/exportable but not trusted for detection.
+        push_warning(
+            &mut report,
+            &log,
+            "--film-type chromogenic declared and an IR plane is present, but it is \
+             identified by shape alone (no NewSubfileType=4 marker) and not trusted \
+             for holder detection; film-holder detection is RGB-only"
+                .into(),
+        );
+    } else if info.ir_present && !ir_consumed {
+        // IR present but no consumer engaged it (non-chromogenic, or unknown/silver).
         push_warning(
             &mut report,
             &log,
@@ -3110,12 +3221,24 @@ fn run_inspect(args: IoArgs) -> Result<()> {
                 .into(),
         );
     }
+    // Best-effort, like the candidate search below: a too-small chromogenic image
+    // makes `ir_holder_mask` error on `scan_depth`, but `inspect` is informational
+    // and must not abort only because `--film-type` was passed — report it as a note.
+    match film_base::ir_holder_mask(&image, film_type) {
+        Ok(Some(mask)) => report.holder_mask = Some(mask),
+        Ok(None) => {}
+        Err(e) => push_warning(
+            &mut report,
+            &log,
+            format!("holder-mask detection skipped — {e}"),
+        ),
+    }
 
     // Candidate rebate bands + suggested Dmin via the inward-scan detector. For
     // inspect this is informational — a refusal is a note, not fatal — and the
     // candidates are reported even when selection refuses, so the user can
     // confirm a rectangle for `--base-region` instead of measuring one.
-    match film_base::rebate_candidates(&image) {
+    match film_base::rebate_candidates(&image, film_type) {
         Ok(candidates) => {
             match film_base::select_auto_base(&image, &candidates) {
                 Ok(est) => {
@@ -3211,6 +3334,35 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         push_warning(&mut report, &log, w.clone());
     }
 
+    // Mirror `convert`'s notes: only the `auto` single-measurement path consults the
+    // IR holder mask, so a chromogenic declaration there degrades to RGB-only when
+    // there is no IR plane, or when the IR plane is shape-only (unverified
+    // provenance). The `--grid` and explicit/region paths never touch IR, so the
+    // declaration is a genuine no-op for them and needs no note.
+    if !args.grid
+        && matches!(source, FilmBaseSource::Auto)
+        && args.film_type.unwrap_or_default().ir_transparent()
+    {
+        if !info.ir_present {
+            push_warning(
+                &mut report,
+                &log,
+                "--film-type chromogenic declared but the scan has no IR plane; \
+                 using RGB-only film-holder detection for the film base"
+                    .into(),
+            );
+        } else if !image.ir_verified {
+            push_warning(
+                &mut report,
+                &log,
+                "--film-type chromogenic declared and an IR plane is present, but it is \
+                 identified by shape alone (no NewSubfileType=4 marker) and not trusted \
+                 for holder detection; using RGB-only film-holder detection for the film base"
+                    .into(),
+            );
+        }
+    }
+
     let base = if args.grid {
         // Grid calibration: clap rejects `--grid` with `--film-base` /
         // `--auto-base`, so the rectangle is `--base-region` or the full frame.
@@ -3250,12 +3402,15 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     } else {
         // Single-measurement path: `film_base::estimate` guards the base
         // finite-and-positive at birth (auto-base-redesign) and may attach
-        // quality warnings (non-uniform region, cross-edge disagreement).
+        // quality warnings (non-uniform region, cross-edge disagreement). The
+        // declared film type lets the `auto` source use the IR holder mask when
+        // the scan is chromogenic and carries an IR plane.
         let est = film_base::estimate(
             &image,
             &FilmBaseParams {
                 source: source.clone(),
             },
+            args.film_type.unwrap_or_default(),
         )?;
         report.film_base_source = Some(source);
         for w in est.warnings {
@@ -4752,6 +4907,34 @@ mod tests {
         let cfg = merge(recipe, &parse_convert(&["--input-meaning", "colorimetric"])).unwrap();
         assert_eq!(cfg.input.transfer, TransferAssertion::Auto);
         assert_eq!(cfg.input.meaning, MeaningAssertion::Colorimetric);
+    }
+
+    #[test]
+    fn merge_film_type_flag_overrides_recipe_else_keeps_recipe() {
+        // `--film-type` maps to `input.film_type`; the flag replaces a recipe
+        // value, and its absence never clobbers one (a forgotten merge arm would
+        // silently make the flag a no-op — the four-spot knob rule).
+        let mut recipe = ResolvedConfig::default();
+        recipe.input.film_type = FilmType::Silver;
+
+        // No flag → the recipe value survives.
+        let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
+        assert_eq!(cfg.input.film_type, FilmType::Silver);
+
+        // The flag wins over the recipe.
+        let cfg = merge(recipe, &parse_convert(&["--film-type", "chromogenic"])).unwrap();
+        assert_eq!(cfg.input.film_type, FilmType::Chromogenic);
+
+        // Over the default recipe, the flag sets the declared type.
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--film-type", "chromogenic"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.input.film_type, FilmType::Chromogenic);
+        // ...and the untouched default is `unknown` (the safe off state).
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[])).unwrap();
+        assert_eq!(cfg.input.film_type, FilmType::Unknown);
     }
 
     #[test]
