@@ -20,7 +20,10 @@ Results write-up: [`docs/reports/real-scan-verification.md`](../../docs/reports/
 
 - A release build of `nc`: `cargo build --release` (the harness auto-locates
   `target/release/nc` at the repo root).
-- The real scans at `../nc-assets/` (sibling of the repo, per CLAUDE.md).
+- The real scans at `../nc-assets/` (sibling of the repo, per CLAUDE.md), with a
+  generated `manifest.json` at the assets root — the harness reads its roll list
+  from the manifest via `nctool` (see Notes). Generate it with
+  `PYTHONPATH=scripts/analysis python3 -m nctool manifest generate`.
 - `jq`, `python3`, and macOS `/usr/bin/time` on `PATH`.
 
 ## Usage
@@ -58,9 +61,11 @@ NC=target/debug/nc OUTDIR=/tmp/out bash scripts/real-scan-verify/harness.sh conv
 
 ## Notes
 
-- The roll → {unexposed, fully-exposed, real frames} mapping is hard-coded in the
-  `ROLLS` array at the top of `harness.sh`; update it when assets change. A future
-  [`conversion-analysis-tooling`](../../docs/tasks/conversion-analysis-tooling.md)
-  task will drive this from an asset **manifest** instead and add image-library
-  analysis + NLP-vs-nc comparison.
+- The roll → {unexposed, fully-exposed, real frames} mapping now comes from the
+  asset **manifest** (`$A/manifest.json`), not a hard-coded array: `harness.sh`
+  fills `ROLLS` from `python3 -m nctool manifest roles` (the
+  [`asset-manifest`](../../docs/tasks/asset-manifest.md) task). To change what the
+  harness converts, edit the frame `role`s in the manifest and regenerate — only
+  rolls with a complete unexposed+leader pair are emitted. If the manifest is
+  missing, the harness fails loudly (exit 2) with the generate command to run.
 - Converted images are large and **not committed**; regenerate with `convert`.

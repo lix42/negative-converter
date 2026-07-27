@@ -34,14 +34,20 @@ at [`scripts/analysis/manifest.sample.json`](../../../scripts/analysis/manifest.
 
 ## Generate / update
 
-Run the committed generator from the repo root:
+Run from the repo root via the `nctool` package (canonical entry point):
 
 ```bash
-python3 scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc PATH] [--reuse-hash] [--dry-run]
+PYTHONPATH=scripts/analysis python3 -m nctool manifest generate \
+  [--asset-root DIR] [--nc PATH] [--reuse-hash] [--dry-run]
 ```
 
-- `ASSET_ROOT` defaults to `$NC_ASSET_ROOT`, else `../nc-assets` (the machine-local
-  symlink to the Drive folder). Point it elsewhere to scan a different copy.
+`scripts/analysis/generate_manifest.py [ASSET_ROOT] [--nc] [--reuse-hash] [--dry-run]`
+is a thin backward-compat shim that forwards to the same code (needs no
+`PYTHONPATH`).
+
+- `--asset-root` (shim: positional `ASSET_ROOT`) defaults to `$NC_ASSET_ROOT`, else
+  `../nc-assets` (the machine-local symlink to the Drive folder). Point it elsewhere
+  to scan a different copy.
 - The `nc` binary is found via `--nc`, `$NC`, `./target/release/nc`,
   `./target/debug/nc`, or `nc` on `PATH` — each candidate is **verified** to be
   this project's CLI (`--version` prints `nc <ver>`), so the system netcat
@@ -84,9 +90,11 @@ warm updates, but a same-size edit would go undetected).
   against the source roll's frames; NLP outputs map to `Portra160-2026-07-22`.
 - The inventory tracks **image artifacts** (`.tif`/`.tiff`). Companion files that
   share an image's stem — `.json` recipe/report sidecars and `.jpg` previews — are
-  intentionally **not** separate entries; they travel with their image. A future
-  orphan/missing validator must treat a stem-matched `.json`/`.jpg` as a companion
-  of its tracked image, not as an untracked orphan.
+  intentionally **not** separate entries; they travel with their image. `validate`
+  reflects this: its orphan check walks the **entire** asset tree recursively for
+  `.tif`/`.tiff` images (so a misplaced or deeply-nested scan is still flagged),
+  but only images — non-image companions (`.json`/`.jpg`) and `manifest.json`
+  itself are excluded and never reported as orphans.
 
 ## Metadata source & fallback
 
@@ -101,7 +109,12 @@ says so) — but only when the current bytes still match the prior `sha256`, so 
 file replaced at the same path is never paired with stale metadata. Carry-forward
 is therefore **checksum-gated**: `regenerable` outputs skip checksums, so they are
 not carried (they are reproducible — just re-run with `nc` present). The run exits
-non-zero only when a file fails *all* inspection (an `error` entry).
+non-zero when any file fails *all* inspection (an `error` entry, exit 1), and
+fails **loudly up front (exit 2)** on operational problems: a missing asset root,
+an unreadable/unsupported-schema existing manifest, an invalid explicit `--nc`,
+or — by default — a wholesale **nc-absent** run (which would yield an
+exiftool-only placeholder manifest; pass `--allow-exiftool-fallback` to build
+that degraded manifest deliberately).
 
 ## After generating
 
@@ -109,8 +122,36 @@ non-zero only when a file fails *all* inspection (an `error` entry).
   orphan, a frame that failed inspection, a missing NLP counterpart). A count of
   `exiftool`-fallback entries is expected (the float outputs); an `error` count is
   not.
-- To surface stale/removed files, compare disk vs manifest — files in the manifest
-  whose paths no longer exist are stale; files on disk absent from the manifest are
-  untracked. (A dedicated `validate` mode is the `asset-manifest` task's follow-up.)
+- To surface stale/removed files, run `validate` — it reports **drift** (a recorded
+  `sha256` no longer matches the file), **missing** (in the manifest, gone from
+  disk), **orphans** (any `.tif`/`.tiff` anywhere in the tree that is untracked —
+  a full-tree walk, so a misplaced/nested scan is caught), **errors** (an entry
+  whose inspection failed — no authoritative metadata), and **no-checksum** (a
+  **non-regenerable** entry missing its `sha256` — an integrity gap). It **only
+  reports** — it never deletes; act on its output yourself, then re-run `generate`
+  to fold in new/renamed files. Only entries in an explicitly `regenerable: true`
+  bucket may lack a `sha256`; those can't be drift-checked and are listed as
+  `unchecked` (informational, not a problem). Exit: 0 clean, 1 discrepancies, 2
+  operational error (no/invalid manifest).
+
+  ```bash
+  PYTHONPATH=scripts/analysis python3 -m nctool manifest validate [--asset-root DIR]
+  ```
 - The manifest is not committed (it lives with the assets); update the committed
   `manifest.sample.json` only if the **schema** changes, not on data changes.
+
+## Harness integration (`roles`)
+
+The real-scan harness (`scripts/real-scan-verify/harness.sh`) no longer hard-codes
+its roll list — it sources the per-roll calibration triples from the manifest:
+
+```bash
+PYTHONPATH=scripts/analysis python3 -m nctool manifest roles [--asset-root DIR]
+# emits: <roll>|<unexposed>.tif|<leader>.tif|<real1>.tif <real2>.tif …
+```
+
+Only rolls with **exactly one** `unexposed` and one `leader` frame are emitted (a
+freezable Dmin/Dmax pair); all-`real` rolls like the NLP source are skipped. So the
+role assignments in `manifest.json` are what the harness converts — keep them
+accurate. Frozen recipes depend only on the Dmin/Dmax frames, so a manifest-driven
+run is byte-identical to the former hard-coded array.

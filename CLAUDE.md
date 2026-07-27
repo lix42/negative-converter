@@ -213,8 +213,10 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   symlink** `../nc-assets → <GoogleDrive>/temp/nc-assets` (each machine points its
   own; not committed). The folder is organized `rolls/<roll>/`, `samples/`,
   `converted/{nc,nlp}/`, with a tracked `manifest.json` inventory at its root
-  (roles, dims, `ir_present`, checksums, NLP↔source links) — regenerate it with
-  `scripts/analysis/generate_manifest.py` or the `asset-manifest` skill. Decoder
+  (roles, dims, `ir_present`, checksums, NLP↔source links) — regenerate/validate
+  it with `python -m nctool manifest generate` / `validate` (or the
+  `asset-manifest` skill; `scripts/analysis/generate_manifest.py` is now a thin
+  shim into `nctool`). Decoder
   unit-test fixtures are committed separately under `tests/fixtures/`.
   **Never read them into context**; inspect IFD
   structure with `exiftool` (`tiffinfo` is not installed here) or `nc inspect`, and
