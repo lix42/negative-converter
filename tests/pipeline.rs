@@ -172,6 +172,9 @@ fn convert_simple_writes_tiff_sidecar_and_report() {
         serde_json::json!({"type": "simple"})
     );
     assert_eq!(report["recipe"]["reconstruction"]["type"], "simple");
+    // The pinned working-space mapping is stamped on every convert report
+    // (design-spec §8), independent of reconstruction path — here `simple`.
+    assert_eq!(report["working_mapping"], "nc-film-rgb-v1");
     assert_eq!(report["output"], out.to_str().unwrap());
     assert!(report["film_base"].is_object(), "film base reported");
     assert!(report["loss"].is_object(), "encode loss reported");
@@ -2433,6 +2436,8 @@ fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
         report["reconstruction_result"]["curve"]["dmax"]["provenance"],
         "default"
     );
+    // Same pinned mapping identifier on the density/sigmoid path as on simple.
+    assert_eq!(report["working_mapping"], "nc-film-rgb-v1");
     assert!(
         report["dmax"].as_f64().is_some_and(f64::is_finite),
         "the shared anchor must be reported: {report}"

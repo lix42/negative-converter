@@ -151,7 +151,7 @@ plane is a separate single channel, carried but not consumed (§6.1).
 | **density `D` / `B` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `B = density_scale·D + density_offset` (per-channel corrected density); `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)` (after regional balance, §7.2) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `B`/`D′` shifted by the offset (and, for `D′`, the regional balance) | `density::to_density`, `density::regional_balance`, `DensityImage.density` |
 | **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | reconstruction→curve handoff inside `density::reconstruct` |
 | **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | curve-defined and unclamped `f32` | `algo::FilmRgbImage`, `algo::reconstruct` (shipped typed reconstruction output) |
-| **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | planned working-space mapper |
+| **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | `pipeline::working_space` mapper (implemented; uncommitted, not yet wired into the render path) |
 | **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
 | **output sample** (terminal) | the written image value | brighter | preset/container-defined integer or float encoding | `io::encode` and planned HDR encoders |
 
@@ -395,8 +395,9 @@ later.
 The shipped implementation selects the tagged reconstruction with
 `--reconstruction simple|density`; density then selects
 `--density-curve exponential|sigmoid`. Every reconstruction path returns the
-typed `FilmRgbImage` boundary (`algo::reconstruct`), so only the future
-working-space mapper can construct `AcesCgImage`. The pre-reconstruction
+typed `FilmRgbImage` boundary (`algo::reconstruct`), so only the working-space
+mapper (`pipeline::working_space`, implemented but not yet wired into the render
+path) can construct `AcesCgImage`. The pre-reconstruction
 `--algorithm simple|density|sigmoid` selector (a boxed `Converter` returning an
 untyped `LinearImage`) is **removed** — the flag and the old recipe forms are
 rejected with a migration error (nc is unreleased; no aliases).
@@ -617,11 +618,15 @@ pub fn finish_print(
     print: &PrintParams,
 ) -> Result<(LinearImage, Option<[f32; 3]>)>;
 
-// Target working-space boundary (film-rgb-working-space): named output code
-// accepts AcesCgImage rather than FilmRgbImage.
-pub struct AcesCgImage { /* private */ }
+// Working-space boundary (film-rgb-working-space, `pipeline::working_space`):
+// implemented (uncommitted; not yet wired into the render path — no non-test
+// callers). Named output code will accept AcesCgImage rather than FilmRgbImage.
+// The mapping is a total pure matrix transform (no failure mode — non-finite
+// inputs pass through, counted later at encode), so it returns the value
+// directly rather than a Result.
+pub struct AcesCgImage { /* private; constructor module-private to the mapper */ }
 
-pub fn map_nc_film_rgb_v1(image: FilmRgbImage) -> Result<AcesCgImage>;
+pub fn map_nc_film_rgb_v1(image: FilmRgbImage) -> AcesCgImage;
 ```
 
 ## 8. CLI design
@@ -734,7 +739,7 @@ their current pixel ordering until migration.
 The convert report's `recipe` echoes the effective (resolved) config — the
 sidecar's exact object — so `recipe.reconstruction` is the exact tagged object
 above. Resolution diagnostics use this exact additional shape (unrelated report
-fields omitted; `working_mapping` lands with the `film-rgb-working-space`
+fields omitted; `working_mapping` is added by the `film-rgb-working-space`
 task):
 
 ```json
