@@ -17,6 +17,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -145,6 +146,32 @@ class TestRoles(Base):
         self.assertEqual(rc, 2)
         self.assertIn("no manifest.json", err)
 
+    def test_pair_with_no_real_frames_skipped(self):
+        # A complete unexposed+leader pair but no `real` frames must NOT emit
+        # `RollA|u|l|` (empty 4th field) — the harness convert/ir stages would run
+        # over an empty list. Skip it, and with nothing emitted exit 1.
+        self.write_manifest({"schema_version": 1, "rolls": {"RollA": {"frames": [
+            {"file": "rolls/RollA/u.tif", "role": "unexposed"},
+            {"file": "rolls/RollA/l.tif", "role": "leader"},
+        ]}}})
+        rc, out, err = self.roles()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip(), "")
+        self.assertIn("no real frames", err)
+
+    def test_ir_capable_real_frame_ordered_first(self):
+        # The harness IR stage takes the first real frame; ensure an IR-capable
+        # (ir_present) frame leads even when it sorts later by name.
+        self.write_manifest({"schema_version": 1, "rolls": {"RollA": {"frames": [
+            {"file": "rolls/RollA/u.tif", "role": "unexposed"},
+            {"file": "rolls/RollA/l.tif", "role": "leader"},
+            {"file": "rolls/RollA/aaa_hdr.tif", "role": "real", "ir_present": False},
+            {"file": "rolls/RollA/zzz_hdri.tif", "role": "real", "ir_present": True},
+        ]}}})
+        rc, out, _ = self.roles()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "RollA|u.tif|l.tif|zzz_hdri.tif aaa_hdr.tif")
+
 
 # --------------------------------------------------------------- load_manifest
 
@@ -161,6 +188,18 @@ class TestLoadManifest(Base):
         self.assertEqual(data, {})
         self.assertIsNotNone(err)
         self.assertIn("not valid JSON", err)
+
+    def test_non_object_json_rejected(self):
+        # Valid JSON that isn't an object ([], null, a scalar) must be a clean
+        # error, not an AttributeError from `.get()` on a list/None.
+        p = os.path.join(self.A, "manifest.json")
+        for payload in ("[]", "null", "\"hi\"", "42"):
+            with open(p, "w") as f:
+                f.write(payload)
+            data, err = manifest.load_manifest(p)
+            self.assertEqual(data, {}, payload)
+            self.assertIsNotNone(err, payload)
+            self.assertIn("not a JSON object", err)
 
     def test_schema_v2_rejected(self):
         p = os.path.join(self.A, "manifest.json")
@@ -434,6 +473,24 @@ class TestValidate(Base):
         rc, _, err = self.validate()
         self.assertEqual(rc, 2)
         self.assertIn("unsupported schema_version", err)
+
+
+class TestWriteManifest(Base):
+    def test_preserves_existing_mode(self):
+        # Replacing a group/world-readable manifest (e.g. 0664 on a shared Drive
+        # folder) must not silently tighten it to mkstemp's 0600.
+        p = os.path.join(self.A, "manifest.json")
+        self.write_manifest({"schema_version": 1, "rolls": {}})
+        os.chmod(p, 0o664)
+        manifest.write_manifest(p, {"schema_version": 1, "rolls": {"R": {"frames": []}}})
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o664)
+
+    def test_new_file_honors_umask_not_0600(self):
+        p = os.path.join(self.A, "new.json")
+        manifest.write_manifest(p, {"schema_version": 1})
+        umask = os.umask(0)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o666 & ~umask)
 
 
 if __name__ == "__main__":

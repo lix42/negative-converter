@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -299,6 +300,11 @@ def load_manifest(mpath: str) -> tuple[dict, str | None]:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         return {}, f"{mpath} is not valid JSON ({e})"
+    # Syntactically valid JSON can still be a non-object (`[]`, `null`, a string);
+    # reading schema fields off it would raise AttributeError. Reject loudly.
+    if not isinstance(data, dict):
+        return {}, (f"{mpath} is not a JSON object "
+                    f"(top-level {type(data).__name__})")
     ver = data.get("schema_version")
     if ver is not None and ver != 1:
         return {}, (f"{mpath} has unsupported schema_version {ver} "
@@ -528,6 +534,17 @@ def write_manifest(mpath: str, m: dict) -> None:
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp forces 0600; replacing an existing (possibly group/world-readable,
+        # e.g. 0664 on a shared Drive folder) manifest must not silently tighten its
+        # permissions. Preserve the existing mode; for a brand-new file fall back to
+        # a umask-respecting default rather than the restrictive 0600.
+        try:
+            mode = stat.S_IMODE(os.stat(mpath).st_mode)
+        except FileNotFoundError:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(tmp, mode)
         os.replace(tmp, mpath)
     except Exception:
         try:
@@ -736,7 +753,7 @@ def cmd_roles(args) -> int:
         return 2
     emitted = 0
     for roll, r in sorted(data.get("rolls", {}).items()):
-        by_role: dict[str, list[str]] = {"unexposed": [], "leader": [], "real": []}
+        by_role: dict[str, list[dict]] = {"unexposed": [], "leader": [], "real": []}
         for fr in r.get("frames", []):
             role = fr.get("role", "real")
             if role not in by_role:
@@ -749,14 +766,28 @@ def cmd_roles(args) -> int:
                       "treating it as 'real' so it is not silently dropped — fix the "
                       "role in manifest.json", file=sys.stderr)
                 role = "real"
-            by_role[role].append(os.path.basename(fr["file"]))
-        un, ld = by_role["unexposed"], by_role["leader"]
+            by_role[role].append(fr)
+        un, ld, reals = by_role["unexposed"], by_role["leader"], by_role["real"]
         if len(un) != 1 or len(ld) != 1:
             print(f"note: skipping roll {roll!r} (unexposed={len(un)}, leader={len(ld)}; "
                   "need exactly one of each to freeze a calibration recipe)",
                   file=sys.stderr)
             continue
-        print(f"{roll}|{un[0]}|{ld[0]}|{' '.join(by_role['real'])}")
+        if not reals:
+            # A calibration pair with no `real` frames has nothing for the harness
+            # to convert; emitting `roll|un|ld|` (empty 4th field) would drive the
+            # convert / ir / determinism stages over an empty frame list.
+            print(f"note: skipping roll {roll!r} (unexposed+leader pair but no real "
+                  "frames to convert)", file=sys.stderr)
+            continue
+        # Order IR-capable frames first so the harness's IR stage (which takes the
+        # first real frame) gets an HDRi frame whenever the roll has one. The sort
+        # is stable, so a roll whose real frames all share `ir_present` (the common
+        # case) keeps its manifest order unchanged.
+        reals.sort(key=lambda f: not f.get("ir_present", False))
+        real_names = " ".join(os.path.basename(f["file"]) for f in reals)
+        un_name, ld_name = os.path.basename(un[0]["file"]), os.path.basename(ld[0]["file"])
+        print(f"{roll}|{un_name}|{ld_name}|{real_names}")
         emitted += 1
     if emitted == 0:
         print("error: no roll had a complete unexposed+leader calibration pair",
