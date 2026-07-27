@@ -1032,7 +1032,7 @@ than one is a usage error); whichever is given replaces a recipe's source:
 - `--auto-base` (default) ⇒ `"auto"` — detect the unexposed rebate band behind
   the film holder (the inward-scan detector; see the ladder below). On no
   confident band it **fails loudly** and *suggests* `--base-content` — the opt-in
-  content source owned by the separate `film-base-content-fallback` task (ladder
+  content source owned by the separate `film-base/content-fallback` task (ladder
   tier 3 below); auto never silently falls back to it.
 
 **How to obtain `Dmin` — the acquisition ladder.** `Dmin` is a property of the
@@ -1088,7 +1088,7 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    to the image with no unexposed film visible, a per-channel high percentile of
    the *exposed content* approximates the base (the thinnest area of a negative
    is the scene's deepest black, close to true base). This is an **explicit
-   opt-in source** owned by the dedicated `film-base-content-fallback` task
+   opt-in source** owned by the dedicated `film-base/content-fallback` task
    (`--base-content` / `film_base.source = "content"`) — it is **not** part of
    the auto detector: auto refusal only *suggests* it and never silently falls
    back, and the report will record that the base came from content statistics.
@@ -1297,10 +1297,10 @@ false-positive on legitimate high-contrast conversions).
   pure transfer-encode — and the ACEScg→P3 render and SDR gamut policy that produce
   them — is the target state owned by `sdr-display-rendering`, not this axis. This
   is the profile/encoding axis; the full `display-p3` *preset* (container,
-  tone/gamut policy) remains a planned `output-presets` name not yet accepted.
+  tone/gamut policy) remains a planned `output/presets` name not yet accepted.
 - `--bigtiff auto|on|off` (default `auto`)
 
-Planned `output-presets` replaces the depth-only default with `gain-map-hdr` and
+Planned `output/presets` replaces the depth-only default with `gain-map-hdr` and
 explicit `display-p3`, `compatibility`, `film-master`, `hdr-pq`, `hdr-hlg`, and
 `custom` policies. `film-master` encodes NC film RGB v1 mapped unclamped linear
 ACEScg before print/display controls and rejects frame-local auto Dmax.
@@ -1375,7 +1375,7 @@ affect the output bytes (telemetry on or off ⇒ byte-identical TIFF + sidecar).
   caught up front — an odd log path must never silently append into the scan).
 
 **Telemetry record shape (`schema_version` 2, serialize-only JSON).** Designed for
-a future background uploader (§12, `telemetry-upload`) to drain and ship:
+a future background uploader (§12, `telemetry/upload`) to drain and ship:
 ```json
 {
   "schema_version": 2,
@@ -1484,7 +1484,7 @@ the grid *disagreement* warning.
 
 These are deliberately deferred and recorded here so they aren't lost. Items
 graduate into tracked tasks in [TASKS.md](TASKS.md) — several already have
-(item 2's sigmoid → `algo-sigmoid`; item 3's B&W rendering → `bw-support`;
+(item 2's sigmoid → `algo/sigmoid`; item 3's B&W rendering → `bw-support`;
 plus `dmax-white-anchor`, `auto-neutral-wb`, and `regional-color-balance` from
 the NLP feature comparison, Phase 6).
 
@@ -1495,7 +1495,7 @@ the NLP feature comparison, Phase 6).
    stages: `defect_mask`, `inpaint`. New flags under an `--ir-*` namespace.
 2. **Additional curve/reconstruction models.** The **sigmoid / explicit
    H&D-curve** model has since **shipped** as the tagged sigmoid density curve
-   (§7.3, task `algo-sigmoid`); still open: possibly a power-law/exponent model
+   (§7.3, task `algo/sigmoid`); still open: possibly a power-law/exponent model
    (RawTherapee-style) for camera-scanned negatives. Added as a new tagged
    `reconstruction.curve` variant.
 3. **Black & white film support.** The *rendering* half has graduated into the
@@ -1531,7 +1531,7 @@ the NLP feature comparison, Phase 6).
    (coordinates + spread) so CLI users confirm instead of measuring — the same
    data a future UI would highlight. The opt-in **content-based source**
    (`film_base.source = "content"` / `--base-content`, §9 ladder tier 3) is
-   **reassigned** to the dedicated `film-base-content-fallback` task (item 13)
+   **reassigned** to the dedicated `film-base/content-fallback` task (item 13)
    and is **not** implemented here — the auto-refusal message only *suggests* it.
    Remaining: threshold tuning against full-size scans rides
    `real-scan-verification`.
@@ -1554,7 +1554,7 @@ the NLP feature comparison, Phase 6).
     JSON record per `nc convert` (image + per-stage timing + run context) written
     to a local JSONL log and/or one-off file (`--telemetry` / `--telemetry-file`,
     `NC_TELEMETRY_LOG`; see §9), best-effort and byte-identical-output-preserving.
-    The `telemetry-strategy` spike is **complete**; its approved
+    The `telemetry/strategy` spike is **complete**; its approved
     [design note](telemetry-strategy.md) fixes the remaining shape. The client
     keeps custom JSON (no embedded OTel SDK/Collector) and sends a separately
     versioned, allowlisted upload projection to an nc-owned Cloudflare Worker +
@@ -1574,8 +1574,8 @@ the NLP feature comparison, Phase 6).
     `NC_TELEMETRY=0` disables automatic collection/networking. Upload carries no
     persistent identity, `params_hash`, exact paths/timestamps/dimensions/sizes,
     messages, recipe/parameter values, or raw backtraces. The implementation is
-    split into `telemetry-schema-v2`, `telemetry-ingestion-service`,
-    `telemetry-upload`, and `telemetry-panic-hook`; the latter is deliberately
+    split into `telemetry/schema-v2`, `telemetry/ingestion-service`,
+    `telemetry/upload`, and `telemetry/panic-hook`; the latter is deliberately
     described as sanitized Rust **panic reporting**, not general native-crash
     capture. The anonymous endpoint cannot prove event provenance, so results are
     advisory/opt-in/unverified rather than exact population rates. V1 is hard
@@ -1594,7 +1594,7 @@ the NLP feature comparison, Phase 6).
     → cross-frame agreement → drop-to-single; content estimation only on explicit
     opt-in) emits the frozen recipe and provenance that `nc roll` replays.
     Tracked: shipped `roll-conversion`; open `base-acquisition-planner` and
-    `film-base-content-fallback`.
+    `film-base/content-fallback`.
 14. **Roll-fixed `Dmax` from a fully-exposed reference frame.** *(Implemented —
     `dmax-reference`.)* Supersedes the frame-local `auto` default: `Dmax` is a
     film+scanner calibration reused per roll like `Dmin`. The default
@@ -1734,7 +1734,7 @@ the NLP feature comparison, Phase 6).
     against all batch inputs/outputs/sidecars. Core full-size TIFF/resource verification remains independently runnable;
     final gain-map/preset metadata, faithful film-rendering consistency, and
     cross-device behavior are a separate gate.
-    Tracked: `gain-map-hdr-output`, `hdr-avif-output`, `output-presets`,
+    Tracked: `gain-map-hdr-output`, `hdr-avif-output`, `output/presets`,
     `display-output-acceptance`.
 
 ## 13. Open questions

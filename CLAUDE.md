@@ -21,10 +21,14 @@ explicitly corrected once already.
   maintained design source; rendered HTML may be regenerated after the feature
   roadmap stabilizes.
 - `docs/TASKS.md` — the plan: distilled design, the canonical dependency graph,
-  and the phased task checklist. This is the control center for what to build next.
-- `docs/tasks/<name>.md` — per-task spec (goal / design / how-to-verify / deps).
-- `docs/progress.md` — execution log; read the relevant section before starting a
-  task, append to your task's section as you work.
+  and the task checklist grouped by epic. This is the control center for what to
+  build next.
+- `docs/tasks/<epic>/<name>.md` — per-task spec (goal / design / how-to-verify /
+  deps). Task ids are `<epic>/<name>`.
+- `docs/progress/<epic>.md` — execution log, one file per epic, each opening with
+  an `## Epic summary`. Before starting a task, read your epic's file in full plus
+  the `Epic summary` of every epic you depend on; append to your task's section as
+  you work. `docs/progress/_unassigned.md` parks log sections that name no task.
 - `docs/reports/<name>.md` — versioned conversion baselines / comparisons.
   `v0-baseline.md` records the current default-output behavior (the reference point
   future versions are measured against; see the `conversion-versioning` task).
@@ -34,12 +38,25 @@ explicitly corrected once already.
 ## Task-tracking workflow
 
 Work is planned and tracked with the `task-tracking` skill (the `/tasks:*`
-commands). `docs/TASKS.md` is the authoritative status (the `[ ]`/`[~]`/`[x]`
-checkboxes) and the dependency graph; `docs/progress.md` is the narrative. When
-picking up work: consult `TASKS.md` for what's unblocked (a task is executable
-when all its deps are `[x]`), read the task file and the relevant `progress.md`
-sections, then implement. Keep the Mermaid diagram, the canonical dependency list,
-and per-task Dependencies sections in sync — `TASKS.md` wins on conflicts.
+commands). The plan is in **epic mode**: `docs/TASKS.md` is the authoritative
+status (the `[ ]`/`[~]`/`[x]` checkboxes) and the task-level dependency graph;
+`docs/progress/<epic>.md` is the narrative. When picking up work: consult
+`TASKS.md` for what's unblocked (a task is executable when all its deps are
+`[x]`), read the task file plus its epic's progress file and the `Epic summary`
+of each epic it depends on, then implement. Keep the epic rollup, the task-level
+Mermaid diagram, the canonical dependency list, and per-task Dependencies
+sections in sync — `TASKS.md` wins on conflicts. The **rollup may legitimately
+contain cycles**; only the task graph must be acyclic.
+
+**Moving a task between epics is a rename with a long tail.** The skill's
+link-fixing step only covers `](…)` targets — backticked *prose* paths rot
+silently, including task ids in `src/` doc comments and `docs/design-spec.md`.
+Only a changed **stem** breaks hard (`algo-sigmoid` → `algo/sigmoid` now resolves
+to nothing); a task that merely gained an epic prefix still substring-matches.
+**Never bulk-rewrite ids** — `color-management` is also ordinary English for ICC
+work, and `asset-manifest` / `perf-telemetry` also name skills. Progress logs are
+**append-only**: add a cross-reference as a new dated entry, never as a mid-body
+insertion (that silently breaks the verbatim history).
 
 ## Architecture
 
@@ -65,9 +82,11 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   reduction happens only at the final encode. HDR is a first-class concern.
 - **Density conversion and print rendering are separate sub-stages** — the core
   color-fidelity rule. Don't collapse them.
-- The current algorithms remain pluggable behind `Converter`. The replacement
-  roadmap adopts tagged `simple` or `density` reconstruction, with density
-  selecting an `exponential` (default) or `sigmoid` curve.
+- Algorithms are pluggable behind the tagged `reconstruction` recipe object:
+  `algo::reconstruct` resolves it into `simple` or `density` reconstruction
+  (density selecting an `exponential` (default) or `sigmoid` curve);
+  `algo::finish_print` is the stage-4 print bridge. The old `Converter` trait and
+  `AlgoParams` are gone.
 - The **IR channel** (HDRi 64-bit input) is decoded and, by default, **preserved
   but not acted on**; carry it through, don't consume it. The one exception is
   **IR-assisted film-holder detection** (`ir-holder-detection`): under an explicit
@@ -121,9 +140,11 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   specific values happen to agree across libm; never checksum a full frame, an
   encoded file, or post-lcms2 (color-transformed) pixels in a cross-platform gate.
 - `Cargo.lock` is committed (binary crate). The crate-level `#![allow(dead_code)]`
-  is gone; the only remaining allows are three narrow, documented item-level ones
-  (`algo/mod.rs`, `pipeline/color.rs`) for API surface the single Step-1 path
-  doesn't exercise — don't add new ones without a comment saying who will use it.
+  is gone; the remaining allows are narrow, documented item-level ones
+  (`algo/mod.rs`, `pipeline/color.rs`, `pipeline/working_space.rs` — the last for
+  the produced-but-not-yet-wired ACEScg mapper) for API surface the single Step-1
+  path doesn't exercise — don't add new ones without a comment saying who will
+  use it.
 - **Codex review on a worktree.** `/codex:review` is a codex-plugin *command*
   (not a skill) that reviews the **current directory's** git state — so run it
   *from inside the worktree you want reviewed*. Pick the scope to match where the

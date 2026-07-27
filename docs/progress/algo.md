@@ -1,0 +1,1038 @@
+# Negative Converter — algo Progress Log
+
+Execution log for the `algo` epic: what was done and how, key decisions, what
+works, what doesn't. TASKS.md holds the authoritative status (the checkboxes);
+this file is the narrative beside it.
+
+One `##` section per task in this epic, named by the bare task name (the part
+after the `/`). Read this whole file before starting a task in this epic, and
+read other epics' `Epic summary` sections when you depend on them. Append
+entries — don't rewrite earlier ones.
+
+## Epic summary
+
+What other epics need to know about `algo`:
+
+- **The shipped surface is `reconstruct(image, base, config) -> (FilmRgbImage,
+  ReconstructionReport)` plus `finish_print`** — the old `Converter` trait and
+  `AlgoParams` are gone. The recipe is one **tagged `reconstruction` object**
+  (`schema_version: 1`) selecting `simple` or `density`, with density carrying a
+  tagged `exponential` (default) or `sigmoid` curve. The legacy `algorithm` +
+  top-level `density`/`sigmoid`/`simple` keys are **rejected with migration
+  errors** — never re-add them as aliases.
+- **`FilmRgbImage` is the typed boundary out of this epic.** Private fields,
+  constructible only inside `algo`, so nothing can mint one that skipped
+  reconstruction. `working_space::map_nc_film_rgb_v1` is its only intended
+  consumer; its legacy alternative is `finish_print`, the stage-4 bridge that
+  presets will displace.
+- **Polarity: a *denser* negative renders *brighter*.** Stage 3 is
+  `10^(+γ·(D′ − Dmax))`, not the `10^(−…)` in early spec sketches. A regression
+  test pins this.
+- **Density conversion and print rendering are separate sub-stages** — the core
+  fidelity rule. Stage 2 (`to_density` → `regional_balance`) is shared by both
+  curves; the curve is stage 3; `render_print` is the shared stage 4. A future
+  curve injects itself as the stage-3 closure and reuses the rest.
+- **Anchoring is not optional for sigmoid.** Both curves consume the resolved
+  scalar `Dmax` from `film-base`; sigmoid *requires* a positive anchor and rejects
+  `none`. `DmaxSource::None` is the bit-exact scene-referred escape hatch and is
+  a density-only feature.
+- **Mutually exclusive knobs are one enum, never parallel fields** — `WbSource`,
+  `BalanceRange`, `DmaxSource`, the tagged `Reconstruction`/`DensityCurve`. This
+  is what makes the flags-win merge sound and provenance representable.
+- **Auto modes are two-pass and report their result for reuse.** Auto white
+  balance renders a neutral analysis pass, estimates, then re-renders through the
+  normal slot; the resolved gains ride back in the report and reproduce the output
+  **bit-exactly** when fed back as explicit values. Same pattern for
+  `balance_range`. The sidecar records the *mode*; the report carries the frozen
+  values — freeze from the report.
+- **A knob that would be silently ignored is a loud error, not a no-op.** An auto
+  WB mode under an algorithm with no print WB stage, a customized `gamma` under
+  sigmoid, sigmoid flags under exponential — all rejected or warned after merge.
+- **Numerical discipline:** non-finite input propagates through every stage
+  untouched so `io::encode`'s non-finite counter still sees it. Never launder
+  `NaN` (`f32::max(NaN, 0.0)` returns `0.0` — a real trap here). Extreme-but-finite
+  params that would posterize are bounded by explicit caps (`contrast ≤ 50`, knee
+  widths ≤ 10) because such output trips *no* counter.
+- **Golden fixtures live in `pipeline::stages::golden`** — curated **per-pixel**
+  `f32::to_bits` vectors, plus a decoded-pixels hash. Never checksum a whole
+  encoded TIFF or post-lcms2 pixels: the embedded ICC and colour transform differ
+  by target, so such a gate is green locally and red on CI.
+
+
+## interface
+**Status:** done
+**Updated:** 2026-06-16
+
+- Goal: `Converter` trait + algorithm selection so converters are pluggable.
+- **Done.** Everything lives in `src/algo/mod.rs`:
+  - `Converter` trait kept **object-safe** — params live in the implementor, no
+    associated `Params` type, `convert(&self, image, base) -> Result<LinearImage>`.
+    The design-spec §7.2 sketch shows an associated-type variant; that can't form
+    `Box<dyn Converter>`, which `build()` and the verification both need, so this
+    task supersedes the sketch (noted in a doc comment on the trait).
+  - `Algorithm { Simple, Density }` — `Copy`, `serde(rename_all="lowercase")` so it
+    round-trips as `"simple"`/`"density"`, `#[default] Density` (the documented
+    default algorithm).
+  - `FromStr for Algorithm` with `type Err = NcError`; unknown names →
+    `NcError::Usage` (exit 2), failing loudly instead of defaulting. CLI parses
+    `--algorithm` through this.
+  - `AlgoParams` enum: `Simple(SimpleParams)` and
+    `Density { density: DensityParams, print: PrintParams }`. **Decision:** the
+    `Density` variant (and the `Density` converter struct) carries **both**
+    sub-stages' params now — density correction + the separate print render —
+    rather than deferring `PrintParams` to `algo-density`. They stay distinct
+    fields, preserving the density/print separation (core fidelity rule).
+    `AlgoParams::algorithm()` reports which algorithm a param set selects.
+  - `build(params: AlgoParams) -> Box<dyn Converter>` — **infallible**, takes the
+    param set by value and moves it into the converter (no clone). The task sketch
+    had `build(algo, params)` taking the algorithm separately, but the
+    `AlgoParams` variant already *is* the algorithm selector (`AlgoParams::algorithm()`
+    derives it totally), so a separate `Algorithm` argument carried zero info and
+    only created a mismatch error that one argument makes unrepresentable
+    ("make illegal states unrepresentable"). Any `--algorithm` vs flag
+    contradiction is resolved/rejected in `cli-framework` where the flag context
+    lives, and the CLI hands `build` one already-valid `AlgoParams`. (Decision from
+    the ship code review — type-design agent.) The match is exhaustive over
+    `AlgoParams`, so a future algorithm variant fails at compile time.
+  - `AlgoParams::algorithm() -> Algorithm` kept (CLI uses it to derive the
+    algorithm for the JSON report from the param set alone).
+- **Touched `algo/density.rs`:** `Density` struct now has `density: DensityParams`
+  + `print: PrintParams` (was `params: DensityParams`). `algo-density` fills the
+    `convert` body and consumes both fields.
+- **Notes for dependent tasks:**
+  - `algo-simple` / `algo-density`: just implement `Converter::convert` on the
+    existing `Simple` / `Density` structs; the field shapes are fixed (`Simple.params`,
+    `Density.density` + `Density.print`). Don't widen the trait — push new tone
+    controls into the param structs.
+  - `cli-framework`: parse `--algorithm` via `Algorithm::from_str` (maps unknown →
+    `Usage` for you); assemble an `AlgoParams` for the chosen algorithm and pass it
+    to `algo::build`. `Algorithm` serializes lowercase for the JSON report/recipe.
+- **Verify:** `cargo build`, `cargo clippy --all-targets -- -D warnings`, and
+  `cargo fmt --check` all clean; `cargo test` 13/13 (6 new: `from_str` ok + unknown
+  → exit 2, default = density, lowercase serialize, object-safe boxed call, `build`
+  for both algorithms, `build` mismatch → exit 2). Object-safety proven by a test
+  `Identity` converter exercised through `Box<dyn Converter>`.
+
+
+## simple
+**Status:** done
+**Updated:** 2026-07-12
+
+- Goal: channel-inversion baseline converter (debug / B&W) with white balance and
+  black/white points.
+- **Done.** `src/algo/simple.rs` implements `Converter::convert` on `Simple`. It's
+  the only file changed — `SimpleParams`' knobs (`invert_white_balance`,
+  `clip_low`, `clip_high`) were already fully wired by `cli-framework` (recipe
+  struct in `types.rs`, `SimpleOverrides` + merge arm + `validate` checks in
+  `cli.rs`), so **no new knobs** were added and no four-spot wiring was needed.
+- **Algorithm (pure, per channel, linear working space):**
+  1. neutralize the film base — `normalized = value / base[c]` (removes the
+     orange-mask multiplicative cast; an unexposed base pixel → 1.0);
+  2. invert — `positive = 1 - normalized`;
+  3. white balance — `* invert_white_balance[c]`;
+  4. black/white points — linear remap `(x - clip_low) / (clip_high - clip_low)`.
+  A neutral base `[1,1,1]` makes step 1 inert, giving the pure `1 - v` reference.
+  No density-domain math (log/exp) — that's what distinguishes `density`.
+- **Decisions:**
+  - **Base neutralization is a divide, using the pipeline-provided `FilmBase`** —
+    the task spec's step 1 ("optional normalize against base") and design-spec
+    §7.1's "border neutralization". It reuses the existing film-base knobs
+    (`--film-base`/`--base-region`/`--auto-base`); "optional" is expressed by a
+    neutral base being inert, not by a new flag.
+  - **No clamping** anywhere in the stage — output f32 may fall outside `[0,1]`
+    (HDR/scene-referred); clamping is the u16 encoder's job (CLAUDE.md clamp
+    boundary). Locked by `does_not_clamp_out_of_range_values`.
+  - **rayon** `par_chunks_exact(3).flat_map_iter(..).collect()` — per-pixel
+    independent, and rayon's ordered collect keeps it deterministic. `rgb.len()`
+    is a multiple of 3 (a `LinearImage` invariant), so every chunk is one triple.
+  - **IR plane carried through untouched** (`image.ir.clone()`), per Step-1 rule.
+- **Review loop (pr-review-toolkit, 4 agents parallel + 1 confirmation round):**
+  All four (code / silent-failure / tests / comments) converged on **one**
+  important finding: the original `convert` doc claimed `cli::validate` guarantees
+  a positive/finite `base` so the divide can't hit zero — **true only for
+  `FilmBaseSource::Explicit`.** For `Region`/`Auto` the base is runtime-estimated
+  by `film_base::estimate`, which has no positivity guarantee (a `--base-region`
+  over the dark holder → `percentile` returns `0.0`), so `value / 0.0` would emit
+  silent `inf`/`NaN` — a "quietly wrong image", violating fail-loudly.
+  - **Fix (kept inside this task's file):** `convert` now guards the base up front
+    — any channel that isn't finite-and-positive → `NcError::Other` (exit 1) with
+    an actionable message (pass `--film-base` / point `--base-region` at the
+    rebate). This stage is the first to divide by the base, so the guard is a
+    *first* validation of a runtime-derived value, not a redundant re-check of a
+    CLI-validated one (consistent with `film_base.rs`'s own defense-in-depth).
+    Doc comment corrected to attribute each guarantee to the right layer.
+  - Also added, per the test reviewer: `applies_base_then_invert_then_wb_then_clip_in_order`
+    (all four ops active with distinct per-channel values — catches a step
+    reorder that the one-op-at-a-time tests miss) and
+    `parallel_path_preserves_sample_order` (large multi-chunk image, position-
+    dependent samples — pins the rayon-collect ordering).
+  - Confirmation re-review came back clean (no remaining/new important issues).
+- **Notes for dependent tasks:**
+  - **`pipeline-orchestration`:** `Simple::convert` can now return an error
+    (degenerate base) as well as `LinearImage::new` failures — propagate its
+    `Result`, don't `unwrap`. Exit 1 on a degenerate estimated base.
+  - **`algo-density` (follow-up, not fixed here):** `density` will also divide by /
+    take `log10` of the base (`D = -log10(scan/Dmin)`) and needs the **same base
+    guard**; its `convert` is still a `todo!()` stub, so there's no live gap today.
+  - **`film-base-estimation` (recommended follow-up, out of this task's scope):**
+    the deeper fix is for `film_base::estimate` to reject a non-positive/non-finite
+    estimated base loudly at the point it's born (beside its existing uniformity /
+    brighter-than-interior gates), which would make the base valid for *every*
+    consumer, not just `simple`. Left to that task rather than editing its
+    completed file from here.
+- **Verify:** `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build`, `cargo test` all clean. Full suite **87/87** (11 new
+  `algo::simple` tests: inversion, base neutralization divides-before-invert, WB
+  scaling, clip endpoint remap, combined-ordering, no-clamp passthrough, IR
+  present/absent, dimension preservation, parallel order, degenerate-base error).
+- **2026-07-12 — closed out.** Manual review approved; shipped via `/ship`
+  (gates re-run green, CLAUDE.md gained the film-base guard gotcha, PR opened
+  from branch `algo-simple`). The notes above for `pipeline-orchestration` /
+  `algo-density` / `film-base-estimation` stand.
+
+
+## density
+**Status:** done
+**Updated:** 2026-07-12
+
+- Goal: density-domain converter (Cineon/negadoctor style) with separate density
+  and print-render sub-stages; the default algorithm.
+- **Done.** `src/algo/density.rs` implements the `density` converter as two pure,
+  independently-testable sub-stage fns composed by `Converter::convert`:
+  - `to_density(image, base, &DensityParams) -> DensityImage` — stages 1–2.
+  - `render(&DensityImage, density_gamma, &PrintParams) -> LinearImage` — stages 3–4.
+  - `DensityImage` is the algo-internal intermediate (corrected density + carried
+    IR + dims), `pub(crate)`, no validated constructor (its length invariants hold
+    by construction from a validated `LinearImage`).
+- **Exact equations chosen (per channel `c`), for reproducibility:**
+  1. transmission → density: `D_c = -log10(max(scan_c, EPS) / base_c)`, `EPS = 1e-6`.
+  2. density correction: `D'_c = density_scale_c · D_c + density_offset_c`.
+  3. density → positive: `lin_c = 10^(density_gamma · D'_c)`.
+  4. print render: `lin_c = white_balance_c · 2^print_exposure · lin_c − black_point`,
+     then per-channel highlight soft-clip.
+  - **Highlight soft-clip:** identity for `x ≤ 1.0` (nominal display white) or
+    `amount ≤ 0`; above white, `out = 1 + amount·(1 − e^(−(x−1)/amount))`, an
+    exponential knee asymptoting to `1 + amount`. `amount = highlight_compress`.
+    The `1.0` threshold is a documented anchor (definition of "highlight"), not a
+    hidden knob — the exposed control is `highlight_compress`.
+  - **Orange-mask compensation is structural:** dividing by the *per-channel* base
+    lands an unexposed sample on `D = 0` in every channel, so a neutral patch stays
+    neutral with default params; `density_offset`/`density_scale` trim the residual
+    per-channel balance/contrast.
+- **Key decision — polarity sign fix (deliberate deviation from the task-file /
+  design-spec §7.2 sketch).** The sketch wrote stage 3 as `10^(−D'·gamma)`. With
+  `D = -log10(scan/base)` (which is `≥ 0` and *grows* with the film's optical
+  density: base = scene black at `D=0`, dense negative = scene highlight at large
+  `D`), that formula yields `scan/base` — i.e. the original **negative** — not a
+  positive. A true positive must brighten as `D` grows, so stage 3 uses
+  `10^(+gamma·D')`. **Verified against darktable `negadoctor`'s source** (via
+  WebFetch): its print output increases with film density (denser negative →
+  brighter print), confirming the `+` sign. Guarded by
+  `convert_is_positive_polarity_denser_is_brighter` so a regression to the `−` sign
+  fails the build.
+- **No new knobs.** All params consumed (`density_scale/offset/gamma`,
+  `print_exposure/black_point/white_balance/highlight_compress`) were already wired
+  across the four coupled spots by `algo-interface` + `cli-framework`, so no
+  `cli.rs`/`types.rs` param additions were needed — only a validation tightening
+  (below).
+- **`cli.rs` change (validation only):** `--highlight-compress` now must be `>= 0`
+  (was finite-only). A negative value is silently a no-op in the soft-clip, so it
+  now fails loudly at the CLI boundary (exit 2) per the "no silent no-op knob" rule.
+- **Fail-loudly hardening (from review):**
+  - `Density::convert` guards the film base via `check_base` (finite & `> 0` per
+    channel, else `NcError::Other`/exit 1). The CLI validates an *explicit* base,
+    but an **auto/region-estimated** base is never CLI-checked and could be `0`
+    (e.g. a `--base-region` over a black holder) → division by zero → a silently
+    black image. Guarded at the base's consumption point instead.
+  - Non-finite scan input (`NaN`/`±inf`) propagates as `NaN` density (not laundered
+    by the `EPS` floor), and the soft-clip passes non-finite through unchanged, so
+    `io::encode`'s non-finite counter still surfaces corrupt/overflowed values. The
+    `EPS` floor applies only to *finite* zero/negative/denormal transmission.
+  - `render` builds its output via `LinearImage::new(...).expect(...)` (O(1) length
+    checks) so a future invariant regression panics loudly instead of minting a
+    malformed image.
+- **Output is scene-referred / HDR.** With neutral defaults the base maps to `1.0`
+  and exposed detail sits above it; nothing is clamped here (per the project rule —
+  clamping is the u16 encode's job, which counts/report clips). Fit to a display
+  range with a negative `--print-exposure` and/or `--black-point`, or keep the HDR
+  range via `--out-depth f32`.
+- **Notes for `pipeline-orchestration`:** call `algo::build(AlgoParams::Density{..})`
+  and `Converter::convert` as usual; `convert` can now return `NcError::Other` when
+  the resolved/estimated film base is invalid — surface it as a normal pipeline
+  error. The density-domain default is intentionally exposure-hot (base → 1.0);
+  when wiring `inspect`/reports, remember output may exceed `[0,1]` (expected, HDR).
+- **Verify:** `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, build,
+  and `cargo test` all clean — full suite **95/95** (21 new density tests + a cli
+  validate case). Density tests cover: `-log10` ratio, per-channel/orange-mask base,
+  scale-then-offset order, epsilon floor on finite zero/negative, non-finite scan
+  propagation, IR carry-through (both sub-stages + convert), the `10^` curve, gamma
+  exponent, wb→exposure→black order, soft-clip (disabled/below-white/rolloff/bounded/
+  non-finite pass-through), soft-clip routed through `render`, composition
+  (`convert == render∘to_density`), positive polarity (denser → brighter), neutral
+  patch stays neutral, default output finite/no-blow-up, and the base guard
+  (zero/negative/NaN/inf → error).
+- **Review:** ran `pr-review-toolkit:review-pr` (code-reviewer, silent-failure-hunter,
+  type-design-analyzer, pr-test-analyzer) — 2 rounds.
+  - Round 1 findings fixed: negative `--highlight-compress` no-op → CLI reject;
+    NaN/inf scan laundering → propagate NaN; zero-base silent-black → `check_base`;
+    `pub` → `pub(crate)` + validated-constructor in `render`; test gaps (non-finite
+    input, non-tautological soft-clip-in-render, no-blow-up) → added.
+  - Round 2: code-reviewer clean; silent-failure-hunter flagged `soft_clip` still
+    masking `+inf` → `1+amount` under compression → fixed with the `!x.is_finite()`
+    guard + test. Re-ran gates: clean.
+  - Minor/dismissed: `check_base` uses exit-1 (`Other`) rather than exit-4
+    (`Unsupported`) for a bad *estimated* base — a defensible judgment call, kept
+    (explicit bad base is already exit-2 at the CLI).
+- **2026-07-12 — closed out.** Manual review approved; shipped via `/ship` (gates
+  re-run green, PR opened from branch `algo-density`). **Follow-up for the spec:**
+  design-spec §7.2's stage-3 sketch (`10^(−D'·gamma)`) has the polarity bug
+  described above — correct it (and design-spec.html together) to `10^(+gamma·D')`.
+- **2026-07-13 — PR-review follow-ups.** From bot review on the PR: `render` now
+  consumes its `DensityImage` (in-place transform, IR moved not cloned); film-base
+  transmissions are bounded to `(0, 1]` at both the CLI (`--film-base`, exit 2) and
+  `check_base` (estimated/recipe base, exit 1) — a `90`-for-`0.90` typo previously
+  blew out silently. **Deferred design finding (for `pipeline-orchestration` /
+  spec):** with default params the render maps scene black (base) to `1.0` and all
+  detail *above* it, so the default u16 encode clips the whole image (loudly, via
+  the clip report, but still unusable). Needs a display-range anchor — e.g. a
+  Dmax-style white anchor or different default `print_exposure`/`black_point` —
+  decided at the spec level (§7.2/§9 defaults) alongside the polarity correction.
+
+
+## dmax-white-anchor
+**Status:** done
+**Updated:** 2026-07-13
+
+- Goal: anchor scene white (Dmax) in the density render so default u16 output
+  fills the display range instead of clipping (PR #12 review finding; NLP
+  comparison priority 1). Includes the design-spec §7.2 polarity correction.
+- **Done.** The `render` sub-stage (`src/algo/density.rs`) now renders density
+  relative to a display-white anchor `Dmax`; `to_density` is untouched and the two
+  sub-stages stay separate. Full CI gate clean; suite **122/122**.
+- **Exact formula + chosen form (for reproducibility):**
+  - Stage 3 is now `lin_c = 10^(density_gamma · (D'_c − Dmax))`.
+  - **Gain form (chosen):** this factors as `10^(γ·D') · 10^(−γ·Dmax)`, so the
+    constant `anchor_gain = 10^(−γ·Dmax)` is **folded into the stage-4 exposure
+    gain**: `exposure_gain = anchor_gain · 2^print_exposure`. Picked over
+    subtracting `Dmax` inside the exponent because the anchor and `print_exposure`
+    are both multiplicative scalars — folding makes the bit-exactness guarantee
+    trivial (see below) and keeps the per-pixel hot loop one multiply.
+  - **Auto percentile:** `AUTO_DMAX_PERCENTILE = 0.995` (99.5th) of the *finite*
+    corrected densities, **scalar/pooled across all channels** (a per-channel
+    anchor would double as color correction — deferred to `auto-neutral-wb`).
+    Nearest-rank via `select_nth_unstable_by(round((n−1)·p), f32::total_cmp)`
+    (O(n); the order-statistic value is tie-order-independent ⇒ deterministic).
+    Non-finite densities are filtered out first; empty/all-non-finite ⇒ `0.0`
+    (neutral gain 1.0, not a panic). 0.995 catches genuine scene white while
+    ignoring the top ~0.5% (specular sparkle / dust / hot pixels).
+- **Knob shape (one enum, per §9 conventions):** `DmaxSource { Auto (default) |
+  Explicit(f32) | None }` in `types.rs`, recipe key **`density.dmax`** (sits beside
+  `density_gamma` in `DensityParams`, and like `density_gamma` is applied in the
+  render sub-stage — that's why it lives under `density.*`, not `print.*`).
+  Serializes `"auto"` / `{"explicit":<d>}` / `"none"`, mirroring `FilmBaseSource`.
+  CLI: mutually-exclusive `--d-max <d>` / `--auto-d-max` / `--no-d-max` (clap
+  `conflicts_with_all`, dedicated `DmaxOverrides` group like `FilmBaseOverrides`).
+  Four coupled spots all wired: `DmaxOverrides` field + merge arm + `validate`
+  (explicit d-max must be finite & `> 0`) + recipe field, each with a test.
+- **Bit-exact `None` guarantee (HDR f32 workflows depend on it):** `DmaxSource::
+  None` ⇒ `resolve_dmax` returns `None` ⇒ `anchor_gain` returns the literal `1.0`
+  ⇒ `exposure_gain = 1.0 · 2^print_exposure`, which is `2^print_exposure`
+  bit-for-bit in IEEE-754, and the per-pixel arithmetic is otherwise unchanged.
+  Pinned by `none_anchor_is_bit_exact_with_pre_anchor_render`, which recomputes the
+  pre-anchor expression and asserts `assert_eq!` on f32 (not an epsilon).
+- **Default is now `Auto`** — this deliberately changes the default `density`
+  output from scene-referred (base → 1.0, everything above) to display-range-
+  filling (scene white → ≈1.0). That is the whole point of the task (closes PR #12's
+  "default u16 clips the whole image"). Verified on the real-scan fixture
+  (`tests/fixtures/hdr-48bit.tif`) via a throwaway `#[ignore]` probe (removed):
+  default `Auto` u16 clipped fraction **0.49%** (spot highlights only) vs
+  **99.9996%** with `--no-d-max`; resolved Dmax ≈ 1.087.
+- **Resolved anchor rides back for the report:** the `Converter` trait gained a
+  **defaulted** `convert_reported(&self, image, base) -> Result<(LinearImage,
+  ConvertReport)>` (`algo/mod.rs`); `ConvertReport { dmax: Option<f32> }`. `Density`
+  implements the real work in `convert_reported` and has `convert` delegate to it
+  (`.0`); `simple` inherits the default (no diagnostics). This is a *diagnostics
+  output* channel (analogous to `EncodeReport`), not a control knob, so it doesn't
+  reopen the "don't widen the trait for controls / associated-Params breaks
+  object-safety" decision — `Box<dyn Converter>` still works.
+- **Spec updated (md + html together):** §7.2 stage-3 corrected to `10^(+γ·D')`
+  (was the ambiguous "exponential back-transform"; polarity bug per the
+  `algo-density` note), plus new polarity + Dmax-anchor prose; §9 density-stage
+  gained the `--d-max`/`--auto-d-max`/`--no-d-max` keys under `density.dmax`.
+- **Review (pr-review-toolkit, 5 agents parallel):** code-reviewer, silent-failure,
+  type-design, tests, comments.
+  - code-reviewer: **no findings at threshold** — confirmed bit-exactness,
+    determinism, four-spot wiring, fail-loud all sound.
+  - silent-failure-hunter, 2 MEDIUM — both analyzed and **dismissed with rationale
+    (not code-changed):** (1) "Auto anchor can be non-positive → brightens" — this
+    is *correct* display-fill behavior for a dim frame (bring near-white content up
+    to 1.0); the explicit-path positivity guard exists for *typo* protection on user
+    input, whereas Auto is a trusted deterministic measurement, so the asymmetry is
+    intentional. (2) "pathological `--density-gamma`×`--d-max` underflows gain to 0 ⇒
+    all-black finite image the encoder backstop can't see" — reachable only with
+    absurd inputs, and in most such cases `10^(γ·D')` overflows to `+inf` first ⇒
+    `inf·0 = NaN` ⇒ *is* caught by the encoder's non-finite counter; the narrow
+    all-black-finite edge is best surfaced as an orchestration warning (see note
+    below), not speculative clamping in the pure stage.
+  - type-design: clean (DmaxSource is a textbook "one enum, not parallel fields",
+    defaulted `convert_reported` is a sound object-safe diagnostics channel).
+  - tests: added 5 (nearest-rank precision on distinct values, Auto→render
+    end-to-end scene-white→1.0, anchor×print_exposure composition at a known value,
+    scalar-pooled-across-channels guard, nested `density.dmax` recipe parse).
+  - comments: accurate; reworded the `Auto` doc ("no `--d-max` flag" → "none of the
+    three dmax flags").
+- **Notes for `algo-sigmoid`:** reuse this anchor — the S-curve tone map wants the
+  same "scene white → display white" reference. The resolved `Dmax` (frame-local
+  scene-white density) is the natural shoulder anchor; consume it via the same
+  `DmaxSource`/`convert_reported` path rather than re-measuring, and keep the
+  `None`-is-bit-exact escape hatch for HDR.
+- **Notes for `pipeline-orchestration`:** call `Converter::convert_reported` (not
+  `convert`) so `ConvertReport.dmax` reaches the JSON report — add it beside the
+  film base. **Nothing consumes `convert_reported` yet** (only tests), so wire it
+  or the reporting channel stays a no-op. Also consider a report warning when the
+  resolved anchor gain is degenerate (underflow → ~all-black, or overflow) since the
+  encoder's clip/non-finite counters can't see an all-zero-but-finite image
+  (silent-failure Finding 2). `convert`/`convert_reported` can still return
+  `NcError::Other` on a bad estimated base (unchanged from `algo-density`).
+
+- 2026-07-14 — **PR #17 review fixes.** (1) The anchor is now applied in the
+  exponent (`10^(γ·(D'−Dmax))`) instead of a folded `10^(−γ·Dmax)` gain — the
+  factored form overflowed f32 when `γ·D'` alone exceeded the pow10 range (e.g.
+  γ=5 with EPS-clamped D'≈8 rendered scene white as inf); regression test added.
+  `None` stays bit-exact (`d − 0.0 == d`). (2) The Auto anchor now measures a
+  deterministic strided sample capped at 2^20 values (~4 MB transient) instead
+  of copying the full density buffer — stride derived from length only, bumped
+  off multiples of 3 so interleaved RGB isn't single-channel biased; small
+  images are unaffected (stride 1). Spec §7.2 sentence updated to match.
+- 2026-07-14 — **closed out.** Manual review approved; shipped via `/ship`
+  (gates re-run green: 122 tests; branch rebased onto post-docs main). Unblocks
+  `algo-sigmoid`. Merge-time follow-up with `pipeline-orchestration` stands:
+  wire `convert_reported`'s `ConvertReport.dmax` into the JSON report.
+
+
+## sigmoid
+**Status:** done
+**Updated:** 2026-07-14
+
+- Goal: third converter — S-curve (H&D / paper response) tone mapping in density
+  space with toe/shoulder control (design-spec §12 roadmap; NLP comparison
+  priority 2).
+- **Done.** New `Converter` impl in `src/algo/sigmoid.rs`, selected via
+  `--algorithm sigmoid`. Reuses `to_density` (stages 1–2), the resolved `Dmax`
+  anchor (`resolve_dmax`), and the film-base guard (`check_base`) from
+  `density`; stage 4 was factored out of `density::render` into a shared
+  `render_print` and is reused unchanged. Full CI gate clean (see the final gate
+  run at the end of this section for the current suite total).
+- **Exact formula (the concrete, documented curve — spec §7.3):** per channel,
+  in log₁₀-output space, with `A = Dmax` (resolved anchor) and `c = contrast`:
+  ```text
+  t = c·(D' − A)                                 the density algorithm's straight line
+  F = −c·A                                       paper-black floor (the line's value at D' = 0)
+  p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skipped if toe = 0)
+  v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skipped if shoulder = 0)
+  lin = 10^v
+  ```
+  Chosen over a closed-form logistic because the task requires **reduction to
+  the straight line as toe/shoulder → 0** — with both `0` the knee branches are
+  skipped and the expression is *bit-identical* to density's stage 3
+  (`10^(c·(D'−A))`), pinned by an `assert_eq!` end-to-end test. Properties (all
+  test-pinned): strictly monotonic; **white asymptote `1.0` reached from strictly
+  below with the guarantee `lin ≤ 1.0` for every finite density when
+  `shoulder > 0`** (so the default u16 encode cannot clip highlights — verified on
+  the real-scan fixture: density default clips 3 429 samples / 0.49 %, sigmoid
+  clips **0**, same resolved anchor 1.6281); black asymptote `≈ 10^(−c·A)` (exact
+  when `shoulder = 0`). `shoulder = 0` gives no highlight roll-off — highlights
+  follow the toe-shaped line and can exceed `1.0` like `density`.
+- **Knee order is load-bearing (PR-review fix, 2026-07-14).** Two independent
+  reviews (Codex P2 + pr-review comment-analyzer) caught that the original order —
+  shoulder first, **toe last** — let the toe soft-max lift the white asymptote to
+  `(1 + 10^(−c·A/toe))^toe > 1`, which *overshoots and clips* for a small anchor
+  (e.g. `--d-max 0.1`, default `toe 0.2`, `c 1` → ≈ `1.056`), defeating the headline
+  "shoulder ⇒ no highlight clip" guarantee. **Fix: reorder to toe-first,
+  shoulder-last**, so the soft-min-with-white is the final op and nothing can lift
+  it. This trades a raised white asymptote for an *imperceptibly* lowered black
+  floor (the shoulder now nudges the floor a hair below `10^(−c·A)` — negligible).
+  The shoulder is written in the **manifestly-bounded** form
+  `−shoulder·log10(1 + 10^(−p/shoulder))` (algebraically equal to
+  `p − shoulder·log10(1 + 10^(p/shoulder))` but a negative × non-negative, so
+  `v ≤ 0` in *f32 by construction* — the subtraction form rounded a hair above 0,
+  `10^v = 1.0000006`, which would clip). Regression tests: a curve-level sweep over
+  small-anchor / low-contrast / toe≫shoulder param sets asserting `lin ≤ 1.0`, and
+  an e2e `--d-max 0.1` asserting `clipped_high == 0`. Bit-exact `toe=shoulder=0`
+  reduction preserved (both branches still skipped).
+- **Numerical gotchas (recorded for future density-domain curves):**
+  - `log10(1 + 10^y)` must be the stable `max(y,0) + log10(1 + 10^(−|y|))` —
+    the naive form overflows `10^y` at `y ≳ 38` (e.g. any tiny-but-nonzero knee
+    width) and would send the knee to `−inf` instead of its asymptote.
+  - Rust's `f32::max(NaN, 0.0)` returns `0.0` (NaN-launder trap!) — the stable
+    form still propagates NaN via its second term; pinned by a test. NaN
+    density → NaN output for `io::encode`'s non-finite counter, per the
+    `SCAN_EPSILON` convention in `density.rs`.
+- **Refactor first (pure, bit-exact):** `density::render` used to fuse stage 3
+  (`10^(γ·(D'−Dmax))`) with stage 4 (WB → `2^exposure` → black point →
+  soft-clip). Stage 4 is now `render_print(density, tone, print)` with the
+  stage-3 curve injected as a per-sample closure — same arithmetic order, so
+  the existing value-pinning render tests (incl.
+  `none_anchor_is_bit_exact_with_pre_anchor_render`) double as the bit-exact
+  regression suite; all pass unchanged. The two sub-stages stay separately
+  parameterized (core fidelity rule).
+- **Param/knob shape (four coupled spots wired, each with a test):**
+  - `SigmoidParams { contrast (>0, default 1.0), toe (≥0, default 0.2),
+    shoulder (≥0, default 0.2) }` in `types.rs`; recipe section `sigmoid.*`
+    (`sigmoid.contrast` / `sigmoid.toe` / `sigmoid.shoulder`).
+  - CLI flags `--sigmoid-contrast` / `--sigmoid-toe` / `--sigmoid-shoulder`
+    (`SigmoidOverrides` in `cli.rs`) — prefixed for namespacing; recipe keys
+    drop the prefix (like `--d-max` ⇒ `density.dmax`).
+  - `merge` arms + merge test; `validate`: contrast finite `>0`, knee widths
+    finite `≥0` (a negative width would silently read as "knee off").
+  - `ResolvedConfig` gained the `sigmoid` section; `AlgoParams::Sigmoid
+    { density, sigmoid, print }`; `stages::algo_params` takes `&SigmoidParams`.
+- **Anchor decision:** the S-curve is anchored on `[0, Dmax]` (white knee and
+  black floor both derive from it), so it **requires** an anchor — reused via
+  the same `DmaxSource`/`resolve_dmax`/`convert_reported` path as `density`
+  (one measurement, reported as `report.dmax` identically). `sigmoid` +
+  `dmax = none` is rejected: `validate` (Usage, exit 2) for the CLI/recipe
+  path, plus a fail-loud backstop inside `convert_reported` (exit 1) for
+  programmatic construction. The `None`-is-bit-exact HDR escape hatch stays a
+  `density`-algorithm feature (documented in §9).
+- **`density_gamma` is ignored under sigmoid** (it parameterizes the straight
+  line the S-curve replaces; `sigmoid.contrast` is the analogue). Because the
+  rest of the `density.*` section *is* consumed (scale/offset/dmax), a
+  customized-but-ignored gamma is the silent-no-op trap — `run_convert` emits a
+  report warning (which `--strict` promotes) when `algorithm = sigmoid` and
+  `density_gamma != 1.0`. Fully inert sections (e.g. `simple.*` under density)
+  stay silent as before — the warning is only for the partial-consumption case.
+- **`--highlight-compress` interaction (documented, not disabled):** the
+  shoulder compresses in density space before exposure/WB; the print soft-clip
+  compresses in linear space after them. They compose; with the shoulder on and
+  neutral print params nothing exceeds `1.0`, so the (default-off) soft-clip
+  simply never engages.
+- **Real-scan spot check** (committed fixture, throwaway `#[ignore]` probe,
+  removed): contrast sweep 0.7 / 1.0 / 1.5 → p50 0.373 / 0.245 / 0.121 and
+  mid-separation (p75−p25) 0.235 / 0.227 / 0.176 — midtone contrast visibly
+  adjustable; max sample 0.926 / 0.944 / 0.965 — highlights roll off smoothly,
+  never reaching 1.0 (no hard clip); shadow separation (p05−p01) stays positive
+  at every contrast.
+- **Docs:** design-spec **md + html together** — new §7.3 (curve, anchors,
+  reduction, anchor requirement, gamma/soft-clip interactions), §6 diagram and
+  §2/§12 algorithm lists, §8 recipe-section list, §9: `--algorithm` gains
+  `sigmoid`, density-stage header notes the sharing, `--no-d-max` marked
+  density-only, new "Sigmoid stage" section with the three knobs.
+- **Notes for dependents:** `render_print` is the shared stage-4 entry point
+  for any future density-domain curve (power-law roadmap item) — inject the
+  curve as the `tone` closure, keep `resolve_dmax` as the single anchor source.
+  `auto-neutral-wb` / `regional-color-balance` operate on `density.*`/`print.*`
+  and therefore apply to `sigmoid` runs unchanged.
+- **Review (pr-review-toolkit, parallel panel):** code-reviewer, comment,
+  test-coverage, type-design, silent-failure. Two findings fixed:
+  - **(type-design/silent-failure, correctness):** the `Auto`-resolved anchor was
+    only checked `Some(_)`, not positive. `auto_dmax` can return `0.0`
+    (empty/all-non-finite) or a *negative* percentile when a wrong film base
+    pushes most corrected densities below zero; with `anchor ≤ 0` the toe floor
+    `10^(−contrast·anchor) ≥ 1`, so every sample renders above display white — a
+    quietly-wrong all-white image. Fixed: `convert_reported` now guards
+    `resolved.filter(|a| a.is_finite() && *a > 0.0)` and errors loudly (exit 1),
+    covering the `none` programmatic path *and* the degenerate-`Auto` case (the
+    CLAUDE.md film-base gotcha, mirroring `simple.rs`). Tests added
+    (`convert_rejects_a_non_positive_auto_anchor`: scan>base → negative percentile,
+    plus a smuggled negative `Explicit`).
+  - **(test-coverage, sev-6):** the `density_gamma`-ignored-under-sigmoid warning
+    had no coverage. Added an e2e (`sigmoid_warns_when_density_gamma_is_ignored`)
+    asserting the warning fires for sigmoid+custom gamma, is absent for
+    sigmoid+default and density+custom, and `--strict` promotes it to exit 1.
+  - Re-ran code-review after the fixes: **clean, no findings** (bit-exact refactor,
+    four-spot wiring, exit codes, docs md+html sync all confirmed). Gates green:
+    fmt clean, clippy clean, build clean, **152 unit + 21 e2e** tests pass.
+- **Rebased onto `origin/main` 3c7f5bd** (post-#20/#21/#22). Conflicts resolved:
+  - `src/types.rs`, `src/cli.rs`: #20 renamed the output knob `--out-depth
+    u16|f32` → `--output-hdr` bool (`OutputParams.hdr`; `OutDepth` is now internal,
+    dropped from the cli import). Adjusted my sigmoid test in `pipeline/stages.rs`
+    (`out_depth: OutDepth::F32` → `hdr: true`) — the only code touch the rebase
+    needed. Kept `output_hdr_bool_drives_depth` (upstream) alongside my
+    `SigmoidParams` / `algorithm_serializes_sigmoid_lowercase` tests; dropped the
+    now-obsolete `out_depth_serializes_lowercase`.
+  - `docs/TASKS.md`: kept upstream's new `dmax-reference` task line and marked
+    `algo-sigmoid` `[x]`.
+  - `docs/design-spec.md`+`.html` §9/§12: combined upstream's `--output-hdr`
+    wording and the `bw-support` roadmap graduation with my §7.3/sigmoid-stage
+    additions.
+  - Confirmed no sibling-agent content leaked (initial bare `stash pop` grabbed a
+    sibling's stash off the **shared** worktree stash stack; recovered by
+    `reset --hard origin/main` then re-applying my own stash by immutable SHA).
+- **New-design review:** the new (unstarted) `dmax-reference` task will change the
+  *default acquisition* of `Dmax` (per-frame auto → roll-fixed reference) and
+  demote `--auto-d-max`, but explicitly **keeps the anchor a positive scalar in
+  density units and keeps the render machinery** — so the sigmoid anchor contract
+  (positive scalar via `DmaxSource`, `--no-d-max` rejected, degenerate-Auto guard)
+  is unaffected. No sigmoid change needed now; when `dmax-reference` lands the
+  sigmoid default path simply consumes the fixed reference anchor (still positive).
+- Post-rebase gates: fmt/clippy/build clean; **155 unit + 21 e2e** tests pass
+  (unit count rose from the new base's added tests).
+- **Second review round (2026-07-14, Codex + pr-review 5-agent).** Primary
+  correctness fix = the knee-order/white-overshoot bug (documented above). LOW
+  items folded in:
+  1. **Contrast upper bound** — `SIGMOID_CONTRAST_MAX = 50.0` (in `sigmoid.rs`),
+     enforced in `validate`. An extreme slope collapses the S-curve into a hard
+     threshold whose knees launder the blow-out into a finite two-level image that
+     trips *neither* the clip nor the non-finite counter (density surfaces `+inf`);
+     the cap closes that silent-destruction hole. Test + §9 docs (md+html) updated.
+  2. **`debug_assert!`** at the top of `s_curve` (`contrast > 0`, `toe/shoulder ≥ 0`)
+     — defense for the pure stage that otherwise trusts CLI-validated inputs.
+  3. **Contrast-backstop comment** in `convert_reported` explaining the asymmetry
+     (the anchor has a runtime guard; `contrast` is config-only, fully
+     CLI-validated, so no runtime re-check — the debug assert covers programmatic
+     callers).
+  4. **Anchor error now names the true cause** (`anchor_error` helper): `none` →
+     disabled-anchor message; `Some(≤0)` with no finite densities → corrupt/
+     non-finite input (not the base); `Some(≤0)` with finite densities → wrong
+     base. Test `anchor_error_distinguishes_corrupt_input_from_bad_base`.
+  5. **Sigmoid recipe round-trip e2e** with non-default toe/shoulder
+     (`sigmoid_sidecar_recipe_round_trips_through_recipe_in`) — guards the
+     four-spot serialization/merge for the sigmoid section.
+  Deferred (optional nice-to-haves): shoulder↔`--highlight-compress` composition
+  test and a sigmoid e2e determinism assertion — the shared `render_print`/anchor
+  paths are already determinism- and composition-tested via the density suite and
+  the existing sigmoid round-trip; judged low marginal value. Final gates green
+  (see the ship report).
+- **Third review round (2026-07-14, Codex + pr-review 5-agent).** Both reviewers
+  converged on one theme: the manifestly-bounded shoulder that fixed the white
+  overshoot also *silently launders extreme upstream inputs* into a clean in-range
+  sample, contradicting the fail-loud / non-finite-counter discipline. Two
+  complementary MUST-FIXes:
+  1. **Non-finite propagation in `s_curve`.** A non-finite corrected density
+     (`NaN`/`±inf`, e.g. an accepted-but-huge `--density-scale`/`--density-offset`
+     overflowing `to_density`) was mapped by the bounded knees to `10^v = 1.0`,
+     hiding the fault (`density` surfaces it as `+inf`). Fixed: `s_curve` now
+     returns the input `d` verbatim when `!d.is_finite()` **before** the knees, and
+     also surfaces a finite-`d`→non-finite-`p` knee-math overflow (capped contrast
+     × huge offset). So `10^v ≤ 1.0` is guaranteed only for *finite* stage-3
+     output; a non-finite sample rides through to `io::encode`'s counter. Bit-exact
+     `toe=shoulder=0` reduction preserved (finite path untouched). Tests:
+     `s_curve_propagates_non_finite` (NaN/±inf/overflow, knees on & off) and
+     `convert_propagates_non_finite_scan_to_output` (a non-finite scan rides
+     through the full converter). NB: a *CLI-driven* overflow e2e isn't
+     constructible on the committed fixture — its corrected densities are too small
+     to overflow f32 within validated param ranges (scale alone can't; a uniform
+     offset overflows *all* pixels → the anchor-guard's corrupt-input branch, exit
+     1) — so the converter-level test pins the path instead.
+  2. **Knee-width cap.** A huge *finite* `--sigmoid-toe`/`--sigmoid-shoulder`
+     (verified: `shoulder 10000` → all-black, `toe 10000` → all-white) flattens the
+     image with finite in-range samples that trip no counter — the same
+     silent-destruction class the contrast cap closed. Added
+     `SIGMOID_KNEE_MAX = 10.0` (shared for both; ~11× the ~0.05–0.9 photographic
+     range and ~5× a scan's full density range, so it rejects only degenerate
+     widths), enforced in `validate` with an actionable message; §9 docs (md+html)
+     updated; boundary tested (accept at cap, reject cap+1 / 10000 / +inf).
+  SHOULD/LOW also done: hardened the white-ceiling test with an FP-stressful corner
+  (`contrast 50, shoulder 0.001`) plus `s_curve_manifest_form_beats_the_naive_subtraction_form`
+  (asserts the naive subtraction form overshoots >1.0 where `s_curve` stays ≤1.0 —
+  guards against a revert); `convert_requires_a_dmax_anchor` now asserts the
+  `None`-specific "scene-referred" token; scoped the "clipping impossible" doc claim
+  to *stage-3 output under neutral print params* (the print stage can lift samples
+  back above 1.0); refreshed the stale headline test count; `anchor_error` now
+  distinguishes a programmatic non-positive `Explicit` anchor from the wrong-base
+  case; added a `shoulder = 0` complement test (highlights may exceed 1.0 like
+  density). Deferred: shoulder↔`--highlight-compress` composition e2e (low value;
+  both knobs' math is unit-tested and they compose additively in log/linear
+  space). Gates green: **159 unit + 23 e2e**.
+- **Final pass (2026-07-14).** Round-3 review converged (a Codex "won't compile"
+  P0 was a verified false positive — destructuring `self.sigmoid` copies the Copy
+  f32 fields; the crate builds). The one round-3 MEDIUM (within-cap extreme params
+  posterize with no warning) is an **accepted, documented tradeoff**: the caps
+  reject nonsense/degenerate-asymptote values, not aggression — no warning band, no
+  tighter caps (documented at the consts in `sigmoid.rs` and in §9, md+html). Also
+  added: a knees-off finite-overflow case to `s_curve_propagates_non_finite`; a
+  `debug_assert!(matches!(source, DmaxSource::None))` in `anchor_error`'s `None`
+  arm (pins `resolve_dmax` `None` ⟺ source `None`); a near-cap toe
+  (`SIGMOID_KNEE_MAX`) case in the white-ceiling sweep; and scoped the §7.3
+  "cannot clip" claim to stage-3-under-neutral-print (the print stage can lift
+  samples above 1.0). Gates green: **159 unit + 23 e2e**.
+- **Deferred (shared / general-robustness, NOT sigmoid-specific — do not fix under
+  this task):**
+  - A *tiny-positive* `Auto`/`Explicit` `Dmax` anchor passes the `> 0` guard yet is
+    degenerate (renders near-black or extreme). Pre-existing and shared with the
+    `density` render's anchor path (`dmax-white-anchor`); a general anchor-sanity
+    follow-up, not a regression here.
+  - Verifying a non-finite sample still reaches `io::encode`'s non-finite counter
+    *across the lcms2 color transform* (`pipeline::color::to_output`) — a gap
+    shared with `density` (both feed the same color→encode path); belongs to a
+    color/encode robustness pass, not this task.
+
+
+## auto-neutral-wb
+**Status:** done
+**Updated:** 2026-07-14
+
+- Goal: deterministic auto white-balance estimation (gray-world / neutral-
+  percentile) feeding `print.white_balance`, reported for roll reuse (NLP
+  comparison priority 3a).
+- **Done.** Two per-frame estimators behind the existing stage-4 slot; full CI
+  gate clean (fmt / clippy `-D warnings` / build / test), suite **216 tests**
+  (191 unit + 25 E2E). Rebased onto post-#27 main (the `--out-depth` → boolean
+  `--output-hdr` rename #20, bw-support docs #21, roll/versioning follow-ups
+  #22, auto-base inward-scan redesign #23, sigmoid tone algorithm #27). The
+  auto-WB E2E test uses `--output-hdr` (the removed `--out-depth f32`).
+- **Rebased onto the sigmoid refactor (#27): stage 4 is now the shared
+  `render_print(density, tone, white_balance, print)`** — sigmoid fuses its
+  S-curve as the `tone` map. Reconciliation: my WB change made `render_print`
+  take the **resolved** `white_balance: [f32;3]` (it no longer reads
+  `print.white_balance`, now a `WbSource`); the density `render` wrapper is kept
+  (resolved args → `render_print`) for density + its tests. **Auto-WB now works
+  for `sigmoid` too**, not just `density`: both share `render_print` and the
+  print WB stage, so `estimate_wb_gains` is `pub(crate)` and `Sigmoid::
+  convert_reported` runs the same two-pass (neutral analysis render → estimate →
+  re-render through the slot) and reports the gains. The `validate` guard now
+  whitelists `density | sigmoid` (rejects only `simple`, which has no print WB
+  stage) — supporting sigmoid was *less* special-casing than restricting it.
+  Also reconciled: `stages::render` now takes a resolved `&FilmBase`
+  (auto-base #23 moved estimation to the orchestrator) and `stages::algo_params`
+  takes 5 args (sigmoid) — both auto-merged; my WB wiring sits on top unchanged.
+- Design checked against the new `roll-conversion` (auto-WB is a frame-local
+  `--auto-*` mode; reported gains are the value to freeze into a roll recipe's
+  `print.white_balance = {"explicit": […]}`) and `dmax-reference` (Dmax stays a
+  scalar and the render machinery is unchanged, so resolving the anchor once and
+  sharing it across the analysis + final passes still holds) — no code change
+  needed.
+- **Knob shape (the task's core decision): `print.white_balance` is now one
+  source enum, `WbSource { Explicit([f32;3]) | GrayWorld | Percentile }`**
+  (`types.rs`), default `Explicit([1,1,1])` (= neutral, auto off). This is a
+  deliberate **recipe wire-format change**: the key serializes as
+  `{ "explicit": [r,g,b] }` / `"gray-world"` / `"percentile"` (kebab-case,
+  mirroring `FilmBaseSource`/`DmaxSource`), no longer a bare `[r,g,b]` array.
+  Rationale: explicit-beats-auto **by source** falls out of the type — after the
+  merge the variant records provenance, so `--white-balance 1,1,1` over a recipe
+  auto mode means "neutral gains", never re-estimation (a value-based or
+  parallel-field encoding cannot express that). Pre-release, so old sidecars
+  weren't grandfathered; §9 (md + html) updated. CLI: `--white-balance R,G,B`
+  vs `--auto-wb gray-world|percentile` (clap `conflicts_with`; `AutoWb`
+  ValueEnum in `cli.rs`). All four coupled spots wired with tests: override
+  fields, merge arm (source-precedence test included), `validate` (explicit
+  gains positive; auto modes carry no value), recipe nesting test.
+- **An auto mode without `--algorithm density` is a loud usage error (exit 2),
+  not a silent no-op** (review finding, fail-loudly rule): only `density` reads
+  `print.white_balance`, so an auto mode elsewhere would drop the requested
+  estimation silently. `validate` **whitelists `density`** (`!= Density`
+  errors), not blacklists `simple`, so a future third algorithm that also
+  ignores the print stage fails loudly by default — the "forgotten coupled
+  spot" trap (silent-failure review, MEDIUM). §9 (md + html) documents it; test
+  `validate_rejects_auto_wb_with_the_simple_algorithm`. Explicit
+  `print.white_balance` under `simple` stays allowed (inert, not an action
+  dropped — `simple` has its own `invert_white_balance`).
+- **CLI-flag coverage guard:** `every_auto_wb_source_has_a_cli_flag`
+  (`cli.rs`) uses an exhaustive `match` so a future `WbSource` auto mode fails
+  to compile until it is given an `--auto-wb` value — closes the type-design
+  review's "recipe-only mode could ship silently" drift risk.
+- **Estimators (`algo/density.rs::estimate_wb_gains`), deterministic statistics
+  only:** samples come from a strided pixel walk (`AUTO_WB_MAX_PIXELS = 2^20`,
+  whole-pixel stride so no channel bias), non-finite samples dropped per sample,
+  each channel fully sorted (`total_cmp`) so every statistic is order-defined.
+  - `GrayWorld` (≈ NLP Auto-AVG): per-channel mean of the central 98%
+    (`AUTO_WB_TRIM = 0.01` per end) — the trim is frame-relative, so clipped
+    speculars/dead pixels are excluded in both display-anchored and
+    scene-referred (`--no-d-max`) renders. Documented weakness: a dominant
+    scene color biases it (test pins this vs percentile).
+  - `Percentile` (≈ NLP Auto-Neutral): per-channel nearest-rank 95th percentile
+    (`AUTO_WB_PERCENTILE = 0.95`) — equalizes near-white, robust to dominant
+    colors; the top 5% never enters the statistic.
+  - Gains are **green-anchored** (`g = 1.0` exactly): WB corrects color, not
+    exposure. Degenerate channels (all non-finite / non-positive level /
+    non-finite gain) **fail loudly** (`NcError::Other`, exit 1) — never
+    silently-neutral gains.
+- **Estimation reads, application re-renders (the task's hard requirement).**
+  `Density::convert_reported` resolves the Dmax anchor **once**, renders an
+  analysis positive from a *clone* of the density buffer with a fully neutral
+  print (unit gains, 0 EV, no black point, no soft-clip — so the statistics
+  measure exactly the quantity the WB slot multiplies; the user's exposure
+  would cancel in the ratios, black/soft-clip would distort them), estimates,
+  then runs the real `render` with the resolved gains through the standard
+  stage-4 slot. `render`'s signature changed to take the **resolved** anchor
+  (`Option<f32>`) and **resolved** gains (`[f32;3]`) instead of the source
+  enums — both passes must share one anchor without re-measuring; it returns
+  just the image now (resolution moved to the caller). Explicit gains skip the
+  analysis pass entirely, so the default path's per-pixel arithmetic (and
+  output) is unchanged.
+- **Reuse contract pinned bit-exactly:** unit test
+  `auto_wb_output_is_bit_exact_with_explicit_rerun_of_reported_gains` plus E2E
+  `auto_wb_reports_gains_that_reproduce_the_output_when_reused` (report gains →
+  `--white-balance` → byte-identical f32 TIFF; JSON's shortest-round-trip f64
+  parses back to the identical f32). Determinism test (same input ⇒ same gains
+  and rgb) included.
+- **Report:** `ConvertReport` and the convert JSON `Report` gained
+  `white_balance: Option<[f32;3]>` — the *resolved* gains (auto-estimated or
+  explicit; `None` for `simple`). Per the task decision, `nc estimate` was NOT
+  extended (its contract is Dmin-only; it can't render the positive these
+  statistics need — `estimate-reuse-output` territory). Note: the **sidecar**
+  recipe records the auto *mode* (the run's parameters — rerunning it
+  re-estimates); the frozen gains live in the *report*, by design.
+- **Real-scan spot check** (committed fixtures, CLI runs, derived numbers only):
+  with the guessed base `0.9,0.55,0.42` — gray-world `[1.458, 1.0, 0.542]`
+  (hdr-48bit) / `[1.347, 1.0, 0.621]` (hdri-64bit); percentile
+  `[1.583, 1.0, 0.494]` / `[1.543, 1.0, 0.521]`. I.e. the typical blue-heavy
+  post-inversion cast is pulled down toward neutral; dmax unchanged (≈1.63 /
+  ≈1.62), 0% clipping at u16.
+- **Notes for dependents:**
+  - `regional-color-balance`: the global gains here are a single multiplier per
+    channel — they cannot fix shadow/highlight crossover; that task's
+    density-weighted offsets slot into stage 2. Reuse the sampling helpers
+    (`wb_channel_samples` / `trimmed_mean` / `nearest_rank`) if useful, and keep
+    its knob a single source enum like `WbSource`.
+  - Rebate/border pixels are *not* excluded from the statistics (no crop knob
+    exists yet). They render neutral by construction (base → `D=0` in all
+    channels), so they dilute gains toward 1 rather than casting them —
+    deterministic and mild; revisit if a crop/region knob lands.
+  - `estimate-reuse-output`: if `estimate` ever grows a WB story, the report's
+    `white_balance` array is the value to make drop-in reusable.
+- **Review (pr-review-toolkit, 5 dimensions):** code-reviewer clean (all four
+  hard requirements verified); comments clean; tests → the auto-wb+simple
+  no-op + the `--no-d-max` robustness gap (both fixed, above); type-design →
+  the CLI-flag exhaustiveness guard (fixed, above) plus a *recommended*
+  extraction of `render`'s three read `PrintParams` scalars out of the
+  `&PrintParams` arg; silent-failure → the whitelist-vs-blacklist polarity
+  (fixed) plus a LOW note that explicit `--white-balance` under `simple` is
+  silently inert.
+  - **Deliberately not changed (reported with reasoning):** (1) `render` keeps
+    `print: &PrintParams` with `white_balance` documented-as-ignored rather than
+    expanding to a 7-argument signature across ~13 call sites — one `pub(crate)`
+    caller, the ignored field is documented at the signature, and the
+    bit-exact-reuse contract is test-pinned; the code-reviewer did not flag it.
+    (2) explicit `--white-balance` under `simple` staying inert is pre-existing,
+    documented cross-algorithm-knob behavior (a *value* left unused, not a
+    *computation* dropped), not a regression from this task.
+
+
+## regional-color-balance
+**Status:** done
+**Updated:** 2026-07-17
+
+- Goal: shadow/highlight per-channel balance (density-weighted offsets in stage
+  2) to correct color crossover a global gain can't fix (NLP comparison
+  priority 3b).
+- 2026-07-14 — **implemented.** New pure sub-stage `regional_balance`
+  (`algo/density.rs`) completing stage 2 between `to_density` and `render`:
+  `D'_c = B_c + shadow_balance_c·w_lo(D̄) + highlight_balance_c·w_hi(D̄)` with
+  `w_hi = smoothstep((D̄ − lo)/(hi − lo))`, `w_lo = 1 − w_hi` (complementary, so
+  equal balances degenerate to a uniform `density_offset`), and `D̄` the
+  per-pixel **scalar** tone = mean of the *finite* pre-regional corrected
+  channels (per-channel weighting would misfire on exactly the crossover pixels;
+  a NaN channel is excluded from the tone but stays NaN itself, so the encode
+  non-finite counter still sees it).
+- **Decisions:**
+  - *Naming convention (§9):* "shadow"/"highlight" are the **positive's** tone
+    regions — low corrected density (near base) = shadow, high = highlight — and
+    with the positive polarity a **positive balance value brightens that channel
+    in its region**. Documented in §7.2/§9.
+  - *Range anchors:* new enum `BalanceRange` (`types.rs`), `Auto` (default) |
+    `Explicit([lo, hi])` — one enum field, not parallel knobs. `Auto` measures
+    nearest-rank percentiles **0.5 % / 99.5 %** of the per-pixel tone `D̄` over a
+    deterministic strided pixel sample (cap 2^20 pixels, mirrors the `auto_dmax`
+    approach; strides whole RGB triples so no channel-bias bump is needed). The
+    measurement uses the same `D̄` domain the ramps consume, so non-default
+    `density_scale`/`offset` can't make anchors and inputs drift. It deliberately
+    does **not** anchor on the Auto `Dmax` (measured *after* stage 2 — circular).
+  - *Ordering:* regional balance runs **before** `render`, so an `Auto` `Dmax`
+    is resolved from the *post-balance* densities (display-white anchor stays
+    consistent with what is rendered), and before print WB (stage 2 fixes the
+    tone-dependent crossover; print WB the residual global cast).
+  - *Neutral default is bit-exact:* `[0,0,0]` balances return before touching
+    the buffer (even `+0.0` would flip `-0.0`) and skip the measuring pass;
+    pinned by a bit-level test.
+  - *Fail loudly:* a requested balance with an unmeasurable `Auto` range
+    (uniform / all-non-finite frame) is an `NcError::Other` naming
+    `--balance-range` as the recovery — never a silently skipped correction.
+    Explicit ranges are CLI-validated (finite, `lo < hi`; exit 2).
+  - *CLI:* `--shadow-balance R,G,B`, `--highlight-balance R,G,B` (both with
+    `allow_hyphen_values` — negative offsets are the common case),
+    `--balance-range LO,HI` ⊕ `--auto-balance-range` (clap-conflicting pair).
+    All four coupled spots wired (overrides, `DensityParams` fields, merge arms,
+    validate) + merge/recipe-nesting/conflict tests.
+  - *Report:* `ConvertReport.balance_range` → report key `balance_range`
+    (`[lo, hi]`, omitted when `None`) so a roll can reuse one frame's measured
+    range via `--balance-range` — same reuse pattern as `dmax`.
+- **Notes for dependents:** `auto-neutral-wb` — regional balance composes with
+  (and precedes) print WB; if auto-WB ever wants tone context, reuse the
+  measured `balance_range` from the report rather than re-measuring inside
+  stage 2. `algo-sigmoid` — the sub-stage boundary is unchanged: sigmoid replaces
+  the `render` tone map, not stage 2, so regional balance carries over as-is.
+- 2026-07-17 — **rebased onto `algo-sigmoid` (#27) + `auto-base-redesign` +
+  #24/#25/#26** (commit-WIP method). algo-sigmoid refactored `density::render`
+  into a shared `render_print(density, tone, print)` and added a `sigmoid`
+  converter that reuses stages 1–2 (`to_density`) and stage 4 (`render_print`).
+  My `render(density, gamma, dmax, print)` wrapper kept its signature (now
+  delegates to `render_print`), so `density::convert_reported` was unaffected.
+  **Decision — regional balance now applies under `sigmoid` too:** the
+  `shadow_balance`/`highlight_balance`/`balance_range` knobs live in the shared
+  `DensityParams` and regional balance is a stage-2 op, which sigmoid shares —
+  so `sigmoid::convert_reported` now calls `regional_balance` after `to_density`
+  (before its anchor resolve, same post-balance-`Dmax` ordering as `density`) and
+  surfaces `balance_range` in its `ConvertReport`. Without this, `--shadow-balance`
+  would have been a silent no-op under `--algorithm sigmoid` (violating the
+  fail-loud / no-silent-no-op rule). Pinned by three sigmoid tests
+  (applies-not-noop, reports the range, and bit-exact match to `density` with
+  knees off + a balance). `ConvertReport` gained `balance_range`, so sigmoid's
+  `ConvertReport { dmax }` construction was updated to include it. §7.2/§9
+  (both .md and .html) reconciled: the "sigmoid shares this whole section" note
+  now explicitly includes the regional balance.
+
+
+## negative-reconstruction-density-curves
+**Status:** done
+**Updated:** 2026-07-24
+
+- 2026-07-24: Reviewed via the two-engine review-fix-loop (Codex + 5 pr-review
+  lenses: quality, tests, types, silent-failure, comments). Bit-identity was
+  independently proven — a reviewer re-ran the pre-refactor code at HEAD and
+  matched all 9 golden configs + 4 whole-TIFF hashes bit-for-bit. Five findings
+  fixed: `FilmRgbImage::from_linear` `pub(super)`→`pub(in crate::algo)` (the
+  boundary invariant was crate-wide, not module-private) + corrected the
+  overclaiming doc-comments; `merge_json` now handles internally-tagged
+  `reconstruction`/`curve` type switches in roll per-frame overrides
+  (`internally_tagged_switch`), carrying the shared roll-fixed `dmax` — matching
+  the CLI `merge()` semantics; +3 golden fixtures (auto-WB × regional balance,
+  auto-WB × sigmoid, auto balance-range); fixed a golden cross-ref comment; and
+  corrected the stale CLAUDE.md §9 legacy-schema carve-out. Loop converged, the
+  merge_json delta got a targeted re-review (sound). Rebased onto origin/main
+  (past #48 HDR, #49 telemetry, #50 display-p3); clean auto-merge, gates green
+  (325 unit incl. #50's tests + 86 integration). Shipped via /ship.
+- 2026-07-24: CI (Linux) surfaced a non-portable golden: `tiff_hash` hashed the
+  whole encoded TIFF including the embedded ICC, whose header carries
+  platform-dependent bytes (Little CMS), so the macOS-captured hash failed on CI
+  even though every per-pixel `f32::to_bits` golden passed there (pixels are
+  bit-identical cross-platform). Retargeted it to `tiff_pixels_hash`: decode the
+  written TIFF back and hash only the pixel samples + dimensions, excluding the
+  ICC/container. This matches nc's actual determinism contract (byte-identity is
+  per build/architecture, design-spec §8) while still pinning the encode
+  quantization/layout. Test renamed to
+  `golden_no_preset_encoded_pixels_are_unchanged`.
+
+- 2026-07-23: Defined tagged `simple` and `density` reconstruction. Density owns
+  its parameters and a tagged `exponential { gamma }` or
+  `sigmoid { contrast, toe, shoulder }` curve; exponential is the default. The
+  unreleased `--algorithm` and old recipe schema are rejected cleanly.
+- 2026-07-23: Separated corrected density `D′` from the curve, preserved current
+  exponential pixels and the exact sigmoid equation, moved Dmax ownership to
+  the curve, and made every path return typed `FilmRgbImage`. Simple WB/range
+  moves downstream for named presets while legacy no-preset TIFF ordering stays
+  unchanged through migration.
+- 2026-07-23: Pinned the target recipe to one nested tagged
+  `reconstruction` object: density correction lives under `.density`, while
+  exponential/sigmoid parameters and Dmax live under `.curve`. Pinned every CLI
+  key mapping and made cross-curve fields—including customized gamma with
+  sigmoid—fail after merge instead of being ignored.
+- 2026-07-23: Separated `reconstruction.schema_version = 1` from behavioral
+  `pipeline_version`. Partial input may omit the curve and resolve to tagged
+  exponential defaults, while normalized recipes/reports always emit the curve.
+  The bit-identical refactor/no-preset compatibility does not claim a behavioral
+  bump; `conversion-versioning` owns the prospective bump when named-preset
+  activation and simple reordering change default pixels.
+- 2026-07-23 (implementation): **Golden-first refactor.** Before touching any
+  code, captured pre-refactor outputs as bit-level fixtures: per-pixel
+  `f32::to_bits` for nine converter configurations (density exponential
+  default/custom/none/auto-dmax, sigmoid default/custom, simple default, and
+  both auto-WB modes) over a 5-pixel shadow/mid/highlight/out-of-range/base
+  vector, plus FNV-1a byte hashes of four whole encoded TIFFs (density/simple/
+  sigmoid u16 + density f32) from a synthetic 16×16 negative. These live as
+  `pipeline::stages::golden` tests (`golden_*`, incl.
+  `golden_no_preset_tiff_bytes_are_unchanged`) and all pass against the split
+  pipeline — the bit-identical default-exponential / numerically-exact-sigmoid
+  acceptance gate, and the proof this task claims no `pipeline_version` bump.
+- 2026-07-23: **Structure shipped.** `types.rs` gained the tagged
+  `Reconstruction` (custom serde: always emits `schema_version: 1` + `type`;
+  wire structs give named cross-variant-key errors and reject unknown fields at
+  every level; omitted curve normalizes to tagged exponential defaults) with
+  `DensityParams {scale, offset, shadow_balance, highlight_balance,
+  balance_range}`, `ExponentialParams {gamma, dmax}`, `SigmoidParams
+  {contrast, toe, shoulder, dmax}` under `DensityCurve`. `algo::` replaced the
+  `Converter` trait / `AlgoParams` with pure `reconstruct(image, base, config)
+  -> (FilmRgbImage, ReconstructionReport)` — `FilmRgbImage` has private fields
+  and a `pub(super)` constructor, so the reconstruction module is its only
+  producer — plus `finish_print` (the legacy stage-4 bridge; simple passes
+  through untouched). The old fused density render was split into `apply_curve`
+  (stage 3, mints the typed boundary) + `render_print` (stage 4); auto-WB now
+  strides the film positive instead of toning a strided density sample
+  (bit-identical: a per-sample map commutes with striding — pinned by
+  `golden_auto_wb_estimation_is_bit_identical`).
+- 2026-07-23: **Simple WB/clip removed from reconstruction.** Interpreting
+  "downstream, named-presets only": simple reconstruction ends at the unclamped
+  `1 − scan/Dmin` (bit-identical to the old default since the removed controls'
+  defaults were the exact identity), and `--invert-white-balance` /
+  `--clip-low` / `--clip-high` plus the `simple.*` recipe keys are **rejected
+  with migration errors** pointing at the future `print.white_balance` /
+  `print.linear_range` homes — an unreleased tool must not keep a control whose
+  placement is about to change. Customized values are inexpressible until
+  preset migration (loud, never silently different pixels).
+- 2026-07-23: **CLI/recipe surface.** `--reconstruction simple|density` +
+  `--density-curve exponential|sigmoid`; every existing flag remapped exactly
+  per the spec (`--density-scale/-offset` ⇒ `reconstruction.density.scale/
+  .offset`, regional-balance flags ⇒ same-named density fields,
+  `--density-gamma` ⇒ `curve.gamma`, sigmoid flags ⇒ `curve.{contrast,toe,
+  shoulder}`, the four Dmax flags ⇒ `curve.dmax`). `merge` became fallible:
+  invalid tagged combinations (density/curve/Dmax flags with simple, sigmoid
+  flags under exponential, `--density-gamma` under sigmoid — flag presence, not
+  value) are post-merge usage errors naming the offending flag; a curve switch
+  via `--density-curve` carries the roll-fixed `dmax` across variants.
+  `--algorithm` and the legacy `algorithm`/`density`/`sigmoid`/`simple` recipe
+  keys are rejected with migration errors (`reject_removed_flags` /
+  `reject_legacy_recipe_keys`, shared with roll per-frame overrides).
+- 2026-07-23: **Report & telemetry.** The convert report gained `recipe` (the
+  effective config — so `recipe.reconstruction` is the exact tagged schema) and
+  `reconstruction_result` (`{"type":"simple"}` or density with `curve.dmax =
+  {policy, value, provenance}`; policy `fixed|explicit|auto|none`, provenance
+  `default|recipe|cli|auto-frame` — `auto` always reports `auto-frame`, the
+  master-incompatibility marker). Recipe-vs-default provenance is witnessed
+  from the raw JSON at load (`LoadedRecipe.curve_dmax_present`), since a recipe
+  that wrote `"fixed"` is indistinguishable post-defaulting. Telemetry
+  `SCHEMA_VERSION` bumped to 2: `conversion.algorithm` → `conversion.
+  reconstruction` + optional `conversion.curve` (skill + design-spec §9 record
+  examples updated). `estimate`'s `d_max_recipe` fragment keeps its
+  `{"dmax":{"explicit":…}}` shape but now documents/tests the
+  `reconstruction.curve` destination.
+- 2026-07-23: **Docs.** design-spec §2/§4/§6/§7/§8/§9/§10/§12 flipped from
+  "current legacy vs target" to shipped-tagged-schema framing (examples, the
+  interface sketch — `reconstruct`/`finish_print` shipped, `map_nc_film_rgb_v1`
+  still target — and the §9 reconstruction-select section; the "Current shipped
+  keys" callout is gone). NOTE for the main-tree merge: `CLAUDE.md`'s
+  architecture section still describes the `Converter` trait and
+  `algo/{simple,density}` two-algorithm framing — update it there (kept
+  untouched here since the main tree owns it).
+- 2026-07-23: **For `film-rgb-working-space`:** the mapper's input contract is
+  ready — `algo::FilmRgbImage` (private fields; read via `width/height/rgb/ir`,
+  consume via `pub(crate) into_linear`; construction only inside `algo`), and
+  `algo::finish_print` is the seam to displace: the mapper slots between
+  `reconstruct` and the print controls once presets move stage 4 after ACEScg.
+  The report's `working_mapping` field (design-spec §8 example) was deliberately
+  left to that task.
+- 2026-07-23 (review fixes): (1) `FilmRgbImage::from_linear` visibility bug —
+  `pub(super)` on a top-level module is crate-wide; now `pub(in crate::algo)`
+  (real construction restriction) with the overclaiming doc-comments corrected.
+  (2) `merge_json` gained `internally_tagged_switch`: a per-frame roll override
+  that changes `reconstruction.type` or `curve.type` now replaces the tagged
+  object instead of deep-merging a rejected union, carrying the base's `dmax`
+  when the overlay doesn't set it — the same roll-fixed-anchor semantics the
+  CLI `merge` gives `--density-curve` (tests:
+  `merge_json_switches_internally_tagged_type_and_carries_dmax`,
+  `per_frame_override_switches_variants_and_keeps_the_roll_fixed_dmax`).
+  (3) Three golden gaps closed (captured from the proven pipeline): auto-WB ×
+  regional balance, auto-WB × sigmoid curve, and `BalanceRange::Auto` with
+  non-zero balances (`golden_auto_wb_with_regional_balance_is_bit_identical`,
+  `golden_auto_wb_with_sigmoid_curve_is_bit_identical`,
+  `golden_auto_measured_balance_range_is_bit_identical`). (4) `algo/mod.rs`
+  module doc now points at `pipeline::stages` `mod golden` for the fixtures.
+  (5) CLAUDE.md's §9 recipe carve-out corrected in place: the tagged schema is
+  shipped and the legacy forms are rejected (flagged for the user's manual
+  review — it edits project instructions).
+
+
+## bw-support
+
+**Status:** not started
+**Updated:** —
+
+- Goal: Convert B&W negatives to clean mono positives through the existing `density` algorithm.
+
+
+## density-safety-bounds
+
+**Status:** not started
+**Updated:** —
+
+- Goal: Close the gap where a validation-passing density recipe can silently produce a degenerate (e.g. finite all-black) image, via bounded `density_scale`/`density_offset`/`density_gamma` ranges at the CLI `validate` boundary plus a post-render degenerate-output warning.

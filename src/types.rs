@@ -365,7 +365,7 @@ pub struct InputParams {
 ///
 /// The acquisition-ladder tier 3 **content-based source**
 /// (`film_base.source = "content"` / `--base-content`) is owned by the separate
-/// `film-base-content-fallback` task and is deliberately **not** a variant here —
+/// `film-base/content-fallback` task and is deliberately **not** a variant here —
 /// the auto detector only *suggests* it on refusal, never falls back to it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

@@ -1,0 +1,355 @@
+# Negative Converter — output Progress Log
+
+Execution log for the `output` epic: what was done and how, key decisions, what
+works, what doesn't. TASKS.md holds the authoritative status (the checkboxes);
+this file is the narrative beside it.
+
+One `##` section per task in this epic, named by the bare task name (the part
+after the `/`). Read this whole file before starting a task in this epic, and
+read other epics' `Epic summary` sections when you depend on them. Append
+entries — don't rewrite earlier ones.
+
+## Epic summary
+
+What other epics need to know about `output`:
+
+- **The HDR spike is closed and its numbers are binding.** ISO 22028-5:2026 and
+  ISO 21496-1:2025; **203 cd/m² reference white**, **1000 cd/m² target peak**,
+  4.926108 linear and 2.300448 log2 capacity of that display ratio (not
+  per-pixel gain extrema — those come from the offset-adjusted formula). The
+  renderers **may not change reference white, target peak, the common gain-map
+  domain, or the RGB-map decision** without reopening `docs/hdr-output-spike.md`.
+- **Containers:** JPEG + ISO 21496-1 gain map is the default HDR still; 10-bit
+  4:4:4 BT.2020 AVIF is the explicit PQ/HLG path. HEIC is deferred (no portable
+  encoder API for the final gain-map container, plus HEVC licensing risk).
+- **The spike waived the licensed-normative-text review at spike level and
+  re-homed it** as a pre-merge conformance gate on the encoder tasks. Don't treat
+  it as already satisfied.
+- **Ownership split — read this before touching a transform.**
+  `output/display-p3-output` owns only the *destination encoding*: a synthesized
+  Display P3 ICC (Little CMS writes D50 media white, the chromatic-adaptation tag,
+  and Bradford-adapted D65 colorants automatically — verified against the ICC
+  registry) plus the parametric sRGB TRC. `output/sdr-display-rendering` owns
+  ACEScg → rendered-linear destination RGB: reference white, tone, chromatic
+  adaptation, and gamut mapping. Renderers return **rendered-linear** pixels;
+  transfer encoding happens afterward. Gain-map construction consumes the
+  *pre-transfer* rendition so ratios are taken in a common linear domain.
+- **⚠ Display P3 is not yet a product path.** `to_output`'s working space is still
+  linear Rec.709, so selecting `display-p3` today performs a valid but
+  unintended Rec.709→P3 remap plus the sRGB TRC. It becomes the pure P3 encoder
+  once SDR rendering produces linear-P3 values.
+- **Gain-map math is pinned:** per-channel `(HDR + offset_hdr) / (SDR +
+  offset_sdr)` in common linear Display P3 normalized by 203 cd/m². Extrema come
+  from actual per-pixel values over independently tone-mapped renditions. No
+  arbitrary epsilon, no silent clamp, no `0/0` — those are fail-loud cases.
+- **`output/presets` is the migration surface**, and it is atomic: presets reject
+  legacy output-selection flags, the output suffix must match the resolved
+  container and is never rewritten, and `film-master` rejects every non-default
+  downstream control after merge. It depends on `core/conversion-versioning`
+  because activating the new default owns a golden-tested `pipeline_version`
+  boundary.
+- **ICC bytes are platform-dependent**, so profile-inclusive byte hashes are not a
+  valid cross-platform gate — profile determinism here is pinned per build via the
+  dateTime-zeroing path.
+
+
+## display-p3-output
+**Status:** done
+**Updated:** 2026-07-24
+
+- 2026-07-24: Reviewed via the two-engine review-fix-loop (Codex + pr-review
+  lenses: quality, tests, comments, silent-failure). Six findings, all
+  doc/comment/test (no correctness change): reworded the "already-rendered
+  linear-P3 / only transfer-encodes" framing to describe the shipped Rec.709→P3
+  remap + sRGB TRC (marking linear-P3-in as the `sdr-display-rendering` target);
+  added a production-path pixel assertion (saturated Rec.709 red golden) and a
+  deep-shadow sRGB-toe sample; fixed the `srgb_trc` "shared by sRGB" comment; added
+  `display-p3` to `--output-profile` help; relocated the ICC-registry note. Loop
+  converged; gates green. Rebased onto origin/main (past #48 HDR + #49 telemetry);
+  the merged design-spec is coherent (HDR spike confirms Display P3 as the
+  gain-map SDR base and the display-p3-output ↔ sdr-display-rendering split).
+  Shipped via /ship.
+
+- 2026-07-21: Planned a deterministic synthesized Display P3 profile (D65/P3
+  primaries with the piecewise sRGB TRC), avoiding dependence on or redistribution
+  of the macOS system profile. This is the SDR rendition and gain-map base.
+- 2026-07-21: Removed the false dependency on scanner/film characterization.
+  Profile synthesis and ACEScg→P3 transforms can be verified with synthetic
+  ACEScg samples; final product integration remains gated downstream.
+- 2026-07-21: Narrowed ownership after review: this task supplies the standard
+  Display P3 destination transform and ICC metadata. Reference white, SDR tone,
+  and gamut rendering belong to `sdr-display-rendering`.
+- 2026-07-21: Tightened ownership to encoding/profile only: SDR rendering owns
+  ACEScg → rendered linear P3. The ICC v4 profile uses D50 PCS/media white,
+  Bradford-adapted D65 P3 colorants and the adaptation tag; D65 remains the
+  destination encoding white, not the ICC media white.
+
+### Implementation (2026-07-23, uncommitted)
+
+- **Approach.** Added `OutputSpace::DisplayP3` as a new `--output-profile` /
+  `output.output_profile` keyword (`display-p3` / `displayp3`), reusing the
+  existing string knob — no new CLI field, recipe field, or merge arm (the knob
+  already merges at `cli::merge`; verified `display_p3_end_to_end_embeds_p3_icc`
+  drives it through `to_output`). The profile is synthesized with Little CMS from
+  the registered P3 encoding (D65 white 0.3127/0.3290; R 0.680/0.320,
+  G 0.265/0.690, B 0.150/0.060) plus a **parametric** sRGB TRC.
+- **Empirically verified (not assumed) lcms2 6.1.1 behavior** via a throwaway
+  `#[ignore]` probe before writing code: `Profile::new_rgb(D65, P3, srgb_curve)`
+  produces an **ICC v4.4** RGB **Display**-class profile that automatically writes
+  **D50** media white (0.9642/1.0/0.8249), the **`chromaticAdaptationTag`**, and
+  **Bradford D65→D50-adapted colorants** matching the ICC-registry / macOS
+  `Display P3.icc` reference (rXYZ 0.51512/0.24119/-0.00105, etc.). So no manual
+  chad/colorant/white handling is needed — lcms does it. No dependency on or
+  redistribution of the macOS system profile.
+- **TRC.** New `srgb_trc()` helper builds the Little CMS **parametric type-4**
+  (IEC 61966-2.1) curve `[2.4, 1/1.055, 0.055/1.055, 1/12.92, 0.04045]`, not a
+  gamma-2.2 power approximation. `synth` refactored to delegate to a shared
+  `synth_curve(white, primaries, &curve)`; sRGB/ProPhoto/ACEScg paths unchanged.
+- **Encoder semantics.** The "linear P3 → encoded P3" encoder is realized as the
+  lcms working→output transform against the P3 profile. Proven by
+  `linear_p3_samples_encode_with_srgb_trc_and_identity_primaries`: a *linear-P3
+  source* profile → the P3 output profile applies only the sRGB TRC (linear 0.5 →
+  0.735357) and keeps a pure P3 red on the red axis (G,B ≈ 0), i.e. **no gamut
+  mapping and no ACEScg transform** here — those stay with `sdr-display-rendering`.
+- **Determinism.** Reuses the existing `profile_icc` dateTime-zeroing path;
+  `display_p3_icc_is_deterministic_with_zeroed_datetime` asserts byte-identical
+  reruns. Range clamping still happens only at the u16 encode step (unchanged).
+- **Tests added** (`src/pipeline/color.rs`): `display_p3_profile_is_rgb_display_class_with_d50_pcs`,
+  `display_p3_colorants_match_icc_registry_reference`,
+  `display_p3_trc_is_parametric_srgb_not_gamma`,
+  `display_p3_decodes_to_registered_d65_encoding` (transforms encoded P3 → D50
+  XYZ via lcms, un-adapts D50→D65 with the standard Bradford matrix, recovers the
+  registered D65 primaries/white),
+  `linear_p3_samples_encode_with_srgb_trc_and_identity_primaries`,
+  `display_p3_icc_is_deterministic_with_zeroed_datetime`,
+  `display_p3_end_to_end_embeds_p3_icc`; plus `display-p3` cases in
+  `parse_keywords_and_path` and the builtins-validity loop.
+- **Docs.** design-spec §5 output-color bullet and §9 `--output-profile` entry now
+  list `display-p3`. (`docs/design-spec.html` does not exist in this worktree, so
+  nothing to mirror.)
+- **Notes / deferred to `sdr-display-rendering`.** This task does not activate a
+  product path: the current `to_output` working space is still linear Rec.709, so
+  selecting `display-p3` today would colorimetrically remap Rec.709→P3 (a valid
+  conversion, but not the intended SDR render). `sdr-display-rendering` owns the
+  ACEScg→rendered-linear-P3 transform, reference white, SDR tone, and gamut policy;
+  once it produces linear-P3 working values, the same `to_output` transform becomes
+  the pure-TRC P3 encoder these tests exercise. The full `display-p3` *preset*
+  (container/tone/gamut, per `output-presets`) is also still future.
+- **Not done here.** No real-scan visual check in macOS Preview/Photos or on an
+  iPhone (task "How to Verify" item); that needs the activated SDR render and is
+  deferred with the product-activation gate.
+
+### Review-fix pass (2026-07-23, uncommitted)
+
+Six verified doc/comment/test findings (no correctness change), all fixed:
+- Reworded the "already-rendered linear-P3 / only transfer-encodes" framing in
+  three places (`OutputSpace::DisplayP3` doc, design-spec §5, design-spec §9) to
+  describe the *shipped* behavior — sources the linear Rec.709 working profile, so
+  Little CMS does a lossless Rec.709→P3 remap (Rec.709 ⊂ P3, no gamut compression)
+  **plus** the sRGB TRC — and marked the pure linear-P3-in transfer-encode as the
+  future `sdr-display-rendering` state. Also fixed the isolation-test comment to
+  say "here" = the encode step tested in isolation with a synthetic linear-P3
+  source, which does NOT exercise the shipped `to_output` path.
+- New test `to_output_display_p3_remaps_rec709_and_encodes`: drives the real
+  `to_output` path and asserts a saturated Rec.709 red against the expected
+  P3-encoded value derived from the standard Rec.709→P3 matrix + sRGB encode
+  (≈ 0.9175/0.2004/0.1385), plus teeth that G/B lift off zero (contrasting the
+  identity-primaries isolation test). Neutral-only was necessary-not-sufficient.
+- Added a deep-shadow toe sample (lin 0.002 → 0.02584 = 12.92×0.002) to
+  `linear_p3_samples_encode_with_srgb_trc_and_identity_primaries` — exercises the
+  sRGB linear segment that distinguishes the parametric curve from a gamma power
+  (~0.081 there).
+- Fixed the `srgb_trc` comment (it is Display P3's only caller; sRGB output uses
+  `Profile::new_srgb()`).
+- Added `display-p3` to the `--output-profile` CLI help string (`cli.rs`).
+- Moved the "verified against the ICC registry" note off the generic `synth_curve`
+  doc onto the DisplayP3 build arm.
+
+Gate after fixes: `cargo fmt --all --check`, `cargo clippy --all-targets -- -D
+warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
+
+
+## hdr-output-spike
+**Status:** done
+**Updated:** 2026-07-24
+
+- 2026-07-21: Added a decision gate for ISO HDR versus ISO 21496-1 gain-map HDR,
+  HEIC/JPEG containers, encoder/licensing constraints, metadata, reference white,
+  headroom, and cross-platform fallback before committing production code.
+- 2026-07-23: Started the spike. The investigation will pin exact standards and
+  container profiles, compare cross-platform encoder APIs and licensing, inspect
+  metadata round trips with small reference files, and record numeric rendering
+  policy plus a versioned platform/fallback matrix for downstream tasks.
+- 2026-07-23: Wrote
+  [`docs/hdr-output-spike.md`](../hdr-output-spike.md). The
+  provisional implementation choice is JPEG for the default ISO 21496-1 gain-map
+  output and 10-bit 4:4:4 AVIF for explicit PQ/HLG. HEIC is deferred because the
+  portable encoder lacks the final gain-map container API and HEVC/x265 adds
+  licensing and packaging risk.
+- 2026-07-23: Pinned current standards and rendering inputs: ISO 22028-5:2026
+  (which replaced the withdrawn 2023 technical specification), ISO 21496-1:2025,
+  ISO/IEC 23008-12:2025/Amd 1:2025 for a future HEIF path, BT.2100-3,
+  203 cd/m² reference white, 1000 cd/m² initial target peak, 4.926108 linear
+  content headroom, and 2.300448 log2 capacity.
+- 2026-07-23: Prototype PQ/HLG AVIF files carried the intended 10-bit BT.2020
+  CICP values and decoded in macOS ImageIO with 4.92611 PQ headroom. Fixed
+  single-thread encodes were byte-identical on the same build.
+- 2026-07-23: Prototype `libultrahdr` 1.4.0 JPEG metadata decoded in
+  libultrahdr/ExifTool/ImageMagick, but macOS ImageIO rejected the file. Its
+  marker order was ISO APP2, MPF APP2, then JFIF APP0; upstream PR 394 fixes that
+  ordering but is not released. Moving APP0 first and correcting the MPF offset
+  locally still failed ImageIO, so final ISO serialization, repaired Apple
+  decode, physical Android/iPhone/browser viewing, and legal review remain
+  downstream pre-shipping gates; only licensed normative-text review remains a
+  prerequisite for completing the spike itself.
+- 2026-07-24: **Closed.** Decided to proceed *without* the licensed
+  ISO 22028-5:2026 / ISO 21496-1:2025 text — completion gate 1 is waived at the
+  spike level and re-homed to the encoder tasks as a pre-merge conformance gate
+  (`gain-map-hdr-output` owns JPEG serialization/dual-dialect reconstruction,
+  `hdr-avif-output` owns AVIF brands/limits/codec bounds, `display-output-acceptance`
+  owns device evidence). Gates 2 and 3 satisfied: the container/profile/encoder,
+  203-nit reference-white / 1000-nit peak, gain-map formula, and rendering
+  contract (spike note §"Rendering contract") are final as written and give
+  `sdr-display-rendering` / `hdr-display-rendering` everything they need. Those
+  renderers may not change reference white, target peak, the common gain-map
+  domain, or the RGB-map decision without reopening the note. Spike note status
+  line + completion-gates section updated to match.
+
+
+## hdr-display-rendering
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: The HDR spike pinned 203 cd/m² reference white, 1000 cd/m² target
+  peak, PQ as the primary path, explicit HLG assumptions, hue-preserving gamut
+  compression, and a 10-bit full-range BT.2020 4:4:4 AVIF encoder boundary.
+- 2026-07-23: Rebased the renderer on intentional linear ACEScg film values from
+  `film-master-render-pipeline`; physical scene recovery and optional correction
+  profiles are not prerequisites.
+
+- 2026-07-21: Planned a pure scene-linear ACEScg to BT.2020 PQ/HLG render stage.
+  Rec.2100 is a display encoding, not nc's density or internal working space.
+- 2026-07-21: Removed ambiguous ownership of the SDR base; this task now verifies
+  PQ/HLG only, while `sdr-display-rendering` produces the independent SDR render.
+
+
+## hdr-avif-output
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Added the missing owner for libavif/libaom FFI, static packaging,
+  AVIF container and metadata conformance, determinism, licensing inputs, and
+  codec-specific decoded-error thresholds. The initial contract is 10-bit
+  full-range 4:4:4 AVIF v1.2 Advanced Profile, AV1 High Profile level ≤ 6.0,
+  with `avif`/`mif1`/`miaf`/`MA1A` brands inside profile limits and explicit
+  grid or general-brand-only behavior for oversized images.
+
+
+## sdr-display-rendering
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Rebased the renderer on intentional linear ACEScg film values and
+  the shared post-ACEScg print controls from `film-master-render-pipeline`.
+
+- 2026-07-21: Added the missing owner for scene-to-SDR rendering. It consumes
+  characterized linear ACEScg and explicitly resolves print controls, reference
+  white, tone mapping, destination gamut, and P3/sRGB transfer/profile output.
+- 2026-07-21: Coordinated gain-map inputs: SDR reuses the shared linear
+  WB/exposure/black adjustment stage, but owns its stronger SDR highlight/tone
+  policy so that compression is not accidentally imposed on the HDR rendition.
+- 2026-07-21: Made this renderer the sole owner of ACEScg → rendered linear
+  destination RGB, including chromatic adaptation and gamut mapping; Display P3
+  output only transfer-encodes and signals those already-rendered values.
+- 2026-07-21: Corrected the implementation note: the shared linear adjustment
+  stage is owned by `post-characterization-render-pipeline`, not characterization
+  runtime.
+
+
+## gain-map-hdr-output
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: The spike changed the first container from HEIC to JPEG. The task
+  now targets an 8-bit Display P3 base plus a half-resolution RGB map derived in
+  linear Display P3, with final ISO 21496-1 and Android Ultra HDR v1 metadata.
+  Stable libultrahdr 1.4.0 is gated on its JPEG marker-order fix and final-standard
+  serialization; HEIC remains a future container.
+- 2026-07-23: Separated 4.926108 linear display headroom from 2.300448 log2
+  Ultra HDR XMP capacity, required actual per-pixel gain extrema to come from the
+  canonical offset-adjusted formula over independently tone-mapped renderings,
+  and added independent reconstruction plus semantic-agreement and
+  ISO-preference tests for the two metadata dialects.
+- 2026-07-23: Pinned the canonical per-channel gain form to
+  `(HDR + offset_hdr) / (SDR + offset_sdr)` after selecting positive finite
+  offsets. Added fail-loud domain rules and black/near-black/zero/invalid
+  fixtures; no arbitrary epsilon, silent clamp, or `0/0` behavior is permitted.
+- 2026-07-23: Pinned the formula's units to common linear Display P3 normalized
+  by 203 cd/m² reference white: SDR/reference white and 203-nit HDR are `1.0`,
+  while 1000-nit HDR enters as `4.926108...`; offsets use the same domain.
+  Added equal-white gain-1, independently tone-mapped peak, and mixed-unit
+  rejection fixtures so display headroom cannot be mistaken for pixel gain.
+- 2026-07-21: Planned standards-neutral ISO 21496-1 output: Display P3 SDR base
+  plus a gain map reconstructing the HDR rendition, initially targeting HEIC and
+  requiring both Apple and non-Apple interoperability checks.
+- 2026-07-21: Rewired the task to consume `sdr-display-rendering` rather than
+  assuming profile synthesis alone produced an independently valid SDR base.
+- 2026-07-21: Required both renditions to share the identical characterized and
+  adjusted source, and pinned gain-ratio derivation to the standard-required
+  common linear color domain rather than encoded P3/PQ/HLG channel division.
+
+
+## presets
+**Status:** not started
+**Updated:** 2026-07-23
+
+- 2026-07-23: Renamed `scene-master` to `film-master` and defined it as the
+  unclamped linear ACEScg encoding of NC's intentional film rendering. Removed
+  artifact/calibration assumptions; optional correction profiles do not affect
+  preset availability.
+- 2026-07-23: Added `conversion-versioning` as an explicit prerequisite because
+  preset/default activation owns a golden-tested behavioral
+  `pipeline_version` boundary.
+- 2026-07-23: Added `hdr-avif-output` as a prerequisite so PQ/HLG presets cannot
+  become reachable before AVIF encoding, profile/container conformance,
+  packaging, determinism, and codec bounds are implemented.
+
+- 2026-07-21: `gain-map-hdr` is the intended default. Separate presets make SDR
+  Display P3, sRGB compatibility, linear ACEScg scene master, PQ, and HLG explicit;
+  the ambiguous current `--output-hdr` name will not conflate float data with
+  display HDR.
+- 2026-07-21: Defined fail-loud CLI migration rules: the required output suffix
+  must match the resolved container and is never rewritten; named presets are
+  atomic and reject legacy output-selection flags; explicit combinations use
+  `custom`; legacy flag-only calls retain their transitional TIFF behavior.
+- 2026-07-21: Defined `scene-master` as a direct characterized-linear ACEScg
+  branch that bypasses every print/display control. Removed cross-device checks
+  from this task's definition of done; those remain exclusively in downstream
+  `display-output-acceptance`. Preset mechanics remain independent of offline
+  calibration; final color-accuracy acceptance waits for and exercises a real
+  calibrated artifact as well as the explicit provisional fallback.
+- 2026-07-21: Added the scene-master scale contract (no frame-local auto Dmax),
+  distinguished current rendered `--output-hdr`, and made `roll-conversion` a
+  real dependency. Preset migration now owns resolved-container suffixes,
+  manifest/per-frame validation, shared/custom policy, and collision-free
+  sidecar/report naming; the local stale base must reconcile before implementation.
+- 2026-07-21: Tightened preset/roll semantics: scene-master rejects all effective
+  non-default downstream controls after merge and reports the resolved defaults.
+  Each batch image owns its path-derived sidecar, while one roll report retains
+  stdout/`--report-file` routing and collision-checks against the entire batch.
+- 2026-07-21: Added simple-control migration to the preset contract. Named
+  presets characterize raw inversion first, then apply explicit
+  `print.white_balance` and `print.linear_range`; legacy simple flags/keys warn
+  and alias those fields, conflict with replacements, and are not emitted in new
+  recipes/reports. Scene master rejects their non-default resolved values.
+- 2026-07-21: Clarified that simple aliases preserve requested parameter values,
+  not legacy pixels: WB generally does not commute with a channel-mixing
+  characterization. Activating the new order emits a migration diagnostic and
+  bumps `pipeline_version`; legacy no-preset TIFF retains current ordering during
+  migration.
+- 2026-07-21: Pinned linear-range alias merge semantics. Resolution starts from
+  recipe/default; atomic `--linear-range` conflicts with legacy endpoint flags,
+  otherwise `--clip-low`/`--clip-high` independently override their endpoints.
+  Validation runs after merge, provenance is per endpoint, legacy use warns, and
+  scene master rejects every final non-default range while allowing flags to
+  reset recipe endpoints to `[0,1]`.

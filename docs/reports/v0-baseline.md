@@ -122,5 +122,5 @@ roll off highlights) rather than a linear exposure gain.
 
 Maps onto the queued Phase 6 tasks:
 - **cast** → `auto-neutral-wb` (automates exactly the manual WB above — highest-impact gap)
-- **darkness / clipping** → `algo-sigmoid` (tone curve) + `dmax-reference` (roll-fixed Dmax)
+- **darkness / clipping** → `algo/sigmoid` (tone curve) + `dmax-reference` (roll-fixed Dmax)
 - comparison machinery → `conversion-versioning`
