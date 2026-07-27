@@ -28,13 +28,38 @@ ART=${ART:-/private/tmp/rsv-artifacts}   # per-run report JSON (not committed)
 mkdir -p "$REC" "$ART" "$OUTDIR"
 
 # roll | unexposed(Dmin) | fully-exposed(Dmax) | real frames (space sep)
-ROLLS=(
-"Ektar|20260713-nikon-963.tif|20260715-nikon-1009.tif|20260713-nikon-971.tif 20260714-nikon-989.tif 20260714-nikon-991.tif"
-"phoenix|20260712-nikon-933.tif|20260715-nikon-1010.tif|20260712-nikon-936.tif 20260713-nikon-956.tif 20260713-nikon-958.tif"
-"Portra160|20260720-nikon-1059.tif|20260720-nikon-1058.tif|20260720-nikon-1061.tif 20260720-nikon-1065.tif 20260720-nikon-1076.tif 20260721-nikon-1089.tif"
-"Portra400|20260714-nikon-994.tif|20260717-nikon-1032.tif|20260715-nikon-999.tif 20260715-nikon-1011.tif 20260716-nikon-1029.tif"
-"Portra400-leica-flaw|20260719-nikon-1034.tif|20260719-nikon-1033.tif|20260719-nikon-1037.tif 20260719-nikon-1043.tif 20260720-nikon-1049.tif 20260720-nikon-1056.tif"
-)
+#
+# These calibration triples now come from the asset manifest via `nctool`, not a
+# hard-coded list — one source of truth (docs/tasks/asset-manifest.md). `nctool`
+# emits a triple only for rolls with a complete unexposed+leader pair, so the
+# NLP-source roll (all `real`) is skipped and the original five-roll set is
+# reproduced. Because frozen recipes depend only on the Dmin/Dmax frames, the
+# `freeze`-stage `recipes/` are byte-identical to the former hard-coded array;
+# the convert/ir/determinism stages instead run over every `real` frame the
+# manifest lists (a larger/different set than the old curated list). A `while
+# read` loop (not `readarray`) keeps this working on macOS's stock bash 3.2.
+#
+# Capture the `roles` output to a temp file and check its exit status explicitly:
+# process substitution (`< <(...)`) discards the subprocess exit code, so a
+# mid-stream `roles` crash (partial stdout + traceback + exit 1) would otherwise
+# leave a truncated ROLLS and the harness would proceed silently on fewer rolls.
+_roles_out="$ART/manifest-roles.txt"
+PYTHONPATH="$ROOT/scripts/analysis" python3 -m nctool manifest roles --asset-root "$A" >"$_roles_out"
+_roles_rc=$?
+if [ "$_roles_rc" -ne 0 ]; then
+  echo "error: 'nctool manifest roles' exited $_roles_rc (partial/failed read of $A/manifest.json)." >&2
+  echo "       regenerate it first: PYTHONPATH=$ROOT/scripts/analysis \\" >&2
+  echo "         python3 -m nctool manifest generate --asset-root $A" >&2
+  exit 2
+fi
+ROLLS=()
+while IFS= read -r _row; do ROLLS+=("$_row"); done < "$_roles_out"
+if [ ${#ROLLS[@]} -eq 0 ]; then
+  echo "error: no roll calibration triples from $A/manifest.json." >&2
+  echo "       generate it first: PYTHONPATH=$ROOT/scripts/analysis \\" >&2
+  echo "         python3 -m nctool manifest generate --asset-root $A" >&2
+  exit 2
+fi
 
 center_region() { # file -> "X,Y,W,H" for a holder-free center 40% box
   read w h <<<"$($NC inspect "$1" 2>/dev/null | jq -r '"\(.decode.width) \(.decode.height)"')"

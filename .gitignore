@@ -3,5 +3,9 @@
 # Rust
 /target
 
+# Python (nctool toolkit — scripts/analysis)
+__pycache__/
+*.pyc
+
 # Local, environment-specific config (not shared)
 *.local.json

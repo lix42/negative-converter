@@ -3887,3 +3887,102 @@ Four real findings on PR #56, plus one document-only deferral.
   span only if IR-dark through the full scan depth). Mask logic, `film_along_ranges`,
   `median_ir_probe`, probe depth, and the `shallow_probe_…` test were left
   unchanged per the user's decision.
+
+---
+
+## asset-manifest
+**Status:** implemented (uncommitted, in worktree `feat/asset-manifest`)
+**Updated:** 2026-07-24
+
+Formalized the precursor `generate_manifest.py` into the `nctool` package and
+added the missing `validate` mode + a manifest-driven harness. Stdlib only; the
+"never read sample pixels" invariant is preserved (metadata via `nc inspect`,
+bytes only streamed to hash).
+
+- **Package seed** `scripts/analysis/nctool/` (minimal — full skeleton lands in
+  `conversion-metrics`):
+  - `manifest.py` — one implementation of `generate` / `validate` / `roles` plus
+    shared directory walkers (`walk_rolls`/`walk_samples`/`walk_converted`, and a
+    flat `disk_files` for validate) so generate's structured build and validate's
+    on-disk set can never diverge. The generate logic is a faithful port of
+    `generate_manifest.py` (same seeds, rename/checksum-identity preservation,
+    source_frame retarget, encoding inference, atomic write).
+  - `__main__.py` — `python -m nctool manifest {generate,validate,roles}` argparse
+    dispatcher (`--asset-root`, defaults `$NC_ASSET_ROOT` → `../nc-assets`).
+  - `__init__.py` — dependency-free seed docstring.
+- **`generate_manifest.py`** retired to a thin backward-compat shim forwarding its
+  historical CLI to `nctool.manifest.cmd_generate` (the skill/docs reference it by
+  path; no `PYTHONPATH` needed since it inserts its own dir).
+- **`validate`** (new) — reports **drift** (recorded sha256 ≠ file, with a
+  byte-size pre-check before hashing hundreds of MB), **missing** (in manifest, off
+  disk), **orphans** (on disk, untracked); lists regenerable no-sha outputs as
+  `unchecked`. REPORTS only, never deletes. Exit 0 clean / 1 discrepancies / 2
+  operational (no/invalid/unsupported-schema manifest). Does **not** need `nc`.
+- **Harness** `scripts/real-scan-verify/harness.sh` — replaced the hard-coded
+  `ROLLS` array with a `while read` loop (bash 3.2-safe) filling it from
+  `nctool manifest roles`. Only rolls with exactly one unexposed + one leader are
+  emitted (NLP-source roll skipped), reproducing the original five-roll set. Fails
+  loudly (exit 2 + remediation) if the manifest is absent.
+
+**Verified (all on this build, macOS/aarch64):**
+- `generate` on the live assets reproduces the existing/live `manifest.json`
+  **byte-identical** (full sha256 recompute of ~12 GB, ~10 s): 6 rolls, 5 samples,
+  buckets `nc/2026-07-22` (34, regenerable), `nc/V0` (8), `nlp/2026-07-23` (4),
+  same coverage_gaps. Shim path reproduces it too.
+- `validate` on the clean tree → 0 orphans/missing/drift (exit 0). A synthetic
+  tree with a deleted / added / edited file surfaces missing + orphan + drift
+  (exit 1).
+- `roles` emits the five calibration triples with unexposed/leader **matching the
+  hard-coded ROLLS exactly**; `Portra160-2026-07-22` (all real) correctly skipped.
+- **Harness parity:** ran `freeze` with the old hard-coded array vs the new
+  manifest-driven harness on the same binary → **byte-identical `recipes/`**. The
+  new `.json` / `.provenance.json` also match the committed set; the committed
+  `.hdr.json` differ **only in JSON key order** (`output` vs `reconstruction`
+  position, identical values) — a pre-existing artifact of an older harness jq
+  revision, unrelated to this change and reproduced by the old array too. Repo
+  `recipes/` left untouched (restored to committed state after the A/B).
+
+**Notes for `conversion-metrics` / `nlp-comparison`:**
+- The package is intentionally minimal: `__main__.py` dispatches only the
+  `manifest` group. When adding `metrics` / `thumbs`, either extend `__main__.py`
+  or introduce the documented `cli.py` and have `__main__` delegate — the shared
+  walkers and `iter_meta`/`load_manifest`/`Prev` in `manifest.py` are reusable.
+- `python -m nctool` needs `scripts/analysis` on `PYTHONPATH` (the harness and docs
+  set it inline); the shim avoids that only because it inserts its own dir.
+- Open question for the user: the committed `recipes/*.hdr.json` key order lags the
+  current `harness.sh` jq (values identical). Harmless, but a `freeze` re-run will
+  reorder those keys — decide whether to refresh the committed recipes.
+
+**Update 2026-07-24 (review-fix round) — hardened `validate` + tests.**
+Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
+- **Full-tree orphan scan** (`all_disk_images`): `validate`'s orphan check now
+  walks the entire asset tree recursively for `.tif`/`.tiff`, so a root-level stray
+  or a deeply-nested scan (`samples/icc/sub/x.tif`, `rolls/<roll>/sub/x.tif`) is
+  flagged instead of being invisible to the structured generate walkers (left
+  unchanged). Non-image companions (`.json`/`.jpg`) and `manifest.json` are excluded
+  by the extension filter.
+- **Fail on missing checksum for irreplaceable/error entries**: entries carrying an
+  `error`/`metadata_source:"none"` (new `ERRORS`) and non-regenerable entries lacking
+  `sha256` (new `NO CHECKSUM`) are now PROBLEMS (exit 1). Only entries in an explicitly
+  `regenerable: true` bucket may legitimately be `unchecked`.
+- **`inspect()` loud on nc-parse-failure**: `nc inspect` exit 0 with unparseable/
+  missing-key JSON is now a per-file `error` (`metadata_source:"none"`), not a silent
+  downgrade to exiftool placeholders. Non-zero exit (rejection) still falls back.
+  Happy path unchanged (byte-identical reproduction preserved).
+- **Harness roles exit-code**: `harness.sh` now captures `nctool manifest roles` to a
+  temp file and checks `$?` (process substitution discarded it) — a mid-stream `roles`
+  crash fails loud (exit 2 + remediation) instead of proceeding on a truncated ROLLS.
+- **`cmd_roles` unknown-role guard**: a typo'd role warns loudly and is folded into
+  `real` (was silently bucketed into a phantom key via `setdefault`, dropping a frame).
+- **nc-absent is loud**: a wholesale nc-absent `generate` now exits 2 with remediation
+  by default; the degraded exiftool-only mode is gated behind `--allow-exiftool-fallback`.
+- **`write_manifest` durability**: unique `mkstemp` temp + `fsync` before `os.replace`
+  (concurrent-run safe; no zero-length file after a crash).
+- **New committed test suite** `scripts/analysis/nctool/test_manifest.py` (stdlib
+  `unittest`, hermetic synthetic tree, no real assets, `nc` stubbed): 30 tests over
+  roles parity, build preservation/rename/encoding/coverage, load_manifest schema,
+  `inspect` parse-vs-rejection, and `validate` classification + 0/1/2 exit contract.
+  Run: `PYTHONPATH=scripts/analysis python3 -m unittest nctool.test_manifest`.
+- **Verified:** `generate` on live assets still reproduces the manifest
+  **byte-identical** (sha `7351955…`); `validate` clean → exit 0; 30/30 unittests
+  pass; Rust CI green (fmt / clippy -D warnings / build / 411 tests).
