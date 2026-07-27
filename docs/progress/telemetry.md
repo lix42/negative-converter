@@ -227,6 +227,10 @@ What other epics need to know about `telemetry`:
   design-spec §12 item 17 emit_report consumer list now reads "convert/inspect/
   estimate" (md+html); design-spec §9 collision parenthetical now reads
   "(`NC_TELEMETRY_LOG` or the default path)" (md+html).
+- 2026-07-27: Epic-migration redirect — the stdout-broken-pipe-safety task path
+  cited above is now
+  [core/stdout-broken-pipe-safety](../tasks/core/stdout-broken-pipe-safety.md).
+  The entry above is preserved verbatim.
 
 
 ## strategy

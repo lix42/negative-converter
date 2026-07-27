@@ -319,6 +319,9 @@ them so you don't bake in assumptions they'll have to unwind):**
   agreement). **Don't hard-code an orange-mask assumption.**
 
 Both are tracked in `TASKS.md` as dependents of this task.
+- 2026-07-27: Epic-migration redirect — the content-fallback task path cited above
+  is now [film-base/content-fallback](../tasks/film-base/content-fallback.md).
+  The entry above is preserved verbatim.
 
 
 ## white-holder-support
@@ -538,6 +541,9 @@ Three further items the user decided after the review:
 - If grid sampling ever becomes a `convert`-usable source, it must join
   `FilmBaseSource` as a variant (one enum per the conventions), not a bool
   beside it.
+- 2026-07-27: Epic-migration redirect — the grid-verdict-enum task path cited above
+  is now [film-base/grid-verdict-enum](../tasks/film-base/grid-verdict-enum.md).
+  The entry above is preserved verbatim.
 
 
 ## dmax-reference

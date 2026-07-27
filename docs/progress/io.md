@@ -143,6 +143,9 @@ What other epics need to know about `io`:
   instead of being silently dropped. `PlanarConfiguration` read errors now surface
   as `Decode` (a corrupt tag no longer silently defaults to chunky). Added tests:
   `preview_without_ir_decodes_as_hdr`, plus an accepted-by-shape warning assertion.
+- 2026-07-27: Epic-migration redirect — the silverfast-decode task path cited above
+  is now [io/silverfast-decode](../tasks/io/silverfast-decode.md).
+  The entry above is preserved verbatim.
 
 
 ## tiff-encode

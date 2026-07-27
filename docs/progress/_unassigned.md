@@ -82,6 +82,10 @@ The tasks (all deps `[x]` ⇒ executable now, except where noted):
 (pre-release makes it moot — folded into `input-color-management` lifting the
 rejection). **Open:** pick a first task — the doc-accuracy half of
 `release-readiness` is the quickest, most user-visible win.
+- 2026-07-27: Epic-migration redirect — the two task paths cited above have moved
+  to [analysis/real-scan-verification](../tasks/analysis/real-scan-verification.md)
+  and [core/pipeline-orchestration](../tasks/core/pipeline-orchestration.md).
+  The entry above is preserved verbatim.
 
 
 ## color-characterization-calibration
