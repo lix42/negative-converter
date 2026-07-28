@@ -158,8 +158,12 @@ fn render_legacy(
     let (positive, convert) = reconstruct_and_print(image, film_base, reconstruction, print)?;
     let algorithm_ms = ms_since(started);
 
+    // No copy here (`io/memory-preflight`): the pre-transform positive has no
+    // consumer, so it is *moved* into `to_output`, which transforms those very
+    // buffers and hands them back — one full-frame RGB buffer and one full-frame IR
+    // plane less at peak than the clone this used to make.
     let started = Instant::now();
-    let (image, icc) = color::to_output(&positive, output_params)?;
+    let (image, icc) = color::to_output(positive, output_params)?;
     let color_ms = ms_since(started);
 
     Ok(Rendered {
@@ -380,7 +384,7 @@ mod tests {
                 let got = render(&img, &base, &reconstruction, &print, &output).unwrap();
                 let (positive, convert) =
                     reconstruct_and_print(&img, &base, &reconstruction, &print).unwrap();
-                let (want_image, want_icc) = color::to_output(&positive, &output).unwrap();
+                let (want_image, want_icc) = color::to_output(positive, &output).unwrap();
                 let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
                 assert_eq!(
                     bits(&got.image.rgb),

@@ -133,9 +133,27 @@ fn profile_icc(profile: &Profile) -> Result<Vec<u8>> {
 }
 
 /// Transform `image` from the linear working space into the output profile
-/// selected by `params`, returning the converted image and the ICC blob to
-/// embed at encode time. The IR plane is carried through untouched.
-pub fn to_output(image: &LinearImage, params: &OutputParams) -> Result<(LinearImage, Vec<u8>)> {
+/// selected by `params`, returning it alongside the ICC blob to embed at encode
+/// time. The IR plane is not touched at all.
+///
+/// **Consumes and returns the same buffers** (`io/memory-preflight`): this stage
+/// used to clone the whole [`LinearImage`] — the RGB buffer *and* the
+/// never-transformed IR plane — which put a third full-frame image on the heap next
+/// to the orchestrator's decoded image and the algorithm's positive (~16 extra
+/// bytes per pixel, ~1.2 GiB on a 75 MP HDRi scan). The orchestrator has no use for
+/// the pre-transform values, so the copy bought nothing. Moving the image in and
+/// out costs nothing either (a `Vec` move is a handle move — no realloc, no copy)
+/// while keeping the stage a pure `(input, params) -> output` function and making
+/// the half-transformed state unrepresentable: the `Err` returns below take the
+/// caller's image with them, so a failure after the transform (`profile_icc` can
+/// fail *after* `transform_in_place` has run) cannot hand back a buffer whose
+/// values are neither working-space nor output-space.
+///
+/// The values are pixel-for-pixel identical to the old clone-based transform:
+/// `cmsDoTransform` is applied to the same values in the same order, and lcms2
+/// supports in-place operation when the input and output pixel formats match (both
+/// `RGB_FLT` here).
+pub fn to_output(mut image: LinearImage, params: &OutputParams) -> Result<(LinearImage, Vec<u8>)> {
     let explicit = params
         .output_profile
         .as_deref()
@@ -154,14 +172,15 @@ pub fn to_output(image: &LinearImage, params: &OutputParams) -> Result<(LinearIm
     )
     .map_err(|e| NcError::Other(format!("failed to build color transform: {e}")))?;
 
-    let mut out = image.clone();
     // `rgb` is interleaved RGB with len == w*h*3 (enforced by `LinearImage::new`),
     // but the field is `pub`, so guard the invariant loudly: `as_chunks_mut`
     // silently drops a trailing 1–2 elements, which would leave the tail pixels
     // un-transformed in release — a quietly-wrong image, which "fail loudly"
-    // forbids.
-    let rgb_len = out.rgb.len();
-    let (pixels, rest) = out.rgb.as_chunks_mut::<3>();
+    // forbids. Scope note: this length check is the only thing that runs before the
+    // transform — it is not a guarantee about the whole function (the image is
+    // consumed, so no half-transformed buffer is observable either way).
+    let rgb_len = image.rgb.len();
+    let (pixels, rest) = image.rgb.as_chunks_mut::<3>();
     if !rest.is_empty() {
         return Err(NcError::Other(format!(
             "rgb buffer length {rgb_len} is not a multiple of 3"
@@ -170,7 +189,7 @@ pub fn to_output(image: &LinearImage, params: &OutputParams) -> Result<(LinearIm
     transform.transform_in_place(pixels);
 
     let icc = profile_icc(&output)?;
-    Ok((out, icc))
+    Ok((image, icc))
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +367,7 @@ mod tests {
     fn neutral_gray_maps_to_srgb_encoded_value() {
         // Linear 0.5 in the working space → sRGB-encoded ~0.7353.
         let params = OutputParams::default(); // u16 → sRGB
-        let (out, _icc) = to_output(&gray_image(0.5), &params).unwrap();
+        let (out, _icc) = to_output(gray_image(0.5), &params).unwrap();
         for &c in &out.rgb {
             assert!((c - 0.7353).abs() < 0.005, "got {c}, expected ~0.7353");
         }
@@ -357,7 +376,7 @@ mod tests {
     #[test]
     fn srgb_round_trip_within_tolerance() {
         // working → sRGB, then sRGB → working should recover the input.
-        let (encoded, _) = to_output(&gray_image(0.5), &OutputParams::default()).unwrap();
+        let (encoded, _) = to_output(gray_image(0.5), &OutputParams::default()).unwrap();
         let working = working_profile().unwrap();
         let srgb = Profile::new_srgb();
         let back: Transform<[f32; 3], [f32; 3]> = Transform::new(
@@ -420,7 +439,7 @@ mod tests {
             output_profile: Some(path.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let (out, icc) = to_output(&gray_image(0.5), &params).unwrap();
+        let (out, icc) = to_output(gray_image(0.5), &params).unwrap();
         assert!(!icc.is_empty());
         // Custom == that sRGB profile, so 0.5 linear → ~0.7353 encoded.
         for &c in &out.rgb {
@@ -458,10 +477,67 @@ mod tests {
         // The IR plane must survive the color transform byte-for-byte (it is
         // preserved, not consumed, in Step 1).
         let img = LinearImage::new(1, 1, vec![0.5, 0.5, 0.5], Some(vec![0.42])).unwrap();
-        let (out, _icc) = to_output(&img, &OutputParams::default()).unwrap();
+        let (out, _icc) = to_output(img, &OutputParams::default()).unwrap();
         assert_eq!(out.width, 1);
         assert_eq!(out.height, 1);
         assert_eq!(out.ir, Some(vec![0.42]));
+    }
+
+    #[test]
+    fn transform_reuses_the_caller_buffers_and_leaves_the_ir_plane_alone() {
+        // The no-copy contract (`io/memory-preflight`): `to_output` transforms the
+        // image it was handed and gives back the *same* allocations — it must not
+        // clone a second full-frame image (RGB or IR) at peak — and it touches
+        // neither the IR plane's values nor the dimensions.
+        let ir = vec![0.42, 0.99];
+        let rgb = vec![0.5, 0.25, 0.75, 0.1, 0.2, 0.3];
+        let params = OutputParams::default();
+        // Reference values from an independent, identically-built image.
+        let (reference, ref_icc) = to_output(
+            LinearImage::new(2, 1, rgb.clone(), Some(ir.clone())).unwrap(),
+            &params,
+        )
+        .unwrap();
+
+        let img = LinearImage::new(2, 1, rgb, Some(ir.clone())).unwrap();
+        // Captured before the move: a `Vec` move keeps the same heap allocation, so
+        // these pointers must survive into the returned image. A re-introduced
+        // stage-local clone would change them.
+        let rgb_ptr = img.rgb.as_ptr();
+        let ir_ptr = img.ir.as_ref().unwrap().as_ptr();
+        let (out, icc) = to_output(img, &params).unwrap();
+
+        assert_eq!(out.rgb, reference.rgb, "values must match the reference");
+        assert_eq!(icc, ref_icc);
+        assert_eq!(
+            out.ir.as_deref(),
+            Some(&ir[..]),
+            "IR plane must be untouched"
+        );
+        assert_eq!((out.width, out.height), (2, 1));
+        assert_eq!(out.rgb.as_ptr(), rgb_ptr, "RGB buffer was reallocated");
+        assert_eq!(
+            out.ir.as_ref().unwrap().as_ptr(),
+            ir_ptr,
+            "IR plane was reallocated"
+        );
+    }
+
+    #[test]
+    fn malformed_rgb_length_fails_loudly() {
+        // The loud `rgb.len() % 3` guard must still fire (`rgb` is `pub`, so a
+        // malformed buffer is reachable): `as_chunks_mut` would otherwise silently
+        // drop the tail and leave those pixels un-transformed.
+        //
+        // There is no "buffer untouched on the error path" half to assert anymore:
+        // `to_output` consumes the image, so a partially-transformed buffer is
+        // unobservable by construction — which is the point of the consuming
+        // signature.
+        let mut img = LinearImage::new(1, 1, vec![0.5, 0.5, 0.5], None).unwrap();
+        img.rgb.push(0.25); // len 4 — not a multiple of 3
+        let err = to_output(img, &OutputParams::default()).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("not a multiple of 3"), "{err}");
     }
 
     #[test]
@@ -474,7 +550,7 @@ mod tests {
             hdr: true, // → F32 → AcesCg
             ..Default::default()
         };
-        let (out, icc) = to_output(&gray_image(0.5), &params).unwrap();
+        let (out, icc) = to_output(gray_image(0.5), &params).unwrap();
         assert!(!icc.is_empty());
         for &c in &out.rgb {
             assert!(
@@ -494,7 +570,7 @@ mod tests {
             hdr: true, // → F32 → AcesCg
             ..Default::default()
         };
-        let (out, _icc) = to_output(&img, &params).unwrap();
+        let (out, _icc) = to_output(img, &params).unwrap();
         let [r, g, b] = [out.rgb[0], out.rgb[1], out.rgb[2]];
         assert!(r < 1.0, "expected R pulled below 1.0, got {r}");
         assert!(g > 0.0 && b > 0.0, "expected G/B lifted off 0, got {g}/{b}");
@@ -730,7 +806,7 @@ mod tests {
 
         // Neutral gray is invariant under a D65-preserving matrix, so linear 0.5 →
         // sRGB-encoded ~0.7353 pins only the TRC — necessary but not sufficient.
-        let (out, _icc) = to_output(&gray_image(0.5), &params).unwrap();
+        let (out, _icc) = to_output(gray_image(0.5), &params).unwrap();
         for &c in &out.rgb {
             assert!(
                 (c - 0.7353).abs() < 5e-3,
@@ -749,7 +825,7 @@ mod tests {
         let lin_p3_red = [0.822462_f32, 0.033194, 0.017083];
         let expect = lin_p3_red.map(srgb_encode); // ≈ (0.9175, 0.2004, 0.1385)
         let img = LinearImage::new(1, 1, vec![1.0, 0.0, 0.0], None).unwrap();
-        let (out, _icc) = to_output(&img, &params).unwrap();
+        let (out, _icc) = to_output(img, &params).unwrap();
         let got = [out.rgb[0], out.rgb[1], out.rgb[2]];
         for ch in 0..3 {
             assert!(
@@ -796,7 +872,7 @@ mod tests {
             output_profile: Some("display-p3".into()),
             ..Default::default()
         };
-        let (_out, icc) = to_output(&gray_image(0.5), &params).unwrap();
+        let (_out, icc) = to_output(gray_image(0.5), &params).unwrap();
         assert_eq!(
             icc,
             icc_profile(&OutputSpace::DisplayP3).unwrap(),

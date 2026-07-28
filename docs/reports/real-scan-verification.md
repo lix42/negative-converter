@@ -17,6 +17,9 @@ highlight clipping (4.8–10.3 %), the Harman Phoenix dense-base stock tripping 
 the design's sizing model. The memory measurement feeds `streaming-tiled-io`
 STEP 0 (below): on the 8 GB-class target, the user's assumed 4× worst case sits
 close enough to the budget that the `memory-preflight` gate is genuinely required.
+*(Follow-up 3 has since been resolved and the 4× case measured — see the
+2026-07-27 addendum at the end, which also scopes that last claim: the real 74.65 MP
+worst case measures 3.146 GB, 39% of an 8 GB machine, so it fits with headroom.)*
 
 ## Environment
 
@@ -93,6 +96,9 @@ The number STEP 0 needs, measured on the real worst case:
 - **Measured peak: ~930 MiB at 18.66 MP ⇒ ~50 MiB/MP** (16-bit and float alike).
   Peak scales ~linearly with pixel count (decoded RGB **+ carried IR**, algorithm
   `positive`, `to_output` clone, u16 quantize buffer all live near peak).
+  **Superseded — see the 2026-07-27 addendum at the end of this report:** the
+  `to_output` clone is gone and the same frame now measures **681 MB ⇒ ~36 MB/MP**.
+  The ~50 MiB/MP figure below is pre-fix and must not be extrapolated from.
 - This is **~1.5× the design's ~600 MB @ 18 MP model** (`memory-preflight`) — the
   model under-counts because it omits the carried IR plane and the pre-fix
   `to_output` clone. Feed this back into `memory-preflight`'s sizing model.
@@ -143,3 +149,57 @@ No hard defects (no crashes, no silently-wrong images, no determinism breaks).
 - **Converted images** — `../nc-assets/converted/2026-07-22/<roll>/`
   (`_positive.tiff` 16-bit + `_positive_hdr.tiff` float, each with a resolved-recipe
   `.json` sidecar). Not committed (large); regenerate with `harness.sh convert`.
+
+## Addendum 2026-07-27 — `io/memory-preflight` closed follow-up 3
+
+Follow-up 3 above ("peak RSS ~1.5× the sizing model") is resolved. The sizing
+model now lives in `pipeline::memory` and counts the carried IR plane and the
+film-base sampling buffers; the `to_output` clone it also under-counted no longer
+exists (the stage transforms the buffers it is handed). Re-measured on the release
+binary, macOS/aarch64, `/usr/bin/time -l` (measured peaks in decimal GB/MB, budgets
+in GiB):
+
+| frame | run | before | after |
+|---|---|---|---|
+| 18.66 MP HDRi (roll frame) | `convert` u16 | ~975 MB (~930 MiB) | **681 MB** |
+| 74.65 MP HDRi (`samples/largest.tif`) | `convert` u16 | 3.808 GB | **3.146 GB** |
+| 74.65 MP HDRi | `convert --output-hdr` | 3.892 GB | **2.698 GB** |
+| 74.65 MP HDRi | `inspect` / `estimate` | 1.502 GB | 1.503 GB (no render) |
+
+Output is byte-identical before and after on every path measured.
+
+**The 4×-megapixels reading is no longer an assumption.** `samples/largest.tif`
+(10368×7200 = 74.65 MP HDRi) is exactly that case, and it now measures **3.146 GB
+/ 42 B/px** rather than the ~3.7 GiB projected from the pre-fix ~50 MiB/MP. On the
+8 GB M3 Air target (~4–5 GB usable) that leaves real but limited headroom: 3.146 GB
+is 39% of installed RAM, so the estimate stays **below** the preflight's ~70% warn
+line and the warn tier does *not* fire on the documented worst-case scan on the
+documented target. The gate earns its place as a bound on the *unbounded* ceiling
+(and on inputs larger than anything on hand), not because today's worst scan is
+close to it — with `--max-memory` as the escape hatch when a bigger one turns up.
+
+**STEP 0 input for `io/streaming-tiled-io`, restated post-fix:**
+
+- Per-pixel cost is now **decode 18 · film-base 16 + 12·s · render 32 + 12·s ·
+  encode 38 + 12·s B/px** (HDRi u16; `s` = sampled rectangle ÷ frame, ~0.69 for the
+  auto interior, 1.0 for a full-frame `--base-region`); the **encode** phase is the
+  peak for `convert`, since the decoded image is held for `--export-ir` alongside
+  the rendered one, and the **film-base** phase is for `inspect`/`estimate`. Two
+  full images overlap by design, and the film-base sample is *retained* into the
+  later phases because freed pages stay resident.
+- Extrapolating the still-hypothetical 4×-per-side case (~300 MP): ~**11 GiB**
+  (was ~15 GiB). Still beyond the target machine, still hypothetical — the largest
+  real asset is the 74.65 MP frame above.
+- So streaming stays a **conditional GO** on the same terms: justified if the true
+  input envelope moves toward the per-side reading, or a real >~5 GiB peak turns
+  up. Today's worst real scan is comfortably gated instead.
+
+Details, the calibration table, and the two accounting subtleties that cost real
+accuracy are in [`docs/progress/io.md`](../progress/io.md) (`## memory-preflight`)
+and the `pipeline::memory` module doc.
+
+**Open measurement.** Every row above was measured with an explicit `--film-base`,
+so none of them exercised the film-base phase's sampling (added to the model in the
+same-day review pass). The auto path's interior sample is *derived*: 74.65 MP
+`inspect --auto-base` models at 1.811 GB accounted / 2.22 GB estimated. A `time -l`
+run on that path is the one outstanding calibration point.

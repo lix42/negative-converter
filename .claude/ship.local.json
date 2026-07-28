@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "detectedAt": "2026-07-24T22:09:23Z",
+  "version": 3,
+  "detectedAt": "2026-07-27T22:05:00Z",
   "host": "claude",
   "instructions": {
     "file": "CLAUDE.md"
@@ -11,9 +11,9 @@
   },
   "qualityGates": {
     "typecheck": null,
-    "test": "cargo test",
-    "build": "cargo build",
-    "lint": "cargo fmt --all --check && cargo clippy --all-targets -- -D warnings"
+    "test": "cargo test --all-features",
+    "build": "cargo build --all-targets --all-features",
+    "lint": "cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings"
   },
   "tasks": {
     "tasksFile": "docs/TASKS.md"
@@ -25,5 +25,8 @@
     "publishing": "commit-commands:commit-push-pr",
     "ciRepair": null,
     "reviewFeedback": null
+  },
+  "review": {
+    "codexCommand": "node \"/Users/li.xu/.claude/plugins/cache/openai-codex/codex/1.0.6/scripts/codex-companion.mjs\" review --wait"
   }
 }

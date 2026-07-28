@@ -198,3 +198,34 @@ rerunnable harness + frozen recipes under `scripts/real-scan-verify/` (see its `
   (2) Harman Phoenix dense base trips the `Dmax ≳1.0` floor + base-uniformity check
   → candidate new task (per-stock/dense-base Dmax handling); (3) widen
   `memory-preflight` sizing model to count IR + clone. No hard defects.
+
+### Corrections to the parked memory-safety review framing — 2026-07-27
+
+The memory-review Phase A item parked above has since been implemented; its full
+narrative (measurements, the model, the accounting subtleties) lives in
+[`docs/progress/io.md`](io.md) `## memory-preflight`, with the peak re-measurement
+recorded as an addendum to
+[`docs/reports/real-scan-verification.md`](../reports/real-scan-verification.md).
+This entry stays here because it corrects the *parked review notes above*, which
+name no task.
+
+Three corrections to that framing, all worth carrying forward:
+
+- **The pre-fix "~24 GiB / three images" figure was scoped to a hypothetical 4
+  GiB-u16 input, not to anything real.** The largest real asset (`largest.tif`,
+  74.65 MP HDRi) measured **3.808 GB** pre-fix and **3.146 GB** after, and the
+  standard 18.66 MP frame **975 MB → 681 MB** (decimal GB/MB throughout, as
+  `time -l` reports). The gate was still the right call — the ceiling really was
+  unchecked — but the honest headline is "unbounded", not "24 GiB".
+- **After the no-copy fix the peak moved from the render to the *encode* phase.**
+  Two images still overlap (decoded, held for `--export-ir`, plus the rendered
+  one), and the u16 quantize buffer sits on top of both: 38 B/px at encode vs 32 at
+  render. The parked note's "~16 GiB / two images after the in-place fix" counted
+  the render only. `pipeline::memory` is now the one place that model lives — any
+  new full-frame buffer in any stage has to be added there, or the preflight
+  silently under-approves.
+- **Item (3) of the parked follow-ups above ("count IR + clone") was necessary but
+  not sufficient.** Film-base *sampling* also allocates full-frame-scale buffers —
+  `region_channels` materializes its rectangle unstrided into three `Vec<f32>` — so
+  a model counting only the images under-estimates `inspect`/`estimate`. Found in
+  the review pass on the implementation, not in this parked note.

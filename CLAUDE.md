@@ -97,7 +97,7 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`,
-  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split}.rs`
+  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,memory}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure reconstruction→named-output core (stages
   3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
@@ -114,7 +114,8 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   *borrowed* by both display branches. The `film-master` half is wired; the
   display half is built and unit-tested but has no CLI-reachable consumer until
   `output/{sdr,hdr}-display-rendering`, so a non-default `print.linear_range` is a
-  loud usage error rather than a silently-ignored knob),
+  loud usage error rather than a silently-ignored knob;
+  `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
   implementation — `telemetry::params_hash` delegates to it so the core report
@@ -130,13 +131,47 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `--report`, they're operational, so they live only on the CLI arg struct, are
   **not** recipe keys, and must never perturb the deterministic image output.
   How-to lives in the `perf-telemetry` skill; record shape in design-spec §9.
+- **Peak memory is gated before decode, and `pipeline/memory.rs` owns the model.**
+  Every command that decodes runs `memory::preflight` on a metadata-only
+  `io::decode::probe` (never `read_image` — `decode` only returns dimensions after
+  it has allocated) and fails with **exit 6** (`NcError::Resource`) over budget:
+  fixed 6 GiB default, `--max-memory` to override, a `--strict`-promotable warning
+  above ~70% of detected RAM. On `roll` the gate runs per frame and a rejected frame
+  follows roll's ordinary per-frame handling — recorded in its report entry, siblings
+  still written, roll exits **1**, not 6. `--max-memory` is another **operational**
+  flag (arg struct only, never a recipe key, never perturbs output) — with two
+  caveats: the budget also caps the `tiff` read buffers (`min(4 GiB, budget)`), so a
+  small-but-passing budget can turn a decodable file into an exit-3 decode failure;
+  and the warn tier is the **first documented exception** to the "same inputs +
+  params ⇒ identical output" rule below — it compares against detected RAM, so with
+  `--strict` the same run can exit 0 on a big machine and non-zero on a small one
+  (the *image* is still bit-identical; only the exit differs).
+  The model counts the *simultaneously live* full-frame buffers — **decode 18 ·
+  film-base 16+12·s · render 32+12·s · encode 38+12·s bytes/px** for HDRi u16
+  (`s` = sampled rectangle ÷ frame; ~0.69 for the auto interior, 1.0 for a
+  full-frame `--base-region`). For `convert` the **encode** phase is the peak: the
+  decoded image is held for `--export-ir` while the rendered one exists, and the
+  u16 quantize buffer sits on both. For `inspect`/`estimate` the **film-base**
+  phase is — `film_base::region_channels` materializes the sampled rectangle
+  unstrided into three `Vec<f32>`, so sampling is *not* free (that omission was a
+  real bug in the first version of the model). The `12·s` term appears in *every
+  later* phase because freed pages stay resident — the same retention rule that
+  sums the encode buffers; treating it as a competing phase instead
+  under-estimated a real run by 10%. Two images overlapping
+  is by design; three was the bug (`color::to_output` cloned; it now **consumes and
+  returns** the image, transforming those very buffers). If you add a full-frame
+  buffer to any stage, update that model — **nothing tests it against the code**, so
+  the gate silently under-approves until someone does. `decode` is
+  `decode_within(&Path, budget_bytes)`.
 
 ### Stack / commands
 
 Rust (edition 2024), single binary crate `nc`. Dependencies: `clap` (`derive`),
 `tiff`, `image`, `palette`, `lcms2`, `serde`/`serde_json`, `rayon`,
 `kamadak-exif`, `roxmltree` (read-only XML — parses the SilverFast XMP packet
-for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
+for input provenance), `libc` (one `sysctlbyname("hw.memsize")` call on Darwin for
+the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
+(see `Cargo.toml` for versions; bump with `cargo add`).
 
 - `cargo build` — build · `cargo test` — all tests · `cargo test <name>` — one test
 - `cargo clippy --all-targets` — lint (keep clean)
@@ -155,6 +190,21 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   vectors in `pipeline::stages::golden` (captured from the reference code) — those
   specific values happen to agree across libm; never checksum a full frame, an
   encoded file, or post-lcms2 (color-transformed) pixels in a cross-platform gate.
+  Note what `golden` therefore does **not** cover: `assert_golden` pins
+  `reconstruct_and_print`, i.e. **pre**-color-transform pixels. Nothing committed
+  guards `color::to_output`'s output across targets, so a change there is verified
+  by same-machine before/after comparison, not by a checked-in vector.
+- **Only `aarch64-apple-darwin` is installed here, so `#[cfg(target_os = "linux")]`
+  code never compiles locally** — all four gates pass green with a type error
+  sitting in a Linux-only branch, and CI is the first place it builds
+  (`cargo check --target x86_64-unknown-linux-gnu` can't run: no target std, and
+  lcms2-sys would need a cross C toolchain). When adding platform-gated code, gate
+  only the *I/O* and keep the parsing/logic in un-gated helpers with unit tests, so
+  every target compiles and exercises it — `pipeline::memory`'s
+  `parse_meminfo_total` / `parse_cgroup_limit` / `parse_self_cgroup` are the
+  pattern. Same reasoning applies to a `cfg` trichotomy used as a function's tail
+  expression: bind each branch to a `let` instead, or adding a statement later
+  turns the surviving block into an `unused_must_use` error on one target only.
 - `Cargo.lock` is committed (binary crate). The crate-level `#![allow(dead_code)]`
   is gone; the remaining allows are narrow, documented item-level ones
   (`algo/mod.rs`, `pipeline/working_space.rs`, `pipeline/render_split.rs` — the

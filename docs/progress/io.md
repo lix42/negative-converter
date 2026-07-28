@@ -39,11 +39,32 @@ What other epics need to know about `io`:
 - **f32 output is written verbatim** (values > 1.0 preserved); u16 clamps and
   rounds. Non-finite samples are counted at **both** depths, so a numerical fault
   upstream stays visible — don't launder `NaN` into a finite value in a stage.
-- **Known gaps:** artifacts are still written straight to their final paths
-  (`io/transactional-output-writes`), and peak memory is unbounded and honestly
-  larger than the documented 4 GiB input limit implies — measured **~930 MiB at
-  18.66 MP** on real scans (`io/memory-preflight`, then the evaluate-first
-  `io/streaming-tiled-io`).
+- **Known gap:** artifacts are still written straight to their final paths
+  (`io/transactional-output-writes`). *(The "peak memory is unbounded" half of this
+  gap is resolved — see the next bullet.)*
+- **Peak memory is now bounded and reported** (`io/memory-preflight`, done
+  2026-07-27 — supersedes the "unbounded" gap above). Every command that decodes
+  runs a **preflight before decode**, from a metadata-only `io::decode::probe`, and
+  fails with **exit 6** (`NcError::Resource`) when the estimated peak exceeds the
+  budget (fixed 6 GiB default; `--max-memory` to override — operational flag, not
+  a recipe key). Exit 6 is `convert`/`inspect`/`estimate`; on **`roll`** the gate
+  runs per frame and a rejection is that frame's error — recorded in its report
+  entry, siblings still converted and written, roll exits **1** like any
+  frames-failed batch. `pipeline::memory` is the one sizing model: **decode 18 ·
+  film-base 16+12·s · render 32+12·s · encode 38+12·s bytes/px** for HDRi u16
+  (`s` = sampled rectangle ÷ frame), so **encode** is the peak for `convert` and
+  the **film-base** phase for `inspect`/`estimate`. The `12·s` sampling term rides
+  into every *later* phase because freed pages stay resident — the same retention
+  rule that sums the encode buffers. Two full images still overlap by design (the
+  decoded image is held for `--export-ir`). `decode` is now `decode_within(&Path,
+  budget_bytes)`. Anything that adds a full-frame buffer to a stage **must** update
+  that model by hand — no test compares it against the code — or the gate silently
+  under-approves.
+- **`color::to_output` no longer copies** (`LinearImage` in, `(LinearImage,
+  Vec<u8>)` out — it transforms the very buffers it was handed). It used to clone
+  the whole image, IR plane included. Real peak on a 74.65 MP HDRi scan: 3.808 GB →
+  3.146 GB, byte-identical output. Don't reintroduce a stage-local copy of a full
+  image without counting it in the model.
 - **Note:** the log entries for `color/scanner-profile-before-density-experiment`
   are stranded at the tail of the `input-data-semantics` section below — they lost
   their heading in the flat log before this epic split. Read them there.
@@ -461,10 +482,198 @@ What other epics need to know about `io`:
 
 ## memory-preflight
 
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-07-27
 
 - Goal: Make the pipeline's memory use **honest and bounded** without changing its whole-image architecture.
+- 2026-07-27: **Done.** Both halves shipped: the no-copy color transform and the
+  peak-memory preflight. Full CI gate clean (fmt / clippy `-D warnings` / build /
+  472 tests).
+- **Measured on `samples/largest.tif`** (10368x7200 = 74.65 MP HDRi, the new
+  `perf-worst-case` asset — ~4x a standard roll frame), release binary,
+  `/usr/bin/time -l` peak RSS on macOS/aarch64:
+
+  | run | before | after |
+  |---|---|---|
+  | `convert` u16 | 3.808 GB | 3.146 GB |
+  | `convert --output-hdr` | 3.892 GB | 2.698 GB |
+  | `convert --export-ir` | 3.893 GB | 3.146 GB |
+  | `inspect` / `estimate` | 1.502 GB | 1.503 GB (unchanged — no render) |
+
+  A standard 18.66 MP frame went **~975 MB → 681 MB** (the same numbers in binary
+  units: ~930 MiB → 650 MiB) — a 30% cut. Units in this section: measured peaks and
+  model outputs in **decimal GB/MB** (what `time -l` is compared against), budgets
+  and the allowance in **GiB/MiB**. Output is **byte-identical** before/after on all
+  three real-scan paths (u16, hdr, export-ir) and on all six fixture paths (u16 /
+  hdr / display-p3 x HDR / HDRi).
+- **No-copy transform.** `color::to_output(LinearImage, &OutputParams) ->
+  Result<(LinearImage, Vec<u8>)>` — was the same signature with an `image.clone()`
+  inside. It now transforms the buffers it was handed and moves them back out
+  (a `Vec` move is a handle move), so `stages::render` lets the positive *become*
+  the output image. Dropped one full RGB buffer **and** one pointless full IR clone
+  (16 B/px). The `rgb.len() % 3` guard stays. Consuming the image (rather than
+  taking `&mut`) is deliberate: `profile_icc` can fail *after* the transform has
+  run, and a by-reference signature would let that `Err` hand the caller a
+  half-converted buffer.
+- **The sizing model is per-phase, and the render is not the peak anymore.**
+  `pipeline/memory.rs` accounts the simultaneously-live full-frame buffers:
+  decode 18 B/px, film-base 16 + 12·s, render 32 + 12·s, encode 38 + 12·s
+  (HDRi u16, `s` = sampled rectangle ÷ frame). With three images gone the
+  **encode** phase is the peak for `convert` — decoded + rendered + the u16
+  quantize buffer — because the decoded image is held for `--export-ir`. Anyone
+  tempted to "just count the render" will under-estimate by 6 B/px.
+- **Film-base sampling is not free** (caught in review — the first version of the
+  model claimed `film_base` allocated no full-frame buffer, which is false).
+  `film_base::region_channels` materializes its rectangle **unstrided** into three
+  `Vec<f32>` = 12 B per sampled pixel, live alongside the decoded image, and the
+  `auto` path's interior rectangle is ~69% of a 3:2 frame ⇒ ~24 B/px (a full-frame
+  `--base-region` / `--d-max-region` rectangle ⇒ 28 B/px; `--grid` is charged one
+  cell, ~1/16 of its rectangle). For `inspect`/`estimate` the **film-base phase is
+  the peak**, and gating them at 18 B/px let them be admitted and then exceed their
+  own estimate — measured **+26%** on the auto-interior rectangle and **+43%** on a
+  full-frame one. The interior rule lives once, in `film_base::auto_interior_pixels`,
+  which both the sampler and the model call.
+- **Freed is not gone — and the first fix got this wrong.** Counting the film-base
+  phase but letting it *compete* with the others still under-estimated a full-frame
+  `--base-region` **`convert`** by **10.2%** (measured 3.743 GB vs 3.396 GB
+  predicted). The sample is freed before the render, but peak RSS is a high-water
+  mark and the allocator keeps the pages, so it is **retained**: added into the
+  render and encode phases, not competed against them. That makes 50 B/px for that
+  run, which reproduces the measurement to +0.3%. It is the same rule the encode
+  buffers are summed under — one rule, stated once, instead of two ad-hoc choices.
+  Its cost is the default budget: 4 GiB would now reject that (working) run, so the
+  default is **6 GiB**.
+- **Two accounting subtleties that cost real accuracy.** (1) At decode the u16
+  read buffer is freed before the IR plane is read, so those are *alternatives*
+  (`max`), and the common base is the RGB f32 buffer, **not** the whole decoded
+  image — getting this wrong first gave 22 B/px instead of 18 and a +29% error on
+  `inspect`. (2) At encode the IR export buffer *is* freed before the main
+  quantize buffer, and counting them **additively** is a deliberate over-count in
+  line with the err-toward-rejecting policy — not something measurement requires:
+  `convert` and `convert --export-ir` measure the *same* peak RSS, i.e. the IR
+  export buffer never shows up in the high-water mark at all.
+- **Allowance = 15% + 128 MiB** on top of the accounted buffers, for allocator
+  slack, the binary, lcms2, and the tiff writer. Worst measured overhead was
+  **12.9%** (74.65 MP `--output-hdr`; the u16 convert is +10.9% and `inspect`
+  +11.9%, and both 18.66 MP runs measure *below* their accounted total), so 15%
+  keeps a margin — 2.1 percentage points — instead of tracking one machine's
+  allocator exactly. Every calibration point over-estimates (+7% to +13% at
+  full size; looser on small frames, where the fixed term dominates). A preflight
+  that under-estimates is worse than useless — it approves the run that OOMs. The
+  fixed term is also an unavoidable **floor**: nothing can be admitted under a
+  budget of 128 MiB or less, and the rejection message says so instead of
+  suggesting a smaller frame.
+- **Budget: fixed 6 GiB default + `--max-memory`, warn tier tracks RAM.** The
+  hard default is a constant so the pass/fail decision is machine-independent;
+  the *warning* compares against detected physical RAM (70%), which is the one
+  deliberately environment-dependent piece (and, via `--strict`, the one way the
+  exit code can differ between machines — documented in §11 and the module doc).
+  RAM detection is fail-soft: `sysctlbyname("hw.memsize")` on Darwin (new direct
+  `libc` dep — already in `Cargo.lock` transitively), `min(/proc/meminfo MemTotal,
+  cgroup memory limit)` on Linux (v2 `memory.max`, else v1
+  `memory/memory.limit_in_bytes` — `MemTotal` alone reports the *host's* RAM and
+  would keep the warn tier silent inside a container capped well below it, which is
+  where an OOM kill is likeliest), else `None` ⇒ no warning. The Linux body is a
+  plain function, not inline `#[cfg]` code, so it type-checks on macOS too; its
+  parsers are unit-tested on every target.
+- **`--max-memory` is operational, not a recipe key** (like `--report` /
+  `--strict` / telemetry): CLI-only, absent from the sidecar, and proven not to
+  perturb output bytes; a recipe carrying `max_memory` is rejected by
+  `deny_unknown_fields`.
+- **The gate needs a metadata-only probe.** `io::decode::probe(&Path) ->
+  ImageShape` reads IFD0 dimensions/colortype plus an IFD walk for the IR plane
+  and **never calls `read_image`** — `decode` only returns dimensions *after*
+  allocating, which is far too late. Verified: rejecting `largest.tif` under
+  `--max-memory 2GiB` exits 6 in 0.29 s at **3.5 MB** peak RSS, with no output or
+  sidecar written. The probe deliberately mirrors `decode`'s IR rule (skip
+  reduced-res previews, take a full-res 1-channel page); tests pin probe and
+  decode against each other on the fixtures and the three synthetic layouts,
+  because a missed IR plane silently under-estimates by a third of the RGB
+  footprint.
+- **`decode` is now `decode_within(&Path, budget_bytes)`** — one entry point,
+  with the `tiff` read buffers capped at `min(4 GiB, budget)`. That is what
+  reconciles the old standalone 4 GiB input limit with the peak budget: the
+  preflight is the authority, this cap is the defense-in-depth for a header whose
+  strip sizes don't match the shape the probe read. The old budgetless `decode`
+  survives only as a test-module helper.
+- **Per-command profiles matter.** `inspect`/`estimate` gate on
+  `RunProfile::DecodeOnly` (decode ~18 B/px, film-base ~24–28); gating them on the
+  convert peak would reject scans they diagnose comfortably. An e2e test picks a
+  budget *between* the two estimates and asserts `inspect` passes while `convert`
+  exits 6. The film-base phase is sized from a `SamplePlan` the orchestrator derives
+  from the resolved base source plus `estimate`'s `--grid` / `--d-max-region`, so a
+  command's actual sampling — not a guess — reaches the model.
+- **New exit code 6** (`NcError::Resource`), distinct from `Unsupported` (4): the
+  input is fine, it is *this run on this budget* that can't proceed, so an agent
+  can retry with `--max-memory` instead of giving up on the file. Exit 6 is
+  `convert`/`inspect`/`estimate`; on `roll` a rejected frame is recorded per frame
+  (with its `memory` block, which lives on the frame entry rather than on the "ok"
+  payload for exactly that reason), siblings are still written, and the roll exits
+  **1** — roll's ordinary frames-failed code, unchanged by this task.
+- **Reproducing the measurements** (not in `harness.sh`, whose `resource` row is
+  per-roll; `largest.tif` is a standalone sample). Release binary, and the film base
+  is arbitrary because peak RSS doesn't depend on it — this is a memory
+  measurement, not a color baseline:
+
+  ```bash
+  BIG=../nc-assets/samples/largest.tif
+  /usr/bin/time -l ./target/release/nc convert --film-base 0.9,0.55,0.42 \
+      -o /tmp/big.tiff "$BIG" | jq .memory      # estimate vs measured RSS
+  /usr/bin/time -l ./target/release/nc convert --film-base 0.9,0.55,0.42 \
+      --max-memory 2GiB -o /tmp/nope.tiff "$BIG"   # exit 6, ~3.5 MB peak
+  ```
+
+  The report's `memory.estimated_peak_bytes` is directly comparable to
+  `time -l`'s `maximum resident set size`; the pinned pairs live in
+  `pipeline::memory`'s `estimate_stays_conservative_against_the_measured_peaks`.
+- Not done here (deliberately): getting below **two** overlapping images. The
+  decoded image outlives the render because `--export-ir` reads it, so the model
+  keeps counting both. Bounding to a small working set is `io/streaming-tiled-io`.
+- 2026-07-28: **Landed after two review rounds** (six independent reviewers across
+  the two). What the review caught is worth recording, because all of it was in the
+  *model*, not the plumbing:
+  - The first model claimed `film_base` allocated no full-frame buffer. It does —
+    `region_channels` materializes its rectangle unstrided into three `Vec<f32>`.
+    Measured consequence: `estimate --base-region` on the 74.65 MP frame was
+    admitted at a predicted 1.679 GB and actually peaked at **2.119 GB (+26%)**.
+  - The first *fix* (count the phase, let it compete via `max`) still
+    under-estimated a full-frame-region `convert` by **10.2%**. Freed pages stay
+    resident, so the sample had to be **retained** into the later phases. That
+    reproduces the measurement to +0.3% — and forced the default budget from 4 GiB
+    to **6 GiB**, since 4 GiB would have rejected a run that measures 3.743 GB and
+    completes fine.
+  - Ship-time review added two more: an out-of-bounds `--base-region` was charged
+    its raw `w*h` and rejected as a 12852 GiB *resource* overrun (exit 6) instead
+    of the usage error (exit 2) — `sampled_pixels` now clamps to the frame, leaving
+    `region_channels` the authority; and Linux cgroup detection read only the root
+    limit files, so nested (Kubernetes/systemd) cgroups were missed and the warn
+    tier stayed silent in exactly the containers it exists for.
+  - Verified at the end: every one of 11 model-vs-measured pairs is conservative
+    (+4.6% to +76%), and all nine real-scan and fixture outputs are byte-identical
+    to the pre-change baselines.
+  - **For `io/streaming-tiled-io`:** the auto film-base path currently *refuses* on
+    every real asset (no uniform rebate band), so its 8.3 B/px interior sample is a
+    future cost, not a present one — but a user-sized `--base-region` already
+    reaches 12 B/px today, and that is the term the model exists to catch.
+- 2026-07-27 (review pass, same day): the six-reviewer round on this change found
+  one real modelling bug and a set of doc/derivation errors. Carried forward:
+  - The **film-base phase was missing** from the model (see the dedicated bullet
+    above). It only mattered for `inspect`/`estimate`, which could be admitted at 18
+    B/px and then peak at ~24 — the gate approving a run that exceeds its own
+    prediction. `convert` was never wrong, but for the wrong reason.
+  - **Every measured row in the calibration table used an explicit `--film-base`**,
+    so no measurement here exercised the interior sample. The auto path's ~8.3 B/px
+    is *derived* (74.65 MP `inspect --auto-base`: 1.811 GB accounted, 2.22 GB
+    estimated) and still needs a `time -l` run to confirm — the one open calibration
+    item left by this task.
+  - Derived numbers corrected in place: worst measured overhead is **12.9%**, not
+    11% (so the allowance margin is 2.1pp, not 4); the 74.65 MP `convert` estimate is
+    **3.40 GB = 3.16 GiB**, not "~3.25 GB"; the 18.66 MP before/after is
+    **975 → 681 MB** (30%), not the unit-mixed "~930 MiB → 681 MB" (27%).
+  - Nothing enforces the model against the code: the per-phase test compares it
+    against the numbers in the module doc, so a new full-frame buffer is invisible
+    until someone updates both. Stated plainly in the module doc now, since this
+    round is proof it can happen.
 
 
 ## streaming-tiled-io

@@ -171,14 +171,166 @@ fn parse_silverfast_xmp(xml: &str) -> Option<SilverfastXmp> {
     })
 }
 
+/// The pixel-buffer shape of an input file, read from its headers **without
+/// allocating a single pixel buffer** — see [`probe`]. This is what the memory
+/// preflight (`pipeline::memory`) sizes a run from, so it must be obtainable
+/// before `decode` allocates anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ImageShape {
+    pub width: u32,
+    pub height: u32,
+    /// Samples per pixel in the primary image (3 for the formats `decode`
+    /// accepts; reported as found so an unsupported file still gets an honest
+    /// estimate before `decode` rejects it).
+    pub channels: u16,
+    /// Bits per sample of the primary image (16 for accepted files).
+    pub bits_per_sample: u8,
+    /// Whether a full-resolution single-channel plane that `decode` would take as
+    /// the IR plane is present. It costs a third of the RGB footprint again once
+    /// decoded (`u16` read buffer + `f32` plane), so the estimate must know.
+    pub ir_present: bool,
+}
+
+impl ImageShape {
+    /// Validated constructor — the single entry point for building a shape, so a
+    /// degenerate one can never reach the sizing model. Parity with
+    /// [`LinearImage::new`]'s guard, and for the same reason: with `channels` or
+    /// `bits_per_sample` zero, *every* term of `pipeline::memory`'s per-pixel
+    /// accounting collapses and the estimate becomes the fixed allowance for any
+    /// dimensions whatsoever — a gate that passes every budget. Zero width/height
+    /// does the same. Nothing but this constructor's guard stands between that and
+    /// a silently disabled preflight (that `decode` also rejects such files is an
+    /// ordering coincidence in a different function, not an invariant of this one).
+    pub fn new(
+        width: u32,
+        height: u32,
+        channels: u16,
+        bits_per_sample: u8,
+        ir_present: bool,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || channels == 0 || bits_per_sample == 0 {
+            return Err(NcError::Unsupported(format!(
+                "degenerate image shape {width}x{height}, {channels} channel(s), \
+                 {bits_per_sample}-bit: an image with no pixels, no channels, or no \
+                 bit depth cannot be sized or decoded"
+            )));
+        }
+        Ok(Self {
+            width,
+            height,
+            channels,
+            bits_per_sample,
+            ir_present,
+        })
+    }
+}
+
+/// Read an input's [`ImageShape`] from its TIFF headers alone: IFD0's dimensions
+/// and color type plus an IFD walk for the IR plane. **No `read_image` call, so
+/// no pixel buffer is allocated** — this is the metadata-only probe the memory
+/// preflight gates on *before* [`decode`] commits to gigabytes (`decode` returns
+/// dimensions only after `read_image` has already allocated, which is far too
+/// late for an oversized input).
+///
+/// Deliberately **permissive about layout**: it reports the shape it finds and
+/// leaves every accept/reject decision to [`decode`], which stays the single
+/// authority on what nc supports (duplicating those checks here would risk the
+/// two paths disagreeing). Only an unreadable/corrupt header fails, with the same
+/// exit codes [`decode`] uses. The one shape it will *not* report is a degenerate
+/// or unmappable one: a [`ColorType`] outside [`color_shape`]'s arms is an
+/// [`NcError::Unsupported`] here (exit 4, same class `decode` would give it)
+/// rather than a `(0, 0)` channel/depth pair, which would make the memory
+/// preflight's estimate independent of the dimensions and pass every budget.
+///
+/// IR detection deliberately mirrors `decode`'s rule — skip reduced-resolution
+/// previews, then take a full-resolution 1-channel page — because a missed IR
+/// plane would under-estimate the peak by a third of the RGB footprint; the tests
+/// in this module (`probe_agrees_with_decode_*`) pin the two against each other on
+/// the committed fixtures and on synthetic layouts covering the preview cases.
+pub fn probe(path: &Path) -> Result<ImageShape> {
+    let file = File::open(path)
+        .map_err(|e| NcError::Decode(format!("cannot open {}: {e}", path.display())))?;
+    let mut dec =
+        Decoder::new(BufReader::new(file)).map_err(|e| tiff_err(path, "not a readable TIFF", e))?;
+
+    let (width, height) = dec
+        .dimensions()
+        .map_err(|e| tiff_err(path, "reading image dimensions", e))?;
+    let color = dec
+        .colortype()
+        .map_err(|e| tiff_err(path, "reading color type", e))?;
+    let (channels, bits_per_sample) = color_shape(color).ok_or_else(|| {
+        NcError::Unsupported(format!(
+            "{}: unsupported color type {color:?} in the primary image; \
+             only SilverFast HDR/HDRi 16-bit RGB scans are supported",
+            path.display()
+        ))
+    })?;
+
+    // Walk the remaining IFDs for the IR plane, exactly as `decode` does: skip
+    // reduced-resolution previews (bit 0 of `NewSubfileType` *and* smaller
+    // dimensions), and count the first full-resolution single-channel page as IR.
+    // Only IFD metadata is parsed — `next_image` does not read strips.
+    let mut ir_present = false;
+    while !ir_present && dec.more_images() {
+        dec.next_image()
+            .map_err(|e| tiff_err(path, "advancing to the next IFD", e))?;
+        let subfile = dec
+            .find_tag_unsigned::<u32>(Tag::NewSubfileType)
+            .ok()
+            .flatten();
+        let dims = dec
+            .dimensions()
+            .map_err(|e| tiff_err(path, "reading IFD dimensions", e))?;
+        if subfile.is_some_and(|s| s & 0x1 != 0) && dims != (width, height) {
+            continue; // reduced-resolution preview
+        }
+        // A page whose color type is *unmappable* is simply not the IR plane
+        // (`decode` will reject the file if it matters). A page whose color type
+        // cannot be **read** is different: swallowing that error would silently
+        // drop the IR plane from the estimate — 38 → 30 B/px at encode, a 21%
+        // under-estimate derived from an error nobody saw. Surface it like every
+        // other read failure in this walk.
+        let page_channels = color_shape(
+            dec.colortype()
+                .map_err(|e| tiff_err(path, "reading IFD color type", e))?,
+        )
+        .map_or(0, |(c, _)| c);
+        ir_present = dims == (width, height) && page_channels == 1;
+    }
+
+    ImageShape::new(width, height, channels, bits_per_sample, ir_present)
+}
+
+/// Samples per pixel + bits per sample of a `tiff` [`ColorType`] — the two facts
+/// the sizing model needs. Unknown/exotic variants report `None` rather than
+/// guessing: a fabricated channel count would silently skew the estimate, and a
+/// zeroed one would disable the gate entirely, so the caller must fail loudly
+/// instead (`decode` rejects such files anyway).
+fn color_shape(color: ColorType) -> Option<(u16, u8)> {
+    match color {
+        ColorType::Gray(b) => Some((1, b)),
+        ColorType::RGB(b) => Some((3, b)),
+        ColorType::RGBA(b) | ColorType::CMYK(b) => Some((4, b)),
+        ColorType::GrayA(b) => Some((2, b)),
+        _ => None,
+    }
+}
+
 /// Decode a SilverFast HDR/HDRi TIFF at `path` into a linear `f32` image,
 /// returning a [`DecodeInfo`] describing what was found alongside it.
-pub fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
+///
+/// `budget_bytes` caps the `tiff` crate's read buffers (at the classic-TIFF
+/// ceiling, whichever is lower): the orchestrator passes the run's resolved memory
+/// budget, so a header whose advertised strip sizes lied to the memory preflight's
+/// [`probe`] still cannot allocate past what the run was admitted under. See
+/// [`decode_limits`].
+pub fn decode_within(path: &Path, budget_bytes: u64) -> Result<(LinearImage, DecodeInfo)> {
     let file = File::open(path)
         .map_err(|e| NcError::Decode(format!("cannot open {}: {e}", path.display())))?;
     let mut dec = Decoder::new(BufReader::new(file))
         .map_err(|e| tiff_err(path, "not a readable TIFF", e))?
-        .with_limits(decode_limits());
+        .with_limits(decode_limits(budget_bytes));
 
     // --- IFD0: the RGB image -------------------------------------------------
     let (width, height) = dec
@@ -453,17 +605,31 @@ fn normalize_u16(samples: &[u16]) -> Vec<f32> {
     samples.iter().map(|&s| s as f32 / MAX).collect()
 }
 
+/// The structural ceiling on a single read buffer: SilverFast HDR/HDRi are
+/// classic TIFFs, so no legitimate plane can exceed the 32-bit offset limit.
+const CLASSIC_TIFF_CEILING: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+
 /// Decode limits raised above the `tiff` crate's 256 MiB default so full-size
 /// archival scans (a single uncompressed RGB16 IFD can exceed 256 MiB) decode in
-/// one read. Capped at the classic-TIFF ceiling rather than unlimited so a corrupt
-/// oversized header still trips the limit and fails loudly instead of OOMing.
-fn decode_limits() -> Limits {
-    // SilverFast HDR/HDRi are classic TIFFs (< 4 GiB); size both the whole-image
-    // and per-segment buffers to that ceiling.
-    const MAX_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+/// one read, and capped so a corrupt oversized header trips the limit and fails
+/// loudly instead of OOMing.
+///
+/// The cap is the **lower** of the classic-TIFF ceiling and the run's memory
+/// budget (`pipeline::memory`), which at budgets at or above 4 GiB is byte-for-byte
+/// the ceiling that was already here. It is a **per-buffer backstop, not a bound
+/// on the run**: a single buffer may still equal the whole budget the run was
+/// admitted under, and the run was admitted on two-to-three such buffers plus the
+/// allowance. The thing that bounds the run is the memory preflight, which gates
+/// it *before* this point from a metadata-only [`probe`]; this cap only catches a
+/// header whose advertised strip sizes don't match the shape the probe read.
+fn decode_limits(budget_bytes: u64) -> Limits {
+    // Saturate rather than truncate: `as usize` would wrap 4 GiB to 0 on a 32-bit
+    // target and make every decode — even a 1-pixel one — fail the allocation
+    // limit.
+    let max = usize::try_from(budget_bytes.min(CLASSIC_TIFF_CEILING)).unwrap_or(usize::MAX);
     let mut limits = Limits::default();
-    limits.decoding_buffer_size = MAX_BYTES;
-    limits.intermediate_buffer_size = MAX_BYTES;
+    limits.decoding_buffer_size = max;
+    limits.intermediate_buffer_size = max;
     limits
 }
 
@@ -502,9 +668,16 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tiff::encoder::TiffEncoder;
-    use tiff::encoder::colortype::{Gray16, RGB8, RGB16};
+    use tiff::encoder::colortype::{CMYK16, Gray16, RGB8, RGB16, RGBA16};
 
     use super::*;
+
+    /// The structural-cap form of [`decode_within`]: these tests exercise decoding
+    /// itself, not the memory budget, so they read with the classic-TIFF ceiling
+    /// the decoder used before `io/memory-preflight` threaded a budget through.
+    fn decode(path: &Path) -> Result<(LinearImage, DecodeInfo)> {
+        decode_within(path, CLASSIC_TIFF_CEILING)
+    }
 
     /// A temp TIFF that deletes itself on drop, so a failing test can't leak it.
     struct TempTiff(PathBuf);
@@ -1016,5 +1189,169 @@ mod tests {
         assert_eq!(ir.len(), 502 * 462);
         assert_unit_range(&img.rgb);
         assert_unit_range(&ir);
+    }
+
+    // --- probe / decode agreement (the memory preflight's foundation) ---------
+
+    /// [`probe`] and [`decode_within`] must report the same shape for the same
+    /// file. The memory preflight sizes a run from the probe alone, so any
+    /// disagreement — a missed IR plane above all, which costs a third of the RGB
+    /// footprint again — silently under-estimates the peak and lets the gate
+    /// approve a run that then OOMs.
+    fn assert_probe_agrees_with_decode(path: &Path) {
+        let shape = probe(path).expect("probe should succeed on a decodable file");
+        let (img, info) = decode(path).expect("fixture should decode");
+        assert_eq!((shape.width, shape.height), (info.width, info.height));
+        assert_eq!(shape.channels, info.channels, "channels disagree");
+        assert_eq!(
+            shape.bits_per_sample, info.bits_per_sample,
+            "bit depth disagrees"
+        );
+        assert_eq!(
+            shape.ir_present, info.ir_present,
+            "IR presence disagrees (probe {}, decode {})",
+            shape.ir_present, info.ir_present
+        );
+        assert_eq!(shape.ir_present, img.ir.is_some());
+    }
+
+    #[test]
+    fn probe_agrees_with_decode_on_the_real_fixtures() {
+        assert_probe_agrees_with_decode(&fixture("hdr-48bit.tif"));
+        assert_probe_agrees_with_decode(&fixture("hdri-64bit.tif"));
+        assert_probe_agrees_with_decode(&fixture("black-48bit.tif"));
+    }
+
+    #[test]
+    fn probe_agrees_with_decode_across_the_synthetic_layouts() {
+        // Plain HDR (single IFD).
+        let hdr = temp_path("probe-hdr");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&hdr.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(4, 2, &[1000u16; 24]).unwrap();
+        assert_probe_agrees_with_decode(&hdr.0);
+
+        // HDRi (RGB + full-res grayscale IR).
+        let hdri = temp_path("probe-hdri");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&hdri.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(4, 2, &[1000u16; 24]).unwrap();
+        enc.write_image::<Gray16>(4, 2, &[500u16; 8]).unwrap();
+        assert_probe_agrees_with_decode(&hdri.0);
+
+        // HDRi with a reduced-resolution preview between the two — the real
+        // high-res layout, and the case a naive "second IFD is IR" probe gets
+        // wrong in *both* directions (preview taken as IR / IR missed entirely).
+        let preview = temp_path("probe-preview-hdri");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&preview.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(4, 2, &[1000u16; 24]).unwrap();
+        let mut thumb = enc.new_image::<RGB16>(2, 1).unwrap();
+        thumb
+            .encoder()
+            .write_tag(Tag::NewSubfileType, 1u32)
+            .unwrap();
+        thumb.write_data(&[1000u16; 6]).unwrap();
+        let mut ir = enc.new_image::<Gray16>(4, 2).unwrap();
+        ir.encoder().write_tag(Tag::NewSubfileType, 4u32).unwrap();
+        ir.write_data(&[500u16; 8]).unwrap();
+        assert_probe_agrees_with_decode(&preview.0);
+        assert!(probe(&preview.0).unwrap().ir_present, "IR must be found");
+
+        // A preview with no IR plane at all: the preview must not be mistaken for
+        // one (that would over-estimate, but for the wrong reason — and the same
+        // mistake under-estimates when the real IR sits after it).
+        let no_ir = temp_path("probe-preview-noir");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&no_ir.0).unwrap()).unwrap();
+        enc.write_image::<RGB16>(4, 2, &[1000u16; 24]).unwrap();
+        let mut thumb = enc.new_image::<RGB16>(2, 1).unwrap();
+        thumb
+            .encoder()
+            .write_tag(Tag::NewSubfileType, 1u32)
+            .unwrap();
+        thumb.write_data(&[1000u16; 6]).unwrap();
+        assert_probe_agrees_with_decode(&no_ir.0);
+        assert!(!probe(&no_ir.0).unwrap().ir_present);
+    }
+
+    #[test]
+    fn probe_fails_the_same_way_decode_does_on_an_unreadable_file() {
+        // The gate runs before decode, so its failure modes must map to the same
+        // exit codes rather than surfacing as a confusing generic error.
+        let missing = PathBuf::from("/nonexistent/nc-probe-test.tif");
+        assert_eq!(probe(&missing).unwrap_err().exit_code(), 3);
+
+        let garbage = temp_path("probe-garbage");
+        std::fs::write(&garbage.0, b"this is not a TIFF at all").unwrap();
+        assert_eq!(probe(&garbage.0).unwrap_err().exit_code(), 3);
+    }
+
+    #[test]
+    fn probe_reports_the_shape_of_layouts_decode_rejects() {
+        // The probe is deliberately permissive: it reports what it finds so an
+        // unsupported file still gets an honest *estimate* before `decode` rejects
+        // it. These arms of `color_shape` are what the sizing model multiplies, so
+        // pin them — and pin that `decode` is what refuses the file, since the gate
+        // relies on that ordering rather than duplicating the check.
+        let gray = temp_path("probe-gray16");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&gray.0).unwrap()).unwrap();
+        enc.write_image::<Gray16>(4, 2, &[1000u16; 8]).unwrap();
+        let shape = probe(&gray.0).unwrap();
+        assert_eq!((shape.channels, shape.bits_per_sample), (1, 16));
+        assert!(!shape.ir_present, "IFD0 is never its own IR plane");
+        assert_eq!(decode(&gray.0).unwrap_err().exit_code(), 4);
+
+        let cmyk = temp_path("probe-cmyk16");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&cmyk.0).unwrap()).unwrap();
+        enc.write_image::<CMYK16>(4, 2, &[1000u16; 32]).unwrap();
+        let shape = probe(&cmyk.0).unwrap();
+        assert_eq!((shape.channels, shape.bits_per_sample), (4, 16));
+        assert_eq!(decode(&cmyk.0).unwrap_err().exit_code(), 4);
+
+        let rgba = temp_path("probe-rgba16");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&rgba.0).unwrap()).unwrap();
+        enc.write_image::<RGBA16>(4, 2, &[1000u16; 32]).unwrap();
+        let shape = probe(&rgba.0).unwrap();
+        assert_eq!((shape.channels, shape.bits_per_sample), (4, 16));
+        assert_eq!(decode(&rgba.0).unwrap_err().exit_code(), 4);
+
+        // 8-bit RGB maps too (3 channels, 8 bits) and reaches `decode`'s
+        // "expected 3-channel 16-bit RGB" rejection.
+        let rgb8 = temp_path("probe-rgb8");
+        let mut enc = TiffEncoder::new(std::fs::File::create(&rgb8.0).unwrap()).unwrap();
+        enc.write_image::<RGB8>(4, 2, &[200u8; 24]).unwrap();
+        let shape = probe(&rgb8.0).unwrap();
+        assert_eq!((shape.channels, shape.bits_per_sample), (3, 8));
+        let err = decode(&rgb8.0).unwrap_err();
+        assert_eq!(err.exit_code(), 4);
+        assert!(
+            err.to_string().contains("expected 3-channel 16-bit RGB"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn degenerate_shapes_are_rejected_at_construction() {
+        // The guard that keeps a `(0, 0)` channel/depth pair — or zero dimensions —
+        // from reaching `pipeline::memory`, where every per-pixel term would
+        // collapse and the estimate would fit any budget at any size.
+        for (w, h, c, b) in [(0, 1, 3, 16), (1, 0, 3, 16), (1, 1, 0, 16), (1, 1, 3, 0)] {
+            let err = ImageShape::new(w, h, c, b, false).unwrap_err();
+            assert_eq!(err.exit_code(), 4, "{w}x{h} {c}ch {b}-bit");
+            assert!(err.to_string().contains("degenerate image shape"), "{err}");
+        }
+        assert!(ImageShape::new(1, 1, 3, 16, false).is_ok());
+    }
+
+    #[test]
+    fn a_budget_below_the_read_buffer_trips_the_decode_limit() {
+        // The lowered `decode_limits(budget)` branch. Nearly unreachable in
+        // practice — a passing preflight guarantees the budget exceeds the read
+        // buffer — so this pins the intent: the cap is a loud failure, not a
+        // silently truncated read.
+        let err = decode_within(&fixture("hdr-48bit.tif"), 64).unwrap_err();
+        // `tiff`'s limit error is an IO/parse-class failure, not "unsupported".
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(
+            err.to_string().contains("reading RGB image pixels"),
+            "the failure must name the stage: {err}"
+        );
     }
 }

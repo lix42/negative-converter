@@ -685,6 +685,7 @@ dependencies = [
  "kamadak-exif",
  "lcms2",
  "lcms2-sys",
+ "libc",
  "palette",
  "rayon",
  "roxmltree",

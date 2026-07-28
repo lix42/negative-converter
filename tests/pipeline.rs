@@ -5333,3 +5333,523 @@ fn roll_report_carries_the_shared_recipes_identity() {
         "a roll frame and the equivalent single convert share one params_hash"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Memory preflight (`io/memory-preflight`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memory_preflight_reports_the_estimate_and_budget_decision() {
+    // Every command that decodes reports what the preflight decided, with the
+    // per-phase breakdown behind the number the gate compared.
+    let tmp = TempDir::new("mem-report");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, _err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0);
+    let mem = json(&stdout)["memory"].clone();
+    assert_eq!(mem["budget_source"], "default");
+    assert_eq!(mem["budget_bytes"], 6u64 * 1024 * 1024 * 1024);
+    assert_eq!(mem["decision"], "ok");
+    let peak = mem["estimated_peak_bytes"].as_u64().unwrap();
+    let accounted = mem["accounted_bytes"].as_u64().unwrap();
+    assert!(peak > accounted, "the estimate includes the allowance");
+    // The full-pipeline profile sizes all four phases; the encode phase (two images
+    // + the quantize buffer) is the peak, and the film-base phase — one image, since
+    // an explicit `--film-base` samples nothing — is below it.
+    assert!(mem["decode_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(accounted, mem["encode_bytes"].as_u64().unwrap());
+    let film_base = mem["film_base_bytes"].as_u64().unwrap();
+    assert!(
+        film_base > 0 && film_base < accounted,
+        "film-base phase must be sized and below the encode peak: {mem}"
+    );
+
+    // `inspect` gates on the decode-only profile — no render, no encode. It runs
+    // auto detection, so its peak is the film-base phase (the decoded image plus the
+    // sampled interior), *above* the decode phase.
+    let (code, stdout, _err) = run(&["inspect", fixture("hdri-64bit.tif").to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let mem = json(&stdout)["memory"].clone();
+    assert_eq!(mem["render_bytes"], 0);
+    assert_eq!(mem["encode_bytes"], 0);
+    assert_eq!(mem["accounted_bytes"], mem["film_base_bytes"]);
+    assert!(
+        mem["film_base_bytes"].as_u64().unwrap() > mem["decode_bytes"].as_u64().unwrap(),
+        "the auto interior sample must be counted: {mem}"
+    );
+
+    // `estimate` reports the same block on the same profile — and its sampling plan
+    // reaches the model rather than being a constant: the film-base term scales
+    // with the rectangle actually sampled.
+    let (code, stdout, err) = run(&[
+        "estimate",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--base-region",
+        "0,0,60,60",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let small = json(&stdout)["memory"].clone();
+    assert_eq!(small["budget_source"], "default");
+    assert_eq!(small["decision"], "ok");
+    assert_eq!(small["render_bytes"], 0);
+    assert_eq!(small["encode_bytes"], 0);
+    assert_eq!(small["accounted_bytes"], small["decode_bytes"]);
+
+    let (code, stdout, err) = run(&[
+        "estimate",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--grid",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let grid = json(&stdout)["memory"].clone();
+    // `--grid` over the whole frame samples five cells one at a time, so it is
+    // charged for one cell (~1/16 of the frame) — more than a 60x60 rectangle, but
+    // far less than the whole frame, and on a fixture this small still under
+    // decode's 18 B/px. (An earlier model charged the whole enclosing rectangle,
+    // a ~16x over-count that made this phase the peak here.)
+    assert!(
+        grid["film_base_bytes"].as_u64().unwrap() > small["film_base_bytes"].as_u64().unwrap(),
+        "a whole-frame grid must cost more than a 60x60 rectangle:\n{grid}\n{small}"
+    );
+    let whole_frame_sample = 12 * 502 * 462; // if it charged the whole rectangle
+    assert!(
+        grid["film_base_bytes"].as_u64().unwrap()
+            < grid["decode_bytes"].as_u64().unwrap() + whole_frame_sample,
+        "a grid cell must cost far less than the whole rectangle:\n{grid}"
+    );
+    assert_eq!(
+        grid["accounted_bytes"].as_u64().unwrap(),
+        grid["decode_bytes"]
+            .as_u64()
+            .unwrap()
+            .max(grid["film_base_bytes"].as_u64().unwrap()),
+        "accounted is the max over phases:\n{grid}"
+    );
+}
+
+#[test]
+fn over_budget_convert_is_rejected_before_decoding_with_exit_six() {
+    // The gate must fire *before* the pipeline allocates or writes anything: exit
+    // 6 (resource), a message naming both numbers, and no output file / sidecar
+    // left behind.
+    let tmp = TempDir::new("mem-reject");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--max-memory",
+        "1MiB",
+    ]);
+    assert_eq!(code, 6, "over-budget must exit 6:\n{stdout}\n{err}");
+    assert!(err.contains("resource:"), "{err}");
+    assert!(err.contains("--max-memory"), "{err}");
+    assert!(err.contains("1.0 MiB"), "message names the budget:\n{err}");
+    assert!(
+        err.contains("estimated peak"),
+        "message names the estimate:\n{err}"
+    );
+    assert!(!out.exists(), "no output image may be written");
+    assert!(
+        !PathBuf::from(format!("{}.json", out.display())).exists(),
+        "no sidecar may be written"
+    );
+    assert!(
+        stdout.is_empty(),
+        "a rejected run emits no report:\n{stdout}"
+    );
+}
+
+/// A **header-only** classic TIFF: IFD0 advertises `width`x`height` 16-bit RGB in
+/// one strip, and no strip data is written at all. `probe` reads tags only, so it
+/// reports the advertised shape; anything that actually decodes fails. The file is
+/// ~130 bytes whatever the advertised dimensions, which is what makes an
+/// "oversized input" test fast and portable.
+fn write_header_only_rgb16_tiff(path: &std::path::Path, width: u32, height: u32) {
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    // 9 entries: dimensions, bits/sample, compression, photometric, strip offsets,
+    // samples/pixel, rows/strip, strip byte counts (ascending tag order).
+    let ifd_end = 8 + 2 + 9 * 12 + 4; // IFD0 starts at 8
+    let bits_offset = ifd_end as u32; // [16, 16, 16] doesn't fit in 4 bytes
+    let data_offset = bits_offset + 6;
+
+    let mut b: Vec<u8> = Vec::new();
+    b.extend_from_slice(b"II"); // little-endian
+    b.extend_from_slice(&42u16.to_le_bytes());
+    b.extend_from_slice(&8u32.to_le_bytes()); // offset of IFD0
+    b.extend_from_slice(&9u16.to_le_bytes()); // entry count
+    let entry = |tag: u16, ty: u16, count: u32, value: u32, b: &mut Vec<u8>| {
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&ty.to_le_bytes());
+        b.extend_from_slice(&count.to_le_bytes());
+        // Little-endian: a SHORT value sits in the low two bytes of the field.
+        b.extend_from_slice(&value.to_le_bytes());
+    };
+    entry(256, LONG, 1, width, &mut b); // ImageWidth
+    entry(257, LONG, 1, height, &mut b); // ImageLength
+    entry(258, SHORT, 3, bits_offset, &mut b); // BitsPerSample
+    entry(259, SHORT, 1, 1, &mut b); // Compression = none
+    entry(262, SHORT, 1, 2, &mut b); // PhotometricInterpretation = RGB
+    entry(273, LONG, 1, data_offset, &mut b); // StripOffsets
+    entry(277, SHORT, 1, 3, &mut b); // SamplesPerPixel
+    entry(278, LONG, 1, height, &mut b); // RowsPerStrip (one strip)
+    entry(279, LONG, 1, 6, &mut b); // StripByteCounts (deliberately short)
+    b.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+    assert_eq!(b.len(), ifd_end);
+    b.extend_from_slice(
+        &[
+            16u16.to_le_bytes(),
+            16u16.to_le_bytes(),
+            16u16.to_le_bytes(),
+        ]
+        .concat(),
+    );
+    std::fs::write(path, &b).unwrap();
+}
+
+#[test]
+fn an_oversized_header_is_rejected_while_the_heap_is_still_empty() {
+    // The central claim of `io/memory-preflight`: the gate runs *before* the large
+    // allocation. A header-only TIFF advertising 100000x100000 RGB16 (a 30 GB
+    // convert peak) with no pixel data is what discriminates the two orderings:
+    // `probe` reads tags only and succeeds, so a preflight *before* decode rejects
+    // it with the resource error (exit 6) having allocated nothing, whereas a gate
+    // placed after decode would have to try the read first and would surface a
+    // decode/limits error (exit 3) instead — or OOM.
+    let tmp = TempDir::new("mem-header-only");
+    let input = tmp.path("oversized.tif");
+    write_header_only_rgb16_tiff(&input, 100_000, 100_000);
+    assert!(
+        std::fs::metadata(&input).unwrap().len() < 1024,
+        "the oversized input must stay a tiny file"
+    );
+    let out = tmp.path("out.tiff");
+
+    let (code, stdout, err) = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(
+        code, 6,
+        "an oversized header must be rejected as a resource error, not decoded:\n{stdout}\n{err}"
+    );
+    assert!(err.contains("resource:"), "{err}");
+    assert!(err.contains("100000x100000"), "{err}");
+    assert!(!out.exists(), "nothing may be written");
+    assert!(
+        stdout.is_empty(),
+        "a rejected run emits no report:\n{stdout}"
+    );
+
+    // Same file, same command, with a budget large enough to admit the estimate:
+    // now the run gets as far as the decode, which fails on the absent pixel data.
+    // That is the proof the exit 6 above came from the preflight rather than from
+    // the file being unreadable.
+    let (code, _stdout, err) = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--max-memory",
+        "512GiB",
+    ]);
+    assert_ne!(
+        code, 6,
+        "with room in the budget the gate must not fire:\n{err}"
+    );
+    assert!(!out.exists());
+}
+
+#[test]
+fn roll_reports_the_preflight_decision_per_frame() {
+    // Frames can differ in dimensions (so in estimated peak) under one shared
+    // budget, and the gate runs per frame — so the decision is reported per frame,
+    // not once for the roll.
+    let tmp = TempDir::new("mem-roll-report");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--max-memory",
+        "2GiB",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let frames = report["frames"].as_array().expect("frames array");
+    assert_eq!(frames.len(), 2);
+    for frame in frames {
+        let mem = &frame["memory"];
+        assert_eq!(mem["budget_source"], "flag");
+        assert_eq!(mem["budget_bytes"], 2u64 * 1024 * 1024 * 1024);
+        assert_eq!(mem["decision"], "ok");
+        assert!(mem["estimated_peak_bytes"].as_u64().unwrap() > 0);
+    }
+    // The HDRi frame carries an IR plane, so it must estimate above the HDR one.
+    let hdr = frames[0]["memory"]["estimated_peak_bytes"]
+        .as_u64()
+        .unwrap();
+    let hdri = frames[1]["memory"]["estimated_peak_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        hdri > hdr,
+        "the IR-carrying frame must estimate higher ({hdri} vs {hdr})"
+    );
+}
+
+#[test]
+fn roll_gates_each_frame_against_the_shared_budget() {
+    // The gate is per frame, not per roll: a budget between the two frames'
+    // estimates must convert the smaller one and fail only its sibling — with the
+    // sibling's resource error in its own frame entry, and the roll still exiting
+    // non-zero.
+    let tmp = TempDir::new("mem-roll-mixed");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr_in = fixture("hdr-48bit.tif");
+    let hdri_in = fixture("hdri-64bit.tif");
+
+    // Read both estimates from a roll that fits, rather than hardcoding fixture
+    // arithmetic that would rot with the model.
+    let probe_dir = tmp.path("probe");
+    let (code, stdout, err) = run(&[
+        "roll",
+        hdr_in.to_str().unwrap(),
+        hdri_in.to_str().unwrap(),
+        "--out-dir",
+        probe_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let frames = json(&stdout)["frames"].as_array().unwrap().clone();
+    let small = frames[0]["memory"]["estimated_peak_bytes"]
+        .as_u64()
+        .unwrap();
+    let large = frames[1]["memory"]["estimated_peak_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(small < large);
+    let between = ((small + large) / 2).to_string();
+
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        hdr_in.to_str().unwrap(),
+        hdri_in.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--max-memory",
+        &between,
+    ]);
+    assert_ne!(code, 0, "the over-budget frame must fail the roll:\n{err}");
+    let report = json(&stdout);
+    assert_eq!(report["summary"]["succeeded"], 1);
+    assert_eq!(report["summary"]["failed"], 1);
+    let frames = report["frames"].as_array().unwrap();
+    assert_eq!(frames[0]["status"], "ok");
+    assert_eq!(frames[1]["status"], "failed");
+    let error = frames[1]["error"].as_str().unwrap();
+    assert!(
+        error.contains("resource:") && error.contains("estimated peak"),
+        "the failed frame must carry its own resource error: {error}"
+    );
+    // The frame that fitted was written; its sibling was not.
+    assert!(
+        out_dir.join("hdr-48bit_positive.tiff").exists(),
+        "the in-budget frame must still be converted"
+    );
+    assert!(
+        !out_dir.join("hdri-64bit_positive.tiff").exists(),
+        "the over-budget frame must write nothing"
+    );
+}
+
+#[test]
+fn over_budget_rejection_covers_inspect_estimate_and_roll() {
+    // All four decoding commands are gated, each on its own profile.
+    let tmp = TempDir::new("mem-reject-all");
+    let input = fixture("hdri-64bit.tif");
+    let in_str = input.to_str().unwrap();
+
+    let (code, _out, err) = run(&["inspect", in_str, "--max-memory", "1KiB"]);
+    assert_eq!(code, 6, "inspect must be gated too:\n{err}");
+    let (code, _out, err) = run(&["estimate", in_str, "--max-memory", "1KiB"]);
+    assert_eq!(code, 6, "estimate must be gated too:\n{err}");
+
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let out_dir = tmp.path("out");
+    let (code, _out, err) = run(&[
+        "roll",
+        in_str,
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--max-memory",
+        "1KiB",
+    ]);
+    // Roll gates per frame; a frame that fails the preflight fails the roll (its
+    // own exit code is the roll-level "frames failed" error, not exit 6).
+    assert_ne!(code, 0, "an over-budget frame must fail the roll:\n{err}");
+    assert!(
+        err.contains("resource:") || err.contains("estimated peak"),
+        "the frame's resource error must surface:\n{err}"
+    );
+}
+
+#[test]
+fn decode_only_commands_pass_a_budget_that_rejects_the_full_pipeline() {
+    // The per-profile gate is not cosmetic: a budget between the decode-only and
+    // full-pipeline estimates must admit `inspect` while rejecting `convert`.
+    let tmp = TempDir::new("mem-profile");
+    let input = fixture("hdri-64bit.tif");
+    let in_str = input.to_str().unwrap();
+
+    // Read the two estimates from the reports themselves rather than hardcoding
+    // fixture-size arithmetic that would rot with the model.
+    let (_c, stdout, _e) = run(&["inspect", in_str]);
+    let decode_only = json(&stdout)["memory"]["estimated_peak_bytes"]
+        .as_u64()
+        .unwrap();
+    let out = tmp.path("out.tiff");
+    let (_c, stdout, _e) = run(&[
+        "convert",
+        in_str,
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    let full = json(&stdout)["memory"]["estimated_peak_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        decode_only < full,
+        "decode-only ({decode_only}) must estimate below the full pipeline ({full})"
+    );
+
+    // A budget in between: inspect proceeds, convert is rejected.
+    let between = (decode_only + full) / 2;
+    let budget = between.to_string();
+    let (code, _out, err) = run(&["inspect", in_str, "--max-memory", &budget]);
+    assert_eq!(code, 0, "inspect fits the in-between budget:\n{err}");
+    let out2 = tmp.path("out2.tiff");
+    let (code, _out, err) = run(&[
+        "convert",
+        in_str,
+        "-o",
+        out2.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--max-memory",
+        &budget,
+    ]);
+    assert_eq!(code, 6, "convert exceeds the in-between budget:\n{err}");
+    assert!(!out2.exists());
+}
+
+#[test]
+fn max_memory_is_operational_not_a_recipe_key() {
+    // Like `--report`/`--strict`/`--telemetry`: the budget must not enter the
+    // recipe, must not appear in the sidecar, and must not change a single output
+    // byte. A recipe *carrying* the key must be rejected (`deny_unknown_fields`).
+    let tmp = TempDir::new("mem-not-recipe");
+    let input = fixture("hdri-64bit.tif");
+    let in_str = input.to_str().unwrap();
+
+    let plain = tmp.path("plain.tiff");
+    let budgeted = tmp.path("budgeted.tiff");
+    for (out, extra) in [
+        (&plain, Vec::new()),
+        (&budgeted, vec!["--max-memory", "3GiB"]),
+    ] {
+        let mut args = vec![
+            "convert",
+            in_str,
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+        ];
+        args.extend_from_slice(&extra);
+        let (code, _out, err) = run(&args);
+        assert_eq!(code, 0, "{err}");
+    }
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&budgeted).unwrap(),
+        "--max-memory must not perturb the output image"
+    );
+    let sidecar = std::fs::read_to_string(format!("{}.json", budgeted.display())).unwrap();
+    // Only the key itself: a bare `contains("memory")` over the whole sidecar would
+    // fail on any future recipe key that merely has the substring in its name.
+    assert!(
+        !sidecar.contains("max_memory"),
+        "the budget must not appear in the effective recipe:\n{sidecar}"
+    );
+
+    // …and it is not accepted as a recipe key.
+    let recipe = write_file(
+        &tmp.path("bad.json"),
+        r#"{"max_memory": 4294967296, "film_base": {"source": {"explicit": [0.9, 0.55, 0.42]}}}"#,
+    );
+    let out = tmp.path("nope.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        in_str,
+        "-o",
+        out.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "an unknown recipe key is a usage error:\n{err}");
+    assert!(!out.exists());
+}
+
+#[test]
+fn malformed_max_memory_is_a_usage_error() {
+    let tmp = TempDir::new("mem-bad-flag");
+    let out = tmp.path("out.tiff");
+    for bad in ["0", "lots", "4.5GiB", "12PiB"] {
+        let (code, _stdout, err) = run(&[
+            "convert",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--max-memory",
+            bad,
+        ]);
+        assert_eq!(
+            code, 2,
+            "--max-memory {bad:?} must be a usage error:\n{err}"
+        );
+        assert!(!out.exists());
+    }
+}
