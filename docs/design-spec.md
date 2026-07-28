@@ -151,7 +151,7 @@ plane is a separate single channel, carried but not consumed (§6.1).
 | **density `D` / `B` / `D′`** | `D = −log10(scan / Dmin)`, log-scale opacity; `B = density_scale·D + density_offset` (per-channel corrected density); `D′ = B + shadow_balance·w_lo(D̄) + highlight_balance·w_hi(D̄)` (after regional balance, §7.2) | **denser** negative — a **brighter** scene | `D`: `0` at base, `≈ [0, 6]` (slightly `< 0` if a pixel out-transmits the base); `B`/`D′` shifted by the offset (and, for `D′`, the regional balance) | `density::to_density`, `density::regional_balance`, `DensityImage.density` |
 | **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | reconstruction→curve handoff inside `density::reconstruct` |
 | **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | curve-defined and unclamped `f32` | `algo::FilmRgbImage`, `algo::reconstruct` (shipped typed reconstruction output) |
-| **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | `pipeline::working_space` mapper (implemented; uncommitted, not yet wired into the render path) |
+| **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | `pipeline::working_space` mapper (implemented; wired into the `film-master` render branch, not the legacy no-preset path) |
 | **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
 | **output sample** (terminal) | the written image value | brighter | preset/container-defined integer or float encoding | `io::encode` and planned HDR encoders |
 
@@ -213,11 +213,25 @@ detector proposes as possible rebate.
 
 - **Current implemented container:** TIFF (BigTIFF when size requires 64-bit
   offsets).
-- **Current implemented bit depth (flag-controlled):**
-  - default (no `--output-hdr`) → 16-bit integer TIFF (standard archival positive).
-  - `--output-hdr` → 32-bit float TIFF with unclamped values **after the current
-    print-render controls**. This is a transitional rendered float TIFF, neither
-    the future `film-master` nor a Rec.2100 display-HDR image.
+- **Current implemented preset selection:** `--output-preset <legacy|film-master>`
+  / recipe key `output.preset` (default `legacy`). Exactly **two** names are
+  accepted today; every other planned name below is rejected with a
+  "does not accept yet" message, and the pre-release `scene-master` is rejected as an
+  unreleased-schema break (no alias). `legacy` **is** the no-preset state, so it
+  stays compatible with the legacy depth/profile/container flags; `film-master` is
+  a *named* preset and therefore atomic.
+- **Current implemented bit depth:**
+  - default (no preset, no `--output-hdr`) → 16-bit integer TIFF (standard
+    archival positive).
+  - `--output-hdr` (legacy path only) → 32-bit float TIFF with unclamped values
+    **after the current print-render controls**. This is a transitional rendered
+    float TIFF, neither `film-master` nor a Rec.2100 display-HDR image, and it is
+    **never** an alias for the preset.
+  - `--output-preset film-master` → 32-bit float TIFF, unclamped, taken directly
+    from the NC film RGB v1 mapped linear ACEScg with the ACEScg profile embedded
+    and **no** working→output transform, print control, or display rendering. The
+    depth follows from the preset, not from `output.hdr` (which must stay at its
+    default under a named preset).
 - **Current color selection:** the output color space is a CLI
   option (`--output-profile`). The default depends on output depth:
   - 16-bit (default) output → **sRGB** (standard, display-ready positive).
@@ -245,11 +259,13 @@ detector proposes as possible rebate.
   ISO 21496-1 is the public model and non-Apple support is an acceptance
   requirement. HEIC gain maps are deferred pending a portable final-standard
   encoder and approved HEVC licensing/packaging policy.
-- **Planned presets:**
-  - `gain-map-hdr` — default, backward-compatible display HDR;
+- **Presets** (⇧ = accepted by the current CLI, everything else is planned and
+  rejected with a "not accepted yet" message):
+  - `legacy` ⇧ — the no-preset transitional TIFF path (the default);
+  - `film-master` ⇧ — unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering;
+  - `gain-map-hdr` — future default, backward-compatible display HDR;
   - `display-p3` — wide-gamut SDR;
   - `compatibility` — sRGB SDR;
-  - `film-master` — unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering;
   - `hdr-pq` — single-rendition BT.2020 / Rec.2100 PQ;
   - `hdr-hlg` — explicit HLG/broadcast-oriented output;
   - `custom` — expert-selected format/profile policy.
@@ -275,7 +291,38 @@ detector proposes as possible rebate.
   non-default downstream WB/exposure/black/white/highlight/tone/gamut/display-transfer
   control; there is no silent ignore mode. Creatively or print/display-adjusted
   linear output is `custom`; measured correction alone does not rename the
-  preset.
+  preset. **As shipped**, that rejection runs on the *resolved* config
+  (`cli::validate`), so a value is rejected identically whether it came from a
+  recipe, a flag, or a removed simple-control migration — and a flag that resets a
+  recipe value back to its documented default is legitimately accepted, which is how
+  a roll recipe carrying print controls can still be re-exported as a master. The
+  atomicity rule uses the **same resolved-value semantics** for the three selectors: a
+  general presence rule cannot be made to behave identically for a recipe key (only the
+  resolved value can) and would contradict the escape hatch above. So `--bigtiff auto`
+  and an explicit `"hdr": false` are accepted next to a named preset — `auto` means
+  "decide for me" and `hdr: false` is the `serde` default, so neither asserts anything
+  the preset does not already do — while `--output-hdr`, a non-default
+  `output.output_profile`, and `--bigtiff on` are rejected from either provenance.
+  Being value-based, the rule is gated on "is this a *named* preset", so every future
+  preset inherits it.
+  **`--output-sdr` is the one deliberate presence check** (`cli`, before `validate`),
+  and the reason it does not follow the value rule is that it is *not* a
+  reset-to-default: §9 defines it as "**force** the default 16-bit integer output", and
+  a named preset does not write 16-bit integer output — so honouring the preset would
+  silently discard an explicit request for a container it cannot produce. It is also
+  the one selector with **no recipe spelling** (the recipe carries only `hdr: bool`,
+  whose `false` is indistinguishable from omission), so there is no recipe form left
+  behaving differently and detecting it costs a single field read rather than raw-JSON
+  probing. Exit 2, not a warning. `film-master` additionally rejects the **other** frame-local
+  measurement, for the same cross-frame reason as auto Dmax: an `auto`
+  `reconstruction.density.balance_range` *when a balance is actually applied*, because
+  the tone-ramp anchors would then be measured from each frame's own density
+  percentiles. An `auto` range with equal shadow and highlight balances — including the
+  neutral default — consults no range and stays accepted.
+  The resolved-branch record lands in the report as `output_render` (§8). Suffix
+  validation against the preset's resolved container is still owned by
+  `output/presets`; `film-master` is a TIFF, so the existing `.tif`/`.tiff` rule
+  already covers it, including `nc roll`'s automatic `<stem>_positive.tiff` names.
 - **Metadata:** the effective parameter set (recipe) and key estimated values are
   written to a **sidecar JSON** next to the output (paired by name; the same shape
   as `--dump-params`). Current TIFF output embeds the ICC profile of the chosen
@@ -292,11 +339,29 @@ The diagram below depicts the **target / replacement** architecture (tagged
 reconstruction, NC film RGB v1 working-space mapping, and the film-master /
 display-render split). The **current shipped** pipeline implements: decode +
 input-semantics resolution, film-base / `Dmin` estimation, the tagged
-reconstruction to typed `FilmRgbImage` (`algo::reconstruct`), the legacy print
-render applied *after* the typed boundary but before the working→output ICC
-transform (`algo::finish_print` — named presets later move it after the ACEScg
-boundary), and TIFF encode. See the "Architecture" section of `CLAUDE.md` for
-the current-vs-target framing.
+reconstruction to typed `FilmRgbImage` (`algo::reconstruct`), and TIFF encode —
+then branches on the resolved `output.preset` (`pipeline::stages::render`):
+
+- `legacy` (default, no preset) — the legacy print render applied *after* the
+  typed boundary but before the working→output ICC transform
+  (`algo::finish_print` → `pipeline::color::to_output`). Its pixels are frozen until
+  the output-preset migration, pinned by two complementary tests:
+  `pipeline::stages::golden` freezes the **pre-colour-transform** values bit-for-bit
+  (it calls `reconstruct_and_print` directly, so it never crosses the preset
+  `match`), and
+  `stages::legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence`
+  pins that the no-preset branch of `render` is still exactly that sequence composed
+  with `color::to_output`.
+- `film-master` — stage 4 (`working_space::map_nc_film_rgb_v1`) followed by
+  `render_split::film_master`, encoded directly as unclamped f32 with the ACEScg
+  profile attached and no transform.
+
+Stage 5b's **shared print controls** (`render_split::display_source`) are
+implemented and unit-tested but have no CLI-reachable consumer yet: no display
+preset is accepted, so a non-default `print.linear_range` is a loud usage error
+rather than a silently-ignored knob. `output/sdr-display-rendering` and
+`output/hdr-display-rendering` are its consumers. See the "Architecture" section
+of `CLAUDE.md` for the current-vs-target framing.
 
 ```
                  ┌──────────────────────────────────────────────┐
@@ -374,6 +439,13 @@ compression onto the HDR rendition.
 The shared adjustment order is WB → exposure → the existing black-point
 operation → `print.linear_range` affine placement → branch-specific work;
 `linear_range` defaults to `[0,1]` and requires finite `low < high`.
+Mechanically (as shipped in `pipeline::render_split`), the controls are resolved
+**once** into a `ResolvedPrintControls` — an `auto` white balance becomes concrete
+gains there, so the branches cannot re-estimate and drift — applied once, and then
+*borrowed* by both branches from one `SharedDisplaySource`. "SDR and HDR receive
+the identical adjusted source" is therefore structural, not a convention the two
+renderers have to remember. `highlight_compress` is deliberately **not** shared:
+highlight roll-off is branch-specific SDR tone policy.
 
 ### 6.1 IR channel handling (Step 1)
 
@@ -404,8 +476,8 @@ The shipped implementation selects the tagged reconstruction with
 `--reconstruction simple|density`; density then selects
 `--density-curve exponential|sigmoid`. Every reconstruction path returns the
 typed `FilmRgbImage` boundary (`algo::reconstruct`), so only the working-space
-mapper (`pipeline::working_space`, implemented but not yet wired into the render
-path) can construct `AcesCgImage`. The pre-reconstruction
+mapper (`pipeline::working_space`) can construct `AcesCgImage`. It is wired into
+the `film-master` render branch; the legacy no-preset path does not cross it. The pre-reconstruction
 `--algorithm simple|density|sigmoid` selector (a boxed `Converter` returning an
 untyped `LinearImage`) is **removed** — the flag and the old recipe forms are
 rejected with a migration error (nc is unreleased; no aliases).
@@ -421,11 +493,16 @@ The pre-reconstruction converter ran `positive = 1 - scan/Dmin` →
 black/white remap. In the shipped pipeline, stage 3 ends at unclamped
 `U_c = 1 - scan_c/Dmin_c` and returns `FilmRgbImage`. `simple` has no Dmax.
 Inversion WB and clip remapping move after the ACEScg boundary to the downstream
-shared WB/black/range-placement contract; until named presets land they are
-simply **not expressible** — the old flags and `simple.*` recipe keys are
-rejected with a migration error (their defaults were the exact identity, so the
-default simple output is unchanged). Preset migration then resolves
-`--invert-white-balance` to explicit
+shared WB/black/range-placement contract. **As shipped**, both replacement homes
+now exist — explicit `print.white_balance` and `print.linear_range` /
+`--linear-range LOW,HIGH` — but no *display* preset is accepted yet and
+`film-master` bypasses print controls, so a non-default range is still not
+applicable: the old flags and `simple.*` recipe keys remain **rejected with a
+migration error** that names the concrete replacement, and a non-default
+`print.linear_range` is itself rejected rather than silently ignored (their
+defaults were the exact identity, so the default simple output is unchanged).
+Preset migration — activated with the display renderers, not with `film-master` —
+then resolves `--invert-white-balance` to explicit
 `print.white_balance` and clip endpoints to
 `print.linear_range = [low, high]` / atomic `--linear-range LOW,HIGH`. Range
 merge starts from the recipe pair or `[0,1]`; the atomic flag replaces both
@@ -627,14 +704,33 @@ pub fn finish_print(
 ) -> Result<(LinearImage, Option<[f32; 3]>)>;
 
 // Working-space boundary (film-rgb-working-space, `pipeline::working_space`):
-// implemented (uncommitted; not yet wired into the render path — no non-test
-// callers). Named output code will accept AcesCgImage rather than FilmRgbImage.
-// The mapping is a total pure matrix transform (no failure mode — non-finite
-// inputs pass through, counted later at encode), so it returns the value
-// directly rather than a Result.
+// implemented and wired into the `film-master` render branch. Named output code
+// accepts AcesCgImage rather than FilmRgbImage. The mapping is a total pure matrix
+// transform (no failure mode — non-finite inputs pass through, counted later at
+// encode), so it returns the value directly rather than a Result.
 pub struct AcesCgImage { /* private; constructor module-private to the mapper */ }
 
 pub fn map_nc_film_rgb_v1(image: FilmRgbImage) -> AcesCgImage;
+
+// Named-output split (film-master-render-pipeline, `pipeline::render_split`):
+// every entry point accepts AcesCgImage and nothing else. `film_master` is a pure
+// unwrap (the bypass IS the master); the display half resolves the shared print
+// controls once, and both branches then borrow the ONE AdjustedAcesCgImage the
+// resulting SharedDisplaySource owns (`&shared.source`) — so "SDR and HDR receive
+// the identical adjusted source" is structural: there is no per-branch buffer to
+// diverge. AdjustedAcesCgImage and ResolvedPrintControls both have private fields
+// and module-private constructors, so a display renderer cannot be handed a buffer
+// that skipped the shared stage, cannot be handed the master (a LinearImage), and
+// cannot receive controls that skipped the gain/exposure/range validation.
+// DisplayBranch is the seam a consumer matches on to select its renderer; it has no
+// influence on the shared stage, which is why no function here takes one.
+pub fn film_master(aces: AcesCgImage) -> LinearImage;
+pub fn resolve_shared_controls(aces: &AcesCgImage, print: &PrintParams)
+    -> Result<ResolvedPrintControls>;   // the only ResolvedPrintControls producer
+pub fn apply_shared_controls(aces: AcesCgImage, controls: &ResolvedPrintControls)
+    -> AdjustedAcesCgImage;
+pub fn display_source(aces: AcesCgImage, print: &PrintParams)
+    -> Result<SharedDisplaySource>;
 ```
 
 ## 8. CLI design
@@ -729,13 +825,16 @@ density fields take the displayed defaults. Partial input may omit
 resolved recipe/report emits exactly one tagged curve. Partial objects are
 otherwise permitted. Unknown fields are rejected at every level.
 
-Target preset migration later adds `print.linear_range` and emits simple
-WB/range adjustments only under `print`. Legacy
-`simple.invert_white_balance`, `simple.clip_low`, and `simple.clip_high` are
+`print.linear_range` **has shipped** (with the shared display stage), so simple's
+WB/range adjustments already have their replacement homes under `print`; what target
+preset migration still adds is the *alias acceptance*, not the keys. Legacy
+`simple.invert_white_balance`, `simple.clip_low`, and `simple.clip_high` are to be
 accepted solely as warned input aliases during the preset migration described in
 §9; they are not part of `reconstruction` and are currently rejected with a
-migration error (as are the flags). Legacy no-preset TIFF calls retain
-their current pixel ordering until migration.
+migration error (as are the flags), because neither replacement has a consumer in
+this build — `film-master` bypasses print controls and no display preset is accepted,
+so an alias could only warn and then hard-error on the same run. Legacy no-preset
+TIFF calls retain their current pixel ordering until migration.
 
 ### Reports & determinism
 
@@ -777,9 +876,40 @@ task):
       }
     }
   },
-  "working_mapping": "nc-film-rgb-v1"
+  "working_mapping": "nc-film-rgb-v1",
+  "output_render": {
+    "preset": "legacy",
+    "print_controls": true,
+    "display_render": true,
+    "encoding": "rendered-u16-tiff",
+    "content": "print-rendered positive in the selected output colour space; …",
+    "working_mapping": "nc-film-rgb-v1",
+    "reconstruction_schema_version": 1
+  }
 }
 ```
+
+`output_render` (`convert` only) records **which branch out of the ACEScg boundary
+ran and what it applied**, so a consumer never has to re-derive it from the recipe.
+`preset` is the resolved `output.preset`; `print_controls` says whether the
+print/tone sub-stage ran *at all* (not whether its values were non-default — it is
+`false` for `film-master`, and also for legacy `simple`, whose positive passes
+through untouched); `display_render` says whether any tone/gamut/transfer operation
+ran. `encoding` is a stable identifier —
+`rendered-u16-tiff` | `transitional-rendered-float-tiff` |
+`unclamped-linear-acescg-float-tiff` — and the legacy float name deliberately reads
+as *rendered*, because `--output-hdr` is never a film master. `content` states what
+the pixels contain; for `film-master` it names the intentional
+film/lens/development/scanner/reconstruction/curve rendering and explicitly
+disclaims physical scene recovery. It names the resolved roll-fixed `Dmax` placement
+only when the run actually made one — `simple` has no anchor and exponential
+`dmax = none` places none, and claiming one there would be a false provenance
+statement. `working_mapping` is repeated inside the block
+so a master's provenance is self-contained, and
+`reconstruction_schema_version` mirrors `reconstruction.schema_version`. The
+behavioral `pipeline_version` is a **separate** field owned by
+`conversion-versioning`; this build stamps none, so it is absent rather than
+guessed.
 
 For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object;
 for exponential `"none"`, `dmax` is
@@ -815,6 +945,26 @@ nc convert in.tiff -o out.tiff \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
   --highlight-compress 0.3
+
+# The film master: unclamped 32-bit float linear ACEScg straight out of the
+# NC film RGB v1 mapping, ACEScg profile embedded, no print or display controls at
+# all. Reconstruction + the density curve + the roll-fixed Dmax placement ARE in
+# the master (that is the intentional film rendering); WB/exposure/black/range and
+# every display operation are not. The preset is atomic, so a NON-DEFAULT
+# --output-hdr / --output-profile / --bigtiff alongside it is a usage error (a
+# default-valued --bigtiff auto is fine; --output-sdr is rejected outright, since it
+# forces a 16-bit container the master cannot produce) — as is a print control,
+# --auto-d-max, or a measured --auto-balance-range. Never silently dropped.
+nc convert frame12.tiff -o frame12_master.tiff \
+  --output-preset film-master \
+  --film-base 0.92,0.55,0.42 --d-max 1.64
+# → report.output_render = { "preset": "film-master", "print_controls": false,
+#     "display_render": false, "encoding": "unclamped-linear-acescg-float-tiff",
+#     "working_mapping": "nc-film-rgb-v1", … }
+# Re-exporting a graded roll recipe as a master: reset its print controls on the
+# command line (flags win, and the rejection is on the RESOLVED value).
+nc convert frame12.tiff -o frame12_master.tiff --params roll-A.json \
+  --output-preset film-master --print-exposure 0 --white-balance 1,1,1
 
 # Reuse a roll recipe but override one knob for this frame.
 nc convert frame12.tiff -o frame12_pos.tiff \
@@ -924,7 +1074,13 @@ object (§8). Names are binding and unknown keys are rejected
 
 ### Input / decode
 - `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
-  Recipe key `input.export_ir`.
+  Recipe key `input.export_ir`. The sidecar is written at the **same resolved output
+  depth as the primary image** (`OutputParams::depth()`), so it is 16-bit for the
+  default, and 32-bit float for both legacy `--output-hdr` and `--output-preset
+  film-master` — the preset resolves f32 without `output.hdr` being set, so the IR
+  container follows even though the flag was not passed. The IR *samples* never
+  change: the plane is carried through the pipeline untouched (Step-1 rule: preserve,
+  don't consume), so only the quantization headroom differs.
 - `--film-type <silver|chromogenic|unknown>` ⇒ `input.film_type` (default
   `"unknown"`) — the declared film chemistry. `chromogenic` (C-41 colour or
   C-41-process B&W) is IR-transparent, so on an HDRi scan that carries an IR plane
@@ -1226,10 +1382,20 @@ false-positive on legitimate high-contrast conversions).
 ### Print / tone render
 - `--print-exposure <f>` — overall positive exposure.
 - `--black-point <f>` — paper black / shadow floor.
-- Target shared render contract adds `--linear-range LOW,HIGH` /
-  `print.linear_range` (default `[0,1]`) for the exact affine
-  `(x-low)/(high-low)` black/range placement (black/white-point placement). It is distinct from the existing
-  density print `black_point` and from SDR/HDR reference white in nits.
+- `--linear-range LOW,HIGH` / `print.linear_range` (default `[0,1]` = the exact
+  identity) — the shared render contract's exact affine `(x-low)/(high-low)`
+  black/range placement (black/white-point placement). It is distinct from the
+  existing density print `black_point` and from SDR/HDR reference white in nits. An
+  **atomic pair**: the flag replaces both endpoints, and passing the default `0,1`
+  is the flags-win reset of a recipe's non-default pair. Validated after merge for
+  finite `low < high` **and** a representable span (two individually-finite
+  endpoints whose difference overflows would silently collapse every sample). A
+  negative `LOW` is legal, so a leading `-` is accepted.
+  **Shipped state:** only the shared display stage applies it and no display preset
+  is accepted yet (`output/sdr-display-rendering` / `output/hdr-display-rendering`
+  own the branch renderers), while the legacy no-preset path keeps its frozen
+  ordering and `film-master` bypasses print controls entirely — so a non-default
+  value is currently a **loud usage error** rather than a silently-ignored knob.
 - White balance — a single mutually-exclusive choice, recipe key
   `print.white_balance` (default `{ "explicit": [1, 1, 1] }` = neutral; see
   §7.2). The two flags conflict (passing both is a usage error); whichever is
@@ -1257,10 +1423,15 @@ false-positive on legitimate high-contrast conversions).
 - `--highlight-compress <f>` — highlight roll-off amount.
 
 ### Simple algorithm
-- Current legacy controls: `--invert-white-balance R,G,B` and
-  `--clip-low <f>` / `--clip-high <f>`. They currently run before the output
-  transform. In the target film-preserving pipeline they are not simple
-  reconstruction parameters. Preset migration accepts them as warned aliases:
+- Removed legacy controls: `--invert-white-balance R,G,B` and
+  `--clip-low <f>` / `--clip-high <f>`. In the pre-split converter they ran before
+  the output transform; **as shipped they are rejected flags** (hidden args carrying
+  a migration error that names the concrete replacement) and the matching `simple.*`
+  recipe keys are rejected too, because they are not simple reconstruction
+  parameters in the film-preserving pipeline. Preset migration is to accept them as
+  warned aliases — activated with the named *display* presets, not with
+  `film-master`, since until then neither replacement has a consumer and an alias
+  could only warn and then hard-error on the same run:
   inversion WB maps to explicit `print.white_balance`, while clip endpoints map
   to `print.linear_range` / atomic `--linear-range LOW,HIGH`. Resolve the recipe
   pair or `[0,1]` first. The atomic flag replaces both endpoints and conflicts
@@ -1277,15 +1448,53 @@ false-positive on legitimate high-contrast conversions).
 
 ### Output / encode (current terminal stage; target stages 5–6)
 - `-o, --output <path>` (required)
+- `--output-preset <legacy|film-master>` — the atomic output **policy** choice;
+  recipe key `output.preset` (default `legacy`). One mutually-exclusive enum field,
+  never parallel bools: a preset resolves a whole coherent container/depth/profile
+  policy plus which branch of the ACEScg boundary runs.
+  - `legacy` **is** the no-preset state — the transitional TIFF path where the print
+    controls run before the working→output ICC transform — so it stays compatible
+    with `--output-hdr`/`--output-sdr`/`--output-profile`/`--bigtiff` and produces a
+    byte-identical file to passing no preset at all.
+  - `film-master` is a *named* preset: an unclamped 32-bit float linear ACEScg TIFF
+    taken directly from the NC film RGB v1 mapping with the ACEScg profile embedded
+    and no transform. Being named it is **atomic** — a **non-default** resolved value
+    for any of the legacy selectors below is a usage error next to it, from a flag or
+    a recipe key alike; a value that already equals the documented default
+    (`--bigtiff auto`, `"hdr": false`) is accepted, since it asks the preset for
+    nothing it does not already do. `--output-sdr` is the exception and is rejected by
+    flag **presence**: it *forces* 16-bit integer output, which the master cannot
+    produce, so it is a contradicted request rather than a redundant one (and it has no
+    recipe spelling, so nothing is left behaving differently). It resolves f32 itself rather than through
+    `output.hdr`, and after recipe/CLI merge it rejects the frame-local measurements
+    `auto` `Dmax` and (when a balance is actually applied) `auto`
+    `reconstruction.density.balance_range`, plus every non-default print control
+    (`print_exposure`, `black_point`, `white_balance`, `highlight_compress`,
+    `linear_range`) whatever their source. There is no ignore-conflicting-controls
+    mode; a linear export that also wants a creative/print/display adjustment is the
+    `custom` workflow. Supported anchors by curve: exponential — `fixed` (default),
+    explicit/roll, or `none` (unity placement); sigmoid — `fixed` or explicit/roll
+    (`none` is rejected for the S-curve regardless of preset); `simple` has no
+    `Dmax`.
+  - Every other planned name (`gain-map-hdr`, `display-p3`, `compatibility`,
+    `hdr-pq`, `hdr-hlg`, `custom`) is rejected with a distinct "not accepted yet"
+    message rather than a generic unknown-value error, and the pre-release
+    `scene-master` is rejected as an unreleased-schema break naming the rename —
+    **not** an alias. The flag and the recipe key share one parser, so a name gets
+    the same diagnosis wherever it appears.
 - `--output-hdr` — current transitional flag: write a 32-bit float unclamped
-  **rendered** TIFF after the current print controls, not the future `film-master`
-  or Rec.2100 display HDR; without it output is 16-bit integer. Recipe key
+  **rendered** TIFF after the current print controls, never the `film-master`
+  preset (which is a *different* flag — see `--output-preset`) or Rec.2100 display
+  HDR; without it output is 16-bit integer. Recipe key
   `output.hdr` (bool, default `false`). It will be replaced by the explicit
   `film-master`/display-HDR preset model.
 - `--output-sdr` — force the default 16-bit integer output, overriding a
   recipe's `output.hdr = true` (the flags-win escape hatch; an absent
   presence flag never clobbers a recipe value). Conflicts with
-  `--output-hdr`; passing both is a usage error.
+  `--output-hdr`; passing both is a usage error. Also a usage error next to a
+  **named** output preset (checked by flag presence, unlike the other selectors —
+  see `--output-preset`): the preset resolves a container this flag forces a
+  different one for, and it has no recipe spelling to mirror the check onto.
 - `--output-profile <srgb|prophoto|acescg|display-p3|path-to-icc>` (default is
   depth-aware: `srgb` for the 16-bit default, `acescg` for `--output-hdr`).
   `display-p3` tags a wide-gamut SDR Display P3 destination (P3 primaries, D65
@@ -1317,8 +1526,9 @@ explicitly reset recipe values to defaults, and the resolved report records the
 effective values/provenance and that no display transfer ran. A selected
 `correction.profile` is not a downstream creative/print/display control:
 corrected output remains `film-master` and records mandatory profile
-identity/hash/scope provenance. Those preset names are not accepted by the current
-CLI yet. `nc roll` migration is part of the preset task: automatic names use
+identity/hash/scope provenance. Of those names only `film-master` is accepted by
+the current CLI (see `--output-preset` above); the rest are not yet.
+`nc roll` migration is part of the preset task: automatic names use
 each resolved container suffix, manifest/per-frame overrides validate
 independently, and each sidecar derives from its final image path. The single roll
 report remains on stdout or the explicit `--report-file`; that destination is
@@ -1349,8 +1559,14 @@ invariant violations are **loud, `--strict`-promotable warnings** rather than
 hard errors, so a deliberate best-effort batch remains usable: (1) a shared
 `film_base.source` other than `explicit` re-estimates Dmin per frame; (2) the
 active Dmax key set to `auto` measures Dmax per frame; (3) a per-frame override
-that sets `film_base` changes that frame's Dmin; and (4) a per-frame override
-that changes the active Dmax key changes that frame's placement. Shared `fixed`, explicit, or
+that sets `film_base` changes that frame's Dmin; (4) a per-frame override
+that changes the active Dmax key changes that frame's placement; and (5) a per-frame
+override that sets `output.preset` gives that frame a different output **policy** —
+a different branch out of the ACEScg boundary, so a different *image class* (unclamped
+linear master vs rendered TIFF), not merely a different rendering. (5) warns even when
+the override restates the shared preset, because `frames[].status` carries no
+`output_render` block (that is a `convert`-only report field), leaving the
+`frames[].overrides` echo as the only other trace. Shared `fixed`, explicit, or
 `none` Dmax policies remain deterministic across the roll. `input.export_ir` is rejected in roll mode (one
 path, N frames). Determinism: same batch + same recipe ⇒ byte-identical output per
 frame.
@@ -1374,11 +1590,11 @@ affect the output bytes (telemetry on or off ⇒ byte-identical TIFF + sidecar).
   input/output/sidecar/report-file is still a loud usage error (a config mistake,
   caught up front — an odd log path must never silently append into the scan).
 
-**Telemetry record shape (`schema_version` 2, serialize-only JSON).** Designed for
+**Telemetry record shape (`schema_version` 3, serialize-only JSON).** Designed for
 a future background uploader (§12, `telemetry/upload`) to drain and ship:
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "timestamp_ms": 1752566400000,
   "nc_version": "0.1.0",
   "target": "aarch64-apple-darwin",
@@ -1393,6 +1609,7 @@ a future background uploader (§12, `telemetry/upload`) to drain and ship:
     "color": 18.4, "encode": 1.0, "ir_export": 0.6
   },
   "conversion": {
+    "preset": "legacy",
     "reconstruction": "density", "curve": "exponential",
     "params_hash": "92a827ffd2d0aebd",
     "film_base_source": { "explicit": [0.9, 0.55, 0.42] },
@@ -1405,9 +1622,19 @@ a future background uploader (§12, `telemetry/upload`) to drain and ship:
 only for density reconstruction (`simple` has no curve stage) and
 `conversion.dmax` only when the curve applied an anchor (schema v2 replaced
 v1's `conversion.algorithm` with the `reconstruction` + `curve` pair).
+`conversion.preset` is the resolved `output.preset` — v3 added it, because without it
+a `film-master` run is indistinguishable from a legacy one. `conversion.output_hdr`
+means "a 32-bit float TIFF was written", derived from the same `OutputParams::depth()`
+the encoder uses rather than read off the `output.hdr` switch: `film-master` pins that
+switch at its default while still resolving f32, so the switch alone would report
+`false` for an f32 master.
 `params_hash` is a stable hash of the
 effective recipe JSON (the same bytes as the sidecar), so identical conversions
-share a hash without the record carrying the whole recipe.
+share a hash without the record carrying the whole recipe. The value shown above is
+**illustrative**: because it covers the *whole* recipe it changes whenever any key is
+added, removed, or re-defaulted (adding `print.linear_range` and `output.preset` changed
+it, and the next schema change will again). Nothing asserts it — treat it as a shape
+example, not a reproducible constant.
 
 ## 10. Code architecture (Rust)
 

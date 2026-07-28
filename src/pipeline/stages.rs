@@ -1,20 +1,43 @@
-//! Stage wiring as pure functions — threads film-base → reconstruction →
-//! legacy print render → output color transform together for the orchestrator
-//! to call.
+//! Stage wiring as pure functions — threads film-base → reconstruction → the
+//! selected output branch together for the orchestrator to call.
 //!
 //! This is the in-memory core of the `convert` pipeline (design-spec §6, stages
-//! 2–4). Decode (stage 1) and encode (stage 5) are I/O and stay with the
-//! orchestrator (`cli`); everything here is pure `(input, params) -> output` so
-//! it composes and unit-tests without touching the filesystem — with one
+//! 3–5a — there is no 5b/display arm: `render_split::display_source` exists but
+//! nothing here calls it until `output/{sdr,hdr}-display-rendering`). Film-base
+//! estimation (stage 2) is the orchestrator's, and
+//! decode (stage 1) and encode (the final stage) are I/O and stay with
+//! the orchestrator (`cli`); everything here is pure `(input, params) -> output`
+//! so it composes and unit-tests without touching the filesystem — with one
 //! documented exception: [`render`] reads a wall clock to fill [`StageTimings`]
 //! for the telemetry record (a report-only channel; the pixels stay
 //! deterministic and untouched by the measurement).
+//!
+//! [`render`] dispatches on the resolved [`OutputPreset`]:
+//!
+//! - **`legacy`** (no preset, the default) — the frozen transitional path
+//!   `reconstruct → finish_print → color::to_output`: the print controls run
+//!   *before* the working→output ICC transform, exactly as they did before
+//!   presets existed. `golden` (below, `#[cfg(test)]`) pins its
+//!   **pre-colour-transform** pixels bit-for-bit by calling
+//!   [`reconstruct_and_print`] directly, and
+//!   `legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence` pins
+//!   that this branch of [`render`] is still exactly that sequence — the boundary
+//!   `golden` cannot see, because it never crosses the preset `match`.
+//! - **`film-master`** — `reconstruct → map_nc_film_rgb_v1 → render_split::film_master`:
+//!   the mapped unclamped linear ACEScg buffer is encoded directly with the
+//!   ACEScg ICC attached and **no** colour transform, print control, or display
+//!   rendering. Running `color::to_output` here would re-apply the
+//!   Rec.709→ACEScg matrix on values that already crossed it, so the master
+//!   deliberately bypasses that stage and only fetches the profile blob.
 
 use std::time::Instant;
 
 use crate::algo;
-use crate::pipeline::color;
-use crate::types::{FilmBase, LinearImage, OutputParams, PrintParams, Reconstruction, Result};
+use crate::pipeline::color::{self, OutputSpace};
+use crate::pipeline::{render_split, working_space};
+use crate::types::{
+    FilmBase, LinearImage, OutputParams, OutputPreset, PrintParams, Reconstruction, Result,
+};
 
 /// The in-memory pipeline result the orchestrator hands to the encoder: the
 /// output-color-transformed positive image and the ICC blob to embed alongside
@@ -82,10 +105,11 @@ pub(crate) fn reconstruct_and_print(
     ))
 }
 
-/// Run pipeline stages 3–4 on a decoded image and an **already-resolved** film
-/// base: reconstruct negative → typed film positive → legacy print render, then
-/// transform the result into the output color space. Returns the
-/// color-transformed image and the ICC blob to embed.
+/// Run the in-memory pipeline on a decoded image and an **already-resolved** film
+/// base, taking whichever branch `output_params.preset` selects: `legacy`
+/// (reconstruct → print render → working→output ICC transform) or `film-master`
+/// (reconstruct → NC film RGB v1 → the unwrapped ACEScg buffer, no transform).
+/// Returns the image to encode and the ICC blob to embed alongside it.
 ///
 /// Film-base estimation (stage 2) is deliberately **not** done here — the
 /// orchestrator resolves the base first (via [`film_base::estimate`]) so it can
@@ -110,6 +134,26 @@ pub fn render(
     print: &PrintParams,
     output_params: &OutputParams,
 ) -> Result<Rendered> {
+    match output_params.preset {
+        OutputPreset::Legacy => {
+            render_legacy(image, film_base, reconstruction, print, output_params)
+        }
+        OutputPreset::FilmMaster => render_film_master(image, film_base, reconstruction),
+    }
+}
+
+/// The frozen legacy no-preset path: reconstruct → print render → working→output
+/// ICC transform — the pre-preset contract. `golden` pins the
+/// [`reconstruct_and_print`] half's pixels bit-for-bit, and
+/// `legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence` pins that
+/// this function is still that sequence composed with `color::to_output`.
+fn render_legacy(
+    image: &LinearImage,
+    film_base: &FilmBase,
+    reconstruction: &Reconstruction,
+    print: &PrintParams,
+    output_params: &OutputParams,
+) -> Result<Rendered> {
     let started = Instant::now();
     let (positive, convert) = reconstruct_and_print(image, film_base, reconstruction, print)?;
     let algorithm_ms = ms_since(started);
@@ -122,6 +166,51 @@ pub fn render(
         image,
         icc,
         convert,
+        timings: StageTimings {
+            algorithm_ms,
+            color_ms,
+        },
+    })
+}
+
+/// The `film-master` branch: reconstruct → NC film RGB v1 → encode directly.
+///
+/// No print controls are consumed (they are validated all-default at the CLI
+/// boundary before this runs — a requested adjustment is a loud error, never
+/// silently dropped), no `color::to_output` transform runs (the pixels are
+/// *already* linear ACEScg; transforming again would double-apply the matrix),
+/// and nothing is clamped. The ICC blob is the ACEScg profile the values are
+/// genuinely in, fetched without building a transform.
+///
+/// [`ConvertReport::white_balance`] stays `None` here by construction: no
+/// white-balance stage ran, and reporting resolved gains for a master that
+/// applied none would be a false provenance claim. The reconstruction's own
+/// resolved diagnostics (`dmax`, `balance_range`) *are* reported — they are part
+/// of what the master contains.
+fn render_film_master(
+    image: &LinearImage,
+    film_base: &FilmBase,
+    reconstruction: &Reconstruction,
+) -> Result<Rendered> {
+    let started = Instant::now();
+    let (film, recon) = algo::reconstruct(image, film_base, reconstruction)?;
+    let master = render_split::film_master(working_space::map_nc_film_rgb_v1(film));
+    let algorithm_ms = ms_since(started);
+
+    let started = Instant::now();
+    // Profile only — no transform. `icc_profile` builds the same ACEScg profile
+    // `to_output` would embed, so the tag matches the pixels exactly.
+    let icc = color::icc_profile(&OutputSpace::AcesCg)?;
+    let color_ms = ms_since(started);
+
+    Ok(Rendered {
+        image: master,
+        icc,
+        convert: ConvertReport {
+            dmax: recon.dmax,
+            white_balance: None,
+            balance_range: recon.balance_range,
+        },
         timings: StageTimings {
             algorithm_ms,
             color_ms,
@@ -258,6 +347,251 @@ mod tests {
     }
 
     #[test]
+    fn legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence() {
+        // `golden` pins `reconstruct_and_print`'s pixels, but it calls that helper
+        // *directly* — it never crosses `render`'s `match output_params.preset`. So
+        // swapping the two match arms would leave every golden green, and the
+        // legacy-vs-legacy e2e comparison (implicit vs explicit `--output-preset
+        // legacy`) would stay byte-identical too. Pin the boundary itself: the
+        // no-preset render must BE `color::to_output(reconstruct_and_print(…))`,
+        // bit-for-bit, image and ICC.
+        //
+        // In-process, so both sides come from this build's lcms2 and this is not the
+        // cross-target ICC/post-transform trap.
+        let img = synthetic_negative(8, 8);
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
+        let print = PrintParams {
+            print_exposure: -0.5,
+            black_point: 0.01,
+            ..PrintParams::default()
+        };
+        for reconstruction in [Reconstruction::Simple, density_default(), sigmoid_default()] {
+            for output in [
+                OutputParams::default(),
+                OutputParams {
+                    hdr: true,
+                    ..OutputParams::default()
+                },
+                OutputParams {
+                    output_profile: Some("srgb".into()),
+                    ..OutputParams::default()
+                },
+            ] {
+                let got = render(&img, &base, &reconstruction, &print, &output).unwrap();
+                let (positive, convert) =
+                    reconstruct_and_print(&img, &base, &reconstruction, &print).unwrap();
+                let (want_image, want_icc) = color::to_output(&positive, &output).unwrap();
+                let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+                assert_eq!(
+                    bits(&got.image.rgb),
+                    bits(&want_image.rgb),
+                    "{reconstruction:?} / {output:?}"
+                );
+                assert_eq!(
+                    got.image.ir, want_image.ir,
+                    "{reconstruction:?} / {output:?}"
+                );
+                assert_eq!(got.icc, want_icc, "{reconstruction:?} / {output:?}");
+                assert_eq!(got.convert, convert, "{reconstruction:?} / {output:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn film_master_render_bypasses_the_colour_transform_and_print_controls() {
+        // The film-master branch must hand back the *mapped* ACEScg pixels: no
+        // print render, and no `color::to_output` transform (which would
+        // re-apply the Rec.709→ACEScg matrix on values that already crossed it).
+        // Pin that by recomputing the expected buffer through the mapper directly.
+        let img = synthetic_negative(8, 8);
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
+        let out = render(
+            &img,
+            &base,
+            &density_default(),
+            // Non-default print controls are a *usage error* under film-master
+            // (`cli::validate`); a defaulted set proves the branch simply never
+            // consults them.
+            &PrintParams::default(),
+            &OutputParams {
+                preset: OutputPreset::FilmMaster,
+                ..OutputParams::default()
+            },
+        )
+        .unwrap();
+
+        let (film, _) = algo::reconstruct(&img, &base, &density_default()).unwrap();
+        let want = working_space::map_nc_film_rgb_v1(film).into_linear();
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&out.image.rgb), bits(&want.rgb));
+        // The embedded tag is the *linear* ACEScg profile the values are genuinely
+        // in — byte-identical to what `icc_profile` builds, so no display profile
+        // and no transfer curve was substituted for the master. (Local-only byte
+        // comparison: both sides come from the same lcms2 build in this process, so
+        // this is not the cross-target ICC-bytes trap.)
+        assert_eq!(out.icc, color::icc_profile(&OutputSpace::AcesCg).unwrap());
+        // The master applied no white balance, so it claims none…
+        assert_eq!(out.convert.white_balance, None);
+        // …but the reconstruction's own resolved anchor IS part of the master.
+        assert_eq!(out.convert.dmax, Some(crate::algo::density::NOMINAL_DMAX));
+    }
+
+    #[test]
+    fn no_tone_gamut_or_transfer_operation_runs_on_film_master() {
+        // The branch fixture for "`film-master` bypasses display rendering": run the
+        // *same* inputs down both branches and show the legacy branch's operations
+        // are observable while the master's pixels stay the mapper's output.
+        let img = synthetic_negative(8, 8);
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
+        let master_params = OutputParams {
+            preset: OutputPreset::FilmMaster,
+            ..OutputParams::default()
+        };
+        let (film, _) = algo::reconstruct(&img, &base, &density_default()).unwrap();
+        let mapped = working_space::map_nc_film_rgb_v1(film).into_linear();
+
+        // (a) A print control the legacy branch honours (2^1 exposure doubles every
+        //     sample) leaves the master untouched. `render` is a pure function, so it
+        //     is callable with the combination `cli::validate` rejects — which is
+        //     exactly what makes this a bypass proof rather than a validation proof.
+        let hot = PrintParams {
+            print_exposure: 1.0,
+            ..PrintParams::default()
+        };
+        let master = render(&img, &base, &density_default(), &hot, &master_params).unwrap();
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(
+            bits(&master.image.rgb),
+            bits(&mapped.rgb),
+            "a print control must not reach the master"
+        );
+        let legacy_hot = render(
+            &img,
+            &base,
+            &density_default(),
+            &hot,
+            &OutputParams {
+                hdr: true,
+                ..OutputParams::default()
+            },
+        )
+        .unwrap();
+        // `master * 1.5` is only a meaningful bar if the master sample is positive —
+        // post-matrix ACEScg legitimately goes negative, and a `<= 0` master would
+        // make the comparison trivially true.
+        assert!(
+            master.image.rgb[0] > 0.0,
+            "the fixture's first master sample must be positive for the bound below \
+             to mean anything (got {})",
+            master.image.rgb[0]
+        );
+        assert!(
+            legacy_hot.image.rgb[0] > master.image.rgb[0] * 1.5,
+            "the legacy branch must actually apply the exposure it was given \
+             (legacy {} vs master {})",
+            legacy_hot.image.rgb[0],
+            master.image.rgb[0]
+        );
+
+        // (b) A transfer/gamut operation the legacy branch honours (`srgb`, whose ICC
+        //     carries the piecewise sRGB TRC) also leaves the master untouched: the
+        //     master's samples stay linear, so a mid value must be visibly lower than
+        //     the display-encoded one.
+        let legacy_srgb = render(
+            &img,
+            &base,
+            &density_default(),
+            &PrintParams::default(),
+            &OutputParams {
+                output_profile: Some("srgb".into()),
+                ..OutputParams::default()
+            },
+        )
+        .unwrap();
+        let master_plain = render(
+            &img,
+            &base,
+            &density_default(),
+            &PrintParams::default(),
+            &master_params,
+        )
+        .unwrap();
+        assert!(
+            legacy_srgb.image.rgb[0] > master_plain.image.rgb[0] + 0.05,
+            "the legacy branch must apply the sRGB transfer it was given \
+             (legacy {} vs master {})",
+            legacy_srgb.image.rgb[0],
+            master_plain.image.rgb[0]
+        );
+    }
+
+    #[test]
+    fn film_master_render_ignores_the_output_hdr_switch_entirely() {
+        // `film-master` resolves f32 by definition, not via `output.hdr`. The depth
+        // half is pinned in `types` (`film_master_resolves_f32_independently_of_the_
+        // hdr_switch`); what belongs *here* is that `render` itself does not consult
+        // the switch — flip it and the master's pixels and ICC must be bit-identical.
+        // (`render` is pure, so it is callable with the combination `cli::validate`
+        // rejects, which is what makes this a bypass proof.)
+        let img = synthetic_negative(8, 8);
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
+        let render_with = |hdr: bool| {
+            render(
+                &img,
+                &base,
+                &density_default(),
+                &PrintParams::default(),
+                &OutputParams {
+                    preset: OutputPreset::FilmMaster,
+                    hdr,
+                    ..OutputParams::default()
+                },
+            )
+            .unwrap()
+        };
+        let (off, on) = (render_with(false), render_with(true));
+        let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+        assert_eq!(bits(&off.image.rgb), bits(&on.image.rgb));
+        assert_eq!(off.icc, on.icc);
+        // …and both resolve the f32 encode depth the branch is defined by.
+        for hdr in [false, true] {
+            assert_eq!(
+                OutputParams {
+                    preset: OutputPreset::FilmMaster,
+                    hdr,
+                    ..OutputParams::default()
+                }
+                .depth(),
+                crate::types::OutDepth::F32
+            );
+        }
+    }
+
+    #[test]
+    fn film_master_render_works_for_every_reconstruction_path() {
+        // The split is producer-agnostic: simple, exponential, and sigmoid all
+        // reach the master through the same mapper.
+        let img = synthetic_negative(8, 8);
+        let base = FilmBase::from([0.9, 0.55, 0.42]);
+        let params = OutputParams {
+            preset: OutputPreset::FilmMaster,
+            ..OutputParams::default()
+        };
+        for reconstruction in [Reconstruction::Simple, density_default(), sigmoid_default()] {
+            let out = render(
+                &img,
+                &base,
+                &reconstruction,
+                &PrintParams::default(),
+                &params,
+            )
+            .unwrap();
+            assert_eq!(out.image.rgb.len(), 8 * 8 * 3, "{reconstruction:?}");
+            assert_eq!(out.convert.white_balance, None, "{reconstruction:?}");
+        }
+    }
+
+    #[test]
     fn render_rejects_a_degenerate_base() {
         // Defense-in-depth: even if a zero-channel base reached `render` (estimate
         // now rejects it at birth), the reconstruction must reject it rather than
@@ -347,6 +681,7 @@ mod golden {
             black_point: 0.01,
             white_balance: WbSource::Explicit([1.0, 1.05, 1.1]),
             highlight_compress: 0.2,
+            ..PrintParams::default()
         }
     }
 

@@ -99,11 +99,13 @@ pub fn resolve_output_space(explicit: Option<OutputSpace>, depth: OutDepth) -> O
     })
 }
 
-/// The ICC bytes to embed for a given space. The `convert` pipeline obtains the
-/// blob from [`to_output`] (which returns it alongside the transformed image);
-/// this stays a standalone helper for building a space's ICC in isolation, used
-/// by the tests here.
-#[allow(dead_code)]
+/// The ICC bytes to embed for a given space, **without** building a transform.
+///
+/// The legacy path gets its blob from [`to_output`] (which returns it alongside the
+/// transformed image), but the `film-master` branch has no transform to build — its
+/// pixels are already linear ACEScg — so `pipeline::stages`' film-master render calls
+/// this directly to fetch the tag that matches them. Byte-identical to what
+/// `to_output` would embed for the same space: both route through [`profile_icc`].
 pub fn icc_profile(space: &OutputSpace) -> Result<Vec<u8>> {
     profile_icc(&build_profile(space)?)
 }

@@ -1036,3 +1036,16 @@ What other epics need to know about `algo`:
 **Updated:** —
 
 - Goal: Close the gap where a validation-passing density recipe can silently produce a degenerate (e.g. finite all-black) image, via bounded `density_scale`/`density_offset`/`density_gamma` ranges at the CLI `validate` boundary plus a post-render degenerate-output warning.
+- 2026-07-27 (from the `color/film-master-render-pipeline` review; **no code changed
+  here**): a **second** silent-underflow site was confirmed and reproduced — the
+  **stage-4 print render**, not the stage-3 tone map this task's original context block
+  describes. `render_print`'s `2f32.powf(print.print_exposure)` (`algo/density.rs:478`)
+  and `px[c] * wb[c] * exposure_gain` (`:486`) are guarded only by `finite()` /
+  `positive()`, so `--print-exposure=-200` writes 100 % zero samples at rc 0 with every
+  `loss` counter at 0, no warning, and `--strict` also 0; `--white-balance=1e-45,1,1`
+  kills exactly one channel the same way (so a whole-image collapse test would miss it).
+  The overflow direction (`--print-exposure 300`) is already loud via `clipped_low`.
+  The measurement table, the exact reproduction command, and two implementation notes
+  (why a naive `is_normal()` on user-supplied gains is the wrong fix here, and where a
+  reference predicate already exists in `pipeline::render_split`) are in the task
+  file's second `Context` block — start there rather than rediscovering it.

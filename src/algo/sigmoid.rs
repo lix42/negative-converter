@@ -884,6 +884,7 @@ mod tests {
             black_point: 0.02,
             white_balance: WbSource::Percentile,
             highlight_compress: 0.4,
+            ..PrintParams::default()
         };
         let curve = DensityCurve::Sigmoid(SigmoidParams {
             contrast: 1.4,

@@ -31,8 +31,8 @@ use crate::telemetry;
 use crate::types::{
     BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams, DmaxSource, EncodeReport,
     FilmBase, FilmBaseParams, FilmBaseSource, FilmType, InputParams, MeaningAssertion, NcError,
-    OutputParams, PrintParams, Reconstruction, ReconstructionType, Result, TransferAssertion,
-    WbSource,
+    OutputParams, OutputPreset, PrintParams, Reconstruction, ReconstructionType, Result,
+    TransferAssertion, WbSource,
 };
 
 // ---------------------------------------------------------------------------
@@ -466,6 +466,17 @@ pub struct PrintOverrides {
     /// Highlight roll-off amount.
     #[arg(long)]
     pub highlight_compress: Option<f32>,
+    /// Black/white-range placement endpoints for the shared display stage: the
+    /// exact affine `(x - LOW)/(HIGH - LOW)` applied last, after white balance,
+    /// exposure, and the black point (recipe key `print.linear_range`, default
+    /// `0,1` = identity). This is the replacement home for `simple`
+    /// reconstruction's removed `--clip-low`/`--clip-high` endpoints. A negative
+    /// `LOW` is legal, so a leading `-` is accepted. Only a named display preset
+    /// consumes it, so a non-default value is currently a loud usage error rather
+    /// than a silently-ignored knob.
+    #[arg(long = "linear-range", value_name = "LOW,HIGH", value_parser = parse_lo_hi,
+          allow_hyphen_values = true)]
+    pub linear_range: Option<[f32; 2]>,
 }
 
 /// Removed simple-reconstruction controls (design-spec §7.1/§9). Simple
@@ -492,8 +503,40 @@ pub struct SimpleOverrides {
 }
 
 /// Output / encode overrides (design-spec §9, stage 5).
+///
+/// `--output-preset` is the atomic output *policy* choice; the three legacy
+/// selectors below (`--output-hdr`/`--output-sdr`, `--output-profile`,
+/// `--bigtiff`) are the pre-preset depth/profile/container knobs a **named**
+/// preset resolves itself, so a non-default one alongside it is a usage error —
+/// checked on the *resolved value* in [`validate_output_preset`], identically for
+/// a flag and for a recipe key. `--output-sdr` is the one exception: it *forces*
+/// 16-bit integer output, which a named preset cannot produce, so it is rejected by
+/// flag **presence** ([`reject_output_sdr_with_named_preset`]) even though its
+/// resolved value is the default. (None of this can be a clap `conflicts_with`: the
+/// conflict depends on the preset's *value* — `--output-preset legacy` is the
+/// no-preset state and stays compatible with all three — and, for the other
+/// selectors, on the selector's own value, since `--bigtiff auto` resolves the
+/// documented default and is therefore accepted.)
 #[derive(Args, Debug, Default)]
 pub struct OutputOverrides {
+    /// Named output policy: `legacy` (default — the transitional TIFF path, where
+    /// the print controls run before the output ICC transform) or `film-master`
+    /// (unclamped 32-bit float linear ACEScg TIFF taken straight from the NC film
+    /// RGB v1 mapping, bypassing every print/display control). Recipe key
+    /// `output.preset`. A named preset is atomic: it resolves container, depth, and
+    /// profile itself, so it rejects a non-default `--output-hdr` /
+    /// `--output-profile` / `--bigtiff` (from a flag or the recipe alike; a value that
+    /// already equals the documented default, like `--bigtiff auto`, is accepted), and
+    /// rejects `--output-sdr` outright — it forces 16-bit integer output a named preset
+    /// cannot produce. On top
+    /// of that, `film-master` rejects the frame-local measurements
+    /// `--auto-d-max`/`--auto-balance-range` plus every non-default
+    /// downstream control. `--output-hdr` is a *rendered* float TIFF and is never
+    /// an alias for `film-master`. The remaining planned preset names
+    /// (`gain-map-hdr`, `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`,
+    /// `custom`) are not accepted yet.
+    #[arg(long = "output-preset", value_name = "PRESET")]
+    pub output_preset: Option<String>,
     /// Write a 32-bit float TIFF (full HDR, no precision loss) instead of the
     /// default 16-bit integer TIFF.
     #[arg(long, conflicts_with = "output_sdr")]
@@ -696,6 +739,108 @@ fn reconstruction_result(
     }
 }
 
+/// Which branch out of the NC film RGB v1 ACEScg boundary this conversion took,
+/// and what that branch did (design-spec §5/§8). Serialize-only.
+///
+/// Exists so a consumer can tell — without re-deriving it from the recipe —
+/// whether the pixels are the unclamped linear film master or a rendered image,
+/// and so the master's content claim is explicit: it is NC's *intentional film
+/// rendering*, never a physical scene-linear recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct OutputRenderResult {
+    /// The resolved output preset (`"legacy"` / `"film-master"`).
+    pub preset: OutputPreset,
+    /// Whether the print / tone-render sub-stage (white balance, exposure, black
+    /// point, range placement, highlight roll-off) **ran at all** — not whether its
+    /// values were non-default. Always `false` for `film-master` (the branch never
+    /// reaches the stage), and also `false` for legacy `simple`, whose positive
+    /// passes through untouched (design-spec §7.1).
+    pub print_controls: bool,
+    /// Whether any display rendering — tone mapping, destination gamut mapping, or
+    /// a transfer/display encoding — ran. Always `false` for `film-master` (its
+    /// ACEScg profile is a *linear* tag on already-ACEScg values, not a transform).
+    pub display_render: bool,
+    /// The encoding the preset resolved to, as a stable identifier.
+    pub encoding: &'static str,
+    /// What the pixels contain. For `film-master` this states the intentional-film
+    /// content and explicitly disclaims physical scene recovery; it names the
+    /// roll-fixed `Dmax` placement only when the run actually made one (`simple` and
+    /// exponential `dmax = none` make none).
+    pub content: &'static str,
+    /// The pinned working-space mapping identifier the pixels crossed
+    /// (`"nc-film-rgb-v1"`), repeated inside this block so a master's provenance
+    /// is self-contained. Mirrors the top-level `working_mapping`.
+    pub working_mapping: &'static str,
+    /// Wire-schema version of the tagged `reconstruction` object the master was
+    /// built from (`reconstruction.schema_version`). Recorded so a master names
+    /// every version it depends on. The **behavioural** `pipeline_version` is a
+    /// separate field owned by `core/conversion-versioning`; this build does not
+    /// stamp one yet, so it is deliberately absent rather than guessed.
+    pub reconstruction_schema_version: u32,
+}
+
+/// Whether this reconstruction places a display-white anchor the master's report
+/// may claim. `simple` has no curve stage, and the exponential curve's `dmax =
+/// none` is the scene-referred unity placement — neither anchors anything.
+/// (`auto` cannot appear here: `validate_output_preset` rejects it under the
+/// preset.)
+fn master_places_dmax(reconstruction: &Reconstruction) -> bool {
+    matches!(
+        reconstruction,
+        Reconstruction::Density { curve, .. } if curve.dmax() != DmaxSource::None
+    )
+}
+
+/// Build the report's `output_render` from the resolved config. Pure derivation
+/// (like [`reconstruction_result`]): the branch and what it applies are fully
+/// determined by the preset plus the reconstruction, so there is nothing to thread
+/// back from the render.
+fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
+    let (print_controls, display_render, encoding, content) = match cfg.output.preset {
+        OutputPreset::FilmMaster => (
+            false,
+            false,
+            "unclamped-linear-acescg-float-tiff",
+            // A `Dmax` placement is *supported*, not guaranteed: validation
+            // deliberately accepts `dmax = none` for the exponential curve (the
+            // scene-referred unity placement) and `simple` has no anchor at all, so
+            // claiming one unconditionally would be a false provenance statement on
+            // exactly the runs a consumer most needs to distinguish.
+            if master_places_dmax(&cfg.reconstruction) {
+                "intentional film rendering (film, lens, development, scanner, \
+                 reconstruction, density curve, and the resolved roll-fixed Dmax \
+                 placement); not a physical scene-linear recovery"
+            } else {
+                "intentional film rendering (film, lens, development, scanner, and \
+                 reconstruction; this run placed no Dmax anchor); not a physical \
+                 scene-linear recovery"
+            },
+        ),
+        OutputPreset::Legacy => (
+            // The legacy print render only runs for a density reconstruction;
+            // `simple`'s positive passes through it untouched (design-spec §7.1).
+            matches!(cfg.reconstruction, Reconstruction::Density { .. }),
+            // The legacy path always runs the working→output ICC transform.
+            true,
+            match cfg.output.depth() {
+                crate::types::OutDepth::F32 => "transitional-rendered-float-tiff",
+                crate::types::OutDepth::U16 => "rendered-u16-tiff",
+            },
+            "print-rendered positive in the selected output colour space; the \
+             transitional float form is already print-rendered and is not a film master",
+        ),
+    };
+    OutputRenderResult {
+        preset: cfg.output.preset,
+        print_controls,
+        display_render,
+        encoding,
+        content,
+        working_mapping: working_space::WORKING_MAPPING_ID,
+        reconstruction_schema_version: crate::types::RECONSTRUCTION_SCHEMA_VERSION,
+    }
+}
+
 /// Machine-readable result emitted on stdout (or `--report-file`). One shape
 /// serves all three commands; irrelevant fields are `None`/empty and omitted
 /// from the JSON (`skip_serializing_if`), so an agent gets a clean object per
@@ -731,6 +876,12 @@ pub struct Report {
     /// `conversion-versioning`, never a silent change to v1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_mapping: Option<&'static str>,
+    /// Which branch out of the ACEScg boundary the conversion took and what that
+    /// branch applied (`convert`): the resolved preset, whether print controls or
+    /// display rendering ran, the resolved encoding, and the master's explicit
+    /// content claim (design-spec §5/§8). See [`OutputRenderResult`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_render: Option<OutputRenderResult>,
     /// What the decoder found (`inspect`): format, dimensions, channels, bit
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -980,6 +1131,15 @@ fn sets_curve_dmax(v: &serde_json::Value) -> bool {
         .is_some()
 }
 
+/// Whether a recipe/override JSON object explicitly carries `output.preset` — the
+/// witness behind `roll`'s third roll-consistency warning. A raw-JSON probe like
+/// [`sets_curve_dmax`], not a resolved-value comparison, because an override that
+/// *restates* the shared preset is still a per-frame assertion of the output policy
+/// and the roll report has no other place to surface it.
+fn sets_output_preset(v: &serde_json::Value) -> bool {
+    v.get("output").and_then(|o| o.get("preset")).is_some()
+}
+
 /// Whether any of the four (clap-mutually-exclusive) `Dmax` flags was passed —
 /// the CLI witness for the report's `Dmax` provenance, and the merge's "replace
 /// the recipe curve's `dmax`" trigger.
@@ -1227,6 +1387,22 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
     if let Some(v) = args.print.highlight_compress {
         cfg.print.highlight_compress = v;
     }
+    // `--linear-range LOW,HIGH` ⇒ `print.linear_range`: an atomic pair (both
+    // endpoints at once), so it replaces the recipe's pair entirely. Passing the
+    // documented default `0,1` is the flags-win reset of a recipe's non-default
+    // pair — allowed, and it is what makes a recipe usable under `film-master`.
+    if let Some(v) = args.print.linear_range {
+        cfg.print.linear_range = v;
+    }
+
+    // output preset: an atomic policy choice, so the flag replaces the recipe's
+    // preset entirely (including resetting a recipe's `film-master` back to
+    // `legacy`). Parsed with the shared `OutputPreset::parse`, so an unknown /
+    // not-yet-accepted / renamed name gets the same pinned diagnosis as the recipe
+    // key.
+    if let Some(name) = &args.output_opts.output_preset {
+        cfg.output.preset = OutputPreset::parse(name)?;
+    }
 
     // output: `--output-hdr` is a presence flag — passing it switches the output
     // to 32-bit float; when absent it must not clobber a recipe's `hdr: true`
@@ -1279,9 +1455,31 @@ fn validate_explicit_film_base(base: &[f32; 3]) -> Result<()> {
     Ok(())
 }
 
+/// The **complete** `convert` parameter gate: everything [`validate`] checks, plus the
+/// one rule that needs the raw flags rather than the resolved config
+/// ([`reject_output_sdr_with_named_preset`]).
+///
+/// `convert` orchestrators must call **this**, not `validate` — a `merge` + `validate`
+/// pair silently omits the flag-presence rule and reinstates the bug where
+/// `--output-sdr` next to a named preset writes an f32 master. `roll` legitimately
+/// calls `validate` directly: it has no output flags at all, so there is nothing for
+/// the extra rule to see. (`output/presets` is the next orchestrator here.)
+pub fn validate_convert(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
+    // Flag-shape first: "these two requests contradict each other" is a clearer
+    // diagnosis than whatever value rule the same config might also trip.
+    reject_output_sdr_with_named_preset(cfg, args)?;
+    validate(cfg)
+}
+
 /// Validate a resolved config at the CLI boundary so the pure stages can trust
 /// their inputs. Every failure is a [`NcError::Usage`] (exit 2) — bad recipes and
 /// impossible parameters fail loudly, never producing a quietly wrong image.
+///
+/// **Not the whole `convert` gate.** Every rule here reads only the resolved config, so
+/// it is shared verbatim by `convert` and `roll` (and by each `roll` per-frame
+/// override). `convert` has one additional rule that inspects flag *presence* and
+/// therefore cannot live here; [`validate_convert`] composes the two and is what a
+/// `convert` orchestrator must call.
 pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     let usage = |m: String| NcError::Usage(m);
 
@@ -1447,6 +1645,229 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
             ));
         }
         WbSource::GrayWorld | WbSource::Percentile => {}
+    }
+
+    // Range placement: the endpoints divide the affine, so they must be finite,
+    // ordered `lo < hi`, and have a representable span (the same three checks
+    // `--balance-range` needs — two individually-finite anchors can still overflow
+    // their difference to `+inf`, which would silently collapse every sample).
+    let [lo, hi] = cfg.print.linear_range;
+    finite("--linear-range", &[lo, hi])?;
+    if lo >= hi {
+        return Err(usage(format!(
+            "--linear-range low ({lo}) must be < high ({hi})"
+        )));
+    }
+    if !(hi - lo).is_finite() {
+        return Err(usage(format!(
+            "--linear-range span (high {hi} − low {lo}) overflows f32; use endpoints \
+             whose difference is representable"
+        )));
+    }
+
+    validate_output_preset(cfg)?;
+
+    Ok(())
+}
+
+/// The neutral (identity) range placement — the documented `print.linear_range`
+/// default. Named here so the "is this at its default?" checks below and the
+/// struct default cannot drift.
+fn linear_range_is_default(cfg: &ResolvedConfig) -> bool {
+    cfg.print.linear_range == PrintParams::default().linear_range
+}
+
+/// Output-preset validation (design-spec §5/§9) — the strict, never-silent half of
+/// the named-output split.
+///
+/// **Every rule here is checked on the resolved *value*, and value semantics are
+/// the whole rule** — there is deliberately no second check by flag *presence*.
+/// A knob is rejected identically whether it came from the recipe, a flag, or a
+/// migrated simple-control alias, and a flag that resets a recipe value *back* to
+/// its documented default is legitimately accepted under flags-win semantics
+/// (that is how a roll recipe carrying print controls is re-exported as a master
+/// with `--print-exposure 0`, and it is why `--bigtiff auto` and a recipe
+/// `"hdr": false` — which ask for nothing the preset does not already do — are
+/// accepted next to a named preset).
+///
+/// A *general* presence rule would have to be mirrored for recipe keys to behave the
+/// same, and mirroring it means probing raw JSON per key (the
+/// `LoadedRecipe::curve_dmax_present` machinery) for no gain: the two provenances
+/// must be indistinguishable here, and only the resolved value is. The one flag that
+/// escapes this reasoning is `--output-sdr`, which has *no* recipe spelling and whose
+/// documented meaning a named preset contradicts rather than subsumes; it is rejected
+/// by presence in [`reject_output_sdr_with_named_preset`], which explains why.
+///
+/// Three rules:
+///
+/// 1. **A named preset is atomic** — it resolves the container, bit depth, and
+///    colour profile itself, so a non-default legacy selector is a loud error
+///    rather than a silent override. Applies to *every* named preset (gated on
+///    [`OutputPreset::is_named`], not on `film-master`), so the next preset cannot
+///    silently lose the protection.
+/// 2. **`film-master` bypasses every downstream control, so it rejects a
+///    non-default one** rather than silently ignoring it, and rejects the two
+///    *frame-local measurements* — `auto` `Dmax` and an actually-consulted `auto`
+///    `balance_range` — which normalize per frame and break the cross-frame
+///    consistency a master exists to preserve.
+/// 3. **A non-default `print.linear_range` has no consumer yet.** Only the shared
+///    display stage applies it (`pipeline::render_split`), and no display preset is
+///    accepted yet; the legacy path's frozen ordering does not include it. A knob
+///    that would be silently ignored is a loud error here.
+fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
+    let usage = NcError::Usage;
+    let preset = cfg.output.preset;
+
+    if !linear_range_is_default(cfg) && preset != OutputPreset::FilmMaster {
+        let [lo, hi] = cfg.print.linear_range;
+        return Err(usage(format!(
+            "--linear-range / print.linear_range ({lo},{hi}) is applied only by the \
+             shared display stage of a named display preset, and no display preset is \
+             accepted by this build yet (`output/sdr-display-rendering` / \
+             `output/hdr-display-rendering` own the branch renderers). The legacy \
+             no-preset TIFF path keeps its frozen ordering and does not apply it, so \
+             the value would be silently ignored — it is rejected instead. Leave it at \
+             the default `0,1`."
+        )));
+    }
+
+    // Rule 1 — a named preset is atomic: it resolves the container *format*, depth, and
+    // profile itself, so a non-default legacy selector must not be silently overridden.
+    // Gated on `is_named()` (not on `FilmMaster`) so the next named preset inherits
+    // the protection instead of silently losing it, and the offender is named
+    // individually — a message listing all three would let a "did we blame the right
+    // selector?" test pass vacuously.
+    //
+    // "Atomic" is deliberately not total: `bigtiff` stays at its `auto` default, which
+    // means the **classic-vs-BigTIFF promotion decision is still delegated** to the
+    // size-based `resolve_bigtiff` policy rather than pinned by the preset. That is why
+    // `--bigtiff auto` is accepted here and why a master over ~4 GiB legitimately comes
+    // out as BigTIFF. Only `--bigtiff on|off`, which would *override* that policy, is
+    // the atomicity violation.
+    if preset.is_named()
+        && let Some((name, value)) = cfg.output.non_default_legacy_selector()
+    {
+        return Err(usage(format!(
+            "--output-preset {} is an atomic output policy — it resolves the container \
+             format, bit depth, and colour profile itself (for film-master: an unclamped \
+             32-bit float linear ACEScg TIFF with the ACEScg profile) — but {name} is set \
+             to a non-default value ({value}). Remove that value — the check runs on the \
+             resolved config, so it makes no difference whether it came from the recipe \
+             or from a flag — or drop the preset. A value that already equals the \
+             documented default (`--bigtiff auto`, a recipe `\"hdr\": false`) asks for \
+             nothing the preset does not do and is accepted; `--output-sdr` is the \
+             exception, rejected separately because it *forces* 16-bit integer output the \
+             preset cannot produce. Note --output-hdr is the *transitional rendered* \
+             float TIFF — the print controls have already run — and is never an alias for \
+             film-master.",
+            preset.name()
+        )));
+    }
+
+    if preset != OutputPreset::FilmMaster {
+        return Ok(());
+    }
+
+    // Rule 2a — frame-local auto Dmax. Checked before the control sweep because it
+    // is the master-specific reason, not a generic "non-default" complaint.
+    if let Reconstruction::Density { curve, .. } = &cfg.reconstruction
+        && curve.dmax() == DmaxSource::Auto
+    {
+        return Err(usage(
+            "--output-preset film-master rejects a frame-local auto display-white \
+             anchor (--auto-d-max / reconstruction.curve.dmax = \"auto\"): it measures \
+             the anchor per frame, which normalizes exposure frame-by-frame and breaks \
+             the cross-frame consistency the master exists to preserve. Use the \
+             roll-fixed anchor — the default --fixed-d-max, an explicit --d-max <d> \
+             measured once with `nc estimate --d-max-region`, or (exponential curve \
+             only) --no-d-max for the scene-referred unity placement."
+                .into(),
+        ));
+    }
+
+    // Rule 2b — the *other* frame-local measurement, and the same hazard verbatim:
+    // an `auto` regional-balance range measures this frame's 0.5/99.5 corrected-density
+    // percentiles (`algo::density::measure_balance_range`), so two frames of one roll
+    // get different tone-ramp anchors and their masters are not mutually consistent.
+    //
+    // Rejected only when the range is genuinely consulted: `regional_balance`
+    // short-circuits before measuring whenever the two balances are equal — including
+    // the neutral default — so the default `BalanceRange::Auto` is inert and must stay
+    // accepted. `density::consults_balance_range` is that predicate, kept beside the
+    // short-circuits it mirrors so the two cannot drift.
+    if let Reconstruction::Density { density, .. } = &cfg.reconstruction
+        && density.balance_range == BalanceRange::Auto
+        && crate::algo::density::consults_balance_range(density)
+    {
+        return Err(usage(format!(
+            "--output-preset film-master rejects a frame-local auto regional-balance \
+             range (--auto-balance-range / reconstruction.density.balance_range = \
+             \"auto\") when a balance is actually applied (shadow_balance {:?} vs \
+             highlight_balance {:?}): the ramp anchors are measured from this frame's \
+             density percentiles, so two frames of a roll would be corrected against \
+             different anchors and their masters would not be mutually consistent — the \
+             same reason the master rejects auto Dmax. Measure the range once with `nc \
+             convert` on a representative frame and reuse it via --balance-range LO,HI, \
+             or leave the balances equal (an equal pair is a tone-independent offset and \
+             consults no range).",
+            density.shadow_balance, density.highlight_balance
+        )));
+    }
+
+    // Rule 2c — every non-default downstream control, named individually so the
+    // error says which one and where it came from. `film-master` encodes stage 4
+    // directly, so each of these would otherwise be silently dropped.
+    let d = PrintParams::default();
+    // Destructured, not field-accessed: adding a print control makes this binding
+    // fail to compile, forcing the author to decide whether `film-master` bypasses
+    // it. A field-access sweep would silently omit the new knob and reintroduce
+    // exactly the silent-ignore this rule exists to prevent.
+    let PrintParams {
+        print_exposure,
+        black_point,
+        white_balance,
+        highlight_compress,
+        linear_range,
+    } = &cfg.print;
+    let offender = [
+        (
+            "--print-exposure / print.print_exposure",
+            *print_exposure != d.print_exposure,
+            format!("{print_exposure}"),
+        ),
+        (
+            "--black-point / print.black_point",
+            *black_point != d.black_point,
+            format!("{black_point}"),
+        ),
+        (
+            "--white-balance / --auto-wb / print.white_balance",
+            *white_balance != d.white_balance,
+            format!("{white_balance:?}"),
+        ),
+        (
+            "--highlight-compress / print.highlight_compress",
+            *highlight_compress != d.highlight_compress,
+            format!("{highlight_compress}"),
+        ),
+        (
+            "--linear-range / print.linear_range",
+            *linear_range != d.linear_range,
+            format!("{linear_range:?}"),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(name, non_default, value)| non_default.then_some((name, value)));
+    if let Some((name, value)) = offender {
+        return Err(usage(format!(
+            "--output-preset film-master bypasses all print and display controls, but \
+             {name} is set to a non-default value ({value}). The master is the \
+             unclamped linear ACEScg film rendering — a linear export that also wants \
+             a creative / print / display adjustment is the `custom` workflow (not \
+             accepted by this build yet; owned by `output/presets`). Reset the control \
+             to its default (a flag may reset a recipe value), or drop the preset. \
+             There is no ignore-conflicting-controls mode."
+        )));
     }
 
     Ok(())
@@ -1741,8 +2162,10 @@ fn reject_deprecated_input_flags(o: &InputOverrides) -> Result<()> {
 
 /// Migration errors for the removed algorithm selector and simple-reconstruction
 /// controls. nc is unreleased, so these flags survive only as hidden args that
-/// emit actionable guidance — never as aliases (`reject_legacy_recipe_keys` is
-/// the recipe-side mirror).
+/// emit actionable guidance — not as aliases *in this build*; design-spec §7.1/§9
+/// tie alias activation to the named display presets, which are not accepted yet
+/// (see the comment on the simple controls below). `reject_legacy_recipe_keys` is
+/// the recipe-side mirror.
 fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
     if let Some(name) = &args.algorithm {
         return Err(NcError::Usage(format!(
@@ -1754,23 +2177,91 @@ fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
              (design-spec §8)."
         )));
     }
-    for (flag, present) in [
+    // The removed simple-reconstruction controls. Their replacement print controls
+    // now *exist* (`print.white_balance` shipped with auto-WB; `print.linear_range`
+    // shipped with the shared display stage), so the migration error names the
+    // concrete replacement flag instead of promising a future one.
+    //
+    // They stay **rejections in this build**. Design-spec §7.1/§9 do specify them as
+    // *warned aliases* — but only under the preset migration that lands with the named
+    // display presets, and neither replacement has a consumer here: `film-master`
+    // bypasses print controls and no display preset is accepted, so an alias could only
+    // emit a migration warning and then hard-error on the same invocation. One precise
+    // rejection beats warn-then-fail. `output/{sdr,hdr}-display-rendering` own the
+    // switch to alias behaviour; when they do, the alias must still warn that it
+    // preserves the requested *numbers* and not the legacy pixels (per-channel gains do
+    // not commute with the working-space matrix).
+    for (flag, present, replacement) in [
         (
             "--invert-white-balance",
             args.simple.invert_white_balance.is_some(),
+            "--white-balance R,G,B (recipe `print.white_balance = {\"explicit\": [r, g, b]}`)",
         ),
-        ("--clip-low", args.simple.clip_low.is_some()),
-        ("--clip-high", args.simple.clip_high.is_some()),
+        (
+            "--clip-low",
+            args.simple.clip_low.is_some(),
+            "--linear-range LOW,HIGH (recipe `print.linear_range`) — an atomic pair, \
+             so pass both endpoints",
+        ),
+        (
+            "--clip-high",
+            args.simple.clip_high.is_some(),
+            "--linear-range LOW,HIGH (recipe `print.linear_range`) — an atomic pair, \
+             so pass both endpoints",
+        ),
     ] {
         if present {
             return Err(NcError::Usage(format!(
                 "{flag} was removed: it is not a simple-reconstruction parameter — \
                  simple reconstruction ends at the direct unclamped positive \
-                 `1 - scan/Dmin` (design-spec §7.1). Inversion white balance and the \
-                 clip range return as print controls (print.white_balance / \
-                 print.linear_range) when named output presets land."
+                 `1 - scan/Dmin` (design-spec §7.1). It is a print control that now \
+                 runs *after* the NC film RGB v1 working-space mapping, so use \
+                 {replacement}. The value carries over; the pixels do not — \
+                 per-channel gains and an affine range placement do not commute with \
+                 the working-space matrix, so the result is not bit-identical to the \
+                 pre-mapping behaviour."
             )));
         }
+    }
+    Ok(())
+}
+
+/// `--output-sdr` next to a **named** output preset is a contradictory request, and
+/// the one deliberate exception to [`validate_output_preset`]'s resolved-value rule:
+/// it is checked by flag **presence**.
+///
+/// Why this flag and not `--bigtiff auto` or a recipe `"hdr": false`:
+///
+/// - **Its documented meaning is contradicted, not merely redundant.** design-spec §9
+///   defines `--output-sdr` as "*force* the default 16-bit integer output". A named
+///   preset does not write 16-bit integer output, so honouring the preset silently
+///   discards an explicit request. `--bigtiff auto` means "decide for me" and a recipe
+///   `"hdr": false` asserts nothing at all — those two genuinely ask for nothing the
+///   preset does not already do, so they stay accepted.
+/// - **There is no recipe spelling to mirror.** The recipe carries only `hdr: bool`,
+///   and `false` is the `#[serde(default)]` — indistinguishable from omission, so it
+///   can never encode this request. That is what makes a presence check cheap and
+///   provenance-symmetric here: one field read, no raw-JSON probing of the kind
+///   [`LoadedRecipe`]`::curve_dmax_present` needs, and no recipe form left behaving
+///   differently.
+///
+/// A hard error (exit 2), not a warning: the user asked for a container the preset
+/// cannot produce, and resolving that silently is exactly what "fail loudly" forbids.
+/// Note `--output-hdr` needs no entry here — it resolves a *non-default* `output.hdr`,
+/// so the value rule already rejects it from either provenance.
+fn reject_output_sdr_with_named_preset(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
+    if args.output_opts.output_sdr && cfg.output.preset.is_named() {
+        return Err(NcError::Usage(format!(
+            "--output-sdr forces the default 16-bit integer TIFF, but --output-preset {} \
+             resolves its own container format, bit depth, and colour profile (film-master, \
+             for example, is an unclamped 32-bit float linear ACEScg TIFF), so the two \
+             requests contradict each other and nc will not silently honour one of them. \
+             Drop --output-sdr, or drop the preset. (This one is checked by flag presence \
+             rather than resolved value, because `--output-sdr` has no recipe spelling: \
+             `output.hdr = false` is the default and asserts nothing, so there is no \
+             recipe form of the request to reject in step with it.)",
+            cfg.output.preset.name()
+        )));
     }
     Ok(())
 }
@@ -2068,6 +2559,10 @@ fn convert_frame(
     // on every path (`pipeline::working_space::WORKING_MAPPING_ID`); the typed
     // ACEScg mapper realizes it for the named presets that consume `AcesCgImage`.
     report.working_mapping = Some(working_space::WORKING_MAPPING_ID);
+    // Which branch ran out of that boundary, and what it applied — so a
+    // `film-master` consumer can see "no print controls, no display render,
+    // unclamped linear ACEScg" without inferring it from the recipe.
+    report.output_render = Some(output_render_result(cfg));
 
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).
@@ -2086,6 +2581,11 @@ fn convert_frame(
     let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
         let stage_started = Instant::now();
+        // Same `depth()` the primary encode uses, so the sidecar's container tracks the
+        // output's: 16-bit for the legacy default, f32 for legacy `--output-hdr` **and**
+        // for `film-master` (which resolves f32 without touching `output.hdr`). The IR
+        // *samples* are unchanged either way — the plane is carried, never converted —
+        // so the only difference is quantization headroom. Documented in design-spec §9.
         encode::export_ir(&image, cfg.output.depth(), path)?;
         ir_export_ms = Some(elapsed_ms(stage_started));
         log.info(format_args!("wrote IR plane {}", path.display()));
@@ -2260,7 +2760,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         DmaxSetting::Default
     };
     let cfg = merge(loaded.cfg, &args)?;
-    validate(&cfg)?;
+    // The *complete* convert gate: `validate`'s resolved-config rules plus the one
+    // flag-presence rule that cannot live there (see `validate_convert`).
+    validate_convert(&cfg, &args)?;
 
     // Guard every write target against the input and against each other before
     // anything is decoded or written.
@@ -2740,10 +3242,10 @@ fn reject_roll_unsupported_input(cfg: &ResolvedConfig) -> Result<()> {
 /// override) and output path. Config errors (a bad override, an unsupported knob)
 /// fail loudly here, before any frame is converted; runtime errors (a bad decode,
 /// a degenerate base) surface per frame during conversion. A per-frame override
-/// that touches a roll-fixed calibration (`film_base` or `density.dmax`) is not
-/// rejected — it is applied, with a loud roll-level warning pushed to
-/// `roll_warnings` (like the not-frozen warning), so a deliberate per-frame value
-/// stays possible while the color-consistency break is surfaced and
+/// that touches a roll-fixed choice (`film_base`, `reconstruction.curve.dmax`, or
+/// `output.preset`) is not rejected — it is applied, with a loud roll-level warning
+/// pushed to `roll_warnings` (like the not-frozen warning), so a deliberate
+/// per-frame value stays possible while the consistency break is surfaced and
 /// `--strict`-promotable.
 fn resolve_frames(
     args: &RollArgs,
@@ -2817,6 +3319,34 @@ fn resolve_frames(
                                  in the shared --params recipe (and drop the per-frame \
                                  `reconstruction.curve.dmax`) if you want a frozen, \
                                  consistent roll.",
+                                mf.input.display()
+                            );
+                            log.warn(&msg);
+                            roll_warnings.push(msg);
+                        }
+                        // `output.preset` is the third roll-fixed choice, and the
+                        // coarsest: it selects which branch out of the ACEScg boundary
+                        // runs, so overriding it per frame emits a frame of a different
+                        // *image class* — an unclamped linear ACEScg master among
+                        // rendered u16 positives, or vice versa. Worse than a Dmin/Dmax
+                        // break, and until now the only silent one of the three. Same
+                        // shape as its siblings: apply it, warn loudly at roll level
+                        // (`--strict`-promotable), never reject. It is worth warning
+                        // even for a *matching* override, because `FrameStatus::Ok`
+                        // carries no `output_render` block (that field is convert-only),
+                        // so `frames[].overrides` is the only other place the change is
+                        // visible.
+                        if sets_output_preset(&ov) {
+                            let msg = format!(
+                                "frame {}: a per-frame `params` override sets \
+                                 `output.preset`, overriding the roll's output policy — \
+                                 this frame takes a different branch out of the ACEScg \
+                                 boundary from the rest of the roll, so its pixels are a \
+                                 different image class (unclamped linear ACEScg master vs \
+                                 rendered TIFF), not merely a different rendering. Set the \
+                                 preset once in the shared --params recipe (and drop the \
+                                 per-frame `output.preset`) if you want one consistent \
+                                 roll.",
                                 mf.input.display()
                             );
                             log.warn(&msg);
@@ -3592,7 +4122,12 @@ fn emit_telemetry(
         params_hash: telemetry::params_hash(recipe_json),
         film_base_source: cfg.film_base.source.clone(),
         dmax: report.dmax,
-        output_hdr: cfg.output.hdr,
+        preset: cfg.output.preset,
+        // Via `depth()` — the single place a recipe value becomes a depth — so the
+        // record cannot disagree with what `io::encode` actually wrote. Reading
+        // `cfg.output.hdr` here would report `false` for a `film-master` run, whose
+        // switch is pinned at its default while the branch resolves f32.
+        output_hdr: cfg.output.depth() == crate::types::OutDepth::F32,
         warnings: report.warnings.len(),
     });
 
@@ -4751,6 +5286,741 @@ mod tests {
         // ignored — an old recipe would otherwise quietly encode at 16-bit.
         assert!(
             serde_json::from_str::<ResolvedConfig>(r#"{"output":{"out_depth":"f32"}}"#).is_err()
+        );
+    }
+
+    // --- named output presets: film-master + the shared display controls -------
+
+    /// A resolved config on the `film-master` branch, otherwise all defaults.
+    fn film_master_cfg() -> ResolvedConfig {
+        ResolvedConfig {
+            output: OutputParams {
+                preset: OutputPreset::FilmMaster,
+                ..OutputParams::default()
+            },
+            ..ResolvedConfig::default()
+        }
+    }
+
+    /// The `Usage` message from a config that must fail validation.
+    fn validate_err(cfg: &ResolvedConfig) -> String {
+        match validate(cfg) {
+            Err(NcError::Usage(m)) => m,
+            other => panic!("expected a Usage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_output_preset_flag_replaces_the_recipe_preset() {
+        // The merge arm — a forgotten one silently makes `--output-preset` a no-op
+        // (the four-spot-wiring trap).
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--output-preset", "film-master"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.output.preset, OutputPreset::FilmMaster);
+        // Absent flag → the recipe's preset survives.
+        let recipe: ResolvedConfig =
+            serde_json::from_str(r#"{"output":{"preset":"film-master"}}"#).unwrap();
+        assert_eq!(
+            merge(recipe.clone(), &parse_convert(&[]))
+                .unwrap()
+                .output
+                .preset,
+            OutputPreset::FilmMaster
+        );
+        // An atomic policy choice, so the flag also resets a recipe's named preset
+        // back to the no-preset legacy path (flags win in both directions).
+        assert_eq!(
+            merge(recipe, &parse_convert(&["--output-preset", "legacy"]))
+                .unwrap()
+                .output
+                .preset,
+            OutputPreset::Legacy
+        );
+        // No flag, no recipe key → the default.
+        assert_eq!(
+            merge(ResolvedConfig::default(), &parse_convert(&[]))
+                .unwrap()
+                .output
+                .preset,
+            OutputPreset::Legacy
+        );
+        // The flag shares `OutputPreset::parse`, so a renamed/unknown value is a
+        // usage error at merge, not a silent fallback to legacy.
+        let err = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--output-preset", "scene-master"]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("film-master"), "{err}");
+    }
+
+    #[test]
+    fn merge_linear_range_flag_replaces_the_recipe_pair() {
+        // The merge arm for the atomic `[low, high]` pair.
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--linear-range", "0.02,0.97"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.print.linear_range, [0.02, 0.97]);
+        // A negative low parses (a leading `-` must not be read as a flag).
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--linear-range", "-0.1,1.2"]),
+        )
+        .unwrap();
+        assert_eq!(cfg.print.linear_range, [-0.1, 1.2]);
+        // Absent flag → the recipe pair survives.
+        let recipe: ResolvedConfig =
+            serde_json::from_str(r#"{"print":{"linear_range":[0.05,0.9]}}"#).unwrap();
+        assert_eq!(
+            merge(recipe.clone(), &parse_convert(&[]))
+                .unwrap()
+                .print
+                .linear_range,
+            [0.05, 0.9]
+        );
+        // Passing the documented default is the flags-win *reset* of a recipe's
+        // non-default pair — this is what makes such a recipe usable under
+        // `film-master`, so it must not be treated as "no override given".
+        assert_eq!(
+            merge(recipe, &parse_convert(&["--linear-range", "0,1"]))
+                .unwrap()
+                .print
+                .linear_range,
+            [0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_bad_linear_range() {
+        // The endpoints divide the affine, so all three failure modes must be loud:
+        // non-finite, mis-ordered/degenerate, and an unrepresentable span (two finite
+        // endpoints whose difference overflows would silently collapse every sample).
+        for bad in [
+            [f32::NAN, 1.0],
+            [0.0, f32::INFINITY],
+            [1.0, 0.0],
+            [0.5, 0.5],
+            [-f32::MAX, f32::MAX],
+        ] {
+            let cfg = ResolvedConfig {
+                print: PrintParams {
+                    linear_range: bad,
+                    ..PrintParams::default()
+                },
+                ..film_master_cfg()
+            };
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_non_default_linear_range_because_nothing_applies_it_yet() {
+        // Only the shared display stage applies the range placement, and no display
+        // preset is accepted by this build; the legacy path keeps its frozen ordering
+        // and `film-master` bypasses print controls entirely. So *every* branch would
+        // silently ignore a non-default value — reject it loudly instead.
+        //
+        // The two branches are rejected by *different* rules, so assert each rule's own
+        // distinctive wording: both messages name `linear_range`, which means a
+        // `contains("linear_range")` check would stay green even if one rule vanished.
+        let cfg_with = |preset: OutputPreset| ResolvedConfig {
+            print: PrintParams {
+                linear_range: [0.02, 0.97],
+                ..PrintParams::default()
+            },
+            output: OutputParams {
+                preset,
+                ..OutputParams::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        // Legacy → the "no consumer yet" rule.
+        let msg = validate_err(&cfg_with(OutputPreset::Legacy));
+        assert!(msg.contains("linear_range"), "{msg}");
+        assert!(msg.contains("no display preset is"), "{msg}");
+        // film-master → the print-control bypass sweep, which is a different reason.
+        let msg = validate_err(&cfg_with(OutputPreset::FilmMaster));
+        assert!(msg.contains("linear_range"), "{msg}");
+        assert!(
+            msg.contains("bypasses all print and display controls"),
+            "{msg}"
+        );
+        // The default pair is of course fine on both branches.
+        validate(&ResolvedConfig::default()).unwrap();
+        validate(&film_master_cfg()).unwrap();
+    }
+
+    #[test]
+    fn film_master_rejects_frame_local_auto_dmax_and_pins_the_supported_anchors() {
+        // Frame-local `auto` normalizes exposure per frame, which is exactly the
+        // cross-frame consistency the master exists to preserve — so it is rejected
+        // for *either* curve, from either source.
+        for curve in [
+            DensityCurve::Exponential(ExponentialParams {
+                dmax: DmaxSource::Auto,
+                ..ExponentialParams::default()
+            }),
+            DensityCurve::Sigmoid(SigmoidParams {
+                dmax: DmaxSource::Auto,
+                ..SigmoidParams::default()
+            }),
+        ] {
+            let cfg = ResolvedConfig {
+                reconstruction: Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve,
+                },
+                ..film_master_cfg()
+            };
+            let msg = validate_err(&cfg);
+            assert!(msg.contains("auto"), "{curve:?}: {msg}");
+            assert!(msg.contains("film-master"), "{curve:?}: {msg}");
+            // …and the message points at the roll-fixed alternatives.
+            assert!(msg.contains("--d-max"), "{curve:?}: {msg}");
+        }
+
+        // Supported placements, pinned by curve type (design-spec §5):
+        //   exponential — fixed (default), explicit/roll, and `none` (unity);
+        //   sigmoid     — fixed (default) and explicit/roll; `none` is rejected for
+        //                 the S-curve regardless of preset, so it is not listed.
+        for curve in [
+            DensityCurve::Exponential(ExponentialParams::default()),
+            DensityCurve::Exponential(ExponentialParams {
+                dmax: DmaxSource::Explicit(1.64),
+                ..ExponentialParams::default()
+            }),
+            DensityCurve::Exponential(ExponentialParams {
+                dmax: DmaxSource::None,
+                ..ExponentialParams::default()
+            }),
+            DensityCurve::Sigmoid(SigmoidParams::default()),
+            DensityCurve::Sigmoid(SigmoidParams {
+                dmax: DmaxSource::Explicit(1.64),
+                ..SigmoidParams::default()
+            }),
+        ] {
+            let cfg = ResolvedConfig {
+                reconstruction: Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve,
+                },
+                ..film_master_cfg()
+            };
+            validate(&cfg).unwrap_or_else(|e| panic!("{curve:?} must be accepted: {e}"));
+        }
+        // …and the *un*supported placement stays rejected under the preset too:
+        // `dmax = none` is invalid for the S-curve regardless of preset, so
+        // "supported anchors pinned by curve type" is only half-pinned without it.
+        // The rejection comes from the curve rule, which runs *before*
+        // `validate_output_preset` — pin it here so a reordering that let the preset
+        // path return first could not silently start accepting it.
+        let msg = validate_err(&ResolvedConfig {
+            reconstruction: Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Sigmoid(SigmoidParams {
+                    dmax: DmaxSource::None,
+                    ..SigmoidParams::default()
+                }),
+            },
+            ..film_master_cfg()
+        });
+        assert!(msg.contains("--no-d-max"), "{msg}");
+        assert!(msg.contains("sigmoid"), "{msg}");
+
+        // `simple` has no Dmax at all, so the master accepts it unconditionally.
+        validate(&ResolvedConfig {
+            reconstruction: Reconstruction::Simple,
+            ..film_master_cfg()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn film_master_rejects_a_measured_balance_range_only_when_it_is_consulted() {
+        // The other frame-local measurement, and the same cross-frame hazard as auto
+        // Dmax: an `auto` regional-balance range is measured from *this* frame's density
+        // percentiles, so two frames of a roll get different ramp anchors.
+        //
+        // But `regional_balance` short-circuits before measuring whenever the two
+        // balances are equal — including the neutral default — so the default
+        // `BalanceRange::Auto` is genuinely inert and must stay accepted, or every
+        // default master would break.
+        let master_with = |density: DensityParams| ResolvedConfig {
+            reconstruction: Reconstruction::Density {
+                density,
+                curve: DensityCurve::default(),
+            },
+            ..film_master_cfg()
+        };
+
+        // Accepted: the default (Auto range, neutral balances) — the case that must not
+        // regress — and an equal-but-non-neutral pair, which is a tone-independent
+        // offset that consults no range.
+        validate(&master_with(DensityParams::default())).unwrap();
+        validate(&master_with(DensityParams {
+            shadow_balance: [0.05, 0.0, -0.02],
+            highlight_balance: [0.05, 0.0, -0.02],
+            balance_range: BalanceRange::Auto,
+            ..DensityParams::default()
+        }))
+        .unwrap();
+        // Accepted: unequal balances with an *explicit* roll range — the recovery the
+        // error message points at.
+        validate(&master_with(DensityParams {
+            shadow_balance: [0.1, 0.0, 0.0],
+            highlight_balance: [0.0; 3],
+            balance_range: BalanceRange::Explicit([0.2, 1.6]),
+            ..DensityParams::default()
+        }))
+        .unwrap();
+
+        // Rejected: unequal balances with the measured `Auto` range, whichever side is
+        // set — this is the combination that was silently accepted before.
+        for (name, shadow, highlight) in [
+            ("shadow only", [0.1, 0.0, 0.0], [0.0; 3]),
+            ("highlight only", [0.0; 3], [-0.05, 0.01, 0.0]),
+            ("both unequal", [0.05, 0.0, -0.02], [-0.05, 0.01, 0.0]),
+        ] {
+            let msg = validate_err(&master_with(DensityParams {
+                shadow_balance: shadow,
+                highlight_balance: highlight,
+                balance_range: BalanceRange::Auto,
+                ..DensityParams::default()
+            }));
+            assert!(msg.contains("film-master"), "{name}: {msg}");
+            assert!(msg.contains("--balance-range"), "{name}: {msg}");
+            assert!(msg.contains("frame-local"), "{name}: {msg}");
+        }
+        // …and the same params without the preset are legal on the legacy path.
+        validate(&ResolvedConfig {
+            reconstruction: Reconstruction::Density {
+                density: DensityParams {
+                    shadow_balance: [0.1, 0.0, 0.0],
+                    highlight_balance: [0.0; 3],
+                    balance_range: BalanceRange::Auto,
+                    ..DensityParams::default()
+                },
+                curve: DensityCurve::default(),
+            },
+            ..ResolvedConfig::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn film_master_rejects_every_non_default_print_control() {
+        // The master bypasses stage 4, so a requested adjustment must be a loud
+        // error, never silently dropped. Exhaustive over the print struct — the
+        // destructuring in `validate_output_preset` makes a newly added control fail
+        // to compile there, and this test pins the behaviour for each existing one.
+        let cases: [(&str, PrintParams); 5] = [
+            (
+                "print_exposure",
+                PrintParams {
+                    print_exposure: 0.5,
+                    ..PrintParams::default()
+                },
+            ),
+            (
+                "black_point",
+                PrintParams {
+                    black_point: 0.01,
+                    ..PrintParams::default()
+                },
+            ),
+            (
+                "white_balance",
+                PrintParams {
+                    white_balance: WbSource::Explicit([1.05, 1.0, 0.93]),
+                    ..PrintParams::default()
+                },
+            ),
+            (
+                "white_balance",
+                PrintParams {
+                    white_balance: WbSource::Percentile,
+                    ..PrintParams::default()
+                },
+            ),
+            (
+                "highlight_compress",
+                PrintParams {
+                    highlight_compress: 0.2,
+                    ..PrintParams::default()
+                },
+            ),
+        ];
+        for (name, print) in cases {
+            let cfg = ResolvedConfig {
+                print,
+                ..film_master_cfg()
+            };
+            let msg = validate_err(&cfg);
+            assert!(msg.contains(name), "{name}: {msg}");
+            assert!(msg.contains("film-master"), "{name}: {msg}");
+            // The error must offer no ignore-conflicting-controls escape.
+            assert!(msg.contains("custom"), "{name}: {msg}");
+        }
+        // The all-default print block is what the master requires.
+        validate(&film_master_cfg()).unwrap();
+    }
+
+    #[test]
+    fn named_preset_rejects_a_non_default_legacy_selector_from_either_provenance() {
+        // A named preset is atomic: it resolves container/depth/profile itself, so a
+        // non-default legacy selector is a loud error rather than a silent override.
+        //
+        // The rule is **resolved-value only** — there is deliberately no second check
+        // by flag presence — so a flag and a recipe key must reach the *same* outcome
+        // for the *same* resolved value. Every case below is therefore run through
+        // `merge` + `validate` twice: once flag-sourced, once recipe-sourced.
+        let outcome = |argv: &[&str], recipe_json: &str| -> std::result::Result<(), String> {
+            let recipe: ResolvedConfig = serde_json::from_str(recipe_json).unwrap();
+            let mut full = vec!["--output-preset", "film-master"];
+            full.extend_from_slice(argv);
+            let cfg = merge(recipe, &parse_convert(&full)).unwrap();
+            validate(&cfg).map_err(|e| e.to_string())
+        };
+
+        // Non-default → rejected, from a flag and from the recipe alike, and the
+        // message must blame the offending selector by name (a message listing all
+        // three would make this assertion vacuous).
+        for (key, flag, recipe) in [
+            (
+                "output.hdr",
+                vec!["--output-hdr"],
+                r#"{"output":{"hdr":true}}"#,
+            ),
+            (
+                "output.output_profile",
+                vec!["--output-profile", "srgb"],
+                r#"{"output":{"output_profile":"srgb"}}"#,
+            ),
+            (
+                "output.bigtiff",
+                vec!["--bigtiff", "on"],
+                r#"{"output":{"bigtiff":"on"}}"#,
+            ),
+        ] {
+            for (provenance, msg) in [
+                ("flag", outcome(&flag, "{}").unwrap_err()),
+                ("recipe", outcome(&[], recipe).unwrap_err()),
+            ] {
+                assert!(msg.contains(key), "{key} via {provenance}: {msg}");
+                assert!(msg.contains("atomic output policy"), "{provenance}: {msg}");
+                // `--output-hdr` is a *rendered* float TIFF; the message must say so
+                // rather than let a reader assume it is the same thing as the master.
+                assert!(msg.contains("never an alias"), "{provenance}: {msg}");
+                // Only the offender is blamed.
+                for other in ["output.hdr", "output.output_profile", "output.bigtiff"] {
+                    assert_eq!(
+                        other == key,
+                        msg.contains(other),
+                        "{provenance}: {msg} must blame only {key}"
+                    );
+                }
+            }
+        }
+
+        // A value that *already equals* the documented default is accepted, from both
+        // provenances: `--bigtiff auto` means "decide for me" and a recipe `hdr: false`
+        // is the serde default asserting nothing, so neither asks the preset for
+        // anything it does not already do.
+        //
+        // `--output-sdr` is deliberately NOT in this list even though it also resolves
+        // `hdr = false`: it *forces* 16-bit integer output, so it is rejected by
+        // presence in `reject_output_sdr_with_named_preset` (which `validate` cannot
+        // see, hence the separate test below).
+        for (name, flag, recipe) in [
+            (
+                "bigtiff auto",
+                vec!["--bigtiff", "auto"],
+                r#"{"output":{"bigtiff":"auto"}}"#,
+            ),
+            ("hdr false", vec![], r#"{"output":{"hdr":false}}"#),
+        ] {
+            outcome(&flag, "{}").unwrap_or_else(|e| panic!("{name} flag must be accepted: {e}"));
+            outcome(&[], recipe)
+                .unwrap_or_else(|e| panic!("{name} recipe key must be accepted: {e}"));
+        }
+
+        // The same recipes without the preset stay perfectly legal (legacy path).
+        let legacy: ResolvedConfig =
+            serde_json::from_str(r#"{"output":{"hdr":true,"bigtiff":"on"}}"#).unwrap();
+        validate(&legacy).unwrap();
+        validate(&merge(ResolvedConfig::default(), &parse_convert(&["--output-hdr"])).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn output_sdr_is_rejected_by_presence_next_to_a_named_preset() {
+        // The one deliberate presence check, and the reason it is not a value check:
+        // `--output-sdr` *forces* the default 16-bit integer TIFF (design-spec §9), which
+        // a named preset cannot produce — so it is a contradicted request, not a
+        // redundant one, even though its resolved value (`hdr = false`) IS the default.
+        // Under the value rule alone it exited 0 and silently wrote an f32 master.
+        let check = |argv: &[&str], recipe_json: &str| -> std::result::Result<(), String> {
+            let recipe: ResolvedConfig = serde_json::from_str(recipe_json).unwrap();
+            let args = parse_convert(argv);
+            let cfg = merge(recipe, &args).unwrap();
+            reject_output_sdr_with_named_preset(&cfg, &args).map_err(|e| e.to_string())
+        };
+
+        // Rejected next to a named preset, from either preset provenance — the flag is
+        // the only thing checked by presence, so the *preset*'s source must not matter.
+        for (name, argv, recipe) in [
+            (
+                "flag preset",
+                vec!["--output-preset", "film-master", "--output-sdr"],
+                "{}",
+            ),
+            (
+                "recipe preset",
+                vec!["--output-sdr"],
+                r#"{"output":{"preset":"film-master"}}"#,
+            ),
+            (
+                // The case that motivated the reversal: the user asked for 16-bit
+                // twice and previously received f32 with no diagnostic.
+                "recipe preset + recipe hdr:true",
+                vec!["--output-sdr"],
+                r#"{"output":{"preset":"film-master","hdr":true}}"#,
+            ),
+        ] {
+            let msg = check(&argv, recipe).unwrap_err();
+            assert!(msg.contains("--output-sdr"), "{name}: {msg}");
+            assert!(msg.contains("film-master"), "{name}: {msg}");
+            assert!(msg.contains("16-bit integer"), "{name}: {msg}");
+        }
+
+        // Accepted without a named preset — `--output-sdr` keeps its whole legacy job,
+        // including resetting a recipe `hdr: true`.
+        check(&["--output-sdr"], "{}").unwrap();
+        check(&["--output-sdr"], r#"{"output":{"hdr":true}}"#).unwrap();
+        check(
+            &["--output-preset", "legacy", "--output-sdr"],
+            r#"{"output":{"hdr":true}}"#,
+        )
+        .unwrap();
+        // …and the flag's merge behaviour is untouched by the new rejection.
+        assert!(
+            !merge(
+                serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap(),
+                &parse_convert(&["--output-sdr"])
+            )
+            .unwrap()
+            .output
+            .hdr
+        );
+        // Absent flag → nothing to reject, even under the preset.
+        reject_output_sdr_with_named_preset(&film_master_cfg(), &parse_convert(&[])).unwrap();
+    }
+
+    #[test]
+    fn roll_frame_override_of_output_preset_is_flagged_as_a_consistency_break() {
+        // `output.preset` is the third roll-fixed choice, alongside `film_base` and
+        // `reconstruction.curve.dmax`, and the coarsest: it changes which branch out of
+        // the ACEScg boundary a frame takes, so the frame is a different image class.
+        // It was the only one of the three that warned about nothing.
+        let probe = |json: &str| sets_output_preset(&serde_json::from_str(json).unwrap());
+        assert!(probe(r#"{"output":{"preset":"legacy"}}"#));
+        assert!(probe(r#"{"output":{"preset":"film-master"}}"#));
+        // A raw-JSON probe like `sets_curve_dmax`: an override that merely *restates*
+        // the shared preset is still a per-frame assertion, and the roll report has
+        // nowhere else to surface it (`FrameStatus` carries no `output_render`).
+        assert!(!probe(r#"{"output":{"hdr":true}}"#));
+        assert!(!probe(r#"{"print":{"print_exposure":0.5}}"#));
+        assert!(!probe(r#"{}"#));
+    }
+
+    #[test]
+    fn film_master_accepts_a_recipe_whose_controls_a_flag_resets_to_default() {
+        // The rejection is on the *resolved* value, so flags-win semantics stay
+        // usable: a roll recipe carrying print controls can be re-exported as a
+        // master by resetting them on the command line, without editing the recipe.
+        let recipe: ResolvedConfig = serde_json::from_str(
+            r#"{"print":{"print_exposure":0.5,"white_balance":{"explicit":[1.05,1.0,0.93]}}}"#,
+        )
+        .unwrap();
+        // Without the resets the master rejects it…
+        let cfg = merge(
+            recipe.clone(),
+            &parse_convert(&["--output-preset", "film-master"]),
+        )
+        .unwrap();
+        assert!(validate(&cfg).is_err());
+        // …and with them it is accepted.
+        let cfg = merge(
+            recipe,
+            &parse_convert(&[
+                "--output-preset",
+                "film-master",
+                "--print-exposure",
+                "0",
+                "--white-balance",
+                "1,1,1",
+            ]),
+        )
+        .unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.output.preset, OutputPreset::FilmMaster);
+    }
+
+    #[test]
+    fn output_render_result_serializes_the_documented_shapes() {
+        let value = |cfg: &ResolvedConfig| serde_json::to_value(output_render_result(cfg)).unwrap();
+
+        // `film-master`: no print controls, no display render, unclamped linear
+        // ACEScg, and an explicit disclaimer of physical scene recovery.
+        let master = value(&film_master_cfg());
+        assert_eq!(master["preset"], "film-master");
+        assert_eq!(master["print_controls"], false);
+        assert_eq!(master["display_render"], false);
+        assert_eq!(master["encoding"], "unclamped-linear-acescg-float-tiff");
+        assert_eq!(master["working_mapping"], "nc-film-rgb-v1");
+        assert_eq!(master["reconstruction_schema_version"], 1);
+        let content = master["content"].as_str().unwrap();
+        assert!(content.contains("intentional film rendering"), "{content}");
+        assert!(content.contains("not a physical scene-linear"), "{content}");
+        // The unreleased pre-rename name must appear nowhere in the report.
+        assert!(!master.to_string().contains("scene-master"));
+        // The block's exact key set — which pins that `pipeline_version` is absent
+        // (owned by `core/conversion-versioning`, deliberately not guessed here)
+        // *and* fails if any other field is added without updating this contract.
+        // Asserting `get("pipeline_version").is_none()` alone could never fail: the
+        // struct does not declare the field.
+        let mut keys: Vec<&str> = master
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "content",
+                "display_render",
+                "encoding",
+                "preset",
+                "print_controls",
+                "reconstruction_schema_version",
+                "working_mapping",
+            ]
+        );
+
+        // The master's content claim must not invent a Dmax placement it did not make:
+        // validation deliberately accepts exponential `dmax = none`, and `simple` has no
+        // anchor at all.
+        for (name, reconstruction) in [
+            ("simple", Reconstruction::Simple),
+            (
+                "exponential dmax=none",
+                Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve: DensityCurve::Exponential(ExponentialParams {
+                        dmax: DmaxSource::None,
+                        ..ExponentialParams::default()
+                    }),
+                },
+            ),
+        ] {
+            let anchorless = value(&ResolvedConfig {
+                reconstruction,
+                ..film_master_cfg()
+            });
+            let content = anchorless["content"].as_str().unwrap();
+            assert!(
+                content.contains("placed no Dmax anchor"),
+                "{name}: {content}"
+            );
+            assert!(!content.contains("roll-fixed Dmax"), "{name}: {content}");
+            assert!(
+                content.contains("not a physical scene-linear"),
+                "{name}: {content}"
+            );
+        }
+        // …and the anchored default does claim it.
+        assert!(
+            content.contains("resolved roll-fixed Dmax"),
+            "the default fixed anchor must be claimed: {content}"
+        );
+
+        // legacy u16 (the default): the print stage runs for a density
+        // reconstruction and the working→output ICC transform always runs.
+        let legacy = value(&ResolvedConfig::default());
+        assert_eq!(legacy["preset"], "legacy");
+        assert_eq!(legacy["print_controls"], true);
+        assert_eq!(legacy["display_render"], true);
+        assert_eq!(legacy["encoding"], "rendered-u16-tiff");
+
+        // legacy `--output-hdr`: still a *rendered* float TIFF — the identifier must
+        // not read like a master.
+        let hdr = value(&ResolvedConfig {
+            output: OutputParams {
+                hdr: true,
+                ..OutputParams::default()
+            },
+            ..ResolvedConfig::default()
+        });
+        assert_eq!(hdr["encoding"], "transitional-rendered-float-tiff");
+        assert!(
+            hdr["content"]
+                .as_str()
+                .unwrap()
+                .contains("not a film master")
+        );
+
+        // legacy `simple`: its positive passes through with no print stage.
+        assert_eq!(value(&simple_cfg())["print_controls"], false);
+    }
+
+    #[test]
+    fn removed_simple_flags_name_their_replacement_print_controls() {
+        // In *this* build the removed simple controls are rejections, not the warned
+        // aliases design-spec §7.1/§9 specify: alias activation is tied to the named
+        // display presets, which are not accepted yet, so an alias could only warn and
+        // then hard-error on the same run. The message must name the concrete
+        // replacement, which exists, and must not promise identical pixels —
+        // per-channel gains and an affine range placement do not commute with the
+        // working-space matrix.
+        for (flag, value, replacement) in [
+            ("--invert-white-balance", "1.05,1,0.93", "--white-balance"),
+            ("--clip-low", "0.02", "--linear-range"),
+            ("--clip-high", "0.97", "--linear-range"),
+        ] {
+            let err = reject_removed_flags(&parse_convert(&[flag, value])).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(flag), "{flag}: {msg}");
+            assert!(msg.contains(replacement), "{flag}: {msg}");
+            // …and must not promise identical pixels.
+            assert!(msg.contains("not bit-identical"), "{flag}: {msg}");
+        }
+    }
+
+    #[test]
+    fn help_uses_film_master_and_never_the_pre_release_name() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("convert")
+            .expect("convert subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--output-preset"), "{help}");
+        assert!(help.contains("film-master"), "{help}");
+        assert!(help.contains("--linear-range"), "{help}");
+        assert!(
+            !help.contains("scene-master"),
+            "the pre-release name must not appear in help"
         );
     }
 

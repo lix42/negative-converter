@@ -33,16 +33,40 @@ What other epics need to know about `color`:
   cannot be handed a value that skipped the mapper.
 - **The mapper is total: it returns `AcesCgImage`, not `Result`.** Non-finite
   values pass through and are counted at encode.
-- **⚠ The mapper is defined and tested but NOT yet wired into the render path.**
-  The legacy no-preset path still runs `reconstruct → finish_print →
-  color::to_output`, and its pixels are unchanged. `color/film-master-render-pipeline`
-  and `output/presets` are what activate it. The report already stamps
-  `working_mapping = "nc-film-rgb-v1"` — provenance only, deliberately not a knob.
+- **The mapper is wired into the render path for the `film-master` branch only.**
+  `stages::render` dispatches on `output.preset`: `film-master` runs
+  `reconstruct → map_nc_film_rgb_v1 → render_split::film_master` and skips
+  `color::to_output` entirely, while the **legacy no-preset path still runs
+  `reconstruct → finish_print → color::to_output` and its pixels are unchanged**
+  (the golden fixtures are byte-for-byte green). The display presets that route the
+  rest through the mapper are `output/{sdr,hdr}-display-rendering` / `output/presets`.
+  The report stamps `working_mapping = "nc-film-rgb-v1"` on every path — provenance
+  only, deliberately not a knob.
 - **`to_output` does not clamp** and may hand the encoder out-of-`[0,1]` or
   non-finite values; clamping and loss counting belong to `io/encode`.
-- **`film-master` is the planned unclamped-ACEScg branch** that bypasses print and
-  display controls. It rejects frame-local auto Dmax by design — see
-  `film-base`'s summary for why the anchor must be roll-fixed.
+- **`film-master` is the shipped unclamped-ACEScg branch** (`--output-preset
+  film-master` / `output.preset`, `pipeline::render_split::film_master`) that
+  bypasses every print and display control. It rejects frame-local auto Dmax and
+  every non-default downstream control **loudly**, never silently — see
+  `film-base`'s summary for why the anchor must be roll-fixed. `--output-hdr`
+  remains a *rendered* float TIFF and is never an alias for it.
+- **The preset's rejections are checked on the *resolved value*, with exactly one
+  presence exception.** A knob is rejected identically whether it came from a recipe or
+  a flag, and a flag that resets a value back to its documented default is accepted
+  (that is how a graded roll recipe is re-exported as a master). The exception is
+  `--output-sdr`, rejected by flag **presence**: it *forces* 16-bit integer output the
+  master cannot produce, and it has no recipe spelling, so there is no second
+  provenance to keep in step. Don't generalize the exception, and don't remove it.
+- **`nc roll` treats `output.preset` as roll-fixed**, alongside `film_base` and
+  `reconstruction.curve.dmax`: a per-frame manifest override is applied but raises a
+  loud, `--strict`-promotable roll warning, because it gives that frame a different
+  *image class*, not just a different rendering.
+- **The shared print controls exist but have no CLI-reachable consumer yet.**
+  `render_split::display_source` resolves `WB → exposure → black point →
+  linear_range` once and hands both branches the same borrowed buffer; because no
+  display preset is accepted, a non-default `print.linear_range` is a loud usage
+  error rather than a silently-ignored knob. `output/{sdr,hdr}-display-rendering`
+  are its consumers.
 - **Note:** the log entries for `scanner-profile-before-density-experiment` are
   stranded at the tail of the `input-data-semantics` section in
   [`io.md`](io.md) — they lost their heading in the flat log before this epic
@@ -287,8 +311,8 @@ What other epics need to know about `color`:
 
 
 ## film-master-render-pipeline
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** done
+**Updated:** 2026-07-28
 
 - 2026-07-23: Replaced `scene-master` with `film-master`: unclamped linear
   ACEScg containing the intentional film/lens/development/scanner rendering, not
@@ -302,6 +326,552 @@ What other epics need to know about `color`:
   explicitly selected correction immediately before the split. A corrected
   unclamped ACEScg master remains `film-master` but must identify the correction;
   the default master has no profile and this task does not depend on one.
+
+- 2026-07-27 (implementation, uncommitted in worktree): **Shipped the named-output
+  split.** The mapper from `film-rgb-working-space` is now wired into the render
+  path for the first time — the Epic summary above was rewritten in this same change
+  to say so, replacing its earlier "produced but not yet wired" caveat. Only the
+  `film-master` branch crosses the mapper; the *legacy* path still does not, and its
+  pixels are untouched.
+  - **New module `src/pipeline/render_split.rs`** — the whole split, pure functions
+    only:
+    - `film_master(AcesCgImage) -> LinearImage` is a **pure unwrap**. That is the
+      definition of the master, so any operation added there would be a bug; it does
+      not even *take* a `PrintParams`, so a control cannot leak in by accident.
+    - `resolve_shared_controls(&AcesCgImage, &PrintParams) -> ResolvedPrintControls`
+      resolves the shared controls **once** (an `auto` WB becomes concrete gains
+      there), `apply_shared_controls` applies them in the pinned order
+      `WB → exposure → black point → linear_range`, and `display_source` composes the
+      two into one `SharedDisplaySource`. Both branches then **borrow** that buffer
+      via `branch_source(&shared, DisplayBranch)` — so "SDR and HDR receive the
+      identical adjusted source" is structural (pointer equality in the test), not a
+      convention two renderers must remember.
+    - `AdjustedAcesCgImage` has private fields + a module-private constructor, so
+      `apply_shared_controls` is its only producer. A display renderer that accepts
+      one cannot be handed a buffer that skipped the shared stage — and cannot be
+      handed the master either, which is a plain `LinearImage` and never this type.
+    - `highlight_compress` is deliberately **not** shared: highlight roll-off is
+      branch-specific SDR tone policy. Pinned by a test (a hot sample stays hot).
+  - **`AcesCgImage`-only boundary.** Every function in the split takes an
+    `AcesCgImage`, whose constructor is private to `working_space` and whose only
+    input is a `FilmRgbImage` — so film RGB and raw device RGB *cannot* reach a named
+    output. That is compiler-enforced (documented in a test comment; no `trybuild`
+    dev-dep, per the `algo/mod.rs` precedent). The split stays **producer-agnostic**
+    as the task requires, but every fixture here constructs its input through the
+    direct uncorrected `reconstruct → map_nc_film_rgb_v1` path. **No** correction
+    profile selection/stage/provenance is implemented — that stays
+    `optional-color-correction-profiles`.
+  - **`stages::render` now dispatches on the resolved preset.** `legacy` keeps the
+    frozen `reconstruct → finish_print → color::to_output` ordering (all 11 golden
+    fixtures still green, byte-for-byte); `film-master` runs
+    `reconstruct → map_nc_film_rgb_v1 → film_master` and **skips `color::to_output`
+    entirely**, fetching only the ACEScg ICC blob. That skip is load-bearing:
+    `to_output` would re-apply the Rec.709→ACEScg matrix to values that already
+    crossed it. `ConvertReport::white_balance` stays `None` on the master by
+    construction — reporting gains for a branch that applied none would be a false
+    provenance claim — while the reconstruction's own `dmax`/`balance_range` *are*
+    reported, because they are part of what the master contains.
+  - **New knobs (both fully four-spot wired, with merge tests):**
+    - `--output-preset <legacy|film-master>` / `output.preset` (§9 *Output / encode*)
+      — one `OutputPreset` enum field, never parallel bools. `legacy` **is** the
+      no-preset state (byte-identical to passing nothing, and still compatible with
+      the legacy selectors); `film-master` is *named* and therefore atomic.
+      `OutputParams::depth()` returns `F32` for the master by definition, not via
+      `output.hdr`.
+    - `--linear-range LOW,HIGH` / `print.linear_range` (§9 *Print / tone render*),
+      default `[0,1]` = the exact identity. Atomic pair; validated finite,
+      `low < high`, and **representable span** (two finite endpoints can still
+      overflow their difference and silently collapse every sample — the same trap
+      `--balance-range` has).
+  - **Fail-loud, never-silent rejections** (all on the *resolved* config, so source
+    doesn't matter; all exit 2):
+    - `film-master` + frame-local `auto` Dmax → rejected for either curve, with the
+      roll-fixed alternatives named. Supported anchors are pinned **by curve type**:
+      exponential `fixed`/explicit/`none`, sigmoid `fixed`/explicit, simple none.
+    - `film-master` + any non-default print control → rejected, naming the offender.
+      The sweep **destructures** `PrintParams` rather than field-accessing it, so a
+      future control makes `validate_output_preset` fail to compile and forces an
+      explicit decision — a field-access sweep would silently omit it and reintroduce
+      exactly the silent-ignore this rule exists to prevent.
+    - Named preset + legacy selector → rejected **twice on purpose**: by flag
+      *presence* (so `--output-sdr`, whose value equals the default, still errors) and
+      by resolved *value* (which is what catches a recipe-sourced one). clap
+      `conflicts_with` can't express this, because `--output-preset legacy` is
+      legitimately compatible with all four.
+    - A flag that resets a recipe control back to its documented default **is**
+      accepted — that is how a graded roll recipe gets re-exported as a master
+      without editing it. Pinned by a test.
+    - `scene-master` → rejected as an unreleased-schema break naming the rename, with
+      an explicit "there is no alias". Planned names (`gain-map-hdr`, `display-p3`,
+      `compatibility`, `hdr-pq`, `hdr-hlg`, `custom`) get their own "not accepted
+      yet" message so an agent can tell *not yet* from *typo*. Flag and recipe key
+      share one parser (`OutputPreset::parse`, a custom `Deserialize` delegating to
+      it), so a name is diagnosed identically wherever it appears.
+    - Non-default `print.linear_range` → rejected **on both branches**. Only the
+      shared display stage applies it, no display preset is accepted yet, the legacy
+      ordering is frozen, and the master bypasses print controls — so every path
+      would silently ignore it. See the scope note below.
+  - **New report block `output_render`** (§8): `preset`, `print_controls`,
+    `display_render`, `encoding`
+    (`rendered-u16-tiff` | `transitional-rendered-float-tiff` |
+    `unclamped-linear-acescg-float-tiff`), `content`, `working_mapping`,
+    `reconstruction_schema_version`. `print_controls` means "the stage ran at all",
+    so it is `false` for the master *and* for legacy `simple`. The master's `content`
+    states the intentional film rendering and explicitly disclaims physical scene
+    recovery. `pipeline_version` is **deliberately absent** rather than guessed —
+    `core/conversion-versioning` is still `[ ]` and owns stamping it.
+  - **Determinism / cross-platform care:** no test checksums a whole encoded TIFF, a
+    full frame, or post-lcms2 pixels. Bit-identity is pinned only with small curated
+    per-pixel `to_bits()` vectors (the `pipeline::stages::golden` style); the e2e
+    float-TIFF test asserts sample format + value magnitudes, and the two byte-equal
+    file comparisons it makes are *same-build A-vs-B* reruns, not checked-in hashes.
+
+- 2026-07-27 (scope call — read this before `output/{sdr,hdr}-display-rendering`):
+  **The removed simple controls stay rejections, not warned aliases.**
+  Design-spec §7.1/§9 describe `--invert-white-balance` / `--clip-low` /
+  `--clip-high` becoming warned aliases at "preset migration", and the task's
+  How-to-Verify allows "old-key **rejection or** migration diagnostics". Chose
+  rejection, with the message upgraded to name the concrete replacement that now
+  exists (`--white-balance R,G,B` / `--linear-range LOW,HIGH`) and to state that the
+  *value* carries over but the *pixels* do not. Why: the alias's target,
+  `print.linear_range`, has **no consumer in this build** — the legacy ordering is
+  frozen and `film-master` bypasses print controls — so an alias could only ever emit
+  a migration warning and then hard-error on the same invocation. A single precise
+  rejection is better than warn-then-fail, and §7.1's own wording ties alias
+  activation to *named display presets applying them after NC film RGB mapping*,
+  which is the SDR/HDR tasks, not this one. **What the display tasks inherit:** relax
+  the `linear_range` rule in `cli::validate::validate_output_preset` (rule 2) for
+  their presets, then implement the alias contract §7.1 specifies — atomic flag
+  conflicts with either legacy flag, `--clip-low`/`--clip-high` independently
+  override their endpoint, warn, and report endpoint provenance. Note `merge` has no
+  warnings sink today, so the warning channel needs threading (or the alias
+  resolution needs to move into `convert_frame`).
+  The **value/pixel boundary is already pinned**:
+  `render_split::wb_gains_do_not_commute_with_the_working_space_matrix` shows
+  non-uniform gains give different pixels before vs after the matrix (and that a
+  *uniform* gain does commute, so the difference is genuinely the ordering). Never
+  promise bit-identical migration.
+
+- 2026-07-27 (notes for dependent tasks):
+  - **`output/sdr-display-rendering` / `output/hdr-display-rendering`:** your entry
+    point is `render_split::display_source(AcesCgImage, &PrintParams)` →
+    `SharedDisplaySource`; take your buffer with `branch_source(&shared,
+    DisplayBranch::{Sdr,Hdr})`. Do **not** re-resolve the controls or re-estimate an
+    auto WB — that is the invariant. `shared.controls` tells you what already ran.
+    Reference white, highlight/tone behaviour, destination gamut mapping, and
+    transfer encoding are yours alone; the shared stage clamps nothing and
+    compresses no highlights. Adding a preset also means teaching
+    `stages::render` a new arm and relaxing the `linear_range` rule.
+  - **Auto-WB domain shift:** the legacy estimator runs on pre-matrix film RGB;
+    `resolve_shared_controls` runs the *same* estimators on mapped ACEScg, so an
+    `auto` mode resolves to **different numbers** there. That is the documented
+    consequence of moving the controls after the boundary, not a bug — but it means
+    a display preset's auto WB is not comparable to the legacy report's gains, and
+    `conversion-versioning` owns the resulting `pipeline_version` bump when a preset
+    changes default pixels.
+  - **`color/optional-color-correction-profiles`:** the split is producer-agnostic
+    over `AcesCgImage` exactly so you can insert a correction between the mapper and
+    `film_master`/`display_source` without touching either. Nothing in
+    `render_split` inspects provenance.
+  - **`output/presets`:** `OutputPreset::parse` is the single place to add a name,
+    and it already emits a pinned "not accepted yet" message for each of yours.
+    Output-path *suffix* validation against a preset's resolved container is still
+    unimplemented (`film-master` is a TIFF, so the existing `.tif`/`.tiff` rule
+    covers it, including `nc roll`'s `<stem>_positive.tiff`). A `film-master` roll
+    recipe works today.
+  - **Gates green in the worktree** (`cargo fmt --all --check`, `clippy
+    --all-targets -D warnings`, `cargo build`, `cargo test`): **382 unit + 91
+    integration, 0 failed**. Left uncommitted; `TASKS.md` set to `[~]`, not `[x]`.
+
+- 2026-07-27 (review fixes, still uncommitted in the same worktree): six independent
+  review engines ran over the uncommitted diff; the verified findings are fixed here.
+  Three were behavioural.
+  - **Preset atomicity unified on resolved-value semantics; the flag-presence rule is
+    deleted.** `reject_preset_flag_conflicts` is gone. It checked flag *presence* and
+    early-returned when the preset came from a recipe, while `validate_output_preset`
+    checked the *resolved value* — so a selector whose resolved value equalled its
+    default fell through both, and the *same user intent got opposite outcomes
+    depending only on provenance*. Measured before the fix (`hdri-64bit.tif`,
+    `--film-base 0.9,0.55,0.42`): a recipe `{"output":{"preset":"film-master"}}` plus
+    `--output-sdr` exited **0** and wrote 2 783 902 bytes (4 bytes/sample f32) — a user
+    asking for a 16-bit SDR TIFF silently received unclamped float ACEScg — while the
+    *flag* preset plus `--output-sdr` exited 2. `--bigtiff auto` and an explicit
+    `"hdr": false` were likewise silently ignored.
+    **Why value semantics and not a mirrored presence rule:** the task spec's own
+    wording is "rejects every **non-default** downstream control"; `PrintParams`
+    already works exactly this way and is documented and tested
+    (`film_master_accepts_a_recipe_whose_controls_a_flag_resets_to_default`), so the
+    output side was the odd one out; §5's documented escape hatch ("a roll recipe
+    carrying print controls can still be re-exported as a master") *requires* that a
+    flag resetting a value to its default be accepted, and for `output.hdr` the reset
+    flag is `--output-sdr` — which the presence rule rejected, making that a dead end;
+    and mirroring presence for recipe keys would mean probing raw JSON per key (the
+    `LoadedRecipe::curve_dmax_present` machinery) purely to reproduce a rule that only
+    the resolved value can state. **Consequence, deliberately accepted:** under the
+    preset, `--output-sdr` / `--bigtiff auto` / `"hdr": false` are accepted and still
+    produce the f32 master — they resolve the documented defaults, so they ask the
+    preset for nothing it does not already do. All four previously-incoherent cases now
+    behave identically (exit 0, 2 783 902 bytes), and `hdr: true` is exit 2 from either
+    provenance.
+    Mechanically: the sweep moved to `OutputParams::non_default_legacy_selector`
+    (types.rs), which **destructures** — a new output selector fails to compile there,
+    the same guard the print sweep already had — and returns the offender so the error
+    blames one selector instead of listing all three (the old message listed all three
+    unconditionally, which made "did we blame the right one?" tests vacuous). The rule
+    is now gated on `OutputPreset::is_named()`, not on `FilmMaster`, so the next named
+    preset inherits recipe-side protection; messages take the name from the new
+    `OutputPreset::name()` instead of hardcoding `"film-master"`.
+    **What the display/preset tasks inherit:** there is one atomicity rule, by value,
+    for every named preset. Do not re-add a presence check.
+  - **Telemetry recorded the wrong depth for every master, and could not name the
+    branch.** `output_hdr` read `cfg.output.hdr`, which the preset pins at `false`
+    while `depth()` returns `F32` — verified: `"output_hdr": false` next to
+    `"output_bytes": 2783902`. It now derives from `cfg.output.depth() == F32`, the
+    single place a recipe becomes a depth (its own doc claimed to be that single
+    place; telemetry was a fourth consumer bypassing it). Added
+    `conversion.preset`, without which a master is indistinguishable from a legacy
+    u16 run except by file size. **`SCHEMA_VERSION` 2 → 3**; design-spec §9's record
+    shape and the pinned wire-shape snapshot both updated. There was zero telemetry
+    coverage of the preset; there is now a unit snapshot plus an e2e test that
+    cross-checks `output_hdr` against the bytes actually written.
+  - **The master accepted one frame-local measurement while rejecting its sibling.**
+    Rule 1a's rationale for rejecting `DmaxSource::Auto` ("measures the anchor per
+    frame … breaks the cross-frame consistency the master exists to preserve") applies
+    verbatim to `reconstruction.density.balance_range`, which defaults to
+    `BalanceRange::Auto` and is measured from *this* frame's 0.5/99.5 corrected-density
+    percentiles. `--output-preset film-master --shadow-balance 0.1,0,0` exited 0 with
+    no warning, so two frames of a roll got different ramp anchors. Now rejected — but
+    **only when the range is actually consulted**, because `regional_balance`
+    short-circuits before measuring whenever the two balances are equal (neutral, or
+    equal-but-non-neutral, which collapses to a tone-independent offset). That
+    predicate is `algo::density::consults_balance_range`, deliberately placed beside
+    the short-circuits it mirrors, with a unit test asserting it agrees with
+    `regional_balance`'s observable `Some(range)`/`None` — the default `Auto` range
+    stays accepted, which every default master depends on.
+  - **`ResolvedPrintControls` now has a checked constructor.** It was all-public
+    fields feeding an infallible divide by `high - low` behind a comment claiming CLI
+    validation — untrue even of this module's own tests, which pass `[0.5,1.5]` /
+    `[0.0,0.5]` that `cli::validate` rejects. Fields are private, `new` is the sole
+    constructor (`resolve_shared_controls` already returned `Result` and did not use
+    it), and it validates finite positive WB gains, a finite non-zero
+    `exposure_gain`, a finite `black_point`, and finite `low < high` with a positive
+    representable span. This also closes a real reachable overflow: `--print-exposure
+    200` is `finite()`-valid but `2^200` is `inf`. Accessors (`white_balance()` …)
+    replace the public fields — **`output/{sdr,hdr}-display-rendering` read them
+    through the accessors now**.
+  - **`branch_source` deleted.** Its whole body was `let _ = branch; &shared.source`,
+    and the test "proving" SDR/HDR see the same buffer compared one reference against
+    itself (`ptr::eq(sdr, hdr)` where both came from that pass-through) — it could
+    never fail. Branch-independence is **structural**: `SharedDisplaySource` owns
+    exactly one `AdjustedAcesCgImage` whose constructor is module-private, so there is
+    no per-branch buffer to diverge; that is now stated in a comment instead of
+    asserted, and the test pins what *is* falsifiable — the single buffer really
+    carries the resolved controls, recomputed independently.
+    **Display tasks: take `&SharedDisplaySource` (or `&shared.source`) directly**;
+    `DisplayBranch` remains as the seam you match on to pick a renderer.
+  - **Legacy-branch pixel freeze pinned at the boundary this change introduced.**
+    `stages::golden` calls `reconstruct_and_print` **directly**, so it never crosses
+    the new `match output_params.preset`, and the e2e legacy test compares legacy to
+    legacy — *swapping the two match arms left every one of them green*. New in-process
+    test `legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence` asserts
+    `render(…, &OutputParams::default())` equals
+    `color::to_output(reconstruct_and_print(…))` bit-for-bit (pixels, IR, ICC, report)
+    across all three reconstructions and three output configs. In-process only, so it
+    is not the cross-target ICC/post-lcms2 trap.
+  - **Report no longer claims a Dmax placement that need not exist.** `output_render`'s
+    `content` was a static string ending "and the resolved roll-fixed Dmax placement",
+    but validation deliberately accepts exponential `dmax = none` and `simple` has no
+    anchor. It is now conditional on `master_places_dmax`, with unit + e2e coverage
+    (the old e2e only ran `--d-max 0.2`).
+  - **Tests that could not fail were removed or repaired**, beyond the two above:
+    `film_master_render_is_f32_regardless_of_the_output_hdr_switch` never called
+    `render` (it asserted `!params.hdr` on a literal it had just built) and now flips
+    the switch through `render` and demands bit-identical output; the `pipeline_version`
+    absence assertion (a field the struct does not declare) became an exact key-set
+    assertion; `legacy_hot > master * 1.5` now first asserts `master > 0.0`, since
+    post-matrix ACEScg legitimately goes negative; two fixture-arithmetic-against-
+    literals asserts and a single-process `assert_eq!(run(), run())` determinism test
+    are gone (the GrayWorld coverage the latter carried moved into the auto-WB test,
+    which now loops both estimators); the `linear_range` and auto-Dmax rejection tests
+    now assert phrases distinctive to the rule they name — `contains("auto")` also
+    matched `balance_range: "auto"`, a film-base `"auto"`, and `--auto-wb`, and both
+    `linear_range` rules mention `linear_range`, so each test stayed green with its own
+    rule deleted. `film_master_rejects_frame_local_auto_dmax…` also now pins sigmoid +
+    `dmax: none` as rejected (validation order previously left that unpinned).
+  - **Coverage added:** a master run whose written TIFF contains a **negative** sample
+    (the old test proved "unclamped" only upward; note the `clipped_*` counters are
+    structurally 0 on the f32 path, so they were never the proof the comment claimed);
+    an end-to-end check of the master's embedded **ICC tag**, compared against what the
+    *same binary* embeds for `acescg` and shown to differ from `srgb` — never a
+    checked-in ICC hash; and the `--export-ir` sidecar under the preset, asserting its
+    `SampleFormat`/`BitsPerSample` flip to f32 while the IR samples requantize back to
+    the legacy u16 plane (carried, not consumed). That depth coupling is now documented
+    in design-spec §9's `--export-ir` entry.
+  - **Documentation corrections** (each verified wrong, not stylistic): `render_split`'s
+    module header and closing comment claimed a `FilmRgbImage` "cannot reach a named
+    output … there is no signature that accepts one" — false, `io::encode(&LinearImage,
+    &OutputParams, …)` accepts exactly that pairing; only *construction* is
+    compiler-enforced (`AcesCgImage`'s private fields + module-private `fn new`), which
+    is what both now say, as does `working_space`'s matching overclaim. "Every function
+    here takes an `AcesCgImage`" was false for `branch_source` (now deleted). The
+    "guard it loudly like `color.rs` / `working_space.rs` do" comment named the wrong
+    precedents: `working_space` does `debug_assert!`, `color.rs` returns `Err` and has
+    no assert, and `debug_assert!` is compiled out in release. Four sites said
+    `stages::golden` pins the legacy *branch*'s pixels; it pins the
+    **pre-colour-transform** pixels. `cli.rs` said the removed simple controls stay
+    rejections "**never** warned aliases" while §7.1/§9 specify warned aliases under
+    preset migration — resolved in the spec's direction (rejections *in this build*,
+    aliases activate with the display presets), with §7.1's stale "current legacy
+    controls … currently run before the output transform" corrected to "removed /
+    rejected". §8 no longer says target migration "later adds `print.linear_range`" (it
+    shipped). `CLAUDE.md`'s `stages::render` bullet said "stages 3–4"; `stages.rs` said
+    "2–5a/5b" and has no 5b arm — both corrected. Two **new** broken intra-doc links
+    (`unresolved link to 'golden'`, from `#[cfg(test)] mod golden`) are gone; the four
+    remaining unresolved links and three redundant-target warnings match the pre-feature
+    baseline exactly. `color.rs::icc_profile` lost its stale `#[allow(dead_code)]`
+    ("used by the tests here" — `stages` calls it in production).
+  - **Deferred, recorded for `output/{sdr,hdr}-display-rendering`** (not implemented
+    here): WB gains / `black_point` / `density.scale` are `positive()`/`finite()`-
+    validated with **no upper bound**, while `sigmoid.contrast`/`toe`/`shoulder` and
+    `linear_range`'s span *are* bounded — worth closing that asymmetry when a display
+    renderer consumes them (the `exposure_gain` half is closed above). If
+    `ResolvedPrintControls` ever gains `Serialize`, note `serde_json` renders
+    `f32::INFINITY` as `null`, so an `inf` gain would appear as `null` in the report —
+    the checked constructor now prevents producing one. `density::estimate_wb_gains`
+    hard-errors on channel levels ≤ 0, but post-matrix ACEScg legitimately contains
+    negatives and `wb_channel_samples` filters only non-finite: that is a real domain
+    change for the first display renderer that calls auto WB after the ACEScg boundary.
+    Print controls under legacy `simple` are still accepted-and-silently-dropped (now
+    at least *reported* as `print_controls: false`); pre-existing, needs a
+    reject-or-warn decision. The planned preset names return exit 2 like a typo, while
+    §11 reserves exit 4 for "unsupported variant"; if that changes,
+    `scene_master_is_rejected_as_an_unreleased_schema_break` asserts `code == 2` for
+    `gain-map-hdr` and must move with it.
+  - **`pipeline_version` handoff:** still deliberately absent from the master report.
+    `core/conversion-versioning` is landing it in parallel and its own notes record
+    that the master must eventually name a behavioural version; the carve-out stays,
+    and the vacuous test that "pinned" it is replaced by the key-set assertion above.
+  - **Gates green in the worktree** (`cargo fmt --all --check`, `clippy --all-targets
+    -D warnings`, `cargo build`, `cargo test`): **384 unit + 96 integration, 0
+    failed**. Still uncommitted; `TASKS.md` still `[~]`.
+
+- 2026-07-27 (review round 2, still uncommitted): Codex's delta re-review came back
+  clean and an empirical delta pass re-confirmed B2/B3/the checked constructor
+  (including all five master rejections through the `roll` per-frame manifest path,
+  which is separate code). Four items remained.
+  - **⚠ CORRECTION to the round-1 entry above: `--output-sdr` next to a named preset is
+    now rejected by flag *presence* (exit 2).** Round 1 unified *everything* on
+    resolved-value semantics and recorded `--output-sdr` as "correctly a non-issue". That
+    conclusion was wrong for this one flag — do not re-derive it from the entry above.
+    Everything else in that entry stands: the three selectors (`hdr`,
+    `output_profile`, `bigtiff`) are still value-checked through the destructured
+    `non_default_legacy_selector`, and that part was re-confirmed as closing the
+    future-knob hole.
+    **Why this flag is genuinely different.** (a) *Its documented meaning is
+    contradicted, not merely subsumed.* design-spec §9 defines `--output-sdr` as
+    "**force** the default 16-bit integer output"; a named preset does not write 16-bit
+    integer output, so honouring the preset silently discards an explicit container
+    request. By contrast `--bigtiff auto` means "decide for me" and a recipe
+    `"hdr": false` is the `serde` default asserting nothing — those two genuinely ask
+    for nothing the preset does not already do, and stay accepted. (b) *It has no recipe
+    spelling*, so the cost argument that killed a general presence rule does not reach
+    it: the recipe carries only `hdr: bool`, whose `false` is indistinguishable from
+    omission, so there is no recipe form left behaving differently and detecting the
+    flag costs one field read — no `curve_dmax_present`-style raw-JSON probing. (c) The
+    "reset use" round 1 set out to protect does not survive inspection: recipe
+    `hdr: true` + preset + `--output-sdr` resolved `hdr=false` and wrote the float
+    master, i.e. the user asked for 16-bit *twice* and silently got f32.
+    Implemented as `cli::reject_output_sdr_with_named_preset`, called after `merge` and
+    before `validate` (it needs the resolved preset *and* the raw flags, so it cannot
+    live inside `validate`, which `roll` also calls with config only — and `roll` has no
+    output flags, so it misses nothing). Hard error, not a warning: an explicit request
+    for a container the preset cannot produce is what "fail loudly" covers.
+    `--output-sdr` keeps its entire legacy job when no named preset is in play,
+    including resetting a recipe `hdr: true`. Pinned by
+    `output_sdr_is_rejected_by_presence_next_to_a_named_preset` (both preset
+    provenances, the double-request case, and four accepted legacy shapes) and by the
+    e2e block in `film_master_never_silently_ignores_a_requested_adjustment`.
+    **What the display/preset tasks inherit:** value semantics for the three selectors,
+    plus exactly one presence exception, for exactly one flag, for a stated reason. Do
+    not generalize the exception; do not remove it.
+  - **`roll` now warns on a per-frame `output.preset` override.** It was the only
+    roll-fixed choice of three that warned about nothing: `film_base` and
+    `reconstruction.curve.dmax` each emit a "breaks color consistency" roll warning,
+    while a manifest frame overriding `output.preset` silently emitted one 1.4 MB u16
+    frame among 2.7 MB f32 masters (verified: rc=0, `warnings: None`). Added
+    `sets_output_preset` (a raw-JSON probe like `sets_curve_dmax`) and a third warning
+    beside the other two — same shape, `--strict`-promotable, applied-not-rejected. It
+    warns even for an override that *restates* the shared preset, because
+    `FrameStatus::Ok` carries no `output_render` block (convert-only), leaving
+    `frames[].overrides` as the only other trace. This is the coarsest of the three
+    breaks: not a different Dmin or anchor but a different **image class**. Pinned by
+    `roll_frame_override_of_output_preset_warns_and_is_strict_promotable` (asserts the
+    warning text in the roll report *and* on stderr, that the two frames really are
+    32-bit vs 16-bit, and that `--strict` exits non-zero) plus a unit test on the probe
+    and a no-override control assertion in `roll_accepts_a_film_master_recipe`.
+    design-spec §9's roll-invariant list gained it as item (5).
+  - **`exposure_gain` guard tightened to `is_normal()`.** `!is_finite() || == 0.0`
+    accepted **subnormals**: `2f32.powf(-140.0)` is `7.17e-43` — finite, non-zero, and
+    subnormal (f32 subnormals reach `2^-149`) — so it passed while contradicting the
+    message's own "roughly −126..127" bound. A subnormal gain underflows every
+    `px · wb · gain` product toward zero, producing an all-black image that trips
+    neither the clip counter nor the non-finite counter: the same silent-destruction
+    class the sigmoid contrast/knee caps close. `is_normal()` rejects zero, subnormal,
+    infinite and NaN in one predicate. Added as a ninth case to
+    `resolved_controls_reject_the_values_the_arithmetic_cannot_survive`. Note this guard
+    is not CLI-reachable yet (nothing calls the shared display stage); it is armed for
+    `output/{sdr,hdr}-display-rendering`. Deliberately still unguarded, as inherent:
+    `px · wb · gain` can overflow to `inf` for a *validated* finite gain and a large
+    pixel — that cannot be bounded without knowing the pixels, and `io::encode`'s
+    non-finite counter catches it.
+  - **Telemetry skill doc synced to schema v3.**
+    `.agents/skills/perf-telemetry/SKILL.md` still showed `"schema_version": 2` with no
+    `preset`, and `CLAUDE.md` names that skill as the telemetry how-to — so it
+    contradicted the design-spec §9 update from round 1. Sample record updated, plus
+    prose for `conversion.preset` and for why `output_hdr` is derived from
+    `OutputParams::depth()`. (`.claude/skills/` is a symlink into `.agents/skills/`, so
+    one edit covers both.)
+  - **Measured outcomes** (`hdri-64bit.tif`, `--film-base 0.9,0.55,0.42`):
+    `--output-sdr` + flag preset → rc 2; `--output-sdr` + recipe preset → rc 2;
+    `--bigtiff auto` + preset → rc 0, 2 783 902 B; recipe `hdr:false` + preset → rc 0,
+    2 783 902 B; recipe `hdr:true` + preset → rc 2; `--output-sdr` with no preset → rc 0,
+    1 392 370 B (16-bit, unchanged); roll per-frame preset override → rc 0 with the
+    warning, `--strict` → rc 1.
+  - **Explicitly out of scope, still open:** the planned preset names
+    (`gain-map-hdr` etc.) return `NcError::Usage`/rc 2 where design-spec §11 arguably
+    reserves exit 4 for "unsupported variant". Re-confirmed as unaddressed and
+    deliberately left; `tests/pipeline.rs::scene_master_is_rejected_as_an_unreleased_schema_break`
+    asserts `code == 2` for `gain-map-hdr` and must move if that ever changes.
+  - **Gates green in the worktree** (`cargo fmt --all --check`, `clippy --all-targets
+    -D warnings`, `cargo build`, `cargo test`): **386 unit + 97 integration, 0
+    failed**. Still uncommitted; `TASKS.md` still `[~]`.
+
+- 2026-07-27 (review round 3, pre-PR polish, still uncommitted): both ship reviewers
+  returned "ship — no Critical, no High"; Codex clean. One Medium plus five doc/API
+  polish items.
+  - **Fixed an unfalsifiable `--strict` assertion (the Medium).** The new roll test used
+    `hdri-64bit.tif`, which **carries an IR plane** — so every frame raises a per-frame
+    "IR preserved but not used" warning, `strict_failure` is already true via
+    `frames.iter().any(|f| !f.warnings.is_empty())` (`cli.rs`), and a *no-override* roll
+    on that fixture exits 1 under `--strict` by itself. Measured both ways: no-override
+    `--strict` → rc **1** on `hdri-64bit.tif` vs rc **0** on `hdr-48bit.tif`, both with
+    zero roll-level warnings. So `assert_ne!(code, 0)` passed for the wrong reason and
+    stayed green with `sets_output_preset` gutted to `|_| false`. Switched the test to
+    the IR-free `hdr-48bit.tif` and **added the control run** that makes the promotion
+    falsifiable: same recipe, same fixture, same `--strict`, no override ⇒ rc 0 and an
+    empty/absent roll `warnings`. The warning-*emission* half was already sound (top-level
+    `warnings` is `null` on a no-override run, so the `.expect()` fires if the warning
+    disappears) and was left alone. **General lesson for this repo's roll tests: any
+    `--strict` promotion assertion must use an IR-free fixture, or it proves nothing.**
+  - **Two guard docs made true rather than trimmed.** The `is_normal()` comment claimed
+    it closed the class where "every `px · wb · gain` product underflows", but the guard
+    inspected `exposure_gain` alone. Verified the hole: `--white-balance
+    1e-30,1e-30,1e-30 --print-exposure -100` passes both existing checks (gains
+    positive-finite; `2^-100` = `7.9e-31` is normal) yet the product is `7.9e-61`, which
+    in f32 is **exactly `0.0`** — every sample zeroed, no counter firing. Added a
+    per-channel `(wb[c] * exposure_gain).is_normal()` check, so the claim now holds.
+    Three cases added to the guard test (both-directions product collapse, one-channel
+    collapse so the loop is exercised, and product overflow).
+    Also corrected two overstatements I could measure: the message blamed **both** ends
+    of the exposure range for silent destruction, but the overflow end yields `inf`/`NaN`
+    and **does** trip the non-finite counter — only the subnormal end is silent; and
+    "underflow to `0.0`" is really `3.59e-43` for `2^-140 · 0.5`, i.e. crushed to a
+    quantizes-to-black value, not literally zero. Both now say what is true.
+  - **The span comment's claim was wrong, not the behaviour.** A subnormal-but-positive
+    span (`linear_range: [0.0, 1e-40]`) passes both `ResolvedPrintControls::new` and
+    `cli::validate`, and `0.5 / 1e-40` is `inf` — so "cannot produce inf/NaN from the
+    span itself" was false. Left the behaviour alone (deliberately: it is **loud** via
+    the non-finite counter, unlike the gain underflow) and rewrote the comment to say
+    exactly which failure modes are excluded and which are delegated to the counter.
+    The constructor doc now carries a "what this deliberately does not prevent" note
+    covering both this and `px · gain` overflow for a validated gain.
+  - **`validate` no longer hides convert's second gate.** `validate` is `pub` and reads
+    as *the* CLI-boundary validator, but for `convert` it is incomplete —
+    `reject_output_sdr_with_named_preset` is private and was enforced at one call site,
+    so a future orchestrator doing `merge` + `validate` would reinstate the round-2 bug.
+    Added `pub fn validate_convert(cfg, args)` composing both; `run_convert` calls it, and
+    `validate`'s doc now says it is *not* the whole convert gate and that `roll`
+    legitimately calls it directly (no output flags to miss). **`output/presets`: call
+    `validate_convert`.**
+  - **A generic check no longer carries a film-master-specific claim.**
+    `reject_output_sdr_with_named_preset` is generic over named presets and interpolates
+    `preset.name()`, then asserted "film-master is an unclamped 32-bit float linear
+    ACEScg TIFF" — which would describe `hdr-pq` as an ACEScg float TIFF, exactly what
+    `OutputPreset::name()` exists to prevent. Reworded to "(film-master, **for example**,
+    is …)", the same illustrative construction rule 1 uses.
+  - **"Resolves the container" softened to match the code.** `--bigtiff auto` is
+    accepted next to a named preset (deliberately), so the size-based classic-vs-BigTIFF
+    **promotion decision stays delegated** to `resolve_bigtiff` — a master over ~4 GiB
+    legitimately comes out BigTIFF. Both messages now say "container *format*, bit depth,
+    and colour profile", and rule 1 carries a comment stating that only `--bigtiff
+    on|off` (which would override the policy) is the atomicity violation.
+  - **Stale illustrative `params_hash` marked as such** in both design-spec §9 and
+    `.agents/skills/perf-telemetry/SKILL.md`. Adding `print.linear_range` and
+    `output.preset` changed the sidecar bytes, so `92a827ffd2d0aebd` is stale — and the
+    sample's `"dmax": 1.6195` does not correspond to any default-anchor invocation, so
+    there is no run to re-derive it from. Rather than invent a number, both sites now say
+    the hash is illustrative, covers the whole recipe, and must not be asserted. (Nothing
+    does.)
+  - **Recorded, not fixed — handed to `algo/density-safety-bounds`:** a reachable,
+    fully silent all-black output on the *legacy* path. `render_print`'s
+    `2f32.powf(print.print_exposure)` (`algo/density.rs:478`) and
+    `px[c] * wb[c] * exposure_gain` (`:486`) are guarded only by `finite()`/`positive()`,
+    so on `hdr-48bit.tif` `--print-exposure=-200` writes **100 % zero samples at rc 0
+    with every `loss` counter at 0, no warning, and `--strict` also 0**;
+    `--white-balance=1e-45,1,1` kills exactly one channel the same way (so a
+    whole-image collapse test would miss it); `--print-exposure 300` is already loud
+    (`clipped_low: 695772`). This is a *different site* from the stage-3 tone map that
+    task's original context block describes, so I appended a second `Context` block to
+    `docs/tasks/algo/density-safety-bounds.md` with the measurement table, the
+    reproduction command, and two implementation notes — plus a dated pointer in
+    `docs/progress/algo.md`. Not fixed here on purpose: a naive `is_normal()` on
+    user-supplied gains would reject legitimate extreme-push recipes, and that task owns
+    the real-scan false-positive validation.
+  - **Left alone as instructed:** `DisplayBranch`'s unused-but-`#[allow]`ed status
+    (`output/sdr-display-rendering` introduces the match site), `OutputPreset::parse`'s
+    trim/lowercase leniency (`OutputSpace::parse` precedent), the ICC byte-equality test
+    (same-process both sides; `roll_two_frame_output_is_byte_identical_on_rerun` already
+    depends on stable profile serialization), and the `gain-map-hdr` exit-2-vs-exit-4
+    question.
+  - **Gates green in the worktree** (`cargo fmt --all --check`, `clippy --all-targets
+    -D warnings`, `cargo build`, `cargo test`): **386 unit + 97 integration, 0
+    failed**. Still uncommitted; `TASKS.md` still `[~]`.
+
+- 2026-07-28: **Task closed — shipped.** Landed after three review rounds
+  (Codex + five pr-review lenses in round 1, Codex + silent-failure in round 2, two
+  ship lenses in round 3; final Codex pass clean, `ship-code` verdict "no Critical,
+  no High"). Final gates: **386 unit + 97 integration, 0 failed**; `cargo doc` at the
+  4 pre-existing unresolved links.
+  - **What landed:** `pipeline/render_split.rs` — `film_master` (a pure unwrap of the
+    ACEScg buffer) plus the shared print controls resolved once in the pinned order
+    `WB → exposure → black point → linear_range`. Two knobs: `--output-preset` /
+    `output.preset` and `--linear-range` / `print.linear_range`. `simple`'s
+    `clip_low`/`clip_high` are removed and rejected with a migration diagnostic.
+  - **For `output/{sdr,hdr}-display-rendering` (read this first):** the display half
+    is built and unit-tested but has **no CLI consumer**, so a non-default
+    `print.linear_range` is a loud usage error rather than a silently-ignored knob —
+    flip that when you wire a renderer. Take `&SharedDisplaySource` / `&shared.source`;
+    `branch_source` was deleted as a pure pass-through, and `DisplayBranch` is left
+    for you to introduce a match site. `ResolvedPrintControls::new` is the sole
+    (fallible, private-field) constructor and validates finite-positive WB gains, a
+    normal `exposure_gain`, a finite `black_point`, and a finite positive span —
+    including the per-channel `wb[c] * exposure_gain` product, since two
+    individually-valid factors can collapse to `0.0`.
+  - **Atomicity rule, do not "tidy":** resolved-value for `output.hdr` /
+    `output_profile` / `bigtiff`, deliberately **flag-presence** for `--output-sdr`
+    alone. Round 2 reversed a round-1 decision here — the ⚠ CORRECTION entry above is
+    the authority, and CLAUDE.md now carries the rule.
+  - **Deferred out, with reproductions recorded:** the frame-local auto `Dmin`
+    wording overclaim; unbounded WB/black-point/density-scale inputs; the
+    `Serialize`→`inf`-as-`null` hazard; `estimate_wb_gains` vs post-matrix ACEScg
+    negatives; print controls silently dropped under legacy `simple`; exit-2-vs-4 for
+    planned preset names. Separately, a **reachable, fully silent all-black output**
+    on the legacy print path (`--print-exposure=-200` → 100% zero samples, all loss
+    counters 0, no warning, `--strict` rc 0) is handed to
+    `algo/density-safety-bounds` with its reproduction — it is a *different site*
+    (stage-4 `render_print`) from that task's existing stage-3 context.
+  - **Known carve-out:** `pipeline_version` is deliberately absent from the master
+    report, its absence pinned by test; `core/conversion-versioning` owns adding it.
 
 
 ## optional-color-correction-profiles

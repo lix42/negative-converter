@@ -410,6 +410,23 @@ pub(crate) fn regional_balance(
     Ok(Some([lo, hi]))
 }
 
+/// Whether [`regional_balance`] will actually **consult** the `[lo, hi]` ramp range
+/// for these params — i.e. whether it takes neither of the two short-circuits above.
+///
+/// Both short-circuits are exactly "the balances are equal": a neutral
+/// `[0,0,0]`/`[0,0,0]` pair leaves the buffer untouched, and an equal-but-non-neutral
+/// pair collapses to a tone-independent per-channel offset. So one comparison decides
+/// it, and it lives here — next to the code it mirrors — because a caller that needs
+/// the answer (`cli::validate_output_preset` rejects a frame-local `Auto` range under
+/// `--output-preset film-master`, but only when it is genuinely measured) would
+/// otherwise silently drift if a short-circuit changed.
+///
+/// Note this is about the *range*, not the correction: an equal pair still adjusts the
+/// image, it just needs no measured anchors.
+pub(crate) fn consults_balance_range(params: &DensityParams) -> bool {
+    params.shadow_balance != params.highlight_balance
+}
+
 /// Stage 3 — apply a density curve `tone` (corrected density → positive
 /// linear) to every sample, minting the typed [`FilmRgbImage`] boundary. The
 /// only `FilmRgbImage` producer path — both curves and their callers route
@@ -1128,6 +1145,7 @@ mod tests {
             black_point: 0.01,
             white_balance: WbSource::Explicit(wb),
             highlight_compress: 0.2,
+            ..PrintParams::default()
         };
         let via_config = run(
             &img,
@@ -1352,6 +1370,42 @@ mod tests {
             height,
             density,
             ir: None,
+        }
+    }
+
+    #[test]
+    fn consults_balance_range_matches_regional_balance_observable_behaviour() {
+        // `cli::validate_output_preset` rejects a frame-local `Auto` range under
+        // `film-master` only when it is genuinely measured, using this predicate — so
+        // the predicate must agree with `regional_balance`'s own short-circuits, or
+        // the master would either reject an inert default or accept a real per-frame
+        // measurement. `regional_balance` reports `Some(range)` exactly when it
+        // consulted one, which makes the agreement directly observable.
+        let cases = [
+            ("neutral default", [0.0; 3], [0.0; 3]),
+            ("equal non-neutral", [0.05, 0.0, -0.02], [0.05, 0.0, -0.02]),
+            ("negative zero vs zero", [-0.0; 3], [0.0; 3]),
+            ("shadow only", [0.05, 0.0, -0.02], [0.0; 3]),
+            ("highlight only", [0.0; 3], [-0.05, 0.01, 0.0]),
+            ("both, unequal", [0.05, 0.0, -0.02], [-0.05, 0.01, 0.0]),
+            ("differ in one channel", [0.05, 0.0, 0.0], [0.05, 0.0, 0.01]),
+        ];
+        for (name, shadow_balance, highlight_balance) in cases {
+            let params = DensityParams {
+                shadow_balance,
+                highlight_balance,
+                // Explicit, so the "consulted" case cannot fail on an unmeasurable
+                // frame and muddy the comparison.
+                balance_range: BalanceRange::Explicit([0.5, 2.5]),
+                ..DensityParams::default()
+            };
+            let mut img = density_image(2, 1, vec![0.2, 0.0, 0.0, 2.8, 3.0, 3.0]);
+            let consulted = regional_balance(&mut img, &params).unwrap().is_some();
+            assert_eq!(
+                consulted,
+                consults_balance_range(&params),
+                "{name}: predicate disagrees with regional_balance"
+            );
         }
     }
 
@@ -1725,6 +1779,7 @@ mod tests {
             black_point: 0.01,
             white_balance: WbSource::Explicit(wb),
             highlight_compress: 0.3,
+            ..PrintParams::default()
         };
         let gamma = 1.3;
         assert_eq!(
@@ -2326,6 +2381,7 @@ mod tests {
             black_point: 0.02,
             white_balance: WbSource::Percentile,
             highlight_compress: 0.4,
+            ..PrintParams::default()
         };
         let auto = run(
             &img,
