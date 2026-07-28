@@ -36,11 +36,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::io::decode::{DecodeInfo, SilverFastFormat};
-use crate::types::{DensityCurveType, EncodeReport, FilmBaseSource, ReconstructionType};
+use crate::types::{
+    DensityCurveType, EncodeReport, FilmBaseSource, OutputPreset, ReconstructionType,
+};
 
 /// Telemetry record schema version. Bump on any change to [`TelemetryRecord`]'s
 /// shape so a server can ingest old and new records side by side. Note the record
-/// embeds domain enums (`ReconstructionType`, `DensityCurveType`,
+/// embeds domain enums (`OutputPreset`, `ReconstructionType`, `DensityCurveType`,
 /// `FilmBaseSource`, `SilverFastFormat`) whose serde representation lives
 /// elsewhere — a change to *their* wire form is also a schema change and must
 /// bump this too.
@@ -49,7 +51,13 @@ use crate::types::{DensityCurveType, EncodeReport, FilmBaseSource, Reconstructio
 /// `conversion.reconstruction` (`simple|density`) + optional `conversion.curve`
 /// (`exponential|sigmoid`), following the tagged-reconstruction recipe schema
 /// (`negative-reconstruction-density-curves`).
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3: added `conversion.preset` (`legacy|film-master`), and
+/// `conversion.output_hdr` now means "an f32 TIFF was written" for *every* branch
+/// — it is derived from `OutputParams::depth()` rather than read off the
+/// `output.hdr` switch, which a named preset pins at its default while still
+/// resolving f32 (`color/film-master-render-pipeline`).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Default local JSONL log path, honoring `NC_TELEMETRY_LOG` then the platform
 /// data dir; `None` when no home/data dir can be located (the caller then warns
@@ -185,6 +193,11 @@ pub struct TimingInfo {
 /// carrying the whole recipe; a few high-signal knobs ride alongside it.
 #[derive(Clone, Debug, Serialize)]
 pub struct ConversionInfo {
+    /// Resolved output preset (`"legacy"` / `"film-master"`) — which branch out of
+    /// the NC film RGB v1 ACEScg boundary ran. Recorded because it is the single
+    /// biggest determinant of what the written pixels *are*, and without it a
+    /// `film-master` run is indistinguishable from a legacy `--output-hdr` one.
+    pub preset: OutputPreset,
     /// Reconstruction type (`"simple"` / `"density"`).
     pub reconstruction: ReconstructionType,
     /// The resolved density curve (`"exponential"` / `"sigmoid"`); skipped for
@@ -199,7 +212,11 @@ pub struct ConversionInfo {
     /// Resolved display-white anchor density the density render used, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dmax: Option<f32>,
-    /// Whether HDR (32-bit float) output was written.
+    /// Whether HDR (32-bit float) output was written. Derived from
+    /// [`OutputParams::depth`](crate::types::OutputParams::depth) — the single place
+    /// a recipe becomes a depth — not from the `output.hdr` switch: under
+    /// `film-master` that switch is pinned at its default while the branch still
+    /// resolves f32, so reading it directly would report `false` for an f32 master.
     pub output_hdr: bool,
 }
 
@@ -225,6 +242,8 @@ pub struct OutcomeInfo {
 /// names each field.
 pub struct RecordInputs<'a> {
     pub info: &'a DecodeInfo,
+    /// Resolved output preset (`cfg.output.preset`).
+    pub preset: OutputPreset,
     /// Wall-clock time the record is built, UNIX epoch milliseconds. Injected by
     /// the orchestrator (see [`now_unix_millis`]) so the builder stays pure.
     pub timestamp_ms: u64,
@@ -270,6 +289,7 @@ pub fn build_record(inputs: RecordInputs<'_>) -> TelemetryRecord {
         },
         timing_ms: inputs.timings,
         conversion: ConversionInfo {
+            preset: inputs.preset,
             reconstruction: inputs.reconstruction,
             curve: inputs.curve,
             params_hash: inputs.params_hash,
@@ -431,11 +451,12 @@ mod tests {
             params_hash: "deadbeef".into(),
             film_base_source: FilmBaseSource::Auto,
             dmax: Some(1.8),
+            preset: OutputPreset::Legacy,
             output_hdr: false,
             warnings: 4,
         });
 
-        assert_eq!(rec.schema_version, 2);
+        assert_eq!(rec.schema_version, 3);
         assert_eq!(rec.image.width, 2000);
         assert_eq!(rec.image.height, 3000);
         // 2000 * 3000 = 6e6 pixels → 6.0 MP.
@@ -476,6 +497,7 @@ mod tests {
             params_hash: "0".into(),
             film_base_source: FilmBaseSource::Explicit([0.9, 0.5, 0.4]),
             dmax: None,
+            preset: OutputPreset::Legacy,
             output_hdr: true,
             warnings: 0,
         });
@@ -631,6 +653,7 @@ mod tests {
                 ir_export: Some(2.0),
             },
             conversion: ConversionInfo {
+                preset: OutputPreset::Legacy,
                 reconstruction: ReconstructionType::Density,
                 curve: Some(DensityCurveType::Sigmoid),
                 params_hash: "0123456789abcdef".into(),
@@ -645,14 +668,14 @@ mod tests {
             },
         };
         let expected_full = concat!(
-            r#"{"schema_version":2,"timestamp_ms":1700000000000,"nc_version":"9.9.9","#,
+            r#"{"schema_version":3,"timestamp_ms":1700000000000,"nc_version":"9.9.9","#,
             r#""target":"test-triple","cpu_count":8,"#,
             r#""image":{"format":"hdri","width":100,"height":200,"megapixels":0.25,"#,
             r#""bit_depth":16,"channels":3,"ir_present":true,"input_bytes":1000,"#,
             r#""output_bytes":2000},"#,
             r#""timing_ms":{"total":30.0,"decode":5.0,"film_base":1.0,"algorithm":10.0,"#,
             r#""color":8.0,"encode":4.0,"ir_export":2.0},"#,
-            r#""conversion":{"reconstruction":"density","curve":"sigmoid","#,
+            r#""conversion":{"preset":"legacy","reconstruction":"density","curve":"sigmoid","#,
             r#""params_hash":"0123456789abcdef","#,
             r#""film_base_source":{"explicit":[0.5,0.25,0.125]},"dmax":1.5,"output_hdr":false},"#,
             r#""outcome":{"warnings":1,"clipped":2,"non_finite":0}}"#,
@@ -687,13 +710,18 @@ mod tests {
                 encode: 0.0,
                 ir_export: None,
             },
+            // A `film-master` run of a `simple` reconstruction: no curve, no anchor,
+            // and `output_hdr = true` because the preset resolves f32 without the
+            // `output.hdr` switch. Snapshotted here so the `"film-master"` wire name
+            // and that depth pairing are both pinned.
             conversion: ConversionInfo {
+                preset: OutputPreset::FilmMaster,
                 reconstruction: ReconstructionType::Simple,
                 curve: None,
                 params_hash: "0".into(),
                 film_base_source: FilmBaseSource::Auto,
                 dmax: None,
-                output_hdr: false,
+                output_hdr: true,
             },
             outcome: OutcomeInfo {
                 warnings: 0,
@@ -702,15 +730,15 @@ mod tests {
             },
         };
         let expected_minimal = concat!(
-            r#"{"schema_version":2,"timestamp_ms":0,"nc_version":"9.9.9","#,
+            r#"{"schema_version":3,"timestamp_ms":0,"nc_version":"9.9.9","#,
             r#""target":"test-triple","cpu_count":null,"#,
             r#""image":{"format":"hdr","width":1,"height":1,"megapixels":0.0,"#,
             r#""bit_depth":16,"channels":3,"ir_present":false,"input_bytes":null,"#,
             r#""output_bytes":null},"#,
             r#""timing_ms":{"total":0.0,"decode":0.0,"film_base":0.0,"algorithm":0.0,"#,
             r#""color":0.0,"encode":0.0},"#,
-            r#""conversion":{"reconstruction":"simple","params_hash":"0","#,
-            r#""film_base_source":"auto","output_hdr":false},"#,
+            r#""conversion":{"preset":"film-master","reconstruction":"simple","params_hash":"0","#,
+            r#""film_base_source":"auto","output_hdr":true},"#,
             r#""outcome":{"warnings":0,"clipped":0,"non_finite":0}}"#,
         );
         assert_eq!(serde_json::to_string(&minimal).unwrap(), expected_minimal);

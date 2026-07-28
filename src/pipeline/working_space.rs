@@ -26,11 +26,18 @@
 //! ## Typed boundary
 //! [`AcesCgImage`] has private fields and a module-private constructor, so
 //! [`map_nc_film_rgb_v1`] — the only function in this module that builds one — is
-//! the sole producer. Named color outputs (film-master / display presets, once
-//! they land) accept an `AcesCgImage`; a raw [`FilmRgbImage`](crate::algo::FilmRgbImage)
-//! therefore cannot be tagged with a named ACEScg/Display-P3/sRGB/HDR profile
+//! the sole producer, and that half is **compiler-enforced**. The named-output split
+//! (`pipeline::render_split`: the `film-master` branch and the shared display
+//! controls) accepts an `AcesCgImage` and nothing else, so a raw
+//! [`FilmRgbImage`](crate::algo::FilmRgbImage) cannot *enter* a named output branch
 //! without first crossing this mapper. This is the working-space analogue of
 //! `FilmRgbImage`'s own construction restriction.
+//!
+//! It does **not** follow that profile tagging is type-checked:
+//! `io::encode(image: &LinearImage, params: &OutputParams, …)` will happily write any
+//! buffer with any profile, so keeping the ACEScg tag matched to ACEScg pixels remains
+//! the orchestrator's responsibility (`pipeline::stages` fetches the tag on the same
+//! branch that maps the pixels).
 //!
 //! ## Precision, clamping, non-finite
 //! The matrix multiply runs in **binary64** and stores `f32` — so the only
@@ -121,37 +128,34 @@ impl AcesCgImage {
         }
     }
 
-    // Read accessors — the boundary's inspection API. Exercised by tests until
-    // the named-output presets (`film-master-render-pipeline` / `output/presets`,
-    // the type's designed consumers) land; narrow documented allows per the house
-    // rule (`CLAUDE.md`).
-    #[allow(dead_code)]
+    // Read accessors — the boundary's inspection API, consumed by the
+    // named-output split (`pipeline::render_split`).
+    #[allow(dead_code)] // read by `output/{sdr,hdr}-display-rendering`.
     pub fn width(&self) -> u32 {
         self.width
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read by `output/{sdr,hdr}-display-rendering`.
     pub fn height(&self) -> u32 {
         self.height
     }
 
     /// Read-only view of the interleaved linear-ACEScg pixels.
-    #[allow(dead_code)]
     pub fn rgb(&self) -> &[f32] {
         &self.rgb
     }
 
     /// Read-only view of the carried IR plane, when the input had one.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // read by `output/{sdr,hdr}-display-rendering`.
     pub fn ir(&self) -> Option<&[f32]> {
         self.ir.as_deref()
     }
 
     /// Unwrap into the plain working-space image — the **read** direction of the
-    /// boundary, for the future named-output presets / film-master encode that
-    /// consume an `AcesCgImage`. Constructing one stays restricted to the mapper;
+    /// boundary, for the named-output split (`pipeline::render_split`): the
+    /// `film-master` encode and the shared display stage both consume an
+    /// `AcesCgImage` this way. Constructing one stays restricted to the mapper;
     /// reading one out is not the invariant the type protects.
-    #[allow(dead_code)]
     pub(crate) fn into_linear(self) -> LinearImage {
         // The fields came from a validated LinearImage and are never resized, so
         // the invariants hold; route through the validated constructor anyway
@@ -181,7 +185,6 @@ impl std::fmt::Debug for AcesCgImage {
 /// no clamp or gamut limit, and carries the IR plane through untouched. Any
 /// non-finite input channel propagates as non-finite (counted downstream at
 /// encode, never swallowed here).
-#[allow(dead_code)] // wired in by `film-master-render-pipeline` / `output/presets`.
 pub fn map_nc_film_rgb_v1(film: FilmRgbImage) -> AcesCgImage {
     // Consume the typed film boundary into its validated buffers.
     let mut image = film.into_linear();

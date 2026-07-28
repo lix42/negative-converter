@@ -95,14 +95,14 @@ N runs append N lines. `--telemetry-file <path>` overwrites (a single record).
 Each line is a standalone JSON object with this shape (see `src/telemetry.rs`):
 
 ```json
-{ "schema_version":2, "timestamp_ms":1752566400000,
+{ "schema_version":3, "timestamp_ms":1752566400000,
   "nc_version":"0.1.0", "target":"aarch64-apple-darwin", "cpu_count":14,
   "image":{"format":"hdri","width":502,"height":462,"megapixels":0.231924,
            "bit_depth":16,"channels":3,"ir_present":true,
            "input_bytes":2017230,"output_bytes":1392370},
   "timing_ms":{"total":30.0,"decode":5.0,"film_base":0.0,"algorithm":4.4,
                "color":18.4,"encode":1.0,"ir_export":0.6},
-  "conversion":{"reconstruction":"density","curve":"exponential",
+  "conversion":{"preset":"legacy","reconstruction":"density","curve":"exponential",
                 "params_hash":"92a827ffd2d0aebd",
                 "film_base_source":{"explicit":[0.9,0.55,0.42]},
                 "dmax":1.6195,"output_hdr":false},
@@ -113,8 +113,17 @@ Each line is a standalone JSON object with this shape (see `src/telemetry.rs`):
 only for density reconstruction, and `conversion.dmax` only when the curve
 applied an anchor. (Schema v2 replaced v1's `conversion.algorithm` with the
 `reconstruction` + `curve` pair, mirroring the tagged recipe schema.)
+`conversion.preset` is the resolved `output.preset` (`legacy` | `film-master`) —
+**v3** added it, because without it a `film-master` run is indistinguishable from a
+legacy one except by file size. `conversion.output_hdr` means "a 32-bit float TIFF was
+written" and is derived from the same `OutputParams::depth()` the encoder uses, *not*
+from the `output.hdr` switch: `film-master` pins that switch at its default while still
+resolving f32, so reading the switch reports `false` for an f32 master.
 `params_hash` is a stable FNV-1a of the
-effective recipe JSON (the sidecar bytes), so identical conversions share a hash.
+effective recipe JSON (the sidecar bytes), so identical conversions share a hash. The
+value in the sample above is **illustrative**: it covers the *whole* recipe, so it
+changes whenever any key is added, removed, or re-defaulted. Don't treat it as a
+reproducible constant, and don't assert it in a test.
 
 `jq` recipes over the JSONL log (`jq -c` reads it line by line):
 

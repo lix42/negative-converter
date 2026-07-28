@@ -576,6 +576,15 @@ impl<'de> Deserialize<'de> for WbSource {
 
 /// Print / tone-render knobs (design-spec §9). A **separate** sub-stage from
 /// density conversion — the core fidelity rule; don't collapse the two.
+///
+/// Three of these knobs (`white_balance`, `print_exposure`, `black_point`) plus
+/// [`linear_range`](Self::linear_range) are the **shared** print controls the
+/// named-output split resolves once for both display branches
+/// (`pipeline::render_split`, design-spec §6): the pinned order is
+/// `white balance → exposure → black point → linear_range placement`.
+/// `highlight_compress` is deliberately **not** shared — highlight roll-off is
+/// branch-specific SDR tone policy (`output/sdr-display-rendering`), and the
+/// legacy no-preset render is the only consumer today.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrintParams {
@@ -588,6 +597,18 @@ pub struct PrintParams {
     pub white_balance: WbSource,
     /// Highlight roll-off amount.
     pub highlight_compress: f32,
+    /// Black/white-range placement endpoints `[low, high]` in the rendered
+    /// positive's linear domain — the exact affine `(x − low)/(high − low)` the
+    /// shared display stage applies last (design-spec §6/§9,
+    /// `print.linear_range` / `--linear-range LOW,HIGH`). The default `[0, 1]` is
+    /// the exact identity. Requires finite `low < high`.
+    ///
+    /// This is the replacement home for `simple` reconstruction's removed
+    /// `clip_low`/`clip_high` endpoints (design-spec §7.1) and is distinct from
+    /// the density print `black_point`. Only the shared display stage consumes it,
+    /// so until a named display preset lands a non-default value is rejected
+    /// loudly by `cli::validate` rather than silently ignored.
+    pub linear_range: [f32; 2],
 }
 
 impl Default for PrintParams {
@@ -597,6 +618,7 @@ impl Default for PrintParams {
             black_point: 0.0,
             white_balance: WbSource::default(),
             highlight_compress: 0.0,
+            linear_range: [0.0, 1.0],
         }
     }
 }
@@ -1015,31 +1037,201 @@ impl EncodeReport {
     }
 }
 
+/// Named output preset (design-spec §5/§9, `output.preset` /
+/// `--output-preset`) — the atomic output *policy* choice: which branch the
+/// render takes out of the NC film RGB v1 ACEScg boundary, and the container /
+/// depth / profile that branch resolves.
+///
+/// One mutually-exclusive enum field, like [`FilmBaseSource`] / [`DmaxSource`]:
+/// a preset resolves a whole coherent policy, so it can never be a bag of
+/// independent bools. Serializes kebab-case (`"legacy"` / `"film-master"`).
+///
+/// **Only two variants are accepted today.** The remaining planned preset names
+/// (`gain-map-hdr`, `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`,
+/// `custom`) need the SDR/HDR display renderers and the container work owned by
+/// `output/presets`; [`parse`](Self::parse) rejects them with a pinned
+/// "does not accept yet" message rather than a generic unknown-value error, and
+/// rejects the pre-release name `scene-master` as an unreleased-schema break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutputPreset {
+    /// **No named preset** (default) — the transitional legacy TIFF path: the
+    /// print controls still run *before* the working→output ICC transform, and
+    /// the `output.hdr` / `output.output_profile` / `output.bigtiff` flags select
+    /// depth and profile exactly as they did before presets existed. Its
+    /// *pre-colour-transform* pixels are frozen bit-for-bit by
+    /// `pipeline::stages::golden` (which calls `reconstruct_and_print` directly);
+    /// `stages`' `legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence`
+    /// separately pins that this branch of `render` is still that whole sequence.
+    /// `output/presets` replaces this default with `gain-map-hdr`.
+    #[default]
+    Legacy,
+    /// **`film-master`** — an unclamped 32-bit float linear ACEScg TIFF taken
+    /// **directly** from the NC film RGB v1 mapping. It preserves the intentional
+    /// film, lens, development, scanner, reconstruction, and density-curve
+    /// rendering (including supported fixed/roll `Dmax` placement) and bypasses
+    /// every later white-balance, exposure, black/range-placement, highlight,
+    /// display tone, gamut, and transfer operation. It is **not** a physical
+    /// scene-linear recovery.
+    ///
+    /// The bypass is strict, not silent: `cli::validate` rejects frame-local
+    /// `auto` `Dmax` and every non-default downstream control, whatever their
+    /// source. A linear export that *wants* a creative / print / display
+    /// adjustment is the (not-yet-accepted) `custom` workflow.
+    FilmMaster,
+}
+
+impl OutputPreset {
+    /// Parse the `--output-preset` value / `output.preset` recipe key. Shared by
+    /// the CLI merge and the custom [`Deserialize`] below so a name gets the same
+    /// diagnosis wherever it appears (the `OutputSpace::parse` precedent).
+    pub fn parse(s: &str) -> Result<Self> {
+        // Case-insensitive like `OutputSpace::parse`: these are keywords, not paths.
+        match s.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(OutputPreset::Legacy),
+            "film-master" => Ok(OutputPreset::FilmMaster),
+            // The pre-release name for the same branch. It was renamed *before*
+            // release because "scene" wrongly implied physical scene-linear
+            // recovery; nc is unreleased, so this is a schema break, not an alias.
+            "scene-master" => Err(NcError::Usage(
+                "output preset `scene-master` does not exist — it was renamed \
+                 `film-master` before release (the master carries NC's intentional \
+                 film/lens/development/scanner rendering, not a physical \
+                 scene-linear recovery). Use `film-master`; there is no alias."
+                    .into(),
+            )),
+            planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "hdr-pq" | "hdr-hlg"
+            | "custom") => Err(NcError::Usage(format!(
+                "output preset `{planned}` is a planned name that this build does not \
+                 accept yet (it needs the display renderers / container work owned by \
+                 `output/presets`). Accepted today: `legacy` (the transitional TIFF \
+                 path, the default) and `film-master` (unclamped linear ACEScg float \
+                 TIFF)."
+            ))),
+            other => Err(NcError::Usage(format!(
+                "unknown output preset `{other}` — accepted: `legacy`, `film-master`"
+            ))),
+        }
+    }
+
+    /// Whether this preset is a *named* output (i.e. not the legacy no-preset
+    /// path). Named presets are atomic: the legacy depth/profile/container
+    /// selectors cannot accompany them.
+    pub fn is_named(self) -> bool {
+        !matches!(self, OutputPreset::Legacy)
+    }
+
+    /// The preset's stable wire / CLI name — the same string [`parse`](Self::parse)
+    /// accepts and `Serialize` emits. Diagnostics take the name from here rather
+    /// than hardcoding a literal, so a message about the *next* named preset can
+    /// never end up describing `film-master`.
+    pub fn name(self) -> &'static str {
+        match self {
+            OutputPreset::Legacy => "legacy",
+            OutputPreset::FilmMaster => "film-master",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputPreset {
+    /// Delegates to [`OutputPreset::parse`], so a recipe's `output.preset` gets the
+    /// same pinned migration / not-yet-accepted diagnostics as the CLI flag
+    /// (serde's derived enum error would only list the two accepted variants).
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        let s = String::deserialize(deserializer)?;
+        OutputPreset::parse(&s).map_err(|e| D::Error::custom(e.to_string()))
+    }
+}
+
 /// Output / encode knobs (design-spec §9, stage 5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputParams {
+    /// Named output preset (default `legacy` = no preset). Selects the branch out
+    /// of the ACEScg boundary and, for a named preset, the container/depth/profile
+    /// policy — so under `film-master` the three legacy selectors below must stay
+    /// at their defaults (a named preset is atomic; `cli::validate` rejects a
+    /// non-default one loudly instead of silently overriding it).
+    pub preset: OutputPreset,
     /// HDR output switch (default `false`): `false` → 16-bit integer TIFF,
-    /// `true` → 32-bit float TIFF (full HDR, no precision loss).
+    /// `true` → 32-bit float TIFF (full HDR, no precision loss). Legacy path only
+    /// — it is the *transitional rendered* float TIFF (print controls already
+    /// applied) and is **never** an alias for the `film-master` preset.
     pub hdr: bool,
     /// Output ICC profile selector (`sRGB`/`prophoto`/`acescg`/path). `None`
     /// means the depth-aware default (sRGB for the 16-bit default, wide-gamut
-    /// linear for `hdr`).
+    /// linear for `hdr`). Legacy path only — `film-master` resolves linear ACEScg
+    /// itself.
     pub output_profile: Option<String>,
     /// BigTIFF promotion policy (default `auto`).
     pub bigtiff: BigTiff,
 }
 
 impl OutputParams {
-    /// The encoder bit depth implied by the HDR switch: `hdr = false` →
-    /// [`OutDepth::U16`], `true` → [`OutDepth::F32`]. The single place the
-    /// recipe bool becomes a depth, so encode and color can't disagree.
+    /// The encoder bit depth this output resolves to. The single place a recipe
+    /// value becomes a depth, so encode, IR export, and color can't disagree:
+    ///
+    /// - `film-master` is **always** [`OutDepth::F32`] — the master is unclamped
+    ///   float linear ACEScg by definition, not by an `output.hdr` switch (which
+    ///   must stay at its default under the preset).
+    /// - legacy: `hdr = false` → [`OutDepth::U16`], `true` → [`OutDepth::F32`].
     pub fn depth(&self) -> OutDepth {
-        if self.hdr {
-            OutDepth::F32
-        } else {
-            OutDepth::U16
+        match self.preset {
+            OutputPreset::FilmMaster => OutDepth::F32,
+            OutputPreset::Legacy => {
+                if self.hdr {
+                    OutDepth::F32
+                } else {
+                    OutDepth::U16
+                }
+            }
         }
+    }
+
+    /// The first legacy depth/profile/container selector that is **not** at its
+    /// documented default, as `(name, value)` for a diagnostic — or `None` when all
+    /// three are default (the atomicity precondition for a named preset).
+    ///
+    /// Destructured, not field-accessed: adding an output selector makes this
+    /// binding fail to compile, forcing the author to decide whether a named preset
+    /// resolves it. A field-access sweep would silently omit the new knob and
+    /// reintroduce exactly the silent-override this check exists to prevent — the
+    /// same reason `cli::validate_output_preset` destructures [`PrintParams`].
+    ///
+    /// Each name lists the flag(s) *and* the recipe key, because the check runs on
+    /// the **resolved** value: a selector is rejected identically whether it came
+    /// from a flag or from the recipe, and the message must not guess which.
+    pub fn non_default_legacy_selector(&self) -> Option<(&'static str, String)> {
+        let d = Self::default();
+        let Self {
+            preset: _,
+            hdr,
+            output_profile,
+            bigtiff,
+        } = self;
+        [
+            (
+                "--output-hdr / --output-sdr / output.hdr",
+                *hdr != d.hdr,
+                format!("{hdr}"),
+            ),
+            (
+                "--output-profile / output.output_profile",
+                *output_profile != d.output_profile,
+                format!("{output_profile:?}"),
+            ),
+            (
+                "--bigtiff / output.bigtiff",
+                *bigtiff != d.bigtiff,
+                format!("{bigtiff:?}"),
+            ),
+        ]
+        .into_iter()
+        .find_map(|(name, non_default, value)| non_default.then_some((name, value)))
     }
 }
 
@@ -1484,5 +1676,161 @@ mod tests {
         // the pre-auto-WB render.
         assert_eq!(WbSource::default(), WbSource::Explicit([1.0, 1.0, 1.0]));
         assert_eq!(PrintParams::default().white_balance, WbSource::default());
+    }
+
+    #[test]
+    fn linear_range_default_is_the_exact_identity_and_lives_under_print() {
+        // `(x − 0)/(1 − 0)` is the exact identity, so adding the knob cannot perturb
+        // any existing output. Its recipe home is `print.linear_range` (design-spec
+        // §9's Print / tone render section) — a misplaced key would be silently
+        // rejected by `deny_unknown_fields` on docs-shaped recipes.
+        assert_eq!(PrintParams::default().linear_range, [0.0, 1.0]);
+        let p: PrintParams = serde_json::from_str(r#"{"linear_range":[0.02,0.97]}"#).unwrap();
+        assert_eq!(p.linear_range, [0.02, 0.97]);
+        // Round-trips, and the untouched siblings keep their defaults.
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"linear_range\":[0.02,0.97]"), "{json}");
+        assert_eq!(serde_json::from_str::<PrintParams>(&json).unwrap(), p);
+        assert_eq!(p.print_exposure, 0.0);
+        // The removed simple-reconstruction spelling is not a recipe key here.
+        assert!(serde_json::from_str::<PrintParams>(r#"{"clip_low":0.02}"#).is_err());
+    }
+
+    #[test]
+    fn output_preset_parses_accepted_names_and_diagnoses_the_rest() {
+        assert_eq!(OutputPreset::parse("legacy").unwrap(), OutputPreset::Legacy);
+        assert_eq!(
+            OutputPreset::parse("film-master").unwrap(),
+            OutputPreset::FilmMaster
+        );
+        // Keywords, so case/whitespace-insensitive like `OutputSpace::parse`.
+        assert_eq!(
+            OutputPreset::parse(" Film-Master ").unwrap(),
+            OutputPreset::FilmMaster
+        );
+        assert_eq!(OutputPreset::default(), OutputPreset::Legacy);
+        assert!(OutputPreset::FilmMaster.is_named());
+        assert!(!OutputPreset::Legacy.is_named());
+
+        // The pre-release name is an unreleased-schema break, NOT an alias: the
+        // message must name the rename and the reason, and must not silently accept.
+        let err = OutputPreset::parse("scene-master").unwrap_err();
+        assert!(matches!(err, NcError::Usage(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("scene-master"), "{msg}");
+        assert!(msg.contains("film-master"), "{msg}");
+        assert!(msg.contains("no alias"), "{msg}");
+
+        // A planned-but-unimplemented name gets its own diagnosis rather than a bare
+        // "unknown", so an agent can tell "not yet" from "typo".
+        for planned in [
+            "gain-map-hdr",
+            "display-p3",
+            "compatibility",
+            "hdr-pq",
+            "hdr-hlg",
+            "custom",
+        ] {
+            let msg = OutputPreset::parse(planned).unwrap_err().to_string();
+            assert!(msg.contains("does not accept yet"), "{planned}: {msg}");
+            assert!(msg.contains("film-master"), "{planned}: {msg}");
+        }
+        let msg = OutputPreset::parse("filmmaster").unwrap_err().to_string();
+        assert!(msg.contains("unknown output preset"), "{msg}");
+    }
+
+    #[test]
+    fn output_preset_recipe_key_round_trips_and_shares_the_parse_diagnostics() {
+        // Recipe home is `output.preset` (design-spec §9's Output / encode section).
+        let o: OutputParams = serde_json::from_str(r#"{"preset":"film-master"}"#).unwrap();
+        assert_eq!(o.preset, OutputPreset::FilmMaster);
+        let json = serde_json::to_string(&o).unwrap();
+        assert!(json.contains("\"preset\":\"film-master\""), "{json}");
+        assert_eq!(serde_json::from_str::<OutputParams>(&json).unwrap(), o);
+        assert_eq!(
+            serde_json::from_str::<OutputParams>(r#"{}"#)
+                .unwrap()
+                .preset,
+            OutputPreset::Legacy
+        );
+        // The custom `Deserialize` delegates to `parse`, so the recipe key gets the
+        // same pinned rename diagnosis as the flag (serde's derived error would only
+        // list the accepted variants and never mention the rename).
+        let err = serde_json::from_str::<OutputParams>(r#"{"preset":"scene-master"}"#).unwrap_err();
+        assert!(err.to_string().contains("renamed"), "{err}");
+        assert!(
+            serde_json::from_str::<OutputParams>(r#"{"preset":"gain-map-hdr"}"#)
+                .unwrap_err()
+                .to_string()
+                .contains("does not accept yet")
+        );
+    }
+
+    #[test]
+    fn film_master_resolves_f32_independently_of_the_hdr_switch() {
+        // The master is unclamped float linear ACEScg *by definition*, so its depth
+        // must not depend on `output.hdr` (which stays at its default under the
+        // preset — `cli::validate` rejects a non-default one).
+        let master = OutputParams {
+            preset: OutputPreset::FilmMaster,
+            ..OutputParams::default()
+        };
+        assert_eq!(master.depth(), OutDepth::F32);
+        assert_eq!(master.non_default_legacy_selector(), None);
+        // Legacy keeps the pre-preset switch semantics exactly.
+        assert_eq!(OutputParams::default().depth(), OutDepth::U16);
+        assert_eq!(
+            OutputParams {
+                hdr: true,
+                ..OutputParams::default()
+            }
+            .depth(),
+            OutDepth::F32
+        );
+        // Each legacy selector is individually detected as non-default *and named*
+        // — the sweep must blame the offender, not list all three, or a diagnostic
+        // test could pass while the wrong selector is reported.
+        for (key, value, non_default) in [
+            (
+                "output.hdr",
+                "true",
+                OutputParams {
+                    hdr: true,
+                    ..OutputParams::default()
+                },
+            ),
+            (
+                "output.output_profile",
+                "srgb",
+                OutputParams {
+                    output_profile: Some("srgb".into()),
+                    ..OutputParams::default()
+                },
+            ),
+            (
+                "output.bigtiff",
+                "On",
+                OutputParams {
+                    bigtiff: BigTiff::On,
+                    ..OutputParams::default()
+                },
+            ),
+        ] {
+            let (name, reported) = non_default
+                .non_default_legacy_selector()
+                .unwrap_or_else(|| panic!("{non_default:?} must name an offender"));
+            assert!(name.contains(key), "{name} should name {key}");
+            assert!(reported.contains(value), "{reported} should show {value}");
+            // …and only that one: the other two keys must not appear.
+            for other in ["output.hdr", "output.output_profile", "output.bigtiff"] {
+                assert_eq!(
+                    other == key,
+                    name.contains(other),
+                    "{name} must name {key} and nothing else"
+                );
+            }
+        }
+        // All three at their defaults → nothing to blame.
+        assert_eq!(OutputParams::default().non_default_legacy_selector(), None);
     }
 }

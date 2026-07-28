@@ -377,6 +377,7 @@ mod tests {
             hdr: depth == OutDepth::F32,
             output_profile: None,
             bigtiff,
+            ..OutputParams::default()
         }
     }
 

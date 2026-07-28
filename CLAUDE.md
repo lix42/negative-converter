@@ -62,11 +62,13 @@ insertion (that silently breaks the verbatim history).
 
 A pure-function pipeline orchestrated by a thin CLI layer.
 
-**Current shipped architecture:**
+**Current shipped architecture** — `stages::render` dispatches on the resolved
+`output.preset`:
 
 ```text
-decode → film-base → Algorithm + Converter → LinearImage
-       → output color transform → encode
+decode → film-base → tagged reconstruction → FilmRgbImage
+  ├ legacy (default, no preset) → finish_print → output color transform → encode
+  └ film-master → NC film RGB v1 → linear ACEScg → encode (unclamped f32, no transform)
 ```
 
 **Target replacement architecture (open roadmap tasks):**
@@ -95,14 +97,24 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`,
-  `pipeline/{film_base,color,stages,input_semantics,working_space}.rs`
+  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
-  render; `stages::render` is the pure algorithm→output-color core, stages 3–4;
+  render; `stages::render` is the pure reconstruction→named-output core (stages
+  3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
+  path (`reconstruct → finish_print → color::to_output`) or `film-master`
+  (`reconstruct → map_nc_film_rgb_v1 → render_split::film_master`, no colour
+  transform). It has **no** display (5b) arm — `render_split::display_source`
+  exists but nothing in `render` calls it yet;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
-  ACEScg mapper, produced-but-not-yet-wired into the render path — the
-  display-output presets are its future consumer),
+  ACEScg mapper; `render_split` is the named-output split out of that boundary —
+  `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
+  controls `WB → exposure → black point → linear_range`, resolved once and
+  *borrowed* by both display branches. The `film-master` half is wired; the
+  display half is built and unit-tested but has no CLI-reachable consumer until
+  `output/{sdr,hdr}-display-rendering`, so a non-default `print.linear_range` is a
+  loud usage error rather than a silently-ignored knob),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `cli.rs`, `main.rs`.
   `main`/`cli` are the only orchestrators; stages stay pure. `build.rs` exposes
   the compile target triple as `NC_TARGET` for the telemetry record.
@@ -141,10 +153,10 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
   encoded file, or post-lcms2 (color-transformed) pixels in a cross-platform gate.
 - `Cargo.lock` is committed (binary crate). The crate-level `#![allow(dead_code)]`
   is gone; the remaining allows are narrow, documented item-level ones
-  (`algo/mod.rs`, `pipeline/color.rs`, `pipeline/working_space.rs` — the last for
-  the produced-but-not-yet-wired ACEScg mapper) for API surface the single Step-1
-  path doesn't exercise — don't add new ones without a comment saying who will
-  use it.
+  (`algo/mod.rs`, `pipeline/working_space.rs`, `pipeline/render_split.rs` — the
+  last two for the `AcesCgImage` accessors and the shared display stage awaiting
+  their SDR/HDR consumers) for API surface the single Step-1 path doesn't
+  exercise — don't add new ones without a comment saying who will use it.
 - **Codex review on a worktree.** `/codex:review` is a codex-plugin *command*
   (not a skill) that reviews the **current directory's** git state — so run it
   *from inside the worktree you want reviewed*. Pick the scope to match where the
@@ -226,6 +238,24 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
     sample into `EncodeReport` (`types.rs`) so the loss rides back to the
     orchestrator as a report warning (`--strict` promotes it) — never clamp
     silently anywhere.
+  - *Output-preset atomicity is deliberately asymmetric — don't unify it.* A named
+    preset rejects a **non-default resolved value** for `output.hdr` /
+    `output_profile` / `bigtiff` (either provenance), but rejects `--output-sdr` by
+    **flag presence**. `--output-sdr` has no recipe spelling (`output.hdr = false`
+    *is* the serde default, indistinguishable from omission), so no value rule can
+    see it, and unlike `--bigtiff auto` its documented meaning ("force 16-bit
+    integer") is one the master contradicts. Collapsing the two rules silently
+    writes an f32 master when the user asked for 16-bit.
+  - *`validate` is not the whole `convert` gate.* Every rule inside it reads only
+    the resolved config — which is why `roll` and each per-frame override share it
+    verbatim. `convert` must call **`validate_convert`**, which composes it with the
+    flag-presence check above; `output/presets` is the next orchestrator that has to.
+  - *`--strict` assertions need an IR-free fixture.* `tests/fixtures/hdri-64bit.tif`
+    carries an IR plane, so every frame emits the "IR preserved but not used"
+    warning and **any** `--strict` run on it exits non-zero regardless of the
+    behavior under test. Use `tests/fixtures/hdr-48bit.tif` (IR-free) whenever a test
+    must prove a *specific* warning is strict-promotable, and add a no-override
+    control run so the assertion is falsifiable.
 - **Verify against real sample files.** There is no public spec for the SilverFast
   HDRi on-disk layout; the decoder must be validated against the user's actual
   scans and degrade gracefully on unrecognized layouts. Sample scans live in the

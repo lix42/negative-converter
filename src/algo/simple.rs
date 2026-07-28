@@ -9,10 +9,14 @@
 //! The pre-split simple converter also applied an inversion white balance and
 //! a clip-range remap here. Those are **not** reconstruction parameters
 //! (design-spec §7.1): the typed [`FilmRgbImage`] ends at the direct unclamped
-//! positive `1 − scan/Dmin`, and the controls return downstream — as explicit
-//! `print.white_balance` and `print.linear_range` — when named output presets
-//! land. Their defaults were the exact identity (`(x·1 − 0)/1`), so the default
-//! simple output is bit-identical to the pre-split converter.
+//! positive `1 − scan/Dmin`, and the controls now live downstream as explicit
+//! `print.white_balance` and `print.linear_range`. Both homes *exist*, but neither
+//! is reachable for `simple` yet: `film-master` — the one named preset this build
+//! accepts — bypasses print controls entirely, and the shared display stage that
+//! would apply `linear_range` has no accepted preset. So the §7.1 migration
+//! aliases activate with `output/{sdr,hdr}-display-rendering`, not with
+//! `film-master`. Their defaults were the exact identity (`(x·1 − 0)/1`), so the
+//! default simple output is bit-identical to the pre-split converter.
 
 use rayon::prelude::*;
 

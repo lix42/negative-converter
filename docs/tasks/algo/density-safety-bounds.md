@@ -29,6 +29,45 @@ degenerate (e.g. finite all-black) image. Two complementary mechanisms:
 > `density.rs:221-226` — but it does nothing for the tone-map underflow, so don't
 > mistake it for the guard this task needs.
 
+> **Context — a second confirmed underflow site, with a reproduction.** Found while
+> reviewing `color/film-master-render-pipeline` (2026-07-27) and deliberately **not**
+> fixed there, because the real-scan-validated false-positive guard this task owns is
+> what makes a fix safe. The gap is in the **stage-4 print render**, not the stage-3
+> tone map above: `render_print` computes
+> `exposure_gain = 2f32.powf(print.print_exposure)` (`algo/density.rs:478`) and then
+> `px[c] * wb[c] * exposure_gain` (`density.rs:486`), while `validate` checks only
+> `finite()` on `print_exposure` and `positive()` on explicit WB gains — no upper or
+> lower magnitude bound on either. So a *finite, validation-passing* recipe silently
+> renders black.
+>
+> Measured on the committed IR-free fixture (chosen so no unrelated IR warning muddies
+> the signal): `nc convert tests/fixtures/hdr-48bit.tif -o out.tiff --film-base
+> 0.9,0.55,0.42 <extra>`
+>
+> | extra | rc | `loss` counters | report `warnings` | zero samples |
+> |---|---|---|---|---|
+> | *(none — baseline)* | 0 | all 0 | none | 0 % |
+> | `--print-exposure=-200` | 0 | **all 0** | **none** | **100 %** |
+> | `--white-balance=1e-45,1,1` | 0 | **all 0** | **none** | ~33 % (exactly one channel killed) |
+> | `--print-exposure 300` | 0 | `clipped_low: 695772` | 1 (the loss warning) | 100 % |
+>
+> `--strict` also exits **0** on the `-200` case — there is no warning for it to
+> promote. So **only the underflow direction is silent**; the overflow direction is
+> already loud through the existing clip/non-finite counters. That asymmetry is exactly
+> what the cause-agnostic degenerate-output check in part 2 exists to close, and the
+> `--white-balance` row shows why a whole-image test is not enough: a single-channel
+> collapse must trip it too.
+>
+> Two notes for whoever implements this. **(a)** A naive `is_normal()` on the
+> user-supplied gains would reject legitimate extreme-push recipes, which is why this
+> belongs behind the real-scan-validated collapse check rather than a bound guessed
+> from first principles. **(b)** `pipeline::render_split::ResolvedPrintControls::new`
+> already guards the same arithmetic — `is_normal()` on the gain **and** on each
+> `wb[c] · exposure_gain` product, since individually-valid factors can multiply to
+> `0.0` — but that is the **shared display stage**, which has no CLI-reachable consumer
+> yet, and the legacy print path above does not route through it. Treat it as a
+> reference implementation of the numeric predicate, not as coverage.
+
 ## Design
 
 ### 1. Parameter bounds (committed core)
