@@ -35,6 +35,7 @@ use lcms2::{
     CIExyY, CIExyYTRIPLE, ColorSpaceSignature, Intent, PixelFormat, Profile, ToneCurve, Transform,
 };
 
+use crate::pipeline::sdr::{RenderedSdr, SdrGamut, SdrRenderMetadata};
 use crate::types::{LinearImage, NcError, OutDepth, OutputParams, Result};
 
 /// The output color space to transform into and tag the file with.
@@ -163,22 +164,46 @@ pub fn to_output(mut image: LinearImage, params: &OutputParams) -> Result<(Linea
 
     let working = working_profile()?;
     let output = build_profile(&space)?;
+    transform_in_place(&mut image, &working, &output)?;
+    let icc = profile_icc(&output)?;
+    Ok((image, icc))
+}
+
+/// Apply only the destination's sRGB transfer curve to an SDR-rendered linear
+/// image and return the matching ICC profile. The renderer already performed
+/// ACEScg → destination gamut conversion, so using [`to_output`] here would
+/// incorrectly treat those values as Rec.709 working RGB and remap them again.
+#[allow(dead_code)] // consumed next by standalone SDR activation in `output/presets`.
+pub fn encode_rendered_sdr(
+    rendered: RenderedSdr,
+) -> Result<(LinearImage, Vec<u8>, SdrRenderMetadata)> {
+    let (mut image, metadata) = rendered.into_parts();
+    let (linear, output) = match metadata.gamut {
+        SdrGamut::DisplayP3 => (
+            synth(
+                xyy(0.3127, 0.3290),
+                [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)],
+                1.0,
+            )?,
+            build_profile(&OutputSpace::DisplayP3)?,
+        ),
+        SdrGamut::SRgb => (working_profile()?, build_profile(&OutputSpace::SRgb)?),
+    };
+    transform_in_place(&mut image, &linear, &output)?;
+    Ok((image, profile_icc(&output)?, metadata))
+}
+
+fn transform_in_place(image: &mut LinearImage, input: &Profile, output: &Profile) -> Result<()> {
     let transform: Transform<[f32; 3], [f32; 3]> = Transform::new(
-        &working,
+        input,
         PixelFormat::RGB_FLT,
-        &output,
+        output,
         PixelFormat::RGB_FLT,
         Intent::RelativeColorimetric,
     )
     .map_err(|e| NcError::Other(format!("failed to build color transform: {e}")))?;
-
     // `rgb` is interleaved RGB with len == w*h*3 (enforced by `LinearImage::new`),
-    // but the field is `pub`, so guard the invariant loudly: `as_chunks_mut`
-    // silently drops a trailing 1–2 elements, which would leave the tail pixels
-    // un-transformed in release — a quietly-wrong image, which "fail loudly"
-    // forbids. Scope note: this length check is the only thing that runs before the
-    // transform — it is not a guarantee about the whole function (the image is
-    // consumed, so no half-transformed buffer is observable either way).
+    // but the field is public, so guard against silently dropping a trailing tail.
     let rgb_len = image.rgb.len();
     let (pixels, rest) = image.rgb.as_chunks_mut::<3>();
     if !rest.is_empty() {
@@ -187,9 +212,7 @@ pub fn to_output(mut image: LinearImage, params: &OutputParams) -> Result<(Linea
         )));
     }
     transform.transform_in_place(pixels);
-
-    let icc = profile_icc(&output)?;
-    Ok((image, icc))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -301,9 +324,23 @@ fn build_profile(space: &OutputSpace) -> Result<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algo::reconstruct;
+    use crate::pipeline::render_split::display_source;
+    use crate::pipeline::sdr;
+    use crate::pipeline::working_space::map_nc_film_rgb_v1;
+    use crate::types::{FilmBase, PrintParams, Reconstruction};
 
     fn gray_image(v: f32) -> LinearImage {
         LinearImage::new(1, 1, vec![v, v, v], None).unwrap()
+    }
+
+    fn render_sdr(rgb: &[f32], gamut: SdrGamut) -> RenderedSdr {
+        let scan = rgb.iter().map(|value| 1.0 - value).collect();
+        let image = LinearImage::new((rgb.len() / 3) as u32, 1, scan, None).unwrap();
+        let (film, _) =
+            reconstruct(&image, &FilmBase::from([1.0; 3]), &Reconstruction::Simple).unwrap();
+        let shared = display_source(map_nc_film_rgb_v1(film), &PrintParams::default()).unwrap();
+        sdr::render(&shared, gamut, 0.0).unwrap()
     }
 
     #[test]
@@ -736,45 +773,20 @@ mod tests {
     }
 
     #[test]
-    fn linear_p3_samples_encode_with_srgb_trc_and_identity_primaries() {
-        // The "linear Display P3 → encoded Display P3" encode step tested in
-        // ISOLATION: feed rendered linear-P3 samples through a *synthetic
-        // linear-P3 source* profile into the P3 output profile. Source and
-        // destination share P3 primaries, so this transform is a pure TRC encode —
-        // proving that step performs NO gamut mapping and NO ACEScg transform (that
-        // is `sdr-display-rendering`'s job). This does NOT exercise the shipped
-        // `to_output` path, which sources the linear Rec.709 working profile and
-        // therefore *does* perform a (lossless) Rec.709→P3 primaries remap; the
-        // real path is covered by `to_output_display_p3_*` below.
-        let lin_p3 = synth(
-            xyy(0.3127, 0.3290),
-            [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)],
-            1.0,
-        )
-        .unwrap();
-        let p3 = build_profile(&OutputSpace::DisplayP3).unwrap();
-        let t: Transform<[f32; 3], [f32; 3]> = Transform::new(
-            &lin_p3,
-            PixelFormat::RGB_FLT,
-            &p3,
-            PixelFormat::RGB_FLT,
-            Intent::RelativeColorimetric,
-        )
-        .unwrap();
-        // A deep shadow below the sRGB toe threshold (lin 0.002 < 0.0031308, in the
-        // linear `c·X` segment → 12.92 × 0.002 = 0.02584), neutral mid-gray, a
-        // saturated primary, and a mixed saturated colour. The toe sample is what
-        // distinguishes the parametric curve from a gamma-2.2 power (which would
-        // give ~0.081 here) — the curve's whole reason for existing.
-        let mut px = [
-            [0.002f32, 0.002, 0.002],
-            [0.5, 0.5, 0.5],
-            [1.0, 0.0, 0.0],
-            [0.8, 0.1, 0.4],
-        ];
-        let input = px;
-        t.transform_in_place(&mut px);
-        for (got, inp) in px.into_iter().zip(input) {
+    fn rendered_p3_samples_encode_with_srgb_trc_and_matching_profile() {
+        // Exercise the public renderer → opaque value → encoder seam. The encoder
+        // receives no independently selectable gamut, so a mismatched profile is
+        // unrepresentable; each rendered-linear channel receives only the sRGB TRC.
+        let rendered = render_sdr(
+            &[0.002, 0.002, 0.002, 0.5, 0.5, 0.5, 0.8, 0.1, 0.4],
+            SdrGamut::DisplayP3,
+        );
+        let input: Vec<[f32; 3]> = rendered.image().rgb.as_chunks::<3>().0.to_vec();
+        let (encoded, icc, metadata) = encode_rendered_sdr(rendered).unwrap();
+        assert_eq!(icc, icc_profile(&OutputSpace::DisplayP3).unwrap());
+        assert_eq!(metadata.gamut, SdrGamut::DisplayP3);
+        let encoded: Vec<[f32; 3]> = encoded.rgb.as_chunks::<3>().0.to_vec();
+        for (got, inp) in encoded.iter().copied().zip(input.iter().copied()) {
             for ch in 0..3 {
                 let want = srgb_encode(inp[ch]);
                 assert!(
@@ -785,13 +797,30 @@ mod tests {
                 );
             }
         }
-        // A pure P3 red stays on the red axis: G and B remain ~0. A gamut remap or
-        // an ACEScg transform would bleed energy into G/B — this asserts neither ran.
-        let red = px[2];
-        assert!(
-            (red[0] - 1.0).abs() < 2e-3 && red[1] < 2e-3 && red[2] < 2e-3,
-            "linear-P3 red must stay [~1,~0,~0], got {red:?} (gamut mapping leaked)"
+    }
+
+    #[test]
+    fn rendered_srgb_samples_encode_with_srgb_trc_and_matching_profile() {
+        let rendered = render_sdr(
+            &[0.002, 0.002, 0.002, 0.5, 0.5, 0.5, 0.8, 0.1, 0.4],
+            SdrGamut::SRgb,
         );
+        let input: Vec<[f32; 3]> = rendered.image().rgb.as_chunks::<3>().0.to_vec();
+        let (encoded, icc, metadata) = encode_rendered_sdr(rendered).unwrap();
+        assert_eq!(icc, icc_profile(&OutputSpace::SRgb).unwrap());
+        assert_eq!(metadata.gamut, SdrGamut::SRgb);
+        let encoded: Vec<[f32; 3]> = encoded.rgb.as_chunks::<3>().0.to_vec();
+        for (got, inp) in encoded.iter().copied().zip(input) {
+            for ch in 0..3 {
+                let want = srgb_encode(inp[ch]);
+                assert!(
+                    (got[ch] - want).abs() < 2e-3,
+                    "channel {ch}: {} != sRGB-encoded {want} (input {})",
+                    got[ch],
+                    inp[ch]
+                );
+            }
+        }
     }
 
     #[test]
