@@ -115,9 +115,13 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   display half is built and unit-tested but has no CLI-reachable consumer until
   `output/{sdr,hdr}-display-rendering`, so a non-default `print.linear_range` is a
   loud usage error rather than a silently-ignored knob),
-  `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `cli.rs`, `main.rs`.
+  `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
+  (build/pipeline identity + `stable_hash`, the crate's only params-hash
+  implementation — `telemetry::params_hash` delegates to it so the core report
+  never depends on the opt-in telemetry module), `cli.rs`, `main.rs`.
   `main`/`cli` are the only orchestrators; stages stay pure. `build.rs` exposes
-  the compile target triple as `NC_TARGET` for the telemetry record.
+  the compile target triple as `NC_TARGET` plus `NC_GIT_COMMIT`/`NC_GIT_DIRTY`
+  for the report's identity block.
 - **Telemetry is operational, not a conversion knob.** `src/telemetry.rs` emits
   an opt-in, fail-soft, schema-versioned JSON record per `nc convert` run (image
   facts, per-stage timings, conversion summary) to a JSONL log / one-off file.
@@ -256,6 +260,27 @@ for input provenance) (see `Cargo.toml` for versions; bump with `cargo add`).
     behavior under test. Use `tests/fixtures/hdr-48bit.tif` (IR-free) whenever a test
     must prove a *specific* warning is strict-promotable, and add a no-override
     control run so the assertion is falsifiable.
+  - *Changing a default render trips the drift gate — read its failure message.*
+    `version::PIPELINE_FINGERPRINTS` pairs each `pipeline_version` with hashes over
+    `film_base::estimate`, `reconstruct_and_print` on the curated `stages::golden`
+    vectors, and the default recipe JSON. Bumping is deliberately **not** free: a
+    version with no recorded row panics. **Never edit a historical row's `render`
+    in place** — that silently makes one version label two behaviors. A new
+    *opt-in* knob with a neutral default legitimately moves only the `recipe`
+    hash; refresh that row without bumping. The gate stops before lcms2, so it
+    covers neither the output transform nor `io::{decode,encode}`.
+  - *`params` is a reserved top-level recipe key.* `split_envelope` tells a
+    `{meta, params}` sidecar from a bare legacy recipe by that key alone, so adding
+    a `params` stage section to `ResolvedConfig` would silently reinterpret every
+    recipe as an envelope. A test asserts it stays absent.
+  - *`build.rs` git gotcha (cost me two wrong attempts):* in a **linked worktree
+    `.git` is a file**, so `cargo:rerun-if-changed=.git/HEAD` names a path that
+    doesn't exist — resolve it with `git rev-parse --git-path`. And watching `HEAD`
+    alone never notices a commit: on a branch it's a `ref:` pointer whose contents
+    don't change, so `refs`/`packed-refs`/`index` must be watched too, or the
+    binary reports the **parent** commit and `dirty: true` after every commit.
+    `git rev-parse` also walks *up*, so verify `--show-toplevel` matches
+    `CARGO_MANIFEST_DIR` or a nested checkout stamps an unrelated repo's commit.
 - **Verify against real sample files.** There is no public spec for the SilverFast
   HDRi on-disk layout; the decoder must be validated against the user's actual
   scans and degrade gracefully on unrecognized layouts. Sample scans live in the

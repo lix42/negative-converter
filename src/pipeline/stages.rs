@@ -619,8 +619,12 @@ mod tests {
 /// changed intermediate, a lost anchor) fails these tests immediately, not in a
 /// downstream image diff. This is the task's acceptance gate: the split is a
 /// structural refactor, the default pixels are the contract.
+///
+/// The module is (test-only) `pub(crate)` so the `pipeline_version` drift gate in
+/// [`crate::version`] fingerprints **these exact** curated vectors instead of a
+/// second copy that could quietly drift away from them.
 #[cfg(test)]
-mod golden {
+pub(crate) mod golden {
     use super::*;
     use crate::types::{
         BalanceRange, DensityCurve, DensityParams, DmaxSource, ExponentialParams, SigmoidParams,
@@ -631,7 +635,12 @@ mod golden {
     /// with an IR plane (`[0.1, 0.2, 0.3, 0.4, 0.5]`):
     /// near-base shadow, midtone, dense highlight, out-of-range (above base /
     /// negative / zero → epsilon floor), and exactly-the-base.
-    fn pixels() -> LinearImage {
+    ///
+    /// These five pixels are the crate's cross-platform bit-identity substrate:
+    /// their default-path results are pinned here **and** hashed into the
+    /// `pipeline_version` drift gate (`crate::version`), so both mechanisms measure
+    /// the same thing.
+    pub(crate) fn pixels() -> LinearImage {
         LinearImage::new(
             5,
             1,
@@ -647,7 +656,9 @@ mod golden {
         .unwrap()
     }
 
-    fn base() -> FilmBase {
+    /// The film base [`pixels`] is reconstructed against (shared with the drift
+    /// gate, for the same reason).
+    pub(crate) fn base() -> FilmBase {
         FilmBase::from([0.9, 0.55, 0.42])
     }
 

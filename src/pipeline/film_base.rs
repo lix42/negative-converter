@@ -1036,6 +1036,104 @@ fn percentile(values: &mut Vec<f32>, p: f32) -> f32 {
     *values.select_nth_unstable_by(k, |a, b| a.total_cmp(b)).1
 }
 
+/// The **frozen** synthetic scan the `pipeline_version` drift gate fingerprints
+/// stage 2 over (`crate::version`).
+///
+/// `film_base.source` defaults to [`FilmBaseSource::Auto`], so every default
+/// `nc convert` runs the inward-scan rebate detector over real pixels — a stage the
+/// render fingerprint (which is handed a hardcoded base) cannot see, and the recipe
+/// fingerprint sees only as the string `"auto"`. Retuning [`SAMPLE_PERCENTILE`],
+/// [`REBATE_SCAN_FRAC`], or the band gates changes every default conversion, so it
+/// needs a fingerprint of its own.
+///
+/// **Do not edit [`golden::scan`].** It is a frozen input, not a test convenience:
+/// the gate hashes [`estimate`]'s result over it, so changing the pixels moves the
+/// fingerprint exactly as changing the detector would. It is deliberately
+/// self-contained rather than reusing `tests::scan_with_rebate`, which is a
+/// *parameterized* helper free to evolve with the tests that use it.
+///
+/// **Why hashing this is safe on both macOS/aarch64 and x86_64 Linux** (CLAUDE.md's
+/// cross-platform determinism rule, design-spec §8): the whole stage-2 path is
+/// integer indexing, comparisons, `+`/`-`/`*`/`/` on IEEE floats, and nearest-rank
+/// order-statistic selection ([`percentile`], whose result is the k-th smallest
+/// *value* and so is independent of tie order). There is **no transcendental**
+/// anywhere in this module — no `powf`, `10^`, `log10`, `exp`, or `sqrt` — which is
+/// precisely why the ~1-ULP libm divergence that rules out a whole-frame
+/// reconstruct hash does not apply here.
+#[cfg(test)]
+pub(crate) mod golden {
+    use super::*;
+
+    /// Measured rebate transmission of the user's real film stock, and a
+    /// representative opaque-holder transmission.
+    const REBATE: [f32; 3] = [0.53, 0.26, 0.16];
+    const HOLDER: [f32; 3] = [0.01, 0.01, 0.01];
+
+    /// The frozen 100×100 layout: dark holder ring (3 px) → thin unexposed rebate
+    /// band (4 px, bottom **and** left, so cross-edge agreement is exercised) →
+    /// varied gradient picture interior. Mirrors the real `dark holder → thin inset
+    /// rebate → picture` geometry documented in CLAUDE.md.
+    pub(crate) fn scan() -> LinearImage {
+        let (w, h) = (100u32, 100u32);
+        let mut buf = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let t = (x + y) as f32 / (w + h) as f32;
+                buf.extend_from_slice(&[0.05 + 0.35 * t, 0.03 + 0.20 * t, 0.02 + 0.10 * t]);
+            }
+        }
+        let mut img = LinearImage::new(w, h, buf, None).unwrap();
+        for rect in [
+            [0, 0, w, 3],
+            [0, h - 3, w, 3],
+            [0, 0, 3, h],
+            [w - 3, 0, 3, h],
+        ] {
+            fill(&mut img, rect, HOLDER);
+        }
+        // Bands ripple **along** the edge (bottom by x, left by y), so every strip
+        // perpendicular to the edge carries the same distribution — flat to the
+        // strip-continuity check, textured to the percentile.
+        for x in 0..w {
+            for y in h - 7..h - 3 {
+                set(&mut img, x, y, rebate_at(x));
+            }
+        }
+        for y in 0..h {
+            for x in 3..7 {
+                set(&mut img, x, y, rebate_at(y));
+            }
+        }
+        img
+    }
+
+    /// The rebate transmission at along-edge position `step`.
+    ///
+    /// The band is deliberately **not** flat. A perfectly uniform band returns the
+    /// same value for *any* percentile, so retuning [`SAMPLE_PERCENTILE`] — one of
+    /// the exact changes this fingerprint exists to catch — would leave the hash
+    /// unmoved. A 7% along-edge ripple over ten levels keeps each strip well inside
+    /// [`MAX_RELATIVE_SPREAD`] (0.15) and [`STRIP_CONTINUITY_TOL`] while putting the
+    /// 97th percentile and, say, the 90th on different levels.
+    fn rebate_at(step: u32) -> [f32; 3] {
+        let f = 0.93 + 0.07 * (step % 10) as f32 / 9.0;
+        [REBATE[0] * f, REBATE[1] * f, REBATE[2] * f]
+    }
+
+    fn fill(img: &mut LinearImage, [x, y, w, h]: [u32; 4], rgb: [f32; 3]) {
+        for yy in y..y + h {
+            for xx in x..x + w {
+                set(img, xx, yy, rgb);
+            }
+        }
+    }
+
+    fn set(img: &mut LinearImage, x: u32, y: u32, rgb: [f32; 3]) {
+        let i = ((y * img.width + x) * 3) as usize;
+        img.rgb[i..i + 3].copy_from_slice(&rgb);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +1281,33 @@ mod tests {
         let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
+    }
+
+    #[test]
+    fn the_frozen_drift_gate_scan_resolves_cleanly_and_is_percentile_sensitive() {
+        // The stage-2 drift fingerprint (`crate::version::PipelineFingerprint`)
+        // hashes `estimate` over `golden::scan`. Two properties make that hash
+        // meaningful, and neither is self-evident from the fixture:
+        let img = golden::scan();
+
+        // (1) auto resolves it cleanly — a fixture that errored, or that warned,
+        //     would fingerprint the failure path instead of the detector.
+        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        assert!(est.warnings.is_empty(), "{:?}", est.warnings);
+
+        // (2) the rebate band is textured, so the CHOSEN percentile is observable.
+        //     A flat band returns the same value for every percentile, and retuning
+        //     SAMPLE_PERCENTILE — one of the changes the gate advertises catching —
+        //     would then leave the hash unmoved.
+        let band = [0, 93, 100, 4];
+        let p90 = sample_region_at(&img, band, 0.90).unwrap();
+        let p97 = sample_region_at(&img, band, SAMPLE_PERCENTILE).unwrap();
+        assert_ne!(
+            <[f32; 3]>::from(p90),
+            <[f32; 3]>::from(p97),
+            "the frozen rebate band must not be flat, or the fingerprint cannot see a \
+             retuned SAMPLE_PERCENTILE"
+        );
     }
 
     #[test]

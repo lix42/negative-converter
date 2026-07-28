@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "note": "Benchmark manifest for `python -m nctool compare` (core/conversion-versioning): the FIXED set of scans + recipes two builds are compared over. Cases name frames; the asset inventory (paths + sha256) stays in <asset-root>/manifest.json, which `compare run` resolves them through -- there is deliberately only one asset inventory. Recipe paths are repo-relative and reuse the frozen real-scan recipes so a comparison runs the same parameters the verification harness does.",
+  "sets": {
+    "fixtures": {
+      "root": "repo",
+      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default exponential path, the sigmoid curve, `simple` reconstruction, and f32 (HDR) output. This is the set to use for a determinism / zero-diff check.",
+      "cases": [
+        {
+          "name": "hdri-default",
+          "input": "tests/fixtures/hdri-64bit.tif",
+          "args": ["--film-base", "0.9,0.55,0.42"]
+        },
+        {
+          "name": "hdr-default",
+          "input": "tests/fixtures/hdr-48bit.tif",
+          "args": ["--film-base", "0.9,0.55,0.42"]
+        },
+        {
+          "name": "hdri-f32",
+          "input": "tests/fixtures/hdri-64bit.tif",
+          "args": ["--film-base", "0.9,0.55,0.42", "--output-hdr"]
+        },
+        {
+          "name": "hdri-sigmoid",
+          "input": "tests/fixtures/hdri-64bit.tif",
+          "args": ["--film-base", "0.9,0.55,0.42", "--density-curve", "sigmoid"]
+        },
+        {
+          "name": "hdri-simple",
+          "input": "tests/fixtures/hdri-64bit.tif",
+          "args": ["--film-base", "0.9,0.55,0.42", "--reconstruction", "simple"]
+        }
+      ]
+    },
+    "rolls": {
+      "root": "assets",
+      "note": "The real-scan benchmark: exposed frames from the Ektar and Phoenix rolls (the two rolls docs/reports/v0-baseline.md was measured on), each with its roll's frozen recipe from scripts/real-scan-verify/recipes/ -- so the roll-fixed Dmin/Dmax come from that roll's own calibration rather than a per-frame estimate. Requires the nc-assets Drive folder via ../nc-assets plus a generated manifest.json.",
+      "cases": [
+        {
+          "name": "Ektar-971",
+          "roll": "Ektar",
+          "frame": "20260713-nikon-971",
+          "recipe": "scripts/real-scan-verify/recipes/Ektar.json"
+        },
+        {
+          "name": "Ektar-989",
+          "roll": "Ektar",
+          "frame": "20260714-nikon-989",
+          "recipe": "scripts/real-scan-verify/recipes/Ektar.json"
+        },
+        {
+          "name": "Ektar-991",
+          "roll": "Ektar",
+          "frame": "20260714-nikon-991",
+          "recipe": "scripts/real-scan-verify/recipes/Ektar.json"
+        },
+        {
+          "name": "phoenix-936",
+          "roll": "phoenix",
+          "frame": "20260712-nikon-936",
+          "recipe": "scripts/real-scan-verify/recipes/phoenix.json"
+        },
+        {
+          "name": "phoenix-956",
+          "roll": "phoenix",
+          "frame": "20260713-nikon-956",
+          "recipe": "scripts/real-scan-verify/recipes/phoenix.json"
+        },
+        {
+          "name": "phoenix-958",
+          "roll": "phoenix",
+          "frame": "20260713-nikon-958",
+          "recipe": "scripts/real-scan-verify/recipes/phoenix.json"
+        }
+      ]
+    }
+  }
+}

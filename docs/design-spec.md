@@ -324,8 +324,15 @@ detector proposes as possible rebate.
   `output/presets`; `film-master` is a TIFF, so the existing `.tif`/`.tiff` rule
   already covers it, including `nc roll`'s automatic `<stem>_positive.tiff` names.
 - **Metadata:** the effective parameter set (recipe) and key estimated values are
-  written to a **sidecar JSON** next to the output (paired by name; the same shape
-  as `--dump-params`). Current TIFF output embeds the ICC profile of the chosen
+  written to a **sidecar JSON** next to the output (paired by name). The sidecar is
+  the two-key envelope `{ "meta": {…identity…}, "params": {…recipe…} }`, where
+  `params` is exactly the `--dump-params` document and `meta` is the run's
+  conversion identity (§9). Identity sits *beside* the recipe, never inside it:
+  every recipe struct is `deny_unknown_fields`, so a bare `pipeline_version` key
+  would make every new sidecar fail to reload through `--params`. `--params`
+  accepts **both** the envelope and a bare recipe object (a hand-written recipe,
+  `--dump-params` output, or a pre-envelope sidecar); `meta` is read as provenance
+  and never applied. Current TIFF output embeds the ICC profile of the chosen
   space; future HDR containers carry the profile/CICP and gain/headroom metadata
   required by their preset. The recipe is deliberately *not* embedded in the
   image container (resolved, §13).
@@ -842,6 +849,93 @@ TIFF calls retain their current pixel ordering until migration.
   warnings, timings, output path) to stdout or `--report-file`.
 - `--seed <n>` — fix any stochastic step (none in Step 1, reserved).
 - Stable, documented **exit codes** (see §11).
+
+**Conversion identity (`identity`, every report).** Three independent layers that
+make an output attributable, all **operational** metadata in the same class as
+`--report` and the telemetry flags: no CLI flag, no recipe key, and never a
+changed output pixel.
+
+```json
+{
+  "identity": {
+    "nc_version": "0.1.0",
+    "git_commit": "0d05c800c092",
+    "git_dirty": true,
+    "pipeline_version": 1,
+    "target": "aarch64-apple-darwin",
+    "params_hash": "3575c9feb5d42b2b"
+  }
+}
+```
+
+- `nc_version` / `git_commit` / `git_dirty` / `target` — **build identity**: which
+  binary. Captured by `build.rs`; `git_commit` and `git_dirty` are **omitted**
+  (never the string `"unknown"`) when the build tree had no usable git, so a
+  source-tarball build degrades honestly instead of claiming a clean checkout.
+  `git_dirty: true` means the commit alone does not identify the source.
+- `pipeline_version` — the **behavioral** version, an integer **independent of
+  semver** that bumps *only* when **default** conversion behavior changes. `0` is
+  the Step-1 baseline in `docs/reports/v0-baseline.md`; `1` is current and
+  **collapses every default change since that baseline into one label**:
+  `dmax-reference` replaced the per-frame anchor with the roll-fixed nominal
+  `Dmax = 2.0` **density**, `auto-base-redesign` replaced the auto film-base
+  detector, and `input-semantics` added stage-1b transfer/meaning resolution. (The
+  v0 baseline report measured its numbers with an *explicit* `--film-base`, so those
+  numbers stay comparable; the *default* render crossed three boundaries with only
+  one label available to record them.) This is the axis a version comparison is
+  keyed on.
+- **What the drift gate does and does not cover.** A golden drift test
+  (`version::PIPELINE_FINGERPRINTS`) pairs each version with three fingerprints —
+  the default **render** (the curated per-pixel vectors in
+  `pipeline::stages::golden`), the default **film-base estimate** (stage 2, `auto`
+  over the frozen scan in `pipeline::film_base::golden`, because the render
+  fingerprint is handed a hardcoded base and the recipe fingerprint sees only the
+  string `"auto"`), and the default **recipe values**. Change a default in those
+  stages and the test fails until the version and the fingerprints are updated
+  together. It does **not** cover decode, stage-1b input semantics, the lcms2 output
+  transform or embedded ICC bytes (excluded deliberately — both differ by target, so
+  no cross-platform hash of them exists), encode/quantization, the non-default
+  film-base sources, or the auto detector's behavior on *real* scan geometry. A
+  change confined to those can move default output with every test green;
+  `scripts/real-scan-verify/` and `nctool compare` are the tools for that half.
+- `params_hash` — a stable 64-bit FNV-1a hash of the canonical resolved-recipe
+  JSON: **the exact bytes `--dump-params` writes**, so an agent can reproduce it
+  (`nc convert --dump-params f.json …` then hash `f.json`) and identical
+  configurations are detectable across frames and versions. The sidecar's `params`
+  body is the same **document** but not the same bytes — nesting it under `params`
+  indents every line two extra spaces — so reproduce the hash from a
+  `--dump-params` file, and compare the sidecar as parsed JSON. Omitted for
+  `inspect`/`estimate`, which resolve no full recipe. `nc roll` stamps one
+  `identity` for the **shared** frozen recipe; a per-frame override changes that
+  frame's own hash, which is why each roll frame also reports its own `identity`.
+
+**Comparison basis (`output_stats`, `convert` and each roll frame).** Report-only,
+alongside `loss`:
+
+```json
+{ "output_stats": { "mean": [0.512, 0.487, 0.443] } }
+```
+
+`mean` is the per-channel mean of the samples **as written**, and it is the numeric
+basis `nctool compare` diffs across two builds (per-channel mean ΔRGB is the
+difference of two runs' means, so no output is ever re-read or shipped). Its units
+follow the output depth: the u16 path reports the quantized value scaled back to
+`[0, 1]` (exact integer accumulation, so it is reproducible on every target given
+identical pixels); the `--output-hdr` f32 path reports the verbatim, **unclamped**
+float mean over the *finite* samples, so it may exceed `1.0` and one `NaN` cannot
+swallow the statistic (`loss.non_finite` is where that fault is reported). A u16
+mean and an f32 mean are therefore not comparable, and `compare` refuses to subtract
+them. Only the mean is recorded; ΔE2000 / SSIM need real pixel access and belong to
+§12 item 7's QA harness.
+
+`nc --version` prints the same build identity (semver, `pipeline_version` with a
+one-line description of its default render, commit with a `-dirty` marker — or
+`(dirty unknown)` when cleanliness could not be read, target) so an output can be
+attributed without running a conversion.
+
+Replaying a recipe whose `meta.pipeline_version` differs from the running build's
+is a **loud, `--strict`-promotable warning**: the parameters still apply, but the
+default render changed underneath them, so the pixels will not match the original.
 
 The convert report's `recipe` echoes the effective (resolved) config — the
 sidecar's exact object — so `recipe.reconstruction` is the exact tagged object
@@ -1634,7 +1728,14 @@ share a hash without the record carrying the whole recipe. The value shown above
 **illustrative**: because it covers the *whole* recipe it changes whenever any key is
 added, removed, or re-defaulted (adding `print.linear_range` and `output.preset` changed
 it, and the next schema change will again). Nothing asserts it — treat it as a shape
-example, not a reproducible constant.
+example, not a reproducible constant.`params_hash` is a stable hash of the canonical effective-recipe JSON — the same
+bytes `--dump-params` writes — so identical conversions share a hash without the
+record carrying the whole recipe. The sidecar is an envelope, so its `params` body
+is the same recipe document re-indented rather than the same bytes. The hash is
+computed by the same function as the report's `identity.params_hash`, so a
+telemetry record and report for one run agree. The value shown above is
+**illustrative**: it covers the whole recipe and changes whenever any key is added,
+removed, or re-defaulted. Nothing asserts it as a constant.
 
 ## 10. Code architecture (Rust)
 
@@ -1831,10 +1932,9 @@ the NLP feature comparison, Phase 6).
     (near-opaque in RGB, the max-density endpoint — always available) via
     `estimate --d-max-region` is frozen as `{ "explicit": <d> }`. `--auto-d-max`
     (per-frame exposure normalization) is demoted to opt-in. This changes the
-    default render, which is a `pipeline_version` bump — a **deferred** obligation:
-    there is no `pipeline_version` code constant yet (`conversion-versioning`,
-    item 16, is unshipped), so when it lands this default must be labeled
-    `pipeline_version 1` (the v0→v1 boundary for the density default). In the
+    default render, which is a `pipeline_version` bump — **discharged** by
+    `conversion-versioning` (item 16): this default is labeled
+    `pipeline_version 1`, the v0→v1 boundary for the density default. In the
     replacement pipeline, Dmax belongs to the selected density curve: scalar
     placement for exponential and curve shaping for sigmoid. SDR/HDR rendering
     owns display reference white.
@@ -1849,16 +1949,23 @@ the NLP feature comparison, Phase 6).
     B&W / no-IR (HDR 48-bit) → RGB-only fallback — *not* by color model or IR-plane
     presence. Also sidesteps holder *color* (item 9), since opacity, not color, is
     the IR signal. Tracked: `ir-holder-detection`.
-16. **Conversion versioning & baseline comparison.** Stamp every output with
-    build identity (crate semver + git commit), a behavioral `pipeline_version`
-    (bumps *only* on default-behavior changes, gated by golden-output tests;
-    `v0` = current baseline), and a resolved-params hash — in the **report**, and
-    mirrored into the sidecar only via a backward-compatible metadata envelope
-    (never as bare recipe keys, which would break the `--params`
-    `deny_unknown_fields` round-trip). A benchmark manifest + `compare` step diffs the same scan/recipe set
-    across two builds (per-channel ΔRGB / clip / timing) so quality and
-    performance are trackable version-to-version. Quality metrics (ΔE2000/SSIM)
-    extend via item 7's QA harness; timings via `perf-instrumentation`. `v0` is
+16. **Conversion versioning & baseline comparison.** *(Built, not yet shipped —
+    `conversion-versioning`.)* Every report carries an `identity` block (§9):
+    build identity (crate semver + git commit + dirty flag + target), a behavioral
+    `pipeline_version` (bumps *only* on default-behavior changes, gated by a golden
+    drift test over the default render, the default film-base estimate, and the
+    default recipe values — see §9 for what that gate does **not** cover; `0` = the
+    `v0` baseline, `1` = current), and a resolved-params hash.
+    It is mirrored into the sidecar only via the backward-compatible
+    `{ "meta", "params" }` envelope — never as bare recipe keys, which would break
+    the `--params` `deny_unknown_fields` round-trip; `--params` still accepts a bare
+    legacy recipe. The benchmark manifest `scripts/analysis/benchmark.json` plus
+    `python -m nctool compare run|diff` converts a fixed scan/recipe set under a
+    build and diffs two builds keyed on `pipeline_version` + commit (per-channel
+    mean ΔRGB, clip-fraction delta, per-stage timings); re-running one build yields
+    a zero diff, where the verdict deliberately covers only the deterministic
+    fields (timings are informational). Quality metrics (ΔE2000/SSIM)
+    extend via item 7's QA harness; timings reuse the telemetry record. `v0` is
     recorded in `docs/reports/v0-baseline.md`. Tracked: `conversion-versioning`.
 17. **Stdout broken-pipe safety.** Every stdout JSON write — `emit_report`
     (convert/inspect/estimate) and `nc params` — uses `println!`, which

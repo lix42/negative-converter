@@ -1147,6 +1147,47 @@ impl<'de> Deserialize<'de> for OutputPreset {
     }
 }
 
+/// Per-channel statistics of the samples **as written** to the output file —
+/// report-only, and the numeric basis for cross-version comparison
+/// (`core/conversion-versioning`).
+///
+/// Only the mean is recorded, deliberately: for a fixed scan + recipe, the
+/// per-channel *mean ΔRGB* between two builds is exactly the difference of the two
+/// runs' per-channel means (`mean(a) - mean(b) = mean(a - b)`), so `nctool compare`
+/// derives that metric from two run records without ever re-reading, registering,
+/// or shipping pixels. Richer metrics (ΔE2000, SSIM) need real pixel access and
+/// belong to the QA harness (design-spec §12 item 7), not here.
+///
+/// Units are the written sample's own domain: the u16 path reports the quantized
+/// value scaled back to `[0, 1]` (so it is exact integer arithmetic, identical on
+/// every target given identical pixels); the f32 path reports the verbatim
+/// (unclamped, possibly > 1.0) float mean over the **finite** samples, with
+/// non-finite samples excluded so one `NaN` cannot swallow the whole statistic —
+/// `EncodeReport::non_finite` is where that fault is reported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct OutputStats {
+    /// Mean written sample value per channel `[r, g, b]`. Zero for an empty image.
+    pub mean: [f64; 3],
+}
+
+/// What the encode stage produced: the loss accounting the orchestrator turns into
+/// report warnings, plus the report-only per-channel statistics of the written
+/// samples.
+///
+/// Bundled so the caller never has to re-read the output file to get the statistics.
+/// The means are a **second** pass over the sample buffer (after `quantize_u16` /
+/// the non-finite scan), not a free by-product of the first, and it is paid
+/// unconditionally — including under `--report none`, where nothing consumes it.
+/// Deliberate for now: making it conditional would push the report mode down into
+/// `io::encode`, coupling the encoder to an orchestration concern for one linear scan
+/// of already-hot memory. Revisit if `telemetry/perf-instrumentation` ever shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[must_use]
+pub struct EncodeOutcome {
+    pub loss: EncodeReport,
+    pub stats: OutputStats,
+}
+
 /// Output / encode knobs (design-spec §9, stage 5).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]

@@ -332,18 +332,18 @@ pub fn cpu_count() -> Option<u32> {
         .ok()
 }
 
-/// Stable 64-bit FNV-1a hash of `bytes`, hex-formatted. Hand-rolled (not
-/// `std::hash::DefaultHasher`, whose output isn't guaranteed stable across
-/// toolchains) so the `params_hash` a server sees is reproducible build to build.
+/// Stable 64-bit FNV-1a hash of the canonical resolved-recipe JSON, hex-formatted
+/// — [`crate::version::stable_hash`] under the name the record's field uses.
+///
+/// The implementation lives in `version` because the report/sidecar identity block
+/// (`core/conversion-versioning`) hashes the **same bytes** with the same function:
+/// one hash function means a record's `params_hash` and a report's
+/// `identity.params_hash` are directly comparable, and can't drift apart. It stays
+/// hand-rolled (not `std::hash::DefaultHasher`, whose output isn't guaranteed
+/// stable across toolchains) so the value a server sees is reproducible build to
+/// build.
 pub fn params_hash(recipe_json: &str) -> String {
-    const OFFSET: u64 = 0xcbf29ce484222325;
-    const PRIME: u64 = 0x100000001b3;
-    let mut h = OFFSET;
-    for &b in recipe_json.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(PRIME);
-    }
-    format!("{h:016x}")
+    crate::version::stable_hash(recipe_json)
 }
 
 // ---------------------------------------------------------------------------

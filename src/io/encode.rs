@@ -16,7 +16,10 @@ use tiff::encoder::colortype::{ColorType, Gray16, Gray32Float, RGB16, RGB32Float
 use tiff::encoder::{TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, TiffValue};
 use tiff::tags::Tag;
 
-use crate::types::{BigTiff, EncodeReport, LinearImage, NcError, OutDepth, OutputParams, Result};
+use crate::types::{
+    BigTiff, EncodeOutcome, EncodeReport, LinearImage, NcError, OutDepth, OutputParams,
+    OutputStats, Result,
+};
 
 /// Slack added to the raw sample-data size when deciding BigTIFF auto-promotion:
 /// IFD entries and strip offset/bytecount tables live outside
@@ -35,20 +38,22 @@ const CLASSIC_TIFF_LIMIT: u64 = u32::MAX as u64;
 /// so the encoder embeds exactly the profile the pixels were converted into rather
 /// than re-resolving it. `None` embeds no profile.
 ///
-/// Returns an [`EncodeReport`] recording any quantization clipping so the caller
-/// can fold it into the JSON report (and `--strict` can promote it to an error).
+/// Returns an [`EncodeOutcome`]: the [`EncodeReport`] recording any quantization
+/// clipping so the caller can fold it into the JSON report (and `--strict` can
+/// promote it to an error), plus the report-only [`OutputStats`] of the samples as
+/// written (the cross-version comparison basis).
 pub fn encode(
     image: &LinearImage,
     params: &OutputParams,
     icc: Option<&[u8]>,
     path: &Path,
-) -> Result<EncodeReport> {
+) -> Result<EncodeOutcome> {
     // Borrow the BufWriter into the encoder rather than moving it, so we still
     // own it afterward and can flush explicitly — see `flush_buf`.
     let mut writer = BufWriter::new(create(path)?);
-    let report = encode_to_writer(&mut writer, image, params, icc)?;
+    let outcome = encode_to_writer(&mut writer, image, params, icc)?;
     flush_buf(&mut writer, path)?;
-    Ok(report)
+    Ok(outcome)
 }
 
 /// Whether encoding `image` under `params` (with an `icc_len`-byte embedded
@@ -81,12 +86,18 @@ pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<()
     flush_buf(&mut writer, path)
 }
 
-/// Write the effective recipe JSON to the sidecar next to the output. The sidecar
-/// path is `<output>.json` (e.g. `out.tiff` → `out.tiff.json`), so an output and
-/// its recipe stay paired by name.
-pub fn write_sidecar(output_path: &Path, recipe_json: &str) -> Result<()> {
+/// Write the sidecar JSON next to the output. The sidecar path is `<output>.json`
+/// (e.g. `out.tiff` → `out.tiff.json`), so an output and its recipe stay paired by
+/// name.
+///
+/// The caller composes the document: `cli` writes the
+/// `{ "meta": {…identity…}, "params": {…recipe…} }` envelope
+/// (`core/conversion-versioning`), keeping run identity out of the recipe body so
+/// the sidecar stays reloadable through `--params`. This function only owns the
+/// path and the write error.
+pub fn write_sidecar(output_path: &Path, sidecar_json: &str) -> Result<()> {
     let sidecar = sidecar_path(output_path);
-    std::fs::write(&sidecar, recipe_json)
+    std::fs::write(&sidecar, sidecar_json)
         .map_err(|e| NcError::Write(format!("writing sidecar {}: {e}", sidecar.display())))
 }
 
@@ -108,7 +119,7 @@ fn encode_to_writer<W: Write + Seek>(
     image: &LinearImage,
     params: &OutputParams,
     icc: Option<&[u8]>,
-) -> Result<EncodeReport> {
+) -> Result<EncodeOutcome> {
     let (w, h) = (image.width, image.height);
     let bytes_per_sample = depth_bytes(params.depth());
     let icc_bytes = icc.map_or(0, |b| b.len() as u64);
@@ -120,6 +131,7 @@ fn encode_to_writer<W: Write + Seek>(
     match (params.depth(), big) {
         (OutDepth::U16, false) => {
             let (data, report) = quantize_u16(&image.rgb);
+            let stats = channel_means_u16(&data);
             encode_planar::<_, TiffKindStandard, RGB16>(
                 TiffEncoder::new(writer)?,
                 w,
@@ -127,10 +139,14 @@ fn encode_to_writer<W: Write + Seek>(
                 &data,
                 icc,
             )?;
-            Ok(report)
+            Ok(EncodeOutcome {
+                loss: report,
+                stats,
+            })
         }
         (OutDepth::U16, true) => {
             let (data, report) = quantize_u16(&image.rgb);
+            let stats = channel_means_u16(&data);
             encode_planar::<_, TiffKindBig, RGB16>(
                 TiffEncoder::new_big(writer)?,
                 w,
@@ -138,10 +154,14 @@ fn encode_to_writer<W: Write + Seek>(
                 &data,
                 icc,
             )?;
-            Ok(report)
+            Ok(EncodeOutcome {
+                loss: report,
+                stats,
+            })
         }
         (OutDepth::F32, false) => {
             let report = scan_non_finite(&image.rgb);
+            let stats = channel_means_f32(&image.rgb);
             encode_planar::<_, TiffKindStandard, RGB32Float>(
                 TiffEncoder::new(writer)?,
                 w,
@@ -149,10 +169,14 @@ fn encode_to_writer<W: Write + Seek>(
                 &image.rgb,
                 icc,
             )?;
-            Ok(report)
+            Ok(EncodeOutcome {
+                loss: report,
+                stats,
+            })
         }
         (OutDepth::F32, true) => {
             let report = scan_non_finite(&image.rgb);
+            let stats = channel_means_f32(&image.rgb);
             encode_planar::<_, TiffKindBig, RGB32Float>(
                 TiffEncoder::new_big(writer)?,
                 w,
@@ -160,7 +184,10 @@ fn encode_to_writer<W: Write + Seek>(
                 &image.rgb,
                 icc,
             )?;
-            Ok(report)
+            Ok(EncodeOutcome {
+                loss: report,
+                stats,
+            })
         }
     }
 }
@@ -342,6 +369,62 @@ fn quantize_u16(samples: &[f32]) -> (Vec<u16>, EncodeReport) {
     (data, report)
 }
 
+/// Per-channel mean of quantized u16 samples, normalized back to `[0, 1]` — the
+/// statistic of what the u16 file actually contains.
+///
+/// The accumulation is **integer** (`u64` sums of the written u16 values), so the
+/// result is exactly reproducible on every target given identical pixels: no
+/// floating-point summation order or rounding enters it. Interleaved RGB, so
+/// channel = `index % 3`; a sample count that isn't a multiple of 3 can't occur for
+/// an RGB image (`LinearImage` enforces it), and a partial tail would simply
+/// contribute to the channels it covers.
+fn channel_means_u16(data: &[u16]) -> OutputStats {
+    let mut sums = [0u64; 3];
+    let mut counts = [0u64; 3];
+    for (i, &v) in data.iter().enumerate() {
+        let c = i % 3;
+        sums[c] += v as u64;
+        counts[c] += 1;
+    }
+    OutputStats {
+        mean: std::array::from_fn(|c| {
+            if counts[c] == 0 {
+                0.0
+            } else {
+                sums[c] as f64 / counts[c] as f64 / 65535.0
+            }
+        }),
+    }
+}
+
+/// Per-channel mean of verbatim-written f32 samples (HDR: unclamped, so a mean may
+/// exceed 1.0).
+///
+/// Non-finite samples are excluded from both the sum and the count — a single `NaN`
+/// would otherwise poison the whole statistic, hiding the very comparison the mean
+/// exists for; the fault itself is reported by `EncodeReport::non_finite`. Summation
+/// is sequential in `f64`, so it is deterministic for a given build.
+fn channel_means_f32(data: &[f32]) -> OutputStats {
+    let mut sums = [0f64; 3];
+    let mut counts = [0u64; 3];
+    for (i, &v) in data.iter().enumerate() {
+        if v.is_finite() {
+            let c = i % 3;
+            sums[c] += v as f64;
+            counts[c] += 1;
+        }
+    }
+    OutputStats {
+        mean: std::array::from_fn(|c| {
+            if counts[c] == 0 {
+                0.0
+            } else {
+                sums[c] / counts[c] as f64
+            }
+        }),
+    }
+}
+
 /// Scan verbatim-written f32 samples for non-finite values. f32 output is not
 /// clamped (HDR is preserved), so there is no `clipped_*` accounting — but a
 /// `NaN`/`inf` still signals a pipeline numerical fault that must surface, so it
@@ -400,6 +483,10 @@ mod tests {
     }
 
     fn encode_report(image: &LinearImage, params: &OutputParams) -> EncodeReport {
+        encode_outcome(image, params).loss
+    }
+
+    fn encode_outcome(image: &LinearImage, params: &OutputParams) -> EncodeOutcome {
         let mut buf = Cursor::new(Vec::new());
         encode_to_writer(&mut buf, image, params, None).unwrap()
     }
@@ -477,6 +564,42 @@ mod tests {
         let report = encode_report(&faulty, &out(OutDepth::F32, BigTiff::Off));
         assert_eq!(report.non_finite, 2);
         assert!(report.any_loss());
+    }
+
+    #[test]
+    fn u16_stats_are_the_means_of_the_written_clamped_samples() {
+        // The mean is of what the *file* holds: the clamped, quantized values
+        // (2.0 → 65535 → 1.0; -1.0 → 0), not the incoming floats — that is what
+        // makes two builds' means directly comparable.
+        let image = img(2, 1, vec![0.0, 1.0, 0.5, 2.0, -1.0, 0.25], None);
+        let stats = encode_outcome(&image, &out(OutDepth::U16, BigTiff::Off)).stats;
+        assert_eq!(stats.mean[0], (0.0 + 1.0) / 2.0);
+        assert_eq!(stats.mean[1], (1.0 + 0.0) / 2.0);
+        // 0.5 → 32768/65535, 0.25 → 16384/65535: exact integer arithmetic.
+        assert_eq!(stats.mean[2], (32768.0 / 65535.0 + 16384.0 / 65535.0) / 2.0);
+    }
+
+    #[test]
+    fn f32_stats_keep_hdr_values_and_skip_non_finite() {
+        // f32 is written verbatim, so the mean may exceed 1.0...
+        let clean = img(2, 1, vec![0.5, 0.0, 0.0, 1.5, 0.0, 0.0], None);
+        let stats = encode_outcome(&clean, &out(OutDepth::F32, BigTiff::Off)).stats;
+        assert_eq!(stats.mean[0], 1.0); // (0.5 + 1.5) / 2
+
+        // ...and a NaN is excluded rather than poisoning the whole channel mean
+        // (the fault is reported by `EncodeReport::non_finite`).
+        let faulty = img(2, 1, vec![f32::NAN, 0.0, 0.0, 0.75, 0.0, 0.0], None);
+        let outcome = encode_outcome(&faulty, &out(OutDepth::F32, BigTiff::Off));
+        assert_eq!(outcome.loss.non_finite, 1);
+        assert_eq!(outcome.stats.mean[0], 0.75);
+    }
+
+    #[test]
+    fn stats_of_an_empty_channel_are_zero_not_nan() {
+        // Defensive: a zero-sample image must not divide by zero into a NaN that
+        // would then serialize as `null` in the report.
+        assert_eq!(channel_means_u16(&[]).mean, [0.0, 0.0, 0.0]);
+        assert_eq!(channel_means_f32(&[]).mean, [0.0, 0.0, 0.0]);
     }
 
     #[test]
