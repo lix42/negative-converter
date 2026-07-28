@@ -413,10 +413,17 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   run never leaves a truncated final file. Honest guarantee: no partial files +
   minimized inconsistency window, not literal multi-file atomicity (a crash between
   renames can still mix old/new artifacts).
-- [ ] [Memory preflight & in-place transform](tasks/io/memory-preflight.md) — from the
+- [x] [Memory preflight & in-place transform](tasks/io/memory-preflight.md) — from the
   memory-safety review (Phase A, cheap): predict peak allocation and fail loudly
   over a budget before allocating (reconciling the dishonest 4 GiB input limit),
   and drop the whole-image clone in `to_output` (transform in place, skip IR).
+  **Done 2026-07-27** (see [progress/io.md](progress/io.md) `## memory-preflight`):
+  `pipeline::memory` sizing model (decode 18 · film-base 16+12·s · render 32+12·s ·
+  encode 38+12·s B/px) gated before decode from a metadata-only `io::decode::probe`,
+  fixed 6 GiB default budget + `--max-memory` (operational, not a recipe key), new
+  exit code 6; peak on the 74.65 MP `largest.tif` 3.808 → 3.146 GB and 975 → 681 MB
+  at 18.66 MP (decimal GB/MB, a 30% cut), output byte-identical. Re-measurement
+  feeds `io/streaming-tiled-io` STEP 0 (still a conditional GO).
 - [ ] [Streaming / tiled I/O](tasks/io/streaming-tiled-io.md) — memory-safety review
   Phase B (expensive, **evaluate-first**): strip/tile decode + streaming encode.
   STEP 0 gate — evaluate from measured peak whether this is needed at all; if data

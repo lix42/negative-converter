@@ -21,11 +21,12 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use crate::algo::density;
-use crate::io::decode::{DecodeInfo, decode};
+use crate::io::decode::{DecodeInfo, decode_within, probe};
 use crate::io::encode;
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
+use crate::pipeline::memory::{self, MemoryReport, RunProfile, SamplePlan};
 use crate::pipeline::{film_base, stages, working_space};
 use crate::telemetry;
 use crate::types::{
@@ -101,6 +102,33 @@ pub struct ReportArgs {
     pub quiet: bool,
 }
 
+/// The memory preflight's budget — **operational, not a conversion knob**, so it
+/// lives here on the arg structs like `--report`/`--strict`/`--telemetry` and is
+/// deliberately *not* a recipe key: it never enters the recipe/sidecar and can
+/// never perturb a pixel (design-spec §9 Global). Shared by every subcommand that
+/// decodes a scan; each gates on its own pipeline profile (`pipeline::memory`).
+#[derive(Args, Debug, Default)]
+pub struct MemoryArgs {
+    /// Fail before decoding if this run's estimated peak memory would exceed this
+    /// budget (e.g. `8GiB`, `4096MB`, raw bytes). Defaults to 6 GiB — a fixed
+    /// value, so the pass/fail decision is the same on every machine. Operational
+    /// flag — not a recipe key; never affects the output image.
+    #[arg(long = "max-memory", value_name = "BYTES", value_parser = parse_max_memory_arg)]
+    pub max_memory: Option<u64>,
+}
+
+impl MemoryArgs {
+    /// The run's resolved budget (the flag, else the fixed default).
+    fn budget(&self) -> memory::Budget {
+        memory::Budget::resolve(self.max_memory)
+    }
+}
+
+/// clap adapter for [`memory::parse_max_memory`] — clap wants a `String` error.
+fn parse_max_memory_arg(s: &str) -> std::result::Result<u64, String> {
+    memory::parse_max_memory(s).map_err(|e| e.to_string())
+}
+
 /// `inspect`: an input scan plus reporting controls.
 #[derive(Args, Debug)]
 pub struct IoArgs {
@@ -112,6 +140,8 @@ pub struct IoArgs {
     /// unknown default keep the IR path off. See `convert --film-type`.
     #[arg(long = "film-type", value_enum, value_name = "TYPE")]
     pub film_type: Option<FilmType>,
+    #[command(flatten)]
+    pub memory: MemoryArgs,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -157,6 +187,8 @@ pub struct EstimateArgs {
     /// be echoed back.
     #[arg(long)]
     pub strict: bool,
+    #[command(flatten)]
+    pub memory: MemoryArgs,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -228,6 +260,8 @@ pub struct ConvertArgs {
     pub telemetry_file: Option<String>,
 
     #[command(flatten)]
+    pub memory: MemoryArgs,
+    #[command(flatten)]
     pub report: ReportArgs,
 }
 
@@ -272,6 +306,8 @@ pub struct RollArgs {
     /// emitted), like `convert --strict`.
     #[arg(long)]
     pub strict: bool,
+    #[command(flatten)]
+    pub memory: MemoryArgs,
     #[command(flatten)]
     pub report: ReportArgs,
 }
@@ -902,6 +938,14 @@ pub struct Report {
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode: Option<DecodeInfo>,
+    /// What the memory preflight decided before this run decoded anything: the
+    /// estimated peak with its per-phase breakdown, the budget and where it came
+    /// from, the verdict, and the detected RAM the warn tier used
+    /// (`pipeline::memory`). Present on every command that decodes a scan.
+    /// Operational provenance — the budget is not a recipe key and never
+    /// influences the pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryReport>,
     /// Resolved input color semantics (`convert`/`inspect`): the two independent
     /// axes (transfer encoding + measurement meaning) with per-axis evidence,
     /// whether an ICC is embedded plus a safe summary, and whether any transfer
@@ -2591,15 +2635,73 @@ struct ConvertedFrame {
     loss: EncodeReport,
 }
 
-/// The per-frame conversion core: decode → film-base estimate → render → optional
-/// IR export → encode + effective-recipe sidecar. Pure of the operational
-/// concerns (`--strict` gating, report emission, telemetry) the callers layer on
-/// top, so `convert` and `roll` share one byte-for-byte identical frame path.
+/// Run the memory preflight for one input and fold its outcome into the run:
+/// probe the file's shape from headers alone, size the run for `profile` +
+/// `sampling`, reject loudly when it would exceed `budget` (exit 6), and push the
+/// RAM-pressure warning when it fits the budget but not the machine.
+///
+/// Shared by `convert`/`roll` and by `inspect`/`estimate` so the four commands
+/// gate identically — each with its own profile, since `inspect`/`estimate` stop
+/// after decode and must not be judged on a render they never run, and its own
+/// [`SamplePlan`], since the film-base phase's cost depends on which rectangles the
+/// run samples.
+///
+/// `total_ram` is a parameter rather than a `detect_total_ram()` call inside, so
+/// the warn tier — the one piece of this gate that is environment-dependent, and
+/// therefore the one that can make `--strict` exit differently on two machines — is
+/// reachable from a test through the real wiring. Production callers pass
+/// [`memory::detect_total_ram`].
+fn preflight_memory(
+    input: &Path,
+    profile: RunProfile,
+    sampling: SamplePlan,
+    budget: memory::Budget,
+    total_ram: Option<u64>,
+    log: &Log,
+    warnings: &mut Vec<String>,
+) -> Result<MemoryReport> {
+    let shape = probe(input)?;
+    let mem = memory::preflight(&shape, profile, sampling, budget, total_ram)?;
+    log.info(format_args!(
+        "memory preflight: estimated peak {} bytes, budget {} bytes ({:?})",
+        mem.estimate.estimated_peak_bytes, mem.budget_bytes, mem.budget_source
+    ));
+    if let Some(msg) = memory::warn_message(&mem) {
+        push_warning_buf(warnings, log, msg);
+    }
+    Ok(mem)
+}
+
+/// The film-base sampling a resolved [`FilmBaseSource`] will perform, for the
+/// memory model's film-base phase: an explicit base reads no pixels, a region
+/// materializes exactly its rectangle, and `auto` materializes the frame interior
+/// (`film_base::auto_interior_pixels`, resolved inside the model against the probed
+/// shape). `estimate` adds its `--grid` / `--d-max-region` rectangles on top.
+fn sample_plan(source: &FilmBaseSource) -> SamplePlan {
+    match source {
+        FilmBaseSource::Explicit(_) => SamplePlan::none(),
+        FilmBaseSource::Region([_, _, w, h]) => SamplePlan::rect(*w as u64 * *h as u64),
+        FilmBaseSource::Auto => SamplePlan::auto(),
+    }
+}
+
+/// The per-frame conversion core: **stage-0 memory preflight** → decode →
+/// film-base estimate → render → optional IR export → encode + effective-recipe
+/// sidecar. Pure of the operational concerns the callers layer on top (`--strict`
+/// gating, report emission, telemetry), so `convert` and `roll` share one
+/// byte-for-byte identical frame path.
+///
+/// The one operational concern it *does* own is the memory gate
+/// ([`preflight_memory`]), and deliberately: it must run per frame and
+/// immediately before this function's own `decode_within`, which needs the same
+/// budget anyway. Do not "tidy" it up into the orchestrators — that would split
+/// the run's validation across two layers and leave the budget threaded here
+/// regardless.
 ///
 /// The caller must have already validated `cfg` ([`validate`]), rejected the
 /// deprecated input flags ([`reject_deprecated_input_flags`]), and checked
-/// write-target collisions; `convert_frame` assumes a sound config and a safe
-/// `output` path. It resolves and gates the input color semantics itself
+/// write-target collisions; apart from the memory gate above, `convert_frame`
+/// assumes a sound config and a safe `output` path. It resolves and gates the input color semantics itself
 /// (transfer + meaning, [`input_semantics`]) after decode, before the render. It
 /// never
 /// writes to stdout (the report rides back in [`ConvertedFrame`]); progress and
@@ -2609,10 +2711,14 @@ struct ConvertedFrame {
 /// stderr as they occur) so they survive an early failure: on success they are
 /// also moved into the returned report, but on the `Err` path they stay in the
 /// caller's buffer — the roll orchestrator attaches them to a failed frame's
-/// report. The caller decides whether `--strict` promotes them.
-// One over clippy's argument cap: the orchestration core legitimately threads
-// the frame identity, config, and the two report-provenance facts; a params
-// struct for two one-off values would only obscure the call sites.
+/// report. The caller decides whether `--strict` promotes them. `memory_out`
+/// carries the preflight's decision back the same way and for the same reason: a
+/// frame that passed the gate and then failed later is exactly where a reader wants
+/// the estimate, so it must not be lost with the returned report.
+// Two over clippy's argument cap: the orchestration core legitimately threads the
+// frame identity, the config, the run's memory budget, and the two
+// report-provenance out-params; a struct wrapping a handful of one-off values
+// would only obscure the call sites.
 #[allow(clippy::too_many_arguments)]
 fn convert_frame(
     command: &'static str,
@@ -2621,6 +2727,8 @@ fn convert_frame(
     cfg: &ResolvedConfig,
     input_from_cli: InputFromCli,
     dmax_setting: DmaxSetting,
+    budget: memory::Budget,
+    memory_out: &mut Option<MemoryReport>,
     log: &Log,
     warnings: &mut Vec<String>,
 ) -> Result<ConvertedFrame> {
@@ -2653,11 +2761,35 @@ fn convert_frame(
         push_warning_buf(warnings, log, msg);
     }
 
+    // Stage 0 — memory preflight, on a metadata-only header probe. This must run
+    // *before* decode allocates: the whole point is to reject an oversized frame
+    // while the heap is still empty (a check after decode would OOM on exactly the
+    // inputs it exists to catch). Over budget ⇒ loud exit 6; within budget but
+    // most of the machine's RAM ⇒ a `--strict`-promotable warning. Operational
+    // gate — it never touches a pixel, so the output stays deterministic.
+    let mem = preflight_memory(
+        input,
+        RunProfile::Convert {
+            depth: cfg.output.depth(),
+            export_ir: cfg.input.export_ir.is_some(),
+        },
+        sample_plan(&cfg.film_base.source),
+        budget,
+        memory::detect_total_ram(),
+        log,
+        warnings,
+    )?;
+    // Out-param first, so the diagnostic survives a later failure on this frame:
+    // the roll orchestrator attaches it to the frame report either way (a frame that
+    // passed the gate and then failed is exactly where a reader wants the estimate).
+    *memory_out = Some(mem);
+    report.memory = Some(mem);
+
     // Stage 1 — decode. Per-stage wall clocks feed the telemetry record only
     // (they never touch the image/sidecar); measure them regardless of whether
     // telemetry is enabled so the render path is uniform.
     let stage_started = Instant::now();
-    let (image, info) = decode(input)?;
+    let (image, info) = decode_within(input, budget.bytes())?;
     let decode_ms = elapsed_ms(stage_started);
     log.info(format_args!(
         "decoded {:?} {}x{} (ir={})",
@@ -3084,13 +3216,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     if let Some(msg) = pipeline_version_warning(loaded.meta_pipeline_version) {
         push_warning_buf(&mut warnings, &log, msg);
     }
-    let ConvertedFrame {
-        mut report,
-        info,
-        recipe_json,
-        timings: stage_timings,
-        loss,
-    } = convert_frame(
+    let frame = convert_frame(
         "convert",
         &args.input,
         &args.output,
@@ -3100,9 +3226,42 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
             meaning: args.input_opts.input_meaning.is_some(),
         },
         dmax_setting,
+        args.memory.budget(),
+        // `convert` reads the preflight decision off the returned report; the
+        // out-param exists for `roll`'s failed frames.
+        &mut None,
         &log,
         &mut warnings,
-    )?;
+    );
+
+    // A failure here drops the report, and with it every warning accumulated
+    // before the failure point — including the memory preflight's RAM-pressure
+    // note, whose whole point is to explain a run the OS may kill. `log.warn`
+    // already echoed them, but `--quiet` suppresses that, so under `--quiet` they
+    // would be lost on *both* channels. Re-emit unconditionally (the `warn_always`
+    // treatment clipping already gets) before propagating. `roll` has always
+    // honoured this via `frame_report_err`; `convert` did not.
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(e) => {
+            // Only the warnings `--quiet` swallowed: `push_warning_buf` already
+            // echoed each one through `log.warn` as it was raised, so re-emitting
+            // unconditionally would double-print them on a normal run.
+            if log.quiet {
+                for w in &warnings {
+                    log.warn_always(w);
+                }
+            }
+            return Err(e);
+        }
+    };
+    let ConvertedFrame {
+        mut report,
+        info,
+        recipe_json,
+        timings: stage_timings,
+        loss,
+    } = frame;
 
     let total_ms = elapsed_ms(started);
     report.elapsed_ms = Some(total_ms);
@@ -3248,6 +3407,16 @@ struct FrameReport {
     /// serialize as flat sibling keys (`"status":"ok"`, `film_base`, … / `error`).
     #[serde(flatten)]
     status: FrameStatus,
+    /// What the memory preflight decided for *this* frame — mirrors the
+    /// single-frame `Report` field. Per-frame rather than roll-level because
+    /// frames may differ in dimensions (and so in estimated peak) even though
+    /// they share one budget; the gate runs per frame too.
+    ///
+    /// Common to both outcomes, like `warnings`: the gate runs before anything
+    /// else, so a frame that passed it and then failed still has a decision to
+    /// report — and that is precisely the frame whose estimate a reader wants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<MemoryReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
     /// The per-frame recipe override applied (manifest `params`), if any.
@@ -3741,6 +3910,7 @@ fn frame_report_ok(pf: &PlannedFrame, report: Report) -> FrameReport {
             output_stats: report.output_stats,
             identity: report.identity,
         },
+        memory: report.memory,
         warnings: report.warnings,
         overrides: pf.overrides.clone(),
     }
@@ -3749,13 +3919,21 @@ fn frame_report_ok(pf: &PlannedFrame, report: Report) -> FrameReport {
 /// A failed frame's [`FrameReport`] entry — the error message plus any warnings
 /// accumulated before the failure point (decode/IR/film-base notices), so a frame
 /// that warns and then fails still reports them (and they aren't lost to `--quiet`).
-fn frame_report_err(pf: &PlannedFrame, err: &NcError, warnings: Vec<String>) -> FrameReport {
+/// `memory` is whatever the preflight decided before the failure (it runs first, so
+/// only a frame rejected *by* the gate has none).
+fn frame_report_err(
+    pf: &PlannedFrame,
+    err: &NcError,
+    memory: Option<MemoryReport>,
+    warnings: Vec<String>,
+) -> FrameReport {
     FrameReport {
         input: pf.input.clone(),
         output: Some(pf.output.clone()),
         status: FrameStatus::Failed {
             error: err.to_string(),
         },
+        memory,
         warnings,
         overrides: pf.overrides.clone(),
     }
@@ -3899,9 +4077,11 @@ fn run_roll(args: RollArgs) -> Result<()> {
     let (mut succeeded, mut failed) = (0usize, 0usize);
     for pf in &planned {
         log.info(format_args!("converting {}", pf.input.display()));
-        // Per-frame warnings accumulate here so a frame that warns and then fails
-        // still hands them back (the report only rides out on success).
+        // Per-frame warnings and the preflight decision accumulate here so a frame
+        // that warns / gets sized and *then* fails still hands them back (the report
+        // only rides out on success).
         let mut warnings = Vec::new();
+        let mut memory = None;
         match convert_frame(
             "roll",
             &pf.input,
@@ -3909,6 +4089,8 @@ fn run_roll(args: RollArgs) -> Result<()> {
             &pf.cfg,
             InputFromCli::none(),
             pf.dmax_setting,
+            args.memory.budget(),
+            &mut memory,
             &log,
             &mut warnings,
         ) {
@@ -3922,7 +4104,7 @@ fn run_roll(args: RollArgs) -> Result<()> {
                 // continues (the loud non-zero exit + per-frame `error` are the
                 // signal). Echo to stderr too; stdout stays the JSON report.
                 log.warn(&format!("frame {} failed: {e}", pf.input.display()));
-                frames.push(frame_report_err(pf, &e, warnings));
+                frames.push(frame_report_err(pf, &e, memory, warnings));
             }
         }
     }
@@ -3984,12 +4166,6 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     if let Some(rf) = args.report.report_file.as_deref() {
         ensure_write_targets_distinct(&args.input, &[("--report-file", rf)])?;
     }
-    let (image, info) = decode(&args.input)?;
-    log.info(format_args!(
-        "decoded {:?} {}x{} (ir={})",
-        info.format, info.width, info.height, info.ir_present
-    ));
-
     let mut report = Report {
         command: Some("inspect"),
         // `identity` is on EVERY report (design-spec §9), not just conversions —
@@ -4001,6 +4177,28 @@ fn run_inspect(args: IoArgs) -> Result<()> {
         input: Some(args.input.clone()),
         ..Report::default()
     };
+
+    // Memory preflight before decode, on the decode-only profile: `inspect` never
+    // renders or encodes, so gating it on the full-pipeline peak would reject
+    // scans it can diagnose comfortably. It always runs the auto detector below
+    // (the suggested `Dmin`), so the film-base phase counts its interior sample.
+    let budget = args.memory.budget();
+    report.memory = Some(preflight_memory(
+        &args.input,
+        RunProfile::DecodeOnly,
+        SamplePlan::auto(),
+        budget,
+        memory::detect_total_ram(),
+        &log,
+        &mut report.warnings,
+    )?);
+
+    let (image, info) = decode_within(&args.input, budget.bytes())?;
+    log.info(format_args!(
+        "decoded {:?} {}x{} (ir={})",
+        info.format, info.width, info.height, info.ir_present
+    ));
+
     for w in &info.warnings {
         push_warning(&mut report, &log, w.clone());
     }
@@ -4161,12 +4359,6 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         validate_explicit_film_base(b)?;
     }
 
-    let (image, info) = decode(&args.input)?;
-    log.info(format_args!(
-        "decoded {:?} {}x{} (ir={})",
-        info.format, info.width, info.height, info.ir_present
-    ));
-
     let mut report = Report {
         command: Some("estimate"),
         // Same contract as `inspect`: build identity on every report, no
@@ -4176,6 +4368,43 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         input: Some(args.input.clone()),
         ..Report::default()
     };
+
+    // Memory preflight before decode (decode-only profile — `estimate` samples the
+    // decoded image and stops). Its film-base phase is the largest rectangle this
+    // invocation will gather: the base source's own sample (`--grid` samples cells
+    // of `--base-region`, or of the whole frame when it is absent — counted
+    // conservatively as the whole rectangle), plus any `--d-max-region`. They are
+    // gathered one at a time, so the model takes the largest.
+    let budget = args.memory.budget();
+    let mut sampling = if args.grid {
+        match args.film_base.base_region {
+            // `--grid` samples five cells of the rectangle, one at a time, so the
+            // phase peaks at one cell — not at the whole rectangle.
+            Some([_, _, w, h]) => SamplePlan::rect(film_base::grid_cell_pixels(w, h)),
+            None => SamplePlan::none().with_whole_frame_grid(),
+        }
+    } else {
+        sample_plan(&source)
+    };
+    if let Some([_, _, w, h]) = args.d_max_region {
+        sampling = sampling.with_rect(w as u64 * h as u64);
+    }
+    report.memory = Some(preflight_memory(
+        &args.input,
+        RunProfile::DecodeOnly,
+        sampling,
+        budget,
+        memory::detect_total_ram(),
+        &log,
+        &mut report.warnings,
+    )?);
+
+    let (image, info) = decode_within(&args.input, budget.bytes())?;
+    log.info(format_args!(
+        "decoded {:?} {}x{} (ir={})",
+        info.format, info.width, info.height, info.ir_present
+    ));
+
     for w in &info.warnings {
         push_warning(&mut report, &log, w.clone());
     }
@@ -7314,6 +7543,7 @@ mod tests {
             out_dir: dir.clone(),
             recipe_in: None,
             strict: false,
+            memory: MemoryArgs::default(),
             report: ReportArgs::default(),
         };
         let mut shared = exponential_cfg(ExponentialParams {
@@ -7374,6 +7604,7 @@ mod tests {
             out_dir: dir.clone(),
             recipe_in: None,
             strict: false,
+            memory: MemoryArgs::default(),
             report: ReportArgs::default(),
         };
         let shared = ResolvedConfig {
@@ -7441,6 +7672,7 @@ mod tests {
             out_dir: dir.clone(),
             recipe_in: None,
             strict: false,
+            memory: MemoryArgs::default(),
             report: ReportArgs::default(),
         };
         let mut warnings = Vec::new();
@@ -7629,6 +7861,7 @@ mod tests {
                     }),
                     identity: Some(Identity::with_params_hash(version::stable_hash("frame"))),
                 },
+                memory: None,
                 warnings: vec![],
                 overrides: None,
             }],
@@ -7679,9 +7912,11 @@ mod tests {
     }
 
     #[test]
-    fn failed_frame_report_keeps_accumulated_warnings() {
-        // A frame that warned before failing still carries those warnings in its
-        // report entry (they aren't reset to empty on the failure path).
+    fn failed_frame_report_keeps_accumulated_warnings_and_the_preflight_decision() {
+        // A frame that warned and got sized before failing still carries both in its
+        // report entry (neither is reset on the failure path). The memory block lives
+        // on `FrameReport`, not on the `Ok` payload, precisely so a frame that passed
+        // the gate and then failed doesn't throw the estimate away.
         let pf = PlannedFrame {
             input: PathBuf::from("bad.tif"),
             output: PathBuf::from("out/bad_positive.tiff"),
@@ -7690,13 +7925,81 @@ mod tests {
             dmax_setting: DmaxSetting::Default,
         };
         let warnings = vec!["a warning raised before the failure".to_string()];
-        let fr = frame_report_err(&pf, &NcError::Decode("boom".into()), warnings);
+        let mem = memory::preflight(
+            &crate::io::decode::ImageShape::new(1000, 1000, 3, 16, true).unwrap(),
+            RunProfile::DecodeOnly,
+            SamplePlan::auto(),
+            memory::Budget::resolve(None),
+            None,
+        )
+        .unwrap();
+        let fr = frame_report_err(&pf, &NcError::Decode("boom".into()), Some(mem), warnings);
         let v = serde_json::to_value(&fr).unwrap();
         assert_eq!(v["status"], "failed");
         assert_eq!(v["error"], "decode: boom");
         assert_eq!(
             v["warnings"][0], "a warning raised before the failure",
             "a failed frame must keep the warnings accumulated before it failed: {v}"
+        );
+        assert_eq!(
+            v["memory"]["estimated_peak_bytes"], mem.estimate.estimated_peak_bytes,
+            "a failed frame must keep the preflight decision: {v}"
+        );
+    }
+
+    #[test]
+    fn ram_pressure_warning_reaches_the_report_and_strict() {
+        // The warn tier is the one environment-dependent piece of the gate — and,
+        // via `--strict`, the one way "same input + params ⇒ same exit" can break.
+        // Drive it through the real wiring by injecting the RAM figure (there is
+        // deliberately no env override): a machine small enough that the fixture's
+        // estimate exceeds 70% of RAM must produce a report warning, which is what
+        // `--strict` promotes to a failing exit.
+        let log = Log::new(&ReportArgs::default());
+        let input = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hdri-64bit.tif");
+        let budget = memory::Budget::resolve(None);
+
+        // Enough RAM: no warning.
+        let mut warnings = Vec::new();
+        let quiet = preflight_memory(
+            &input,
+            RunProfile::DecodeOnly,
+            SamplePlan::auto(),
+            budget,
+            Some(64 * 1024 * 1024 * 1024),
+            &log,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(quiet.decision, memory::Verdict::Ok);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A machine whose 70% line sits below the estimate: warn, but proceed.
+        let tiny_ram = quiet.estimate.estimated_peak_bytes; // 70% of it is below the estimate
+        let mut warnings = Vec::new();
+        let warned = preflight_memory(
+            &input,
+            RunProfile::DecodeOnly,
+            SamplePlan::auto(),
+            budget,
+            Some(tiny_ram),
+            &log,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(warned.decision, memory::Verdict::Warn);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("70%"), "{warnings:?}");
+        assert!(warnings[0].contains("may swap"), "{warnings:?}");
+        // …and that is a report warning, so `--strict`'s gate (`args.strict &&
+        // !report.warnings.is_empty()`) fails the run on it.
+        let report = Report {
+            warnings,
+            ..Report::default()
+        };
+        assert!(
+            !report.warnings.is_empty(),
+            "the warning must be `--strict`-promotable"
         );
     }
 }

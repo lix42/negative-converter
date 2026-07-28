@@ -175,6 +175,15 @@ pub enum NcError {
     Unsupported(String),
     /// Output write error. Exit 5.
     Write(String),
+    /// A resource limit would be exceeded — today, the memory preflight's
+    /// estimated peak allocation against the run's budget
+    /// (`pipeline::memory`). Exit 6.
+    ///
+    /// Distinct from [`Unsupported`](Self::Unsupported) on purpose: the input is
+    /// perfectly supported, it is *this run on this budget* that cannot proceed,
+    /// and an agent that catches exit 6 knows to retry with `--max-memory` (or on
+    /// a bigger machine) rather than give up on the file.
+    Resource(String),
     /// Generic / unexpected error. Exit 1.
     Other(String),
 }
@@ -189,6 +198,7 @@ impl NcError {
             NcError::Decode(_) => 3,
             NcError::Unsupported(_) => 4,
             NcError::Write(_) => 5,
+            NcError::Resource(_) => 6,
         }
     }
 }
@@ -200,6 +210,7 @@ impl std::fmt::Display for NcError {
             NcError::Decode(m) => ("decode", m),
             NcError::Unsupported(m) => ("unsupported", m),
             NcError::Write(m) => ("write", m),
+            NcError::Resource(m) => ("resource", m),
             NcError::Other(m) => ("error", m),
         };
         write!(f, "{kind}: {msg}")
@@ -1287,6 +1298,7 @@ mod tests {
         assert_eq!(NcError::Decode(String::new()).exit_code(), 3);
         assert_eq!(NcError::Unsupported(String::new()).exit_code(), 4);
         assert_eq!(NcError::Write(String::new()).exit_code(), 5);
+        assert_eq!(NcError::Resource(String::new()).exit_code(), 6);
     }
 
     #[test]

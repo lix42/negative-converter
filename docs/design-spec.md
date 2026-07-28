@@ -1022,6 +1022,45 @@ does change pixels and must cross a prospective, golden-tested
 `pipeline_version` boundary owned by `conversion-versioning`. Recipe/report
 round trips, fixtures, and migration errors pin the reconstruction schema.
 
+**Memory preflight block.** Every command that decodes a scan reports what the
+preflight decided before it allocated anything (§9 Global, `--max-memory`; §11
+exit 6). Byte counts are exact; the per-phase fields are the accounted
+full-frame buffers that are simultaneously live in that phase, and
+`estimated_peak_bytes` is the peak of them plus a calibrated allowance for
+allocator slack and fixed costs — the number the gate compares:
+
+```json
+{
+  "memory": {
+    "estimated_peak_bytes": 3396405248,
+    "accounted_bytes": 2836684800,
+    "decode_bytes": 1343692800,
+    "film_base_bytes": 1811496960,
+    "render_bytes": 2388787200,
+    "encode_bytes": 2836684800,
+    "budget_bytes": 4294967296,
+    "budget_source": "default",
+    "decision": "ok",
+    "detected_total_ram_bytes": 51539607552
+  }
+}
+```
+
+(A 10368x7200 HDRi `convert` at `u16`, default budget, auto film base. The
+`film_base_bytes` figure is the decoded image plus the three `f32` channel vectors
+of the frame-interior rectangle the auto detector samples — ~69% of the frame; an
+explicit `--film-base` samples nothing and the phase is the decoded image alone.)
+
+`budget_source` is `default|flag`, `decision` is `ok|warn` (a rejected run emits
+no report at all), and `detected_total_ram_bytes` is omitted when the platform
+can't report it (which also disables the warn tier). `render_bytes`/`encode_bytes`
+are `0` on `inspect`/`estimate`, which decode, sample, and stop — so for them the
+**film-base** phase, not decode, is usually the peak. `nc roll` reports the same
+block **per frame** (frames may differ in dimensions, and the gate runs per
+frame), not once for the roll — including for a frame that passed the gate and then
+failed for another reason, whose entry carries both its `memory` block and its
+`error`.
+
 ### Example invocations
 
 ```bash
@@ -1633,6 +1672,27 @@ collision-checked against all inputs, outputs, and sidecars before writing.
 - `--report json|none`, `--report-file <path>`
 - `--strict` — promote report warnings (clipping, non-finite samples, grid
   disagreement, …) to a failing exit (see §11); on `convert`, `roll`, and `estimate`
+- `--max-memory <bytes>` — peak-memory budget for the run (`8GiB`, `512MB`, or raw
+  bytes). Every command that decodes a scan (`convert`, `roll`, `inspect`,
+  `estimate`) estimates its peak allocation from a **metadata-only header probe
+  before decoding** and fails with exit 6 when it would exceed the budget. `roll`
+  gates **per frame**, and follows its usual per-frame error handling: the frame's
+  resource error is recorded in its report entry, sibling frames are still
+  converted and written, and the roll exits **1** ("frames failed"), not 6.
+  Default **6 GiB** — deliberately a fixed constant, not a
+  fraction of detected RAM, so the pass/fail decision is the same on every
+  machine. An estimate that fits the budget but exceeds ~70% of detected physical
+  RAM warns instead — `--strict`-promotable on `convert`/`roll`/`estimate`, and
+  report-only on `inspect`, which has no `--strict`. Like `--report`/`--strict`/telemetry
+  this is **operational**: not a recipe key, never in the sidecar, and it can
+  never change an output byte. The estimate, its per-phase breakdown, the budget,
+  and the decision ride out in the JSON report's `memory` block.
+  **Second effect to know about:** the budget also caps the `tiff` crate's read
+  buffers (`min(4 GiB, budget)`), so a budget that admits the run but sits below a
+  single plane's read buffer turns a decodable file into a decode failure (exit 3)
+  rather than a resource error. A passing preflight makes that nearly unreachable —
+  the estimate is a multiple of the read buffer — but it is the one way this
+  operational flag changes an outcome other than the gate's own verdict.
 - `-v/--verbose`, `--quiet`
 
 **Roll (batch, `nc roll` only — orchestration flags, NOT recipe keys).** `nc roll`
@@ -1752,7 +1812,10 @@ nc/
     │   └── encode.rs     # LinearImage → u16/f32 TIFF + ICC + sidecar
     ├── pipeline/
     │   ├── film_base.rs  # Dmin estimation (pure)
-    │   ├── color.rs      # working/output color transforms (lcms2)
+    │   ├── color.rs      # working/output color transforms (lcms2, no copy)
+    │   ├── input_semantics.rs # transfer + measurement-meaning resolver (stage 1b)
+    │   ├── working_space.rs   # NC film RGB v1 → linear ACEScg mapper
+    │   ├── memory.rs     # peak-memory sizing model + budget preflight
     │   └── stages.rs     # stage wiring as pure functions
     ├── algo/
     │   ├── mod.rs        # FilmRgbImage + reconstruct/finish_print
@@ -1785,6 +1848,7 @@ nc/
 | 3 | Input read/decode error (unreadable or unsupported file). |
 | 4 | Unsupported variant (e.g. channel layout we can't handle yet). |
 | 5 | Output write error. |
+| 6 | Resource limit — the run's estimated peak memory exceeds its budget. |
 
 Warnings (e.g. clipped highlights/shadows, IR present but ignored, BigTIFF
 auto-promoted) are surfaced in the JSON report and on stderr, without failing the
@@ -1799,6 +1863,29 @@ recipe key, and the deprecated `--assume-linear` flag are **usage** errors, exit
 2; `--input-profile` (reserved, not applied) is unsupported, exit 4. `nc inspect`
 never fails on ambiguity — it reports the per-axis evidence so the file stays
 diagnosable.
+
+**Memory preflight** (§9 Global, `--max-memory`) maps to exit **6**: before any
+input is decoded, every command that reads a scan estimates the run's peak
+allocation from a metadata-only header probe and compares it against the budget.
+Over budget is a **resource** error, deliberately distinct from *unsupported*
+(exit 4) — the input is fine; it is this run on this budget that cannot proceed,
+so an agent can retry with a larger `--max-memory` (or on a bigger machine)
+rather than discard the file. On `convert`, `inspect`, and `estimate` no image,
+sidecar, or report is produced on that path — though `--dump-params`, which is
+written during argument resolution, lands before the gate runs and so survives a
+rejection. On **`roll`** the same rejection is
+one frame's error: it is recorded in that frame's report entry, the roll continues
+(sibling frames are converted and written), the report is emitted, and the roll
+exits **1** — the batch-level "frames failed" code, as for any per-frame error.
+An estimate that fits the budget but exceeds ~70% of detected physical RAM
+is a `--strict`-promotable **warning**, not a failure. A malformed
+`--max-memory` value is a usage error (exit 2).
+
+Determinism note: the *image output* is unaffected by any of this, and the
+pass/fail decision is machine-independent because the default budget is a fixed
+constant. The **warning** tier is the one deliberately environment-dependent
+piece — so under `--strict` the same input can exit differently on a small
+machine than on a large one.
 
 A **degenerate resolved film base** (a zero / negative / non-finite channel)
 maps to exit 1 (generic error) on both estimate paths: the single-measurement

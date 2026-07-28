@@ -421,19 +421,60 @@ fn mean(rgb: &[f32; 3]) -> f32 {
     (rgb[0] + rgb[1] + rgb[2]) / 3.0
 }
 
-/// The inward scan depth (and strip end-trim): [`REBATE_SCAN_FRAC`] of the
-/// shorter dimension, at least deep enough for a holder strip plus a minimal
-/// band. Errors when the image can't fit the scan plus an interior.
+/// The inward scan depth (and strip end-trim) for a `width`x`height` frame:
+/// [`REBATE_SCAN_FRAC`] of the shorter dimension, at least deep enough for a
+/// holder strip plus a minimal band. `None` when the frame can't fit the scan
+/// plus an interior.
+///
+/// Dimensions-only (rather than `&LinearImage`) so the memory sizing model can
+/// call it before a pixel exists — see [`auto_interior_pixels`].
+fn scan_depth_for(width: u32, height: u32) -> Option<u32> {
+    let cap =
+        ((width.min(height) as f32 * REBATE_SCAN_FRAC).round() as u32).max(MIN_BAND_STRIPS + 1);
+    (2 * cap < width && 2 * cap < height).then_some(cap)
+}
+
+/// [`scan_depth_for`] on an image, erroring loudly when it is too small to scan.
 fn scan_depth(image: &LinearImage) -> Result<u32> {
     let (w, h) = (image.width, image.height);
-    let cap = ((w.min(h) as f32 * REBATE_SCAN_FRAC).round() as u32).max(MIN_BAND_STRIPS + 1);
-    if 2 * cap >= w || 2 * cap >= h {
-        return Err(NcError::Other(format!(
+    scan_depth_for(w, h).ok_or_else(|| {
+        NcError::Other(format!(
             "image {w}x{h} is too small for auto film-base detection; \
              {RECOVERY_ADVICE}"
-        )));
+        ))
+    })
+}
+
+/// Pixel count of the frame-interior rectangle [`select_auto_base`] materializes
+/// when ranking candidates — the one full-frame-scale allocation the auto path
+/// makes (`[cap, cap, w - 2*cap, h - 2*cap]`, ~69% of a 3:2 frame; the per-edge
+/// bands it also samples are at most `cap` thick, so they never dominate).
+///
+/// Exists so `pipeline::memory` can size the film-base phase from the **same**
+/// rule the sampler uses instead of a second copy of it that could drift. `0`
+/// when the frame is too small to scan at all: auto detection then fails inside
+/// [`rebate_candidates`] before any interior sample is gathered, so the model must
+/// not invent an allocation (nor turn a too-small frame into a spurious preflight
+/// rejection).
+pub fn auto_interior_pixels(width: u32, height: u32) -> u64 {
+    match scan_depth_for(width, height) {
+        Some(cap) => (width - 2 * cap) as u64 * (height - 2 * cap) as u64,
+        None => 0,
     }
-    Ok(cap)
+}
+
+/// Pixel count of **one** [`estimate_grid`] cell over a `w`x`h` rectangle —
+/// [`GRID_CELL_FRAC`] per axis, so ~6.25% of the rectangle.
+///
+/// One cell, not five: `estimate_grid` samples the cells **sequentially** and each
+/// `sample_region_at` drops its channel vectors before the next is gathered, so
+/// only one is ever live. Exposed for the same reason as
+/// [`auto_interior_pixels`] — `pipeline::memory` must size the grid path from the
+/// sampler's own cell rule rather than a second copy of it.
+pub fn grid_cell_pixels(w: u32, h: u32) -> u64 {
+    let cw = ((w as f32 * GRID_CELL_FRAC).round() as u32).clamp(1, w.max(1));
+    let ch = ((h as f32 * GRID_CELL_FRAC).round() as u32).clamp(1, h.max(1));
+    cw as u64 * ch as u64
 }
 
 /// What one inward strip looks like to the detector.
@@ -2144,6 +2185,25 @@ mod tests {
         // And the estimate resolves to the rebate under the chromogenic path.
         let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
         assert_close(est.base, REBATE, 0.02);
+    }
+
+    #[test]
+    fn auto_interior_pixels_matches_the_rectangle_the_selector_samples() {
+        // `pipeline::memory` sizes the film-base phase from this helper, so it must
+        // stay the same rectangle `select_auto_base` materializes
+        // (`[cap, cap, w - 2*cap, h - 2*cap]`) — the two must not drift.
+        for (w, h) in [(100u32, 100u32), (502, 462), (10368, 7200)] {
+            let cap = scan_depth_for(w, h).expect("scannable");
+            assert_eq!(
+                auto_interior_pixels(w, h),
+                (w - 2 * cap) as u64 * (h - 2 * cap) as u64,
+                "{w}x{h}"
+            );
+        }
+        // Too small to scan: detection errors before any interior sample exists, so
+        // the model must count nothing (and not fabricate a rejection).
+        assert_eq!(scan_depth_for(6, 6), None);
+        assert_eq!(auto_interior_pixels(6, 6), 0);
     }
 
     #[test]
