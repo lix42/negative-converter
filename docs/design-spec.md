@@ -454,6 +454,31 @@ the identical adjusted source" is therefore structural, not a convention the two
 renderers have to remember. `highlight_compress` is deliberately **not** shared:
 highlight roll-off is branch-specific SDR tone policy.
 
+The resolved SDR policy is deterministic and display-referred. It transforms
+AP1/D60 ACEScg to the selected D65 destination (Display P3 or sRGB) with pinned
+AP1→XYZ, Bradford D60→D65, and XYZ→destination matrices; no installed ICC or CMM
+participates in rendering. Adjusted linear `1.0` is the binding **203 cd/m²
+reference white**. Named SDR always applies a C¹ Hermite shoulder: the baseline
+(`highlight_compress = 0`) starts at `0.75`, reaches `1.0` with zero slope, and
+plateaus at `1.0`; positive highlight compression moves the start earlier using
+the bounded resolution
+`shoulder_start = 0.5 + 0.25 / (1 + highlight_compress)`, so even an extreme
+finite value cannot move it below `0.5` and flatten the whole tonal range. The
+renderer then maps out-of-gamut color to the RGB-cube boundary with one common
+chroma scale around the same-luminance neutral axis. This preserves the neutral
+axis and chroma direction instead of independently clipping channels. Finite
+input that produces non-finite matrix/tone/gamut arithmetic is a loud conversion
+error naming the pixel; the renderer never substitutes black or white. Its typed
+result owns finite non-negative `[0,1]` **pre-transfer**, destination-linear
+pixels together with the resolved gamut metadata. The radial intersection is
+calculated in binary64 and sets its limiting channel to the exact computed cube
+boundary; this is the gamut mapping itself, not a terminal per-channel clamp.
+Any final sample outside the cube is a loud pixel-specific error. A separate
+destination stage derives the matching Display P3 or sRGB profile from that
+metadata, applies only the piecewise sRGB transfer curve, and returns the
+metadata with the encoded pixels. The gain-map path borrows the typed
+pre-transfer pixels.
+
 ### 6.1 IR channel handling (Step 1)
 
 The IR plane (when present) is decoded and carried alongside RGB. With one
@@ -684,9 +709,16 @@ exponential curve. Gamma exists only in the exponential variant. Supplying
 `--density-gamma` while the resolved curve is sigmoid is an invalid combination
 after merge (exit 2), never a warning or ignored value (the pre-reconstruction
 implementation's ignored-gamma warning is gone).
-`--highlight-compress` (a linear-space soft-clip after exposure/WB) composes
-with the shoulder rather than being disabled — with the shoulder on and neutral
-print params it simply never engages, since nothing exceeds `1.0`.
+On the frozen legacy path, `--highlight-compress` remains the existing
+linear-space above-`1.0` soft clip after exposure/WB: `0` disables that legacy
+operation, and with the sigmoid shoulder plus neutral print parameters it simply
+never engages because nothing exceeds `1.0`. Named SDR deliberately gives the
+same control different target semantics: display tone mapping is mandatory,
+`0` selects the baseline Hermite shoulder, and positive values request
+progressively earlier/stronger additional roll-off within the bounded
+`[0.5, 0.75]` shoulder-start range described in §6. Product activation and the
+associated conversion-version boundary remain owned by `output/presets` and
+`conversion-versioning`; until then the legacy behavior is unchanged.
 
 ### Shipped and target interfaces (sketch)
 
@@ -1553,7 +1585,12 @@ false-positive on legitimate high-contrast conversions).
   migration gives simple the same **explicit** downstream WB slot, but does not
   imply that density-based auto estimators support simple without a separately
   specified generalization.
-- `--highlight-compress <f>` — highlight roll-off amount.
+- `--highlight-compress <f>` — highlight roll-off amount. Frozen legacy
+  semantics use `0` as off and positive values for the existing above-`1.0`
+  soft clip. Named SDR target semantics always include the baseline display
+  shoulder: `0` selects that baseline and positive values move its resolved knee
+  earlier, bounded as specified in §6. Preset activation/versioning owns the
+  semantic switch; this is not a second conversion knob.
 
 ### Simple algorithm
 - Removed legacy controls: `--invert-white-balance R,G,B` and
@@ -2102,11 +2139,17 @@ the NLP feature comparison, Phase 6).
     `film-master-render-pipeline`,
     `optional-color-correction-profiles`.
 21. **Display P3 SDR output.** The SDR renderer solely maps ACEScg into rendered
-    linear Display P3, including adaptation/gamut policy. The P3 output task then
-    applies the piecewise sRGB TRC and attaches a deterministic ICC v4 profile:
-    the encoding is D65, while ICC PCS/media white is D50 with Bradford-adapted
-    colorants and the required chromatic-adaptation tag. It performs no second
-    ACEScg transform. Tracked: `display-p3-output`,
+    linear Display P3 or sRGB. It uses pinned AP1/D60→D65 target matrices,
+    binding 203-nit reference white, the mandatory bounded Hermite
+    baseline/additional shoulder, and same-luminance radial RGB-cube boundary
+    gamut mapping; non-finite render arithmetic fails loudly. The opaque result
+    couples its finite pre-transfer pixels to resolved gamut metadata. The
+    destination output task derives its choice from that metadata, applies only
+    the piecewise sRGB TRC, and attaches the matching deterministic ICC v4
+    profile: the encoding is D65, while ICC PCS/media white is D50 with
+    Bradford-adapted colorants and the required chromatic-adaptation tag. It
+    performs no second ACEScg transform. CLI preset activation remains
+    `output/presets` work. Tracked: `display-p3-output`,
     `sdr-display-rendering`.
 22. **Display HDR rendering and format spike.** The spike selects 10-bit 4:4:4
     AVIF for single-rendition HDR and JPEG for gain maps. The spike's remaining

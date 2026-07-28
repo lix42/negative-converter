@@ -34,10 +34,11 @@ What other epics need to know about `output`:
   adaptation, and gamut mapping. Renderers return **rendered-linear** pixels;
   transfer encoding happens afterward. Gain-map construction consumes the
   *pre-transfer* rendition so ratios are taken in a common linear domain.
-- **⚠ Display P3 is not yet a product path.** `to_output`'s working space is still
-  linear Rec.709, so selecting `display-p3` today performs a valid but
-  unintended Rec.709→P3 remap plus the sRGB TRC. It becomes the pure P3 encoder
-  once SDR rendering produces linear-P3 values.
+- **⚠ Display P3 is not yet a product path.** The SDR renderer now produces
+  rendered-linear P3/sRGB and `encode_rendered_sdr` applies only the matching
+  transfer/profile, but `output/presets` still owns CLI activation. Legacy
+  `to_output` continues to source linear Rec.709, so selecting the profile knob
+  directly still performs Rec.709→P3 plus the sRGB TRC.
 - **Gain-map math is pinned:** per-channel `(HDR + offset_hdr) / (SDR +
   offset_sdr)` in common linear Display P3 normalized by 203 cd/m². Extrema come
   from actual per-pixel values over independently tone-mapped renditions. No
@@ -246,8 +247,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 
 ## sdr-display-rendering
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** done
+**Updated:** 2026-07-28
 
 - 2026-07-23: Rebased the renderer on intentional linear ACEScg film values and
   the shared post-ACEScg print controls from `film-master-render-pipeline`.
@@ -264,6 +265,49 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 - 2026-07-21: Corrected the implementation note: the shared linear adjustment
   stage is owned by `post-characterization-render-pipeline`, not characterization
   runtime.
+
+- 2026-07-28: Started implementation from the merged `film-master-render-pipeline`
+  split. The renderer will consume its typed, shared adjusted ACEScg source,
+  produce rendered-linear Display P3 or sRGB plus explicit reference-white/tone/
+  gamut metadata, and keep transfer encoding/profile signaling in the existing
+  destination-output layer.
+- 2026-07-28: Completed the pure SDR branch in `pipeline/sdr.rs`. It accepts only
+  the typed shared adjusted ACEScg source, uses pinned AP1/D60 → P3-D65/sRGB-D65
+  matrices, maps adjusted `1.0` to the binding 203 cd/m² reference white, applies
+  a resolved Hermite highlight shoulder, and maps out-of-gamut colour radially
+  toward the same-luminance neutral axis instead of clipping channels
+  independently. The result is finite, non-negative rendered-linear RGB plus
+  serialized policy metadata naming gamut, reference white, highlight control,
+  shoulder, gamut policy, linear domain, and required transfer/profile.
+- 2026-07-28: Added the destination seam `color::encode_rendered_sdr`: a
+  rendered-linear P3 input receives only the sRGB transfer and Display P3
+  profile, while rendered-linear sRGB receives the sRGB transfer/profile. It
+  deliberately does not re-run the legacy Rec.709-working-space gamut transform.
+  Refactored the existing transform body into a shared in-place helper without
+  changing legacy behavior.
+- 2026-07-28: Verification covers neutral/monotonic ramps, black and reference
+  white, highlight shoulder behavior, finite radial mapping for synthetic
+  out-of-gamut colors, golden P3 and sRGB vectors for the same ACEScg sample,
+  deterministic public rendering/metadata, and destination transfer/profile
+  signaling. `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build`, and `cargo test`
+  are green (446 unit + 123 integration tests).
+- 2026-07-28: Kept product activation out of scope: `display-p3` and
+  `compatibility` remain planned preset names. `output/presets` owns exposing
+  them after the HDR/gain-map/container dependencies land; `gain-map-hdr-output`
+  can consume the renderer's pre-transfer pixels directly.
+- 2026-07-28: Review/fix convergence hardened the finite-output invariant,
+  replaced the independently-selectable encoder gamut with an opaque
+  pixels-plus-metadata seam, bounded named-SDR `highlight_compress` to a mandatory
+  0.75 baseline and 0.5 limiting knee, and removed terminal channel clamps from
+  radial gamut mapping. Binary64 boundary intersection plus an exact limiting
+  channel now constructs `[0,1]` output directly, while any non-finite or
+  out-of-range postcondition fails with the pixel index. Added positive/negative
+  overflow, control-direction, common-chroma-scale, and symmetric P3/sRGB
+  transfer/profile regressions; documented the intentional frozen-legacy versus
+  named-SDR semantic boundary. Final gates passed in order:
+  `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build`, and `cargo test` (446 unit + 123 integration tests).
 
 
 ## gain-map-hdr-output

@@ -97,14 +97,18 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`,
-  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,memory}.rs`
+  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,memory}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure reconstruction→named-output core (stages
   3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
   path (`reconstruct → finish_print → color::to_output`) or `film-master`
   (`reconstruct → map_nc_film_rgb_v1 → render_split::film_master`, no colour
-  transform). It has **no** display (5b) arm — `render_split::display_source`
-  exists but nothing in `render` calls it yet;
+  transform). It has **no CLI-reachable** display (5b) arm yet —
+  `render_split::display_source` feeds the implemented `pipeline::sdr` stage,
+  which returns opaque rendered-linear Display P3/sRGB pixels coupled to their
+  resolved 203-nit tone/gamut metadata; `color::encode_rendered_sdr` consumes
+  that value and derives the matching transfer/profile without a second gamut
+  transform. `output/presets` still owns product/CLI activation;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
@@ -112,9 +116,10 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
   controls `WB → exposure → black point → linear_range`, resolved once and
   *borrowed* by both display branches. The `film-master` half is wired; the
-  display half is built and unit-tested but has no CLI-reachable consumer until
-  `output/{sdr,hdr}-display-rendering`, so a non-default `print.linear_range` is a
-  loud usage error rather than a silently-ignored knob;
+  SDR display half is built and unit-tested but has no CLI-reachable consumer
+  until `output/presets` (HDR remains
+  `output/hdr-display-rendering`), so a non-default `print.linear_range` is a loud
+  usage error rather than a silently-ignored knob;
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
