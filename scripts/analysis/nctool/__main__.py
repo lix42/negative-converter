@@ -1,14 +1,16 @@
 """`python -m nctool` entry point.
 
-Minimal seed for the `asset-manifest` task: only the `manifest` command group
-(generate / validate / roles) is wired up. The downstream `conversion-metrics`
-task adds `metrics` / `thumbs` alongside it.
+Two command groups so far: `manifest` (generate / validate / roles — the
+`asset-manifest` task) and `compare` (run / diff — the version-comparison harness
+of `core/conversion-versioning`). The downstream `conversion-metrics` task adds
+`metrics` / `thumbs` alongside them.
 """
 from __future__ import annotations
 
 import argparse
 import sys
 
+from . import compare as _compare
 from . import manifest as _manifest
 
 ASSET_ROOT_HELP = ("asset root (the folder containing manifest.json); defaults to "
@@ -55,6 +57,41 @@ def build_parser() -> argparse.ArgumentParser:
                                "real-scan harness")
     _add_root(rol)
     rol.set_defaults(func=_manifest.cmd_roles)
+
+    # --- compare: the conversion-versioning comparison harness ---------------
+    cmp_ = sub.add_parser("compare",
+                          help="convert a fixed benchmark set under a build and diff "
+                               "two builds' results")
+    csub = cmp_.add_subparsers(dest="cmd", required=True)
+
+    crun = csub.add_parser("run",
+                           help="convert a benchmark set with one nc build and write "
+                                "its run record")
+    _add_root(crun)
+    crun.add_argument("--nc", required=True,
+                     help="path to the nc binary to benchmark (required and explicit: "
+                          "a comparison of two builds must never auto-discover one)")
+    crun.add_argument("--set", dest="set_name", default="fixtures",
+                      help="benchmark set from benchmark.json (default: fixtures — the "
+                           "committed fixtures, runnable without the Drive assets)")
+    crun.add_argument("--out", help="write the run record here (default: stdout)")
+    crun.add_argument("--benchmark", default=_compare.BENCHMARK,
+                      help="path to the benchmark manifest (default: "
+                           "scripts/analysis/benchmark.json)")
+    crun.add_argument("--skip-checksums", action="store_true",
+                      help="skip hashing the input bytes (faster on 50-160 MB scans; "
+                           "only safe when you have just run `manifest validate`). "
+                           "Recorded per frame as checksums:skipped and surfaced by "
+                           "`compare diff`, so an unverified comparison never looks "
+                           "verified")
+    crun.set_defaults(func=_compare.cmd_run)
+
+    cdiff = csub.add_parser("diff",
+                            help="diff two run records into a version-keyed comparison "
+                                 "report (mean dRGB, clip-fraction delta, timings)")
+    cdiff.add_argument("before", help="run record from the baseline build")
+    cdiff.add_argument("after", help="run record from the candidate build")
+    cdiff.set_defaults(func=_compare.cmd_diff)
 
     return ap
 

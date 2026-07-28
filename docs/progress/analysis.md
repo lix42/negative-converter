@@ -48,6 +48,28 @@ What other epics need to know about `analysis`:
   **reports only, never deletes**, and exits 0 clean / 1 discrepancies / 2
   operational. The harness's roll list comes from `manifest roles`, not a
   hard-coded array.
+- **`python -m nctool compare {run,diff}`** was added by
+  `core/conversion-versioning` (logged in `docs/progress/core.md`): it converts the
+  fixed benchmark set in `scripts/analysis/benchmark.json` under one `nc` build and
+  diffs two builds keyed on `pipeline_version` + commit. It **reuses this epic's
+  inventory** — a benchmark case names a roll + frame *stem* and resolves its path
+  and `sha256` through `manifest.json`, so there is still exactly one asset
+  inventory — and reads only derived numbers (the report's `output_stats` / `loss`
+  and the telemetry record's timings), never pixels. It records the digest of the
+  bytes it actually converted (`input_sha256` + `checksums: verified|computed|skipped`)
+  so a comparison's input identity is provable from the artifact, not just from the
+  exit code.
+  **`compare`'s exit codes deliberately differ from `manifest`'s above:** `0` = the
+  comparison ran and its verdict (identical or differing) is the report — a
+  discrepancy between two *different* builds is the normal answer here, not a fault;
+  `1` = the comparison failed or proved a broken invariant (a case would not convert,
+  input checksum drift, cases disagreeing about the build, or one build producing two
+  different results); `2` = operational/usage. The determinism claim in particular is
+  **precondition-guarded** — it fires only once every *other* explanation for the
+  difference is ruled out (clean pinned source, same frame set, same input digests with
+  no skipped checksum, same output depth, same per-frame `params_hash`); a failed
+  precondition is rc 0 plus a `determinism_check_blocked` note, never an accusation.
+  Documented in `compare.py`'s module docstring and `determinism_blockers`.
 - **NLP comparison is global-metrics + side-by-side thumbnails, no registration**
   — NLP outputs are cropped and differently sized, aligned only by manifest
   `source_frame` identity.

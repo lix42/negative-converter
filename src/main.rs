@@ -10,6 +10,7 @@ mod io;
 mod pipeline;
 mod telemetry;
 mod types;
+mod version;
 
 use std::process::ExitCode;
 

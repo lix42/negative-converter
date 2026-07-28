@@ -381,7 +381,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Pipeline orchestration](tasks/core/pipeline-orchestration.md)
 - [x] [Roll conversion (batch + frozen recipe)](tasks/core/roll-conversion.md)
 - [ ] [Base-acquisition planner (the cascade)](tasks/core/base-acquisition-planner.md) — the roll-level `Dmin`/`Dmax` acquisition cascade: frozen recipe with provenance + confidence, and the roll→single fallback decision
-- [ ] [Conversion versioning & baseline comparison](tasks/core/conversion-versioning.md) — `v0` baseline recorded in [reports/v0-baseline.md](reports/v0-baseline.md)
+- [x] [Conversion versioning & baseline comparison](tasks/core/conversion-versioning.md) — report `identity`, `pipeline_version` **1** (not 0 — `film-base/dmax-reference` already moved the default render) + the golden drift gate, `{meta,params}` sidecar envelope with bare legacy recipes still loading, and `nctool compare run|diff`; `v0` history in [reports/v0-baseline.md](reports/v0-baseline.md). **Known gap: the Python half runs under no CI gate.**
 - [ ] [Stdout broken-pipe safety](tasks/core/stdout-broken-pipe-safety.md) — make every
   stdout JSON write (the report via `emit_report`, `nc params`) tolerate a closed
   pipe (e.g. `nc … | head`) without a panic/backtrace. Pre-existing on `main`, not

@@ -119,11 +119,15 @@ legacy one except by file size. `conversion.output_hdr` means "a 32-bit float TI
 written" and is derived from the same `OutputParams::depth()` the encoder uses, *not*
 from the `output.hdr` switch: `film-master` pins that switch at its default while still
 resolving f32, so reading the switch reports `false` for an f32 master.
-`params_hash` is a stable FNV-1a of the
-effective recipe JSON (the sidecar bytes), so identical conversions share a hash. The
-value in the sample above is **illustrative**: it covers the *whole* recipe, so it
-changes whenever any key is added, removed, or re-defaulted. Don't treat it as a
-reproducible constant, and don't assert it in a test.
+`params_hash` is a stable FNV-1a of the canonical effective-recipe JSON — the exact
+bytes `--dump-params` writes — so identical conversions share a hash. It is **not**
+the sidecar's bytes: the sidecar is the
+`{ "meta": {…identity…}, "params": {…recipe…} }` envelope, whose `params` body is
+the same recipe document re-indented two spaces. The implementation is
+`version::stable_hash`, the same function behind a report's
+`identity.params_hash`, so a telemetry record and report for one run agree. The
+sample value above is **illustrative**: it covers the whole recipe and changes when
+any key is added, removed, or re-defaulted. Do not assert it as a constant.
 
 `jq` recipes over the JSONL log (`jq -c` reads it line by line):
 

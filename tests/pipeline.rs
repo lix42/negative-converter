@@ -132,6 +132,34 @@ fn json(stdout: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("stdout is not valid JSON ({e}):\n{stdout}"))
 }
 
+/// The sidecar path for an output (`out.tiff` → `out.tiff.json`).
+fn sidecar_of(output: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.json", output.display()))
+}
+
+/// Parse a sidecar document whole: `{ "meta": {…identity…}, "params": {…recipe…} }`
+/// (`core/conversion-versioning`).
+fn sidecar(output: &Path) -> serde_json::Value {
+    let path = sidecar_of(output);
+    let txt = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read sidecar {}: {e}", path.display()));
+    serde_json::from_str(&txt)
+        .unwrap_or_else(|e| panic!("sidecar {} is not valid JSON ({e})", path.display()))
+}
+
+/// Just the sidecar's **recipe body** — what used to be the whole document before
+/// the identity envelope. Identity rides in `meta` precisely so this body stays a
+/// bare, `--params`-reloadable recipe.
+fn sidecar_params(output: &Path) -> serde_json::Value {
+    let doc = sidecar(output);
+    assert!(
+        doc.get("params").is_some(),
+        "sidecar must be the {{meta, params}} envelope, got keys {:?}",
+        doc.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
+    doc["params"].clone()
+}
+
 /// A file that starts with the little-endian TIFF magic ("II", 42 or 43).
 fn is_tiff(path: &Path) -> bool {
     let bytes = std::fs::read(path).unwrap();
@@ -158,10 +186,9 @@ fn convert_simple_writes_tiff_sidecar_and_report() {
     ]);
     assert_eq!(code, 0, "simple convert should succeed");
     assert!(is_tiff(&out), "output must be a valid TIFF");
-    // Effective-recipe sidecar next to the output, valid JSON.
-    let sidecar = PathBuf::from(format!("{}.json", out.display()));
-    let recipe: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    // Effective-recipe sidecar next to the output, valid JSON — recipe body under
+    // `params`, beside the `meta` identity envelope.
+    let recipe = sidecar_params(&out);
     assert_eq!(recipe["reconstruction"]["type"], "simple");
     assert_eq!(recipe["reconstruction"]["schema_version"], 1);
 
@@ -989,10 +1016,9 @@ fn sigmoid_sidecar_recipe_round_trips_through_recipe_in() {
         "none",
     ]);
     assert_eq!(ca, 0, "{err}");
-    let sidecar = format!("{}.json", out_a.display());
-    // The sidecar carries the sigmoid section verbatim.
-    let recipe: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    let sidecar = sidecar_of(&out_a).display().to_string();
+    // The sidecar's recipe body carries the sigmoid section verbatim.
+    let recipe = sidecar_params(&out_a);
     assert_eq!(recipe["reconstruction"]["curve"]["type"], "sigmoid");
     assert_eq!(recipe["reconstruction"]["curve"]["contrast"], 1.4);
     assert_eq!(recipe["reconstruction"]["curve"]["toe"], 0.12);
@@ -2443,11 +2469,9 @@ fn convert_sigmoid_runs_end_to_end_and_reports_the_anchor() {
         report["dmax"].as_f64().is_some_and(f64::is_finite),
         "the shared anchor must be reported: {report}"
     );
-    let sidecar: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(format!("{}.json", out.display())).unwrap())
-            .unwrap();
-    assert_eq!(sidecar["reconstruction"]["curve"]["type"], "sigmoid");
-    assert_eq!(sidecar["reconstruction"]["curve"]["contrast"], 1.2);
+    let recipe = sidecar_params(&out);
+    assert_eq!(recipe["reconstruction"]["curve"]["type"], "sigmoid");
+    assert_eq!(recipe["reconstruction"]["curve"]["contrast"], 1.2);
 
     // The anchored shoulder keeps every rendered sample at or below display
     // white, so — unlike the straight line — the default u16 encode cannot
@@ -2635,11 +2659,10 @@ fn auto_wb_reports_gains_that_reproduce_the_output_when_reused() {
     assert_eq!(gains[1].as_f64().unwrap(), 1.0, "green-anchored");
     // The sidecar recipe records the *auto mode* (the run's parameters), so
     // re-running the sidecar re-estimates; the report carries the frozen gains.
-    let sidecar: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{}.json", out_auto.display())).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(sidecar["print"]["white_balance"], "percentile");
+    assert_eq!(
+        sidecar_params(&out_auto)["print"]["white_balance"],
+        "percentile"
+    );
 
     // Reuse run: the reported gains via the explicit flag ⇒ byte-identical TIFF.
     // (JSON prints the f32 gains as shortest-round-trip f64, which parses back
@@ -3462,12 +3485,11 @@ fn roll_frame_sidecar_records_the_merged_recipe() {
         recipe.to_str().unwrap(),
     ]);
     assert_eq!(code, 0, "{err}");
-    let read_sidecar = |name: &str| -> serde_json::Value {
-        let txt = std::fs::read_to_string(out_dir.join(name)).unwrap();
-        serde_json::from_str(&txt).unwrap()
-    };
-    let overridden = read_sidecar("hdri-64bit_positive.tiff.json");
-    let shared = read_sidecar("hdr-48bit_positive.tiff.json");
+    // Each roll frame gets the same `{meta, params}` sidecar a single `convert`
+    // writes; the merged per-frame recipe is the `params` body.
+    let read_sidecar = |stem: &str| -> serde_json::Value { sidecar_params(&out_dir.join(stem)) };
+    let overridden = read_sidecar("hdri-64bit_positive.tiff");
+    let shared = read_sidecar("hdr-48bit_positive.tiff");
     assert_eq!(
         overridden["print"]["print_exposure"].as_f64().unwrap(),
         0.5,
@@ -3681,9 +3703,8 @@ fn film_master_writes_unclamped_float_acescg_and_reports_the_branch() {
 
     // The sidecar records the preset and reloads cleanly (deny_unknown_fields),
     // reproducing the master byte-for-byte on the same build.
-    let sidecar = PathBuf::from(format!("{}.json", out.display()));
-    let recipe: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    let sidecar_path = sidecar_of(&out);
+    let recipe = sidecar_params(&out);
     assert_eq!(recipe["output"]["preset"], "film-master");
     assert_eq!(
         recipe["print"]["linear_range"],
@@ -3696,7 +3717,7 @@ fn film_master_writes_unclamped_float_acescg_and_reports_the_branch() {
         "-o",
         again.to_str().unwrap(),
         "--params",
-        sidecar.to_str().unwrap(),
+        sidecar_path.to_str().unwrap(),
         "--report",
         "none",
     ]);
@@ -4443,5 +4464,872 @@ fn roll_frame_override_of_output_preset_warns_and_is_strict_promotable() {
             || control_report["warnings"].as_array().unwrap().is_empty(),
         "control run must raise no roll-level warning: {}",
         control_report["warnings"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conversion identity + versioning (`core/conversion-versioning`)
+// ---------------------------------------------------------------------------
+
+/// FNV-1a over `text`, hex — a deliberate **independent reimplementation** of
+/// `version::stable_hash` (integration tests can't link the binary crate's
+/// internals). Pinning the algorithm from outside is the point: `params_hash` is a
+/// wire value an agent reproduces by hashing `--dump-params`, so this test suite
+/// must be able to compute it without trusting the code under test.
+fn fnv1a_hex(text: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in text.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The default convert invocation the identity tests share: an explicit film base
+/// (so nothing is estimated per frame) and a clean stdout report.
+fn convert_default(input: &Path, out: &Path, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec![
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ];
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+#[test]
+fn report_carries_every_identity_layer() {
+    // Verify bullet 1: every report carries nc_version, the git commit, the
+    // behavioral pipeline_version, and the params_hash.
+    let tmp = TempDir::new("identity");
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = convert_default(&fixture("hdri-64bit.tif"), &out, &[]);
+    assert_eq!(code, 0, "{err}");
+    let id = &json(&stdout)["identity"];
+
+    assert_eq!(id["nc_version"], env!("CARGO_PKG_VERSION"));
+    // This worktree is a git checkout, so the commit must be a real short hash —
+    // never the string "unknown" (absence is modelled as an omitted field).
+    let commit = id["git_commit"]
+        .as_str()
+        .unwrap_or_else(|| panic!("git_commit must be present in a git build: {id}"));
+    assert!(
+        commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+        "git_commit must be a short hex hash, got {commit:?}"
+    );
+    assert!(
+        id["git_dirty"].is_boolean(),
+        "git_dirty must be a bool: {id}"
+    );
+    // The report's pipeline_version must be THIS build's, not merely "an integer":
+    // cross-check it against the only other place the binary publishes the label.
+    assert_eq!(
+        id["pipeline_version"].as_u64(),
+        Some(pipeline_version_from_version_flag()),
+        "the report's pipeline_version must match `nc --version`: {id}"
+    );
+    let hash = id["params_hash"].as_str().expect("params_hash");
+    assert_eq!(hash.len(), 16, "params_hash is a 64-bit hex digest: {hash}");
+    assert!(!id["target"].as_str().unwrap().is_empty());
+}
+
+/// The `pipeline_version` this binary prints from `--version` — the independent
+/// witness a report's value is checked against.
+fn pipeline_version_from_version_flag() -> u64 {
+    let (code, stdout, err) = run(&["--version"]);
+    assert_eq!(code, 0, "{err}");
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("pipeline_version: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("--version must print `pipeline_version: <n>`:\n{stdout}"))
+        .parse()
+        .expect("pipeline_version must be an integer")
+}
+
+#[test]
+fn inspect_and_estimate_carry_build_identity_without_a_params_hash() {
+    // "`identity`, every report" (design-spec §9) — not just conversions. An
+    // `inspect`/`estimate` result is an artifact someone files, and `params_hash` is
+    // genuinely absent there because no recipe was resolved (which is what makes
+    // `Identity::new`'s `None` a real state rather than a construction artifact).
+    let expected_version = pipeline_version_from_version_flag();
+    for args in [
+        vec!["inspect", fixture("hdri-64bit.tif").to_str().unwrap()],
+        vec![
+            "estimate",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "--base-region",
+            "0,0,502,462",
+        ],
+    ] {
+        let (code, stdout, err) = run(&args);
+        assert_eq!(code, 0, "{args:?}: {err}");
+        let report = json(&stdout);
+        let id = report
+            .get("identity")
+            .unwrap_or_else(|| panic!("{args:?}: no identity in {report}"));
+        assert_eq!(id["nc_version"], env!("CARGO_PKG_VERSION"), "{args:?}");
+        assert_eq!(id["pipeline_version"].as_u64(), Some(expected_version));
+        assert!(!id["target"].as_str().unwrap().is_empty(), "{args:?}");
+        assert!(
+            id.get("params_hash").is_none(),
+            "{args:?} resolves no recipe, so params_hash must be OMITTED: {id}"
+        );
+    }
+}
+
+#[test]
+fn params_hash_is_the_hash_of_the_dump_params_bytes() {
+    // The advertised hash must be reproducible by an agent: hash the exact bytes
+    // `--dump-params` writes and you get `identity.params_hash`. That equality is
+    // what makes the hash a usable cross-frame/cross-version config identity
+    // instead of an opaque number.
+    let tmp = TempDir::new("hash");
+    let out = tmp.path("out.tiff");
+    let dump = tmp.path("params.json");
+    let (code, stdout, err) = convert_default(
+        &fixture("hdri-64bit.tif"),
+        &out,
+        &[
+            "--dump-params",
+            dump.to_str().unwrap(),
+            "--density-gamma",
+            "1.7",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    let dumped = std::fs::read_to_string(&dump).unwrap();
+    let advertised = json(&stdout)["identity"]["params_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        fnv1a_hex(&dumped),
+        advertised,
+        "params_hash must be the hash of the --dump-params bytes"
+    );
+
+    // The sidecar carries the same recipe and advertises the same hash in `meta`, so
+    // the sidecar and the report can never disagree. Compared as parsed JSON, not
+    // text: re-serializing a `serde_json::Value` sorts keys (no `preserve_order`
+    // feature here), so only the *document* is comparable, not the byte order —
+    // the byte-level claim is the `--dump-params` equality asserted above.
+    let doc = sidecar(&out);
+    assert_eq!(doc["meta"]["params_hash"].as_str().unwrap(), advertised);
+    assert_eq!(
+        doc["params"],
+        serde_json::from_str::<serde_json::Value>(&dumped).unwrap(),
+        "the sidecar's params body is the --dump-params document"
+    );
+
+    // A changed knob ⇒ a different hash (the hash is actually sensitive).
+    let out2 = tmp.path("out2.tiff");
+    let (c2, s2, _) = convert_default(
+        &fixture("hdri-64bit.tif"),
+        &out2,
+        &["--density-gamma", "1.8"],
+    );
+    assert_eq!(c2, 0);
+    assert_ne!(
+        json(&s2)["identity"]["params_hash"].as_str().unwrap(),
+        advertised
+    );
+}
+
+#[test]
+fn version_flag_prints_the_full_build_identity() {
+    // `nc --version` must be enough to attribute an output on its own.
+    let (code, stdout, _) = run(&["--version"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "{stdout}");
+    assert!(stdout.contains("pipeline_version:"), "{stdout}");
+    assert!(stdout.contains("commit:"), "{stdout}");
+    assert!(stdout.contains("target:"), "{stdout}");
+}
+
+#[test]
+fn enveloped_sidecar_and_bare_legacy_recipe_both_reload_identically() {
+    // Verify bullet 1, the round-trip trap, BOTH directions:
+    //  (a) the new `{meta, params}` sidecar reloads through `--params`;
+    //  (b) a BARE recipe object (a hand-written recipe, `--dump-params` output, or
+    //      a pre-envelope sidecar) still reloads — the established shape must not
+    //      be broken by the envelope;
+    // and all three outputs are byte-identical, so the envelope costs no pixels.
+    let tmp = TempDir::new("envelope");
+    let input = fixture("hdri-64bit.tif");
+
+    let out_a = tmp.path("a.tiff");
+    let dump = tmp.path("bare.json");
+    let (ca, _, err) = convert_default(
+        &input,
+        &out_a,
+        &[
+            "--dump-params",
+            dump.to_str().unwrap(),
+            "--density-gamma",
+            "1.6",
+            "--report",
+            "none",
+        ],
+    );
+    assert_eq!(ca, 0, "{err}");
+
+    // (a) reload the enveloped sidecar.
+    let out_b = tmp.path("b.tiff");
+    let envelope = sidecar_of(&out_a);
+    let (cb, _, err) = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out_b.to_str().unwrap(),
+        "--params",
+        envelope.to_str().unwrap(),
+        "--report",
+        "none",
+    ]);
+    assert_eq!(cb, 0, "the enveloped sidecar must reload:\n{err}");
+
+    // (b) reload the bare recipe (`--dump-params` output — the legacy shape).
+    let out_c = tmp.path("c.tiff");
+    let (cc, _, err) = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out_c.to_str().unwrap(),
+        "--params",
+        dump.to_str().unwrap(),
+        "--report",
+        "none",
+    ]);
+    assert_eq!(cc, 0, "a bare legacy recipe must still reload:\n{err}");
+
+    let (a, b, c) = (
+        std::fs::read(&out_a).unwrap(),
+        std::fs::read(&out_b).unwrap(),
+        std::fs::read(&out_c).unwrap(),
+    );
+    assert_eq!(a, b, "enveloped reload must reproduce the output");
+    assert_eq!(
+        a, c,
+        "bare-recipe reload must reproduce the same output as the envelope"
+    );
+}
+
+#[test]
+fn identity_fields_are_not_recipe_keys() {
+    // The whole reason for the envelope: identity must NEVER be a recipe key. Each
+    // one, placed bare in a recipe, is a loud unknown-key usage error (exit 2) —
+    // if any of these silently deserialized, `deny_unknown_fields` would have been
+    // weakened and future sidecars would smuggle provenance into the config.
+    let tmp = TempDir::new("not-keys");
+    for key in [
+        r#""nc_version": "0.1.0""#,
+        r#""pipeline_version": 1"#,
+        r#""params_hash": "0000000000000000""#,
+        r#""git_commit": "abc123""#,
+        r#""identity": {}"#,
+    ] {
+        let recipe = write_file(&tmp.path("r.json"), &format!("{{ {key} }}"));
+        let out = tmp.path("out.tiff");
+        let (code, _, err) = run(&[
+            "convert",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+            "--report",
+            "none",
+        ]);
+        assert_eq!(code, 2, "bare identity key {key} must be rejected: {err}");
+    }
+}
+
+#[test]
+fn meta_without_params_is_a_pointed_usage_error() {
+    // A half-written envelope is a malformed envelope, not a bare recipe: it gets a
+    // pointed message instead of the opaque `unknown field 'meta'` serde default.
+    let tmp = TempDir::new("half-envelope");
+    let recipe = write_file(
+        &tmp.path("r.json"),
+        r#"{ "meta": { "pipeline_version": 1 } }"#,
+    );
+    let out = tmp.path("out.tiff");
+    let (code, _, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("`meta` block but no `params`"),
+        "the error must name the envelope shape: {err}"
+    );
+}
+
+#[test]
+fn unknown_meta_fields_are_ignored_but_the_recipe_body_is_still_strict() {
+    // `meta` is provenance, so an OLDER build must tolerate a NEWER build's extra
+    // meta fields (forward compatibility) — while the `params` body keeps its full
+    // `deny_unknown_fields` strictness.
+    let tmp = TempDir::new("meta-fwd");
+    let out = tmp.path("out.tiff");
+    let ok = write_file(
+        &tmp.path("ok.json"),
+        r#"{ "meta": { "invented_future_field": [1, 2], "pipeline_version": 1 },
+             "params": { "print": { "print_exposure": 0.25 } } }"#,
+    );
+    let (code, _, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--params",
+        ok.to_str().unwrap(),
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 0, "unknown meta fields must be ignored:\n{err}");
+
+    // Same flags as the accepted case above, so the ONLY difference is the typo —
+    // otherwise the exit code could be blamed on the missing `--film-base`.
+    let bad = write_file(
+        &tmp.path("bad.json"),
+        r#"{ "meta": {}, "params": { "print": { "print_exposur": 0.25 } } }"#,
+    );
+    let (code, _, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("bad.tiff").to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--params",
+        bad.to_str().unwrap(),
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 2, "a typo inside `params` must still be loud: {err}");
+    assert!(
+        err.contains("print_exposur"),
+        "the error must name the offending key, not just fail: {err}"
+    );
+
+    // `params` itself is the envelope discriminator, so a `params` key *inside* the
+    // recipe body is an unknown recipe key — pinning that a future stage section
+    // can't quietly claim the name and turn every recipe into an envelope.
+    let nested = write_file(
+        &tmp.path("nested.json"),
+        r#"{ "meta": {}, "params": { "params": {} } }"#,
+    );
+    let (code, _, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("nested.tiff").to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--params",
+        nested.to_str().unwrap(),
+        "--report",
+        "none",
+    ]);
+    assert_eq!(code, 2, "`params` must not be a recipe key: {err}");
+}
+
+#[test]
+fn a_non_object_recipe_body_is_refused_instead_of_converting_with_defaults() {
+    // serde's derived visitor accepts a *sequence* for a struct and every recipe
+    // field has a default, so both of these used to convert with ALL-DEFAULT
+    // parameters at exit 0, advertising a params_hash byte-identical to the default
+    // recipe's — a truncated or mis-generated sidecar silently ignoring the recipe
+    // the operator believes is applied.
+    let tmp = TempDir::new("non-object");
+    for (tag, body) in [
+        ("params-array", r#"{ "params": [] }"#),
+        ("bare-array", "[]"),
+        ("params-number", r#"{ "params": 3 }"#),
+    ] {
+        let recipe = write_file(&tmp.path(&format!("{tag}.json")), body);
+        let (code, _, err) = run(&[
+            "convert",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "-o",
+            tmp.path(&format!("{tag}.tiff")).to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--params",
+            recipe.to_str().unwrap(),
+            "--report",
+            "none",
+        ]);
+        assert_eq!(code, 2, "{tag} must be refused: {err}");
+        assert!(err.contains("must be a"), "{tag}: {err}");
+    }
+}
+
+#[test]
+fn an_unreadable_meta_pipeline_version_is_loud_not_silently_ignored() {
+    // Mapped to `None`, an unreadable value is indistinguishable from an absent one
+    // and disables the skew check entirely; truncated with `as u32`, 4294967297
+    // becomes 1 and *matches* a build at pipeline_version 1, suppressing the warning
+    // by pretending to agree with it. Both are the silent replay this label exists
+    // to prevent.
+    let tmp = TempDir::new("bad-meta-version");
+    for (tag, value) in [
+        ("float", "1.0"),
+        ("string", "\"1\""),
+        ("negative", "-1"),
+        ("null", "null"),
+        ("overflow", "4294967297"),
+    ] {
+        let recipe = write_file(
+            &tmp.path(&format!("{tag}.json")),
+            &format!(
+                r#"{{ "meta": {{ "pipeline_version": {value} }},
+                      "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }} }} }}"#
+            ),
+        );
+        let (code, _, err) = run(&[
+            "convert",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "-o",
+            tmp.path(&format!("{tag}.tiff")).to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+            "--report",
+            "none",
+        ]);
+        assert_eq!(
+            code, 2,
+            "meta.pipeline_version {value} must be refused: {err}"
+        );
+        assert!(err.contains("meta.pipeline_version"), "{tag}: {err}");
+    }
+}
+
+#[test]
+fn a_malformed_meta_container_is_refused_like_a_malformed_field() {
+    // The container/field asymmetry: a corrupt *field* inside `meta` was already a
+    // loud exit 2, but a corrupt `meta` *block* degraded to "records no version" and
+    // replayed with no skew check at all — silently reproducing the very mismatch the
+    // label exists to surface.
+    let tmp = TempDir::new("bad-meta-container");
+    for (tag, meta) in [
+        ("null", "null"),
+        ("string", "\"x\""),
+        ("array", "[]"),
+        ("number", "123"),
+    ] {
+        let recipe = write_file(
+            &tmp.path(&format!("{tag}.json")),
+            &format!(
+                r#"{{ "meta": {meta},
+                      "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }} }} }}"#
+            ),
+        );
+        let (code, _, err) = run(&[
+            "convert",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "-o",
+            tmp.path(&format!("{tag}.tiff")).to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+            "--report",
+            "none",
+        ]);
+        assert_eq!(code, 2, "meta={meta} must be refused: {err}");
+        assert!(err.contains("`meta` must be an object"), "{tag}: {err}");
+    }
+}
+
+#[test]
+fn output_stats_report_the_written_samples_for_both_depths() {
+    // `output_stats.mean` is the entire cross-version comparison basis — `nctool
+    // compare` hard-fails without it — so its presence and shape are a contract, not
+    // an implementation detail.
+    let tmp = TempDir::new("output-stats");
+    let out = tmp.path("u16.tiff");
+    let (code, stdout, err) = convert_default(&fixture("hdri-64bit.tif"), &out, &[]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let mean = report["output_stats"]["mean"]
+        .as_array()
+        .unwrap_or_else(|| panic!("output_stats.mean must be present: {report}"));
+    assert_eq!(mean.len(), 3, "one mean per channel: {mean:?}");
+    for v in mean {
+        let v = v.as_f64().expect("a finite number");
+        assert!(
+            v.is_finite() && (0.0..=1.0).contains(&v),
+            "a u16 mean is the quantized value normalized into [0,1], got {v}"
+        );
+    }
+
+    // f32/HDR output is written verbatim, so the mean is reported in *that* domain
+    // (unclamped) — the reason `nctool compare` records the depth beside the mean.
+    let hdr = tmp.path("hdr.tiff");
+    let (code, stdout, err) = convert_default(&fixture("hdri-64bit.tif"), &hdr, &["--output-hdr"]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert_eq!(
+        report["output_stats"]["mean"].as_array().map(Vec::len),
+        Some(3),
+        "output_stats must be reported for --output-hdr too: {report}"
+    );
+
+    // A blown-out render ties the two report fields together: the clamped samples
+    // the mean is taken over are the same ones `loss` counts.
+    let clipped = tmp.path("clipped.tiff");
+    let (code, stdout, err) = convert_default(
+        &fixture("hdri-64bit.tif"),
+        &clipped,
+        &["--print-exposure", "40.0"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert!(
+        report["loss"]["clipped_high"].as_u64().unwrap_or(0) > 0,
+        "a heavily over-exposed print must clip high: {report}"
+    );
+    let mean = report["output_stats"]["mean"][0].as_f64().unwrap();
+    assert!(
+        mean > 0.9,
+        "the mean of the CLAMPED written samples must sit near display white, got {mean}"
+    );
+}
+
+#[test]
+fn roll_frames_carry_their_own_identity_and_comparison_basis() {
+    // A roll's shared identity labels the frozen recipe; a per-frame override
+    // genuinely changes THAT frame's effective recipe, so the difference has to be
+    // visible per frame or the docs' claim that a roll is comparable is empty.
+    let tmp = TempDir::new("roll-frame-identity");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let hdr = fixture("hdr-48bit.tif");
+    let hdri = fixture("hdri-64bit.tif");
+    let manifest = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{ "frames": [
+                 {{ "input": {hdr:?} }},
+                 {{ "input": {hdri:?}, "params": {{ "print": {{ "print_exposure": 0.5 }} }} }}
+               ] }}"#,
+            hdr = hdr.to_str().unwrap(),
+            hdri = hdri.to_str().unwrap(),
+        ),
+    );
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        "--frames",
+        manifest.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let shared_hash = report["identity"]["params_hash"].as_str().unwrap();
+
+    let by_stem = |stem: &str| -> serde_json::Value {
+        report["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["input"].as_str().unwrap().contains(stem))
+            .unwrap_or_else(|| panic!("no frame for {stem} in {report}"))
+            .clone()
+    };
+    let plain = by_stem("hdr-48bit");
+    let overridden = by_stem("hdri-64bit");
+
+    // Every ok frame carries a full identity plus its comparison basis.
+    for (label, frame) in [("plain", &plain), ("overridden", &overridden)] {
+        assert_eq!(
+            frame["identity"]["nc_version"],
+            env!("CARGO_PKG_VERSION"),
+            "{label}: {frame}"
+        );
+        assert_eq!(
+            frame["output_stats"]["mean"].as_array().map(Vec::len),
+            Some(3),
+            "{label} frame must carry output_stats: {frame}"
+        );
+    }
+
+    // The un-overridden frame's hash is the shared recipe's; the overridden frame's
+    // is not — and each frame's sidecar `meta` agrees with its report entry.
+    let plain_hash = plain["identity"]["params_hash"].as_str().unwrap();
+    let over_hash = overridden["identity"]["params_hash"].as_str().unwrap();
+    assert_eq!(
+        plain_hash, shared_hash,
+        "no override ⇒ the shared recipe's hash"
+    );
+    assert_ne!(
+        over_hash, shared_hash,
+        "a per-frame override changes that frame's effective recipe, so its hash must differ"
+    );
+    assert_eq!(
+        sidecar(&out_dir.join("hdr-48bit_positive.tiff"))["meta"]["params_hash"]
+            .as_str()
+            .unwrap(),
+        plain_hash
+    );
+    assert_eq!(
+        sidecar(&out_dir.join("hdri-64bit_positive.tiff"))["meta"]["params_hash"]
+            .as_str()
+            .unwrap(),
+        over_hash
+    );
+}
+
+#[test]
+fn roll_warns_about_a_version_skewed_shared_recipe() {
+    // `roll` has its own skew wiring, distinct from `convert`'s: the mismatch is a
+    // roll-level fact (one shared recipe, N frames), so it rides the roll's warnings
+    // rather than any single frame's.
+    let tmp = TempDir::new("roll-skew");
+    let stale = write_file(
+        &tmp.path("stale.json"),
+        r#"{ "meta": { "pipeline_version": 9999 },
+             "params": { "reconstruction": { "type": "density",
+                            "curve": { "type": "exponential", "dmax": { "explicit": 1.6 } } },
+                         "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } } } }"#,
+    );
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        stale.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "the recipe still applies:\n{err}");
+    let report = json(&stdout);
+    assert!(
+        report["warnings"]
+            .to_string()
+            .contains("pipeline_version 9999"),
+        "the roll-level warnings must carry the skew: {report}"
+    );
+
+    // And `--strict` promotes it, after the report lands.
+    let (code, stdout, _) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        tmp.path("strict").to_str().unwrap(),
+        "--params",
+        stale.to_str().unwrap(),
+        "--strict",
+    ]);
+    assert_eq!(
+        code, 1,
+        "--strict must promote the roll's version-skew warning"
+    );
+    assert_eq!(json(&stdout)["command"], "roll", "the report still lands");
+}
+
+#[test]
+fn replaying_another_pipeline_versions_recipe_warns_and_strict_promotes_it() {
+    // A recipe captured under a different behavioral pipeline_version still
+    // applies, but its default render has changed underneath it — the loud,
+    // `--strict`-promotable warning is the whole point of the version label.
+    let tmp = TempDir::new("version-skew");
+    let stale = write_file(
+        &tmp.path("stale.json"),
+        r#"{ "meta": { "pipeline_version": 9999 },
+             "params": { "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } } } }"#,
+    );
+    let out = tmp.path("out.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--params",
+        stale.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "the recipe still applies:\n{err}");
+    let warnings = json(&stdout)["warnings"].to_string();
+    assert!(
+        warnings.contains("pipeline_version 9999"),
+        "the version skew must be reported: {warnings}"
+    );
+
+    // Same recipe under --strict ⇒ non-zero exit, report still emitted.
+    let (code, stdout, _) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("strict.tiff").to_str().unwrap(),
+        "--params",
+        stale.to_str().unwrap(),
+        "--strict",
+    ]);
+    assert_eq!(code, 1, "--strict must promote the version-skew warning");
+    assert_eq!(
+        json(&stdout)["command"],
+        "convert",
+        "the report still lands"
+    );
+
+    // A recipe recording THIS build's version does not warn.
+    let current = json(
+        &run(&[
+            "convert",
+            fixture("hdri-64bit.tif").to_str().unwrap(),
+            "-o",
+            tmp.path("cur.tiff").to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+        ])
+        .1,
+    )["identity"]["pipeline_version"]
+        .as_u64()
+        .unwrap();
+    let matching = write_file(
+        &tmp.path("matching.json"),
+        &format!(
+            r#"{{ "meta": {{ "pipeline_version": {current} }},
+                  "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }} }} }}"#
+        ),
+    );
+    // No `--strict` here: this HDRi fixture legitimately warns about its unconsumed
+    // IR plane, so a strict exit would prove nothing about the version label. The
+    // assertion is on the warning *text* — no version-skew warning appears.
+    let (code, stdout, _) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("match.tiff").to_str().unwrap(),
+        "--params",
+        matching.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "a matching pipeline_version must convert cleanly");
+    assert!(
+        !json(&stdout)["warnings"]
+            .to_string()
+            .contains("pipeline_version"),
+        "a matching pipeline_version must not warn"
+    );
+}
+
+#[test]
+fn identity_stamping_does_not_perturb_the_output_pixels() {
+    // Identity is operational metadata in the same class as `--report`/telemetry:
+    // it must never move a pixel. Drive the same conversion through every path that
+    // touches the identity code — report on/off, a bare recipe, an enveloped
+    // sidecar carrying a `meta` block, and a version-skew warning — and assert one
+    // single set of TIFF bytes across all of them.
+    let tmp = TempDir::new("no-perturb");
+    let input = fixture("hdri-64bit.tif");
+    let base = tmp.path("base.tiff");
+    let dump = tmp.path("bare.json");
+    let (code, _, err) = convert_default(
+        &input,
+        &base,
+        &["--dump-params", dump.to_str().unwrap(), "--report", "none"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let expected = std::fs::read(&base).unwrap();
+
+    let bare = std::fs::read_to_string(&dump).unwrap();
+    let skewed = write_file(
+        &tmp.path("skew.json"),
+        &format!(r#"{{ "meta": {{ "pipeline_version": 9999 }}, "params": {bare} }}"#),
+    );
+    let envelope = sidecar_of(&base);
+    let variants: [(&str, Vec<&str>); 4] = [
+        ("report json", vec!["--params", dump.to_str().unwrap()]),
+        (
+            "report none",
+            vec!["--params", dump.to_str().unwrap(), "--report", "none"],
+        ),
+        (
+            "enveloped sidecar",
+            vec!["--params", envelope.to_str().unwrap()],
+        ),
+        ("version skew", vec!["--params", skewed.to_str().unwrap()]),
+    ];
+    for (label, extra) in variants {
+        let out = tmp.path(&format!("{}.tiff", label.replace(' ', "-")));
+        let mut args = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        args.extend_from_slice(&extra);
+        let (code, _, err) = run(&args);
+        assert_eq!(code, 0, "{label}: {err}");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            expected,
+            "{label} must produce byte-identical pixels"
+        );
+    }
+}
+
+#[test]
+fn roll_report_carries_the_shared_recipes_identity() {
+    // A roll stamps identity once, for the SHARED frozen recipe; each frame's own
+    // sidecar carries its own (possibly overridden) params_hash.
+    let tmp = TempDir::new("roll-identity");
+    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let id = &report["identity"];
+    assert_eq!(id["nc_version"], env!("CARGO_PKG_VERSION"));
+    assert!(id["pipeline_version"].as_u64().is_some(), "{id}");
+    let shared_hash = id["params_hash"].as_str().expect("shared params_hash");
+    // The frame ran with no override, so its sidecar advertises the same hash as the
+    // roll's shared identity.
+    assert_eq!(
+        sidecar(&out_dir.join("hdr-48bit_positive.tiff"))["meta"]["params_hash"]
+            .as_str()
+            .unwrap(),
+        shared_hash
+    );
+    // And it is the same hash a single `convert` from that recipe reports — the
+    // roll/convert equivalence guarantee extended to config identity. (Asserted
+    // against a real run rather than a re-serialized `Value`, whose key order serde
+    // would sort.)
+    let single = tmp.path("single.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        single.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        json(&stdout)["identity"]["params_hash"].as_str().unwrap(),
+        shared_hash,
+        "a roll frame and the equivalent single convert share one params_hash"
     );
 }
