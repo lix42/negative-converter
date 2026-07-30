@@ -593,9 +593,11 @@ impl<'de> Deserialize<'de> for WbSource {
 /// named-output split resolves once for both display branches
 /// (`pipeline::render_split`, design-spec §6): the pinned order is
 /// `white balance → exposure → black point → linear_range placement`.
-/// `highlight_compress` is deliberately **not** shared — highlight roll-off is
-/// branch-specific SDR tone policy (`output/sdr-display-rendering`), and the
-/// legacy no-preset render is the only consumer today.
+/// `highlight_compress` is deliberately **not** applied in the shared stage:
+/// each named display renderer resolves its own knee from the same amount.
+/// SDR resolves `0.5 + 0.25 / (1 + amount)` in `[0,1]`; HDR applies the same
+/// normalized position across `[1, 1000/203]`. The legacy no-preset render
+/// remains the only CLI-reachable consumer today.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrintParams {
@@ -606,7 +608,9 @@ pub struct PrintParams {
     /// Highlight/neutral white-balance gain source (default explicit `[1, 1, 1]`
     /// = neutral). Auto modes estimate the gains per frame; see [`WbSource`].
     pub white_balance: WbSource,
-    /// Highlight roll-off amount.
+    /// Named-display highlight roll-off amount. Non-negative; positive values
+    /// move each branch's shoulder knee earlier without changing its fixed
+    /// reference white or peak.
     pub highlight_compress: f32,
     /// Black/white-range placement endpoints `[low, high]` in the rendered
     /// positive's linear domain — the exact affine `(x − low)/(high − low)` the

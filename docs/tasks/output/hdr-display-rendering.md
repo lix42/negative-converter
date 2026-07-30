@@ -40,7 +40,16 @@ The separately tracked `hdr-avif-output` task owns AV1 encoding and AVIF
 container/profile conformance for the PQ/HLG signals.
 For a paired gain-map render, it must consume the same resolved shared-adjustment
 parameters as the SDR branch; only display-specific tone/gamut/transfer policy
-diverges after that common source.
+diverges after that common source. Its pre-transfer seam is linear BT.2020, not
+the gain-map's common comparison space: downstream gain-map construction must
+transform it to linear Display P3 before any channel ratio.
+
+`print.highlight_compress` is one user-facing amount with branch-specific named
+display semantics. HDR resolves
+`knee = 1 + (1000/203 - 1) * (0.5 + 0.25/(1 + amount))`, then applies the
+reference-white-preserving Hermite shoulder from that knee to the fixed
+`1000/203` peak. Positive values move the knee earlier without moving either
+203-nit reference white or the 1000-nit peak.
 
 ## How to Verify
 
@@ -49,6 +58,8 @@ diverges after that common source.
   scene ranges.
 - Reference white, target peak, and content headroom land at declared encoded
   and measured luminance values.
+- Positive `highlight_compress` moves the HDR knee earlier and changes highlight
+  rendering while reference white and peak remain fixed.
 - A monotonic luminance-preserving highlight shoulder reaches the declared peak;
   out-of-gamut colors use documented hue-preserving compression without silent
   per-channel clipping.

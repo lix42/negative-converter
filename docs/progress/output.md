@@ -34,6 +34,14 @@ What other epics need to know about `output`:
   adaptation, and gamut mapping. Renderers return **rendered-linear** pixels;
   transfer encoding happens afterward. Gain-map construction consumes the
   *pre-transfer* rendition so ratios are taken in a common linear domain.
+- **The HDR renderer is implemented.** `pipeline::hdr::render_linear` returns
+  finite, non-negative, reference-white-relative BT.2020 pixels. Gain-map work
+  must transform that seam to common linear Display P3 before ratios;
+  `encode_transfer` instead consumes it in place and returns opaque Rec.2100 PQ
+  or HLG pixels plus the full-range CICP 9/16/9 or 9/18/9 contract.
+  Reference white is 203 cd/m², peak is 1000 cd/m², and HLG pins the 1000-nit,
+  zero-black reference OOTF with system gamma 1.2. Presets and containers remain
+  downstream.
 - **⚠ Display P3 is not yet a product path.** The SDR renderer now produces
   rendered-linear P3/sRGB and `encode_rendered_sdr` applies only the matching
   transfer/profile, but `output/presets` still owns CLI activation. Legacy
@@ -218,8 +226,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 
 ## hdr-display-rendering
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** done
+**Updated:** 2026-07-29
 
 - 2026-07-23: The HDR spike pinned 203 cd/m² reference white, 1000 cd/m² target
   peak, PQ as the primary path, explicit HLG assumptions, hue-preserving gamut
@@ -232,6 +240,38 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   Rec.2100 is a display encoding, not nc's density or internal working space.
 - 2026-07-21: Removed ambiguous ownership of the SDR base; this task now verifies
   PQ/HLG only, while `sdr-display-rendering` produces the independent SDR render.
+
+- 2026-07-29: Started implementation from the completed shared display source
+  and SDR branch. The HDR stage remains a pure renderer: one adjusted ACEScg
+  source, fixed 203 cd/m² reference white and 1000 cd/m² target peak, BT.2020
+  destination RGB, explicit PQ/HLG transfer assumptions, and reportable policy
+  metadata. Preset activation and AVIF encoding remain downstream.
+- 2026-07-29: Completed `pipeline::hdr`. The linear seam maps adjusted ACEScg/D60
+  into BT.2020/D65, preserves adjusted `1.0` as 203-nit reference white, and
+  applies a bounded C¹ Hermite shoulder to the 1000-nit / 4.926108-linear peak.
+  Out-of-gamut color intersects the BT.2020 RGB cube radially at constant
+  luminance with one common chroma scale; no per-channel terminal clip is used.
+  The transfer seam mutates that buffer in place: PQ applies the ST 2084 inverse
+  EOTF in absolute nits, while HLG applies the inverse reference OOTF (1000-nit
+  peak, zero black, system gamma 1.2), a scene-linear radial signal-boundary
+  intersection, and the reference OETF. Typed metadata fixes full-range CICP
+  9/16/9 for PQ or 9/18/9 for HLG. The pre-transfer typed BT.2020 value remains
+  borrowable by `output/gain-map-hdr-output`, which must convert it to common
+  linear Display P3; the encoded pair is ready for `output/hdr-avif-output`.
+- 2026-07-29: Verification covers current BT.2100 PQ and HLG vectors, neutral
+  monotonic ramps, exact 203-nit reference-white and 1000-nit peak placement,
+  shoulder continuity/monotonicity, constant-luminance radial gamut mapping,
+  deterministic PQ/HLG goldens, explicit HLG assumptions, and fail-loud invalid
+  inputs. Final gates passed: `cargo fmt --all --check`,
+  `cargo clippy --all-targets --all-features --locked -- -D warnings`,
+  `cargo build`, and `cargo test --no-fail-fast` (458 unit + 123 integration).
+- 2026-07-29: Review tightened the encoded seam to an opaque nonlinear image
+  type, made the BT.2020→common-linear-Display-P3 gain-map boundary explicit,
+  documented the branch-specific HDR highlight knee and downstream preset memory
+  dependency, and added direct linear-domain, matrix, and highlight-control
+  tests. Review gates passed: `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build`, and `cargo test`
+  (461 unit + 123 integration).
 
 
 ## hdr-avif-output

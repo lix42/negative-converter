@@ -70,8 +70,18 @@ affine placement; range endpoints are finite with `low < high`.
 Because per-channel WB generally does not commute with the working-space matrix, an
 alias preserves requested numbers but not legacy pixels. Reports/help say so,
 and `conversion-versioning` owns the golden-tested `pipeline_version` bump when
-this new preset/default ordering activates. The earlier bit-identical tagged
-reconstruction refactor does not cause that bump.
+this new preset/default ordering and the named SDR/HDR interpretations of
+`highlight_compress` activate. The earlier bit-identical tagged reconstruction
+refactor does not cause that bump.
+
+Preset activation is also gated on extending and measuring
+`pipeline::memory`. Its current `RunProfile::Convert` represents the shipped
+legacy render/encode allocation graph; named display paths keep the shared
+adjusted ACEScg buffer live while allocating a 12 B/px branch output, and
+gain-map HDR may keep both renditions plus gain-map/codec staging live. Add
+profile-specific accounting and calibrate it against measured peak RSS before
+any display preset becomes CLI-reachable. Do not silently apply the legacy
+estimate to these new paths.
 
 To preserve exposure across frames, `film-master` rejects frame-local automatic
 Dmax. The exponential density curve accepts supported `none` or fixed/
@@ -152,6 +162,9 @@ preserve misleading terminology.
   resolution, sidecars derived per final image, exactly one roll report on stdout
   or `--report-file`, and report collision rejection against all inputs, outputs,
   and sidecars.
+- Memory-preflight tests select the resolved preset's calibrated allocation
+  profile and cover the shared-source/branch overlap; gain-map tests additionally
+  cover simultaneous rendition and codec staging before default activation.
 
 ## Dependencies
 

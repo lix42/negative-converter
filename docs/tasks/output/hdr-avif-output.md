@@ -48,6 +48,12 @@ license files, and the AOM patent-license review outcome. Retest the lack of
 mastering-display color-volume writer support when upgrading `libavif`; do not
 invent metadata the library cannot serialize.
 
+Before `hdr-pq` or `hdr-hlg` becomes CLI-reachable, extend and calibrate
+`pipeline::memory` for the shared adjusted ACEScg source overlapping the HDR
+renderer’s 12 B/px output and the selected AVIF encoder's staging buffers. The
+current `RunProfile::Convert` is deliberately the shipped legacy model and is
+not sufficient evidence for this new allocation graph.
+
 ## How to Verify
 
 - Independent inspection proves AVIF v1.2 conformance, High Profile level
@@ -66,6 +72,8 @@ invent metadata the library cannot serialize.
   build flags, licenses, patent-review inputs, and binary-size impact recorded.
 - Encoder and allocation failures cross the FFI boundary as stable nc errors
   without leaks, panics, undefined behavior, or partial destination files.
+- Memory-preflight tests and measured calibration cover the named HDR render and
+  AVIF staging overlap before preset activation.
 
 ## Dependencies
 

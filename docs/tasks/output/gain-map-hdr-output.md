@@ -23,6 +23,9 @@ rendering.
 Before transfer encoding, convert both renditions into linear Display P3 and
 derive an RGB gain map there. Never divide encoded Display P3 and PQ/BT.2020
 channel values: their primaries and nonlinear transfer functions are different.
+The implemented HDR renderer's pre-transfer `LinearBt2020Hdr` is therefore an
+input to a required BT.2020→Display P3 conversion, not a ready/common gain-map
+buffer.
 Encode the resulting scale/offset/gamma/headroom metadata and ensure the SDR base
 remains the default representation for unaware readers. The initial target is
 an 8-bit Display P3 JPEG base, 4:4:4 at quality 95, plus a half-resolution RGB
@@ -79,6 +82,14 @@ separate enough that final-standard HEIF/AVIF gain-map encoders can be added
 without changing the rendering model. See
 [the decision note](../../hdr-output-spike.md).
 
+Before this product path becomes CLI-reachable, extend and calibrate
+`pipeline::memory` for the actual overlapping full-frame buffers. At minimum the
+shared adjusted ACEScg source remains live while each 12 B/px display rendition
+is allocated; gain-map construction may require the SDR and converted HDR
+renditions plus gain-map/codec staging simultaneously. The current
+`RunProfile::Convert` intentionally models only the shipped legacy pipeline and
+must not be reused unchanged for this path.
+
 ## How to Verify
 
 - An independent ISO 21496-1 implementation and an independent Ultra HDR v1
@@ -92,6 +103,9 @@ without changing the rendering model. See
   adjusted source and that gains use the pinned offset-adjusted formula in the
   common reference-white-relative linear domain, not encoded P3/PQ/HLG samples
   or mixed absolute/normalized units.
+- Memory-preflight tests and measured calibration cover the gain-map path's
+  simultaneous shared source, SDR, converted common-domain HDR, gain-map, and
+  codec staging buffers before the preset is activated.
 - Equal SDR/HDR reference-white samples (`1.0`) with equal offsets yield gain
   exactly 1. A peak fixture converts 1000 nits to `4.926108...` before the
   formula, then computes expected gain from the actual independently tone-mapped
