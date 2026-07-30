@@ -488,7 +488,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Display P3 output](tasks/output/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
 - [x] [HDR still-output spike](tasks/output/hdr-output-spike.md) — decided ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy; licensed-normative-text check waived at spike level and re-homed to the encoder tasks as a pre-merge gate (2026-07-24)
 - [x] [SDR display rendering](tasks/output/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
-- [ ] [Display-HDR rendering](tasks/output/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
+- [x] [Display-HDR rendering](tasks/output/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
 - [ ] [ISO gain-map HDR output](tasks/output/gain-map-hdr-output.md) — write a backward-compatible Display P3 JPEG base plus ISO 21496-1 and Ultra HDR v1 gain-map metadata
 - [ ] [HDR AVIF output](tasks/output/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
 - [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers

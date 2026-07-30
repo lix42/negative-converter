@@ -152,7 +152,7 @@ plane is a separate single channel, carried but not consumed (§6.1).
 | **`D′` at the reconstruction→curve handoff** | the same corrected density `D′` (row above), named at the point it is passed to the selected density-to-positive curve | **denser** negative — a **brighter** scene | density units — `D′`'s range as defined in the row above (no re-clamping at the boundary) | reconstruction→curve handoff inside `density::reconstruct` |
 | **NC film RGB v1** (`FilmRgbImage`) | intentional positive film rendering from simple inversion or the exponential/sigmoid density curve; interpreted consistently as linear Rec.709/D65 | **brighter** positive — a **brighter** rendered scene | curve-defined and unclamped `f32` | `algo::FilmRgbImage`, `algo::reconstruct` (shipped typed reconstruction output) |
 | **ACEScg film rendering** (`AcesCgImage`) | NC film RGB v1 transformed/adapted into linear ACEScg/D60; preserves film/lens/development/scanner character and is not physical scene recovery | **brighter** rendered value | unclamped `f32`; nominal diffuse white is workflow-defined | `pipeline::working_space` mapper (implemented; wired into the `film-master` render branch, not the legacy no-preset path) |
-| **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | planned SDR/HDR display-render stages |
+| **rendered display positive** | linear ACEScg film rendering after shared white balance/exposure/black/range placement, then output-specific highlight/reference-white/tone and destination gamut mapping | **brighter** rendered value | unclamped until the chosen display policy requires limiting | `pipeline::sdr` / `pipeline::hdr` |
 | **output sample** (terminal) | the written image value | brighter | preset/container-defined integer or float encoding | `io::encode` and planned HDR encoders |
 
 **The one rule.** As the depicted **scene luminance rises**:
@@ -363,12 +363,13 @@ then branches on the resolved `output.preset` (`pipeline::stages::render`):
   `render_split::film_master`, encoded directly as unclamped f32 with the ACEScg
   profile attached and no transform.
 
-Stage 5b's **shared print controls** (`render_split::display_source`) are
-implemented and unit-tested but have no CLI-reachable consumer yet: no display
-preset is accepted, so a non-default `print.linear_range` is a loud usage error
-rather than a silently-ignored knob. `output/sdr-display-rendering` and
-`output/hdr-display-rendering` are its consumers. See the "Architecture" section
-of `CLAUDE.md` for the current-vs-target framing.
+Stage 5b's **shared print controls** (`render_split::display_source`) and both
+pure display renderers are implemented and unit-tested: `pipeline::sdr`
+produces rendered-linear Display P3/sRGB, while `pipeline::hdr` produces
+display-linear BT.2020 plus in-place Rec.2100 PQ/HLG encoding. They have no
+CLI-reachable consumer yet: no display preset is accepted, so a non-default
+`print.linear_range` is a loud usage error rather than a silently-ignored knob.
+See the "Architecture" section of `CLAUDE.md` for the current-vs-target framing.
 
 ```
                  ┌──────────────────────────────────────────────┐
@@ -451,8 +452,10 @@ Mechanically (as shipped in `pipeline::render_split`), the controls are resolved
 gains there, so the branches cannot re-estimate and drift — applied once, and then
 *borrowed* by both branches from one `SharedDisplaySource`. "SDR and HDR receive
 the identical adjusted source" is therefore structural, not a convention the two
-renderers have to remember. `highlight_compress` is deliberately **not** shared:
-highlight roll-off is branch-specific SDR tone policy.
+renderers have to remember. `highlight_compress` is deliberately **not applied**
+by the shared stage: the amount is resolved independently into each named
+display branch's tone policy, so SDR and HDR can use different display-domain
+knees without drifting in their common adjustments.
 
 The resolved SDR policy is deterministic and display-referred. It transforms
 AP1/D60 ACEScg to the selected D65 destination (Display P3 or sRGB) with pinned
@@ -478,6 +481,18 @@ destination stage derives the matching Display P3 or sRGB profile from that
 metadata, applies only the piecewise sRGB transfer curve, and returns the
 metadata with the encoded pixels. The gain-map path borrows the typed
 pre-transfer pixels.
+
+The resolved HDR policy uses the same control amount but a distinct
+reference-white-relative domain. Adjusted linear `1.0` remains the binding
+**203 cd/m² reference white**, the fixed peak is `1000/203 = 4.926108...`, and
+the normalized knee position is
+`0.5 + 0.25 / (1 + highlight_compress)`. The HDR shoulder therefore starts at
+`1 + (1000/203 - 1) * knee_position`, reaches `1000/203` with zero slope, and
+plateaus there. A positive amount moves the HDR knee earlier while reference
+white and peak stay fixed. After the shoulder, same-luminance radial gamut
+mapping produces display-linear BT.2020. Single-rendition output transfer-encodes
+that typed value as PQ/HLG; gain-map construction must first transform it to the
+common linear Display P3 domain used by the SDR rendition.
 
 ### 6.1 IR channel handling (Step 1)
 
@@ -712,11 +727,12 @@ implementation's ignored-gamma warning is gone).
 On the frozen legacy path, `--highlight-compress` remains the existing
 linear-space above-`1.0` soft clip after exposure/WB: `0` disables that legacy
 operation, and with the sigmoid shoulder plus neutral print parameters it simply
-never engages because nothing exceeds `1.0`. Named SDR deliberately gives the
-same control different target semantics: display tone mapping is mandatory,
-`0` selects the baseline Hermite shoulder, and positive values request
-progressively earlier/stronger additional roll-off within the bounded
-`[0.5, 0.75]` shoulder-start range described in §6. Product activation and the
+never engages because nothing exceeds `1.0`. Named SDR and HDR deliberately
+give the same control different target semantics: display tone mapping is
+mandatory, `0` selects each branch's baseline Hermite shoulder, and positive
+values request progressively earlier/stronger additional roll-off. SDR resolves
+the bounded `[0.5, 0.75]` knee in `[0,1]`; HDR resolves the same normalized knee
+position across `[1, 1000/203]`, as described in §6. Product activation and the
 associated conversion-version boundary remain owned by `output/presets` and
 `conversion-versioning`; until then the legacy behavior is unchanged.
 
@@ -1557,8 +1573,8 @@ false-positive on legitimate high-contrast conversions).
   endpoints whose difference overflows would silently collapse every sample). A
   negative `LOW` is legal, so a leading `-` is accepted.
   **Shipped state:** only the shared display stage applies it and no display preset
-  is accepted yet (`output/sdr-display-rendering` / `output/hdr-display-rendering`
-  own the branch renderers), while the legacy no-preset path keeps its frozen
+  is accepted yet (both branch renderers are implemented but not activated),
+  while the legacy no-preset path keeps its frozen
   ordering and `film-master` bypasses print controls entirely — so a non-default
   value is currently a **loud usage error** rather than a silently-ignored knob.
 - White balance — a single mutually-exclusive choice, recipe key
@@ -1587,10 +1603,11 @@ false-positive on legitimate high-contrast conversions).
   specified generalization.
 - `--highlight-compress <f>` — highlight roll-off amount. Frozen legacy
   semantics use `0` as off and positive values for the existing above-`1.0`
-  soft clip. Named SDR target semantics always include the baseline display
-  shoulder: `0` selects that baseline and positive values move its resolved knee
-  earlier, bounded as specified in §6. Preset activation/versioning owns the
-  semantic switch; this is not a second conversion knob.
+  soft clip. Named SDR and HDR target semantics always include their baseline
+  display shoulder: `0` selects the branch baseline and positive values move its
+  resolved knee earlier, bounded in the branch's domain as specified in §6.
+  Preset activation/versioning owns the semantic switch; this is not a second
+  conversion knob.
 
 ### Simple algorithm
 - Removed legacy controls: `--invert-white-balance R,G,B` and
@@ -2154,12 +2171,16 @@ the NLP feature comparison, Phase 6).
 22. **Display HDR rendering and format spike.** The spike selects 10-bit 4:4:4
     AVIF for single-rendition HDR and JPEG for gain maps. The spike's remaining
     gate is normative-text review; encoder conformance and device evidence are
-    downstream pre-shipping gates. The renderer places linear ACEScg film
-    values into BT.2020 Rec.2100 PQ (primary still path) or explicit HLG with
-    203 cd/m² reference white, 1000 cd/m² initial target peak, and documented
-    tone and gamut mapping. Rec.2100 is an output encoding, not the density or
-    internal working space. A separate encoder task owns AVIF v1.2 Advanced
-    Profile conformance, AV1 High Profile level ≤ 6.0, container brands,
+    downstream pre-shipping gates. The implemented pure renderer consumes the
+    shared adjusted ACEScg source, maps it into display-linear BT.2020 with a
+    reference-white-preserving Hermite shoulder and same-luminance radial gamut
+    compression, then encodes Rec.2100 PQ (primary still path) or explicit HLG.
+    It fixes reference white at 203 cd/m² and peak at 1000 cd/m²; HLG records the
+    1000-nit, zero-black reference OOTF with system gamma 1.2. Its typed linear
+    seam feeds gain-map construction, while its in-place PQ/HLG seam carries the
+    full-range CICP 9/16/9 or 9/18/9 contract for AVIF. Rec.2100 is an output
+    encoding, not the density or internal working space. A separate encoder task
+    owns AVIF v1.2 Advanced Profile conformance, AV1 High Profile level ≤ 6.0, container brands,
     oversized-image/grid behavior, metadata, codec bounds, and static
     libavif/libaom packaging. Tracked: `hdr-output-spike`,
     `hdr-display-rendering`, `hdr-avif-output`.

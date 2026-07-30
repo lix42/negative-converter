@@ -97,18 +97,22 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode}.rs`,
-  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,memory}.rs`
+  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,hdr,memory}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure reconstruction→named-output core (stages
   3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
   path (`reconstruct → finish_print → color::to_output`) or `film-master`
   (`reconstruct → map_nc_film_rgb_v1 → render_split::film_master`, no colour
   transform). It has **no CLI-reachable** display (5b) arm yet —
-  `render_split::display_source` feeds the implemented `pipeline::sdr` stage,
-  which returns opaque rendered-linear Display P3/sRGB pixels coupled to their
-  resolved 203-nit tone/gamut metadata; `color::encode_rendered_sdr` consumes
-  that value and derives the matching transfer/profile without a second gamut
-  transform. `output/presets` still owns product/CLI activation;
+  `render_split::display_source` feeds the implemented `pipeline::sdr` and
+  `pipeline::hdr` stages. SDR returns opaque rendered-linear Display P3/sRGB
+  pixels coupled to resolved 203-nit tone/gamut metadata;
+  `color::encode_rendered_sdr` derives the matching transfer/profile without a
+  second gamut transform. HDR returns either opaque display-linear BT.2020
+  pixels (which gain-map work must convert to common linear Display P3 before
+  ratio math) or opaque in-place Rec.2100 PQ/HLG pixels coupled to the fixed
+  203-nit reference-white / 1000-nit peak, shoulder, gamut, HLG OOTF, and CICP
+  contract. `output/presets` still owns product/CLI activation;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
@@ -116,10 +120,9 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
   controls `WB → exposure → black point → linear_range`, resolved once and
   *borrowed* by both display branches. The `film-master` half is wired; the
-  SDR display half is built and unit-tested but has no CLI-reachable consumer
-  until `output/presets` (HDR remains
-  `output/hdr-display-rendering`), so a non-default `print.linear_range` is a loud
-  usage error rather than a silently-ignored knob;
+  SDR and HDR display halves are built and unit-tested but have no CLI-reachable
+  consumer until `output/presets`, so a non-default `print.linear_range` is a
+  loud usage error rather than a silently-ignored knob;
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
@@ -167,7 +170,10 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   returns** the image, transforming those very buffers). If you add a full-frame
   buffer to any stage, update that model — **nothing tests it against the code**, so
   the gate silently under-approves until someone does. `decode` is
-  `decode_within(&Path, budget_bytes)`.
+  `decode_within(&Path, budget_bytes)`. The current `RunProfile::Convert` models
+  the shipped legacy pipeline only: `output/presets` must add and calibrate
+  preset-specific accounting for shared-source + display-render overlap (and
+  both renditions/gain-map staging where applicable) before display activation.
 
 ### Stack / commands
 

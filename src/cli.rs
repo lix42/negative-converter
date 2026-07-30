@@ -508,7 +508,7 @@ pub struct PrintOverrides {
     /// Estimate the white-balance gains per frame from image statistics.
     #[arg(long = "auto-wb", value_enum, value_name = "MODE")]
     pub auto_wb: Option<AutoWb>,
-    /// Highlight roll-off amount.
+    /// Highlight roll-off amount; named SDR/HDR branches resolve their own knee.
     #[arg(long)]
     pub highlight_compress: Option<f32>,
     /// Black/white-range placement endpoints for the shared display stage: the
