@@ -596,3 +596,22 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   differences from film-master to declared transfer, reference-white,
   highlight-headroom, and gamut adaptation. Exponential/simple remain advanced
   diagnostic paths pending a separate retirement decision.
+
+
+## lossless-hdr-tiff
+
+**Status:** not started
+**Updated:** 2026-07-30
+
+- 2026-07-30: Added distinct lossless HDR TIFF contracts for two use cases:
+  bit-exact 32-bit float display-linear BT.2020 interchange, and losslessly
+  stored 16-bit Rec.2100 PQ/HLG code values. Kept both separate from the linear
+  ACEScg `film-master`, consumer HDR AVIF, and gain-map JPEG. The task requires
+  standards-valid, independently inspected signaling and forbids private tags or
+  unsupported viewer-compatibility claims.
+- 2026-07-30: Made `color/colorimetry-source-of-truth` a prerequisite so the new
+  BT.2020 profiles and encoder adapters cannot introduce another set of magic
+  matrices or luma constants. `output/presets` now depends on this task for
+  `hdr-linear-tiff`, `hdr-pq-tiff`, and `hdr-hlg-tiff` activation; its standalone
+  `display-p3` and `compatibility` policies are explicitly 16-bit losslessly
+  stored TIFFs.
