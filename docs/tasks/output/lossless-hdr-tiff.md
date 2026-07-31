@@ -121,3 +121,4 @@ suffix validation, roll naming, reports, and user guidance.
 
 - [Display-HDR rendering](hdr-display-rendering.md)
 - [Colorimetry source of truth and update workflow](../color/colorimetry-source-of-truth.md)
+- [Transactional output writes](../io/transactional-output-writes.md)

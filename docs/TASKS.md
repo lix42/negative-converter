@@ -112,6 +112,7 @@ graph TD
   algo --> film-base
   io --> color
   io --> algo
+  io --> output
   film-base --> algo
   algo --> color
   film-base --> color
@@ -303,6 +304,7 @@ graph TD
   output/hdr-display-rendering --> output/hdr-avif-output
   output/hdr-display-rendering --> output/lossless-hdr-tiff
   color/colorimetry-source-of-truth --> output/lossless-hdr-tiff
+  io/transactional-output-writes --> output/lossless-hdr-tiff
   output/iso-gain-map-metadata --> output/presets
   output/hdr-avif-output --> output/presets
   output/lossless-hdr-tiff --> output/presets
@@ -381,7 +383,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `output/ultrahdr-dependency-externalization` (post-MVP, **deferred maintenance**; no downstream blockers): `output/gain-map-hdr-output`
 - `output/iso-gain-map-metadata` (post-MVP): `output/gain-map-hdr-output`
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
-- `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`
+- `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`, `io/transactional-output-writes`
 - `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `output/lossless-hdr-tiff`, `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `core/conversion-versioning`
 - `telemetry/perf-instrumentation` (post-MVP, **parked**): `core/pipeline-orchestration`
   — LAB criterion benches; prototyped and parked on git branch

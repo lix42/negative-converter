@@ -601,7 +601,7 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 ## lossless-hdr-tiff
 
 **Status:** not started
-**Updated:** 2026-07-30
+**Updated:** 2026-07-31
 
 - 2026-07-30: Added distinct lossless HDR TIFF contracts for two use cases:
   bit-exact 32-bit float display-linear BT.2020 interchange, and losslessly
@@ -615,3 +615,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   `hdr-linear-tiff`, `hdr-pq-tiff`, and `hdr-hlg-tiff` activation; its standalone
   `display-p3` and `compatibility` policies are explicitly 16-bit losslessly
   stored TIFFs.
+- 2026-07-31: Review found that the task required failure-safe final paths while
+  its graph did not require the existing transactional-write implementation.
+  Added `io/transactional-output-writes` as a real prerequisite so the TIFF
+  encoders reuse one atomic-write boundary instead of duplicating it or writing
+  directly to final paths.
