@@ -74,7 +74,7 @@ pub struct LinearBt2020Hdr {
 
 impl LinearBt2020Hdr {
     /// Borrow the finite, non-negative, reference-white-relative BT.2020 pixels.
-    #[allow(dead_code)] // consumed next by `output/gain-map-hdr-output`.
+    #[allow(dead_code)] // borrowed next by the pre-container gain-map seam.
     pub fn image(&self) -> &LinearImage {
         &self.image
     }
@@ -174,7 +174,6 @@ pub fn render(
 /// begins above reference white and reaches the 1000-nit peak with zero slope.
 /// Out-of-gamut colour moves radially toward the same-luminance neutral axis,
 /// preserving chroma direction instead of clipping channels independently.
-#[allow(dead_code)] // consumed next by `output/gain-map-hdr-output`.
 pub fn render_linear(
     shared: &SharedDisplaySource,
     highlight_compress: f32,

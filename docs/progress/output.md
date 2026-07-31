@@ -22,6 +22,14 @@ What other epics need to know about `output`:
 - **Containers:** JPEG + ISO 21496-1 gain map is the default HDR still; 10-bit
   4:4:4 BT.2020 AVIF is the explicit PQ/HLG path. HEIC is deferred (no portable
   encoder API for the final gain-map container, plus HEVC licensing risk).
+  Before final-ISO conformance is available, the explicit `ultra-hdr-v1` JPEG
+  path uses only the public Android/Adobe XMP + MPF/GContainer dialect and must
+  not be labeled ISO-conformant.
+- **Native dependency packaging:** the shipped Ultra HDR implementation keeps
+  the audited libultrahdr/libjpeg-turbo snapshot in-tree for now. A deferred,
+  non-blocking maintenance task may replace it only with an exact published
+  Cargo release that preserves the required marker ordering, static linkage,
+  and network-free native build.
 - **The spike waived the licensed-normative-text review at spike level and
   re-homed it** as a pre-merge conformance gate on the encoder tasks. Don't treat
   it as already satisfied.
@@ -351,8 +359,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 
 ## gain-map-hdr-output
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** in progress
+**Updated:** 2026-07-29
 
 - 2026-07-23: The spike changed the first container from HEIC to JPEG. The task
   now targets an 8-bit Display P3 base plus a half-resolution RGB map derived in
@@ -381,6 +389,59 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 - 2026-07-21: Required both renditions to share the identical characterized and
   adjusted source, and pinned gain-ratio derivation to the standard-required
   common linear color domain rather than encoded P3/PQ/HLG channel division.
+- 2026-07-29: Started implementation on `feat/gain-map-hdr-output`. The work
+  begins at the typed pre-transfer SDR/HDR seams, keeps both renditions in common
+  reference-white-relative linear Display P3 for canonical gain math, and leaves
+  preset/CLI activation to `output/presets`. Current upstream encoder and
+  final-standard metadata behavior will be verified before selecting the narrow
+  container boundary.
+- 2026-07-29: Implemented the first pure `pipeline::gain_map` seam: both branches
+  are rendered from one `SharedDisplaySource`; HDR is transformed from linear
+  BT.2020 into reference-white-relative linear Display P3 with a
+  same-luminance radial compatibility mapping; the exact positive-offset formula
+  produces one coupled SDR/HDR/gain result and actual per-channel extrema.
+  Nine focused tests cover unit gain at reference white, real peak math,
+  black/near-black, invalid offsets, mixed-unit rejection, the pinned matrix,
+  gamut mapping, extrema, determinism, and dimensional coupling.
+- 2026-07-29: Container work is blocked at the task's explicit conformance gate.
+  The machine and current upstream `main` expose libultrahdr 1.4.0; the required
+  segment-order correction remains open as google/libultrahdr PR #394 with
+  changes requested, and no corrected release exists. Context7 is not connected
+  in this environment. Completing final ISO 21496-1:2025 byte serialization
+  requires the licensed standard or an approved equivalently authoritative
+  source plus a reviewed/pinned corrected native source. The task stays in
+  progress; review-fix-loop has not run because the implementation is not
+  complete.
+- 2026-07-30: Ran a partial-seam review/fix pass without attempting the blocked
+  JPEG/ISO serialization or preset activation. Restored narrow pre-container
+  dead-code allowances; added finite-positive per-channel gain gamma policy;
+  pinned independently standards-derived BT.2020-primary → Display-P3 vectors;
+  and separated common-linear HDR and gain ratios into opaque owned types with a
+  consuming container seam. The focused 11-test gain-map suite and all four
+  CI-equivalent gates (`fmt --check`, strict `clippy`, `build`, `test`) passed.
+- 2026-07-30: Revalidated the container gate before resuming. Homebrew still
+  provides libultrahdr 1.4.0; google/libultrahdr PR #394 remains open with
+  changes requested after its latest patch; and current AOSP libultrahdr source
+  still names the draft `urn:iso:std:iso:ts:21496:-1` namespace with ISO writing
+  disabled by default. The ISO site confirms final ISO 21496-1:2025 is published
+  but exposes only the abstract publicly. No further byte-layout, map
+  quantization/downsampling, native FFI, memory calibration, or CLI activation
+  is safe to implement until a permitted authoritative final-standard
+  conformance checklist/oracle and a reviewed corrected encoder source are
+  available.
+- 2026-07-30: Correction to the preceding entry: its PR status came from a stale
+  cached GitHub page. A live `gh pr view` query shows google/libultrahdr PR #394
+  was approved and merged on 2026-07-27 as
+  `11ac0c325bbf56ecf8be8704ff0f79fc9e1aac77`. The reviewed marker-order source is
+  therefore available to pin even though Homebrew still packages 1.4.0. This
+  removes the upstream-patch blocker; the separate final ISO 21496-1:2025
+  conformance/oracle gate remains.
+- 2026-07-30: With user approval, split delivery at the public format boundary.
+  This task now owns a usable explicit `ultra-hdr-v1` JPEG with no ISO claim,
+  while new downstream `output/iso-gain-map-metadata` owns final
+  ISO 21496-1:2025 bytes, dual-dialect agreement, and the conformance oracle.
+  `output/presets` still waits for that ISO extension before making the neutral
+  dual-dialect `gain-map-hdr` output the default.
 
 
 ## presets
@@ -437,3 +498,87 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   Validation runs after merge, provenance is per endpoint, legacy use warns, and
   scene master rejects every final non-default range while allowing flags to
   reset recipe endpoints to `[0,1]`.
+
+
+## iso-gain-map-metadata
+
+**Status:** not started
+**Updated:** 2026-07-30
+
+- 2026-07-30: Split final ISO 21496-1:2025 serialization and dual-dialect
+  conformance from the public Ultra HDR v1 JPEG implementation. This task will
+  reuse exactly one SDR base, gain-map image, and canonical metadata model; it
+  remains blocked on a permitted authoritative final-standard checklist or
+  independent oracle, while `output/gain-map-hdr-output` can now complete and
+  activate the explicitly named non-ISO `ultra-hdr-v1` path.
+
+
+## gain-map-hdr-output (continued)
+
+**Status:** done
+**Updated:** 2026-07-30
+
+- 2026-07-30: Completed the explicit, convert-only `ultra-hdr-v1` preset. It
+  writes a quality-95, 4:4:4 Display P3 SDR primary plus a half-resolution
+  grayscale luminance gain map using the public legacy Ultra HDR v1
+  XMP/MPF/GContainer dialect. The canonical internal calculation remains RGB
+  in common linear Display P3 for the downstream ISO serializer; this preset
+  derives luminance because legacy XMP cannot signal a multichannel map. It
+  writes no ISO or draft ISO marker and makes no ISO-conformance claim.
+- 2026-07-30: Pinned and statically packaged google/libultrahdr at merged marker
+  fix `11ac0c325bbf56ecf8be8704ff0f79fc9e1aac77` and libjpeg-turbo 3.1.0 at
+  `20ade4dea9589515a69793e447a6c6220b464535`. Added complete distribution
+  notices, recursive native-source build invalidation, Linux/macOS CI
+  prerequisites, and deterministic snapshot verification covering 219
+  libultrahdr files and 555 libjpeg-turbo files. Context7 was unavailable, so
+  the narrow private FFI was verified against the pinned upstream headers,
+  implementation, and executable decoder behavior.
+- 2026-07-30: Verified the produced container independently with ExifTool and
+  through libultrahdr reconstruction: legacy gain-map XMP, GContainer and MPF
+  linkage, Display P3 ICC bytes, marker ordering, grayscale component count,
+  odd dimensions, black/reference-white/peak/saturated vectors, and absence of
+  ISO metadata are covered. macOS ImageIO's `sips` opens the corrected JPEG and
+  reports its dimensions; physical Android verification remains conditional on
+  an Android environment, with ordinary JPEG readers retaining the SDR primary.
+- 2026-07-30: Calibrated the gain-map memory profile on an 18.7 MP HDRi real
+  scan. The preflight estimated 1,851,158,528 bytes against a measured
+  1,681,408,000-byte peak RSS, conservatively covering the overlapping render,
+  gain-map, codec-input, and native-output buffers without changing the legacy
+  profile.
+- 2026-07-30: Completed the independent review/fix loop. Fixes covered
+  center-aligned odd-size downsampling, display-render telemetry timing, native
+  notices and reproducible pins, recursive build invalidation, ICC reassembly
+  checks, and real pipeline-to-libultrahdr reconstruction. Both targeted
+  re-reviews finished clean. Final gates passed:
+  `scripts/check-vendored-native.py`, `cargo fmt --all --check`,
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo build --all-targets --all-features`, `cargo test --all-features`
+  (479 unit + 126 integration tests), and `git diff --check`.
+
+
+## ultrahdr-dependency-externalization
+
+**Status:** not started
+**Updated:** 2026-07-31
+
+- 2026-07-31: Kept the reviewed local libultrahdr/libjpeg-turbo snapshot for the
+  current gain-map change. Added this non-blocking follow-up to move dependency
+  ownership back to Cargo after a published `ultrahdr-sys` release contains the
+  required marker-order behavior and provides a fully pinned, network-free
+  static native build. A Git dependency or system library is not the target
+  because it would respectively retain repository-availability risk or make
+  output depend on machine-installed native versions.
+
+
+## gain-map-hdr-output (CI follow-up)
+
+**Status:** done
+**Updated:** 2026-07-31
+
+- 2026-07-31: Fixed the clean-checkout native snapshot gate after the copied
+  upstream `.gitignore` caused ordinary `git add` to omit 20 legitimate files
+  that were still present and hashed locally. The files are force-tracked, and
+  `scripts/check-vendored-native.py` now verifies that every hashed snapshot
+  file is present in the Git index. This is an explicit local-vendoring
+  workaround; `output/ultrahdr-dependency-externalization` removes the snapshot,
+  tracking guard, and verifier together once a qualifying Cargo package exists.

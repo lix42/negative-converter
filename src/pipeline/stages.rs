@@ -2,9 +2,11 @@
 //! selected output branch together for the orchestrator to call.
 //!
 //! This is the in-memory core of the `convert` pipeline (design-spec §6, stages
-//! 3–5a — there is no 5b/display arm: `render_split::display_source` exists but
-//! nothing here calls it until `output/{sdr,hdr}-display-rendering`). Film-base
-//! estimation (stage 2) is the orchestrator's, and
+//! 3–5b). [`render`] owns the legacy/film-master branches;
+//! [`render_gain_map_source`] is the CLI-reachable shared display source for the
+//! explicit `ultra-hdr-v1` path, whose SDR/HDR/gain-map rendering and packaging
+//! the CLI orchestrates afterward. Film-base estimation (stage 2) is the
+//! orchestrator's, and
 //! decode (stage 1) and encode (the final stage) are I/O and stay with
 //! the orchestrator (`cli`); everything here is pure `(input, params) -> output`
 //! so it composes and unit-tests without touching the filesystem — with one
@@ -12,7 +14,7 @@
 //! for the telemetry record (a report-only channel; the pixels stay
 //! deterministic and untouched by the measurement).
 //!
-//! [`render`] dispatches on the resolved [`OutputPreset`]:
+//! The resolved [`OutputPreset`] routes through these stage entrypoints:
 //!
 //! - **`legacy`** (no preset, the default) — the frozen transitional path
 //!   `reconstruct → finish_print → color::to_output`: the print controls run
@@ -29,6 +31,9 @@
 //!   rendering. Running `color::to_output` here would re-apply the
 //!   Rec.709→ACEScg matrix on values that already crossed it, so the master
 //!   deliberately bypasses that stage and only fetches the profile blob.
+//! - **`ultra-hdr-v1`** — `render_gain_map_source` reconstructs once, maps to
+//!   ACEScg, and applies the shared print controls once; the orchestrator then
+//!   feeds that source to both display renderers and the legacy gain-map encoder.
 
 use std::time::Instant;
 
@@ -53,6 +58,13 @@ pub struct Rendered {
     /// report-only channel: it is never serialized into the recipe sidecar and
     /// never read back by any stage, so the byte-identical-output determinism
     /// contract is untouched.
+    pub timings: StageTimings,
+}
+
+/// The shared display source and diagnostics used to build a gain-map output.
+pub struct GainMapSource {
+    pub shared: render_split::SharedDisplaySource,
+    pub convert: ConvertReport,
     pub timings: StageTimings,
 }
 
@@ -139,7 +151,37 @@ pub fn render(
             render_legacy(image, film_base, reconstruction, print, output_params)
         }
         OutputPreset::FilmMaster => render_film_master(image, film_base, reconstruction),
+        OutputPreset::UltraHdrV1 => Err(crate::types::NcError::Other(
+            "`ultra-hdr-v1` must use stages::render_gain_map_source".into(),
+        )),
     }
+}
+
+/// Reconstruct once, cross the NC film RGB v1 boundary, then resolve and apply
+/// the shared print controls exactly once for both gain-map renditions.
+pub fn render_gain_map_source(
+    image: &LinearImage,
+    film_base: &FilmBase,
+    reconstruction: &Reconstruction,
+    print: &PrintParams,
+) -> Result<GainMapSource> {
+    let started = Instant::now();
+    let (film, recon) = algo::reconstruct(image, film_base, reconstruction)?;
+    let shared = render_split::display_source(working_space::map_nc_film_rgb_v1(film), print)?;
+    let algorithm_ms = ms_since(started);
+
+    Ok(GainMapSource {
+        convert: ConvertReport {
+            dmax: recon.dmax,
+            white_balance: Some(shared.controls.white_balance()),
+            balance_range: recon.balance_range,
+        },
+        shared,
+        timings: StageTimings {
+            algorithm_ms,
+            color_ms: 0.0,
+        },
+    })
 }
 
 /// The frozen legacy no-preset path: reconstruct → print render → working→output

@@ -1,0 +1,28 @@
+Upstream: https://github.com/google/libultrahdr
+Revision: 11ac0c325bbf56ecf8be8704ff0f79fc9e1aac77
+Merged PR: https://github.com/google/libultrahdr/pull/394
+
+The implementation source is the exact revision above; its CMake file has one
+packaging-only change that uses the checked-in libjpeg-turbo source instead of a
+network download. It is built with UHDR_WRITE_XMP=ON and
+UHDR_WRITE_ISO=OFF by nc's dependency feature selection. Do not replace it with
+an unreviewed release tarball: nc relies on the merged metadata-writing fix.
+
+The `third_party/turbojpeg` directory is libjpeg-turbo 3.1.0 at revision
+20ade4dea9589515a69793e447a6c6220b464535, the version selected by this
+libultrahdr CMake snapshot. CMake's network download is disabled; the archive is
+built and linked statically.
+
+`scripts/check-vendored-native.py` mechanically verifies separate deterministic
+tree hashes for the libultrahdr snapshot and bundled libjpeg-turbo snapshot.
+The copied upstream tree retains its own `.gitignore`; broad upstream patterns
+such as `build*` and `tests/data` would otherwise cause ordinary `git add` to
+omit real snapshot files while they remain present locally. Those files are
+intentionally force-added, and the verifier checks that every hashed file is in
+the Git index so a clean CI checkout hashes the same tree. This local-vendoring
+workaround and its verifier are removed by
+`output/ultrahdr-dependency-externalization` (see
+`docs/tasks/output/ultrahdr-dependency-externalization.md`).
+The only modification inside the pinned libultrahdr tree is packaging-only:
+`CMakeLists.txt` points ExternalProject at the checked-in turbojpeg tree and
+sets `DOWNLOAD_COMMAND ""`. No codec or image-science source is modified.

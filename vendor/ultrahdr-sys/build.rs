@@ -1,0 +1,434 @@
+use std::env;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let file_name = entry.file_name();
+        if file_name.to_str() == Some(".git") {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(file_name);
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&src_path)?;
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, &dst_path)?;
+            }
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dst_path)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dst_path)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_rerun_tree(path: &Path) -> io::Result<()> {
+    // Watching each directory catches additions/removals; watching each leaf
+    // catches in-place edits. Cargo does not recursively infer both from a list
+    // containing only the files that existed when this build script ran.
+    println!("cargo:rerun-if-changed={}", path.display());
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name().to_str() == Some(".git") {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let entry_path = entry.path();
+        if file_type.is_dir() {
+            emit_rerun_tree(&entry_path)?;
+        } else {
+            println!("cargo:rerun-if-changed={}", entry_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn wasi_toolchain() -> Option<(PathBuf, PathBuf)> {
+    let target = env::var("TARGET").ok()?;
+    if !target.contains("wasm32-wasi") {
+        return None;
+    }
+
+    let prefix = env::var("WASI_SDK_PREFIX")
+        .or_else(|_| env::var("WASI_SDK_PATH"))
+        .unwrap_or_else(|_| "/opt/wasi-sdk".to_string());
+    let env_toolchain = env::var_os("WASI_SDK_TOOLCHAIN_FILE").map(PathBuf::from);
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let toolchain = env_toolchain.unwrap_or_else(|| {
+        let name = if target.contains("wasip1") || target_env == "p1" {
+            "wasi-sdk-p1.cmake"
+        } else {
+            "wasi-sdk.cmake"
+        };
+        PathBuf::from(&prefix).join("share/cmake").join(name)
+    });
+    Some((toolchain, PathBuf::from(prefix)))
+}
+
+fn locate_src_dir(manifest_dir: &Path) -> PathBuf {
+    if let Ok(env) = env::var("ULTRAHDR_SRC_DIR") {
+        return PathBuf::from(env);
+    }
+
+    let submodule_path = manifest_dir.join("libultrahdr");
+    if submodule_path.join("CMakeLists.txt").is_file() {
+        return submodule_path;
+    }
+
+    let workspace_root = manifest_dir
+        .parent()
+        .expect("ultrahdr-sys has no parent dir");
+
+    let submodule_path = workspace_root.join("libultrahdr");
+    if submodule_path.join("CMakeLists.txt").is_file() {
+        return submodule_path;
+    }
+
+    // Fallback: sibling checkout (old layout).
+    workspace_root
+        .parent()
+        .expect("workspace has no parent dir")
+        .join("libultrahdr")
+}
+
+fn apply_patch_once(src_dir: &Path, patch_path: &Path) {
+    if !patch_path.is_file() {
+        return;
+    }
+
+    let patch_str = patch_path
+        .to_str()
+        .expect("patch path contains non-UTF8 characters");
+
+    // If patch applies in reverse, assume already applied.
+    // NOTE: `git apply` doesn't work on crates.io source tarballs (no `.git`), so we use `patch`.
+    // `patch -R` may auto-detect and ignore `-R`, so we add `--force` to make the exit status reliable.
+    let reverse_ok = Command::new("patch")
+        .current_dir(src_dir)
+        .args(["-p1", "--dry-run", "--batch", "--silent", "--force", "-R"])
+        .args(["-i", patch_str])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if reverse_ok {
+        return;
+    }
+
+    let dry_run = Command::new("patch")
+        .current_dir(src_dir)
+        .args(["-p1", "--dry-run", "--batch", "--silent", "--forward"])
+        .args(["-i", patch_str])
+        .status()
+        .expect("failed to execute patch (is `patch` installed?)");
+    if !dry_run.success() {
+        panic!(
+            "failed to apply patch {} in {} (dry-run); set ULTRAHDR_SKIP_PATCHES=1 to bypass",
+            patch_path.display(),
+            src_dir.display()
+        );
+    }
+
+    let status = Command::new("patch")
+        .current_dir(src_dir)
+        .args(["-p1", "--batch", "--silent", "--forward"])
+        .args(["-i", patch_str])
+        .status()
+        .expect("failed to execute patch (is `patch` installed?)");
+    if !status.success() {
+        panic!(
+            "failed to apply patch {} in {}",
+            patch_path.display(),
+            src_dir.display()
+        );
+    }
+}
+
+fn apply_local_patches(manifest_dir: &Path, src_dir: &Path) {
+    if env::var("ULTRAHDR_SKIP_PATCHES").is_ok() {
+        return;
+    }
+    if cfg!(feature = "no-threads") {
+        apply_patch_once(
+            src_dir,
+            &manifest_dir.join("patches/libultrahdr-no-threads.patch"),
+        );
+    }
+}
+
+fn prepare_src_dir(manifest_dir: &Path, src_dir: &Path, out_dir: &Path) -> PathBuf {
+    let work_src = out_dir.join("libultrahdr-src");
+    let _ = fs::remove_dir_all(out_dir.join("build"));
+    let _ = fs::remove_dir_all(&work_src);
+    copy_dir_recursive(src_dir, &work_src).expect("failed to copy libultrahdr sources");
+    apply_local_patches(manifest_dir, &work_src);
+    work_src
+}
+
+fn is_wasm_target(target: &str) -> bool {
+    target.starts_with("wasm32-")
+}
+
+fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let source_dir = locate_src_dir(&manifest_dir);
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+
+    // docs.rs builds in a sandboxed environment without network access.
+    // Skip the full CMake build and only generate bindings for documentation.
+    if env::var("DOCS_RS").is_ok() {
+        println!("cargo:warning=Building for docs.rs: skipping CMake build");
+        let bindings = bindgen::Builder::default()
+            .header(source_dir.join("ultrahdr_api.h").to_string_lossy())
+            .clang_arg(format!("-I{}", source_dir.display()))
+            .rustified_enum("uhdr_.*")
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .layout_tests(false)
+            .allowlist_function("uhdr_.*")
+            .allowlist_type("uhdr_.*")
+            .allowlist_var("UHDR_.*")
+            .generate()
+            .expect("bindgen failed");
+        bindings
+            .write_to_file(out_dir.join("bindings.rs"))
+            .expect("failed to write bindings");
+        return;
+    }
+
+    if !source_dir.join("CMakeLists.txt").is_file() {
+        panic!(
+            "Could not find libultrahdr sources; set ULTRAHDR_SRC_DIR (current: {})",
+            source_dir.display()
+        );
+    }
+
+    let patch_path = manifest_dir.join("patches/libultrahdr-no-threads.patch");
+    println!("cargo:rerun-if-env-changed=ULTRAHDR_SRC_DIR");
+    println!("cargo:rerun-if-env-changed=ULTRAHDR_SKIP_PATCHES");
+    println!("cargo:rerun-if-env-changed=WASI_SDK_PREFIX");
+    println!("cargo:rerun-if-env-changed=WASI_SDK_PATH");
+    println!("cargo:rerun-if-env-changed=WASI_SDK_TOOLCHAIN_FILE");
+    emit_rerun_tree(&source_dir).expect("failed to enumerate vendored native source inputs");
+    println!("cargo:rerun-if-changed={}", patch_path.display());
+
+    let src_dir = prepare_src_dir(&manifest_dir, &source_dir, &out_dir);
+
+    let target = env::var("TARGET").expect("TARGET");
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let is_wasm = is_wasm_target(&target);
+    let wasi = wasi_toolchain();
+
+    let mut cfg = cmake::Config::new(&src_dir);
+    cfg.profile("Release");
+    if let Some((toolchain, prefix)) = &wasi {
+        if !toolchain.is_file() {
+            panic!(
+                "WASI CMake toolchain file not found: {}",
+                toolchain.display()
+            );
+        }
+        cfg.define(
+            "CMAKE_TOOLCHAIN_FILE",
+            toolchain
+                .to_str()
+                .expect("toolchain path contains non-UTF8 characters"),
+        );
+        cfg.define(
+            "WASI_SDK_PREFIX",
+            prefix
+                .to_str()
+                .expect("WASI_SDK_PREFIX contains non-UTF8 characters"),
+        );
+        cfg.define("CMAKE_TRY_COMPILE_TARGET_TYPE", "STATIC_LIBRARY");
+        cfg.define("CMAKE_SYSTEM_NAME", "WASI");
+        cfg.define("CMAKE_SYSTEM_PROCESSOR", "wasm32");
+    }
+    if is_wasm && cfg!(feature = "shared") {
+        panic!("shared linking is not supported for wasm32 targets");
+    }
+    if is_wasm && cfg!(feature = "gles") {
+        panic!("gles feature is not supported for wasm32 targets");
+    }
+
+    let build_shared = cfg!(feature = "shared") && !is_wasm;
+    let disable_threads = cfg!(feature = "no-threads") || is_wasm;
+
+    cfg.define("UHDR_BUILD_EXAMPLES", "OFF");
+    cfg.define("UHDR_BUILD_TESTS", "OFF");
+    cfg.define("UHDR_BUILD_BENCHMARK", "OFF");
+    cfg.define("UHDR_BUILD_FUZZERS", "OFF");
+    cfg.define("UHDR_BUILD_JAVA", "OFF");
+    cfg.define("UHDR_ENABLE_INSTALL", "OFF");
+    cfg.define(
+        "UHDR_BUILD_DEPS",
+        if cfg!(feature = "vendored") {
+            "ON"
+        } else {
+            "OFF"
+        },
+    );
+    cfg.define("BUILD_SHARED_LIBS", if build_shared { "ON" } else { "OFF" });
+
+    if cfg!(feature = "gles") {
+        cfg.define("UHDR_ENABLE_GLES", "ON");
+    }
+    // Control ISO 21496-1 metadata emission via feature flag (default ON).
+    cfg.define(
+        "UHDR_WRITE_ISO",
+        if cfg!(feature = "iso21496") {
+            "ON"
+        } else {
+            "OFF"
+        },
+    );
+    // Control XMP gain map metadata emission via feature flag (default ON).
+    cfg.define(
+        "UHDR_WRITE_XMP",
+        if cfg!(feature = "xmp") { "ON" } else { "OFF" },
+    );
+    if disable_threads {
+        cfg.define("UHDR_DISABLE_THREADS", "ON");
+    }
+    if cfg!(feature = "jpeg-max-dimension") {
+        // Use libjpeg-turbo's hardcoded JPEG_MAX_DIMENSION (65500).
+        cfg.define("UHDR_MAX_DIMENSION", "65500");
+    }
+
+    // Build only the main library target; install target is disabled upstream.
+    let cmake_target = if target_env == "msvc" && !build_shared {
+        "uhdr-static"
+    } else {
+        "uhdr"
+    };
+    cfg.build_target(cmake_target);
+
+    let dst = cfg.build();
+    // Link search paths (CMake binary dir holds libs when install is disabled).
+    println!("cargo:rustc-link-search=native={}/lib", dst.display());
+    println!("cargo:rustc-link-search=native={}/lib64", dst.display());
+    println!("cargo:rustc-link-search=native={}/build", dst.display());
+    if target_env == "msvc" {
+        println!(
+            "cargo:rustc-link-search=native={}/build/Release",
+            dst.display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}/build/Debug",
+            dst.display()
+        );
+    }
+
+    if cfg!(feature = "vendored") {
+        println!(
+            "cargo:rustc-link-search=native={}/build/turbojpeg/src/turbojpeg-build",
+            dst.display()
+        );
+        if target_env == "msvc" {
+            println!(
+                "cargo:rustc-link-search=native={}/build/turbojpeg/src/turbojpeg-build/Release",
+                dst.display()
+            );
+            println!(
+                "cargo:rustc-link-search=native={}/build/turbojpeg/src/turbojpeg-build/Debug",
+                dst.display()
+            );
+        }
+        let jpeg_name = if target_env == "msvc" {
+            "jpeg-static"
+        } else {
+            "jpeg"
+        };
+        println!("cargo:rustc-link-lib=static={}", jpeg_name);
+    } else {
+        // nc distributes a self-contained CLI. CMake locates the platform's
+        // development archive; force the final Rust link to consume the static
+        // archive rather than leaving a runtime libjpeg dependency.
+        if target_os == "macos" {
+            for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
+                if Path::new(prefix).join("libjpeg.a").is_file() {
+                    println!("cargo:rustc-link-search=native={prefix}");
+                }
+            }
+        }
+        println!("cargo:rustc-link-lib=static=jpeg");
+    }
+
+    let link_name = if target_env == "msvc" && !build_shared {
+        "uhdr-static"
+    } else {
+        "uhdr"
+    };
+    let link_kind = if build_shared { "dylib" } else { "static" };
+    println!("cargo:rustc-link-lib={}={}", link_kind, link_name);
+    if target_env != "msvc" {
+        if is_wasm {
+            if let Some((_, prefix)) = &wasi {
+                println!(
+                    "cargo:rustc-link-search=native={}/share/wasi-sysroot/lib/wasm32-wasip1",
+                    prefix.display()
+                );
+                println!("cargo:rustc-link-lib=static=c++");
+                println!("cargo:rustc-link-lib=static=c++abi");
+                println!("cargo:rustc-link-lib=static=setjmp");
+            }
+        } else {
+            let cxx_stdlib = if target_os == "macos" {
+                "c++"
+            } else {
+                "stdc++"
+            };
+            println!("cargo:rustc-link-lib={}", cxx_stdlib);
+        }
+    }
+
+    let bindgen_target = if is_wasm {
+        "i686-unknown-linux-gnu"
+    } else {
+        target.as_str()
+    };
+
+    let mut bindings = bindgen::Builder::default()
+        .header(source_dir.join("ultrahdr_api.h").to_string_lossy())
+        .clang_arg(format!("-I{}", source_dir.display()))
+        .rustified_enum("uhdr_.*")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .layout_tests(false)
+        .clang_arg(format!("--target={}", bindgen_target));
+    if !is_wasm {
+        bindings = bindings
+            .allowlist_function("uhdr_.*")
+            .allowlist_type("uhdr_.*")
+            .allowlist_var("UHDR_.*");
+    }
+    if !is_wasm && let Some((_, prefix)) = &wasi {
+        bindings = bindings.clang_arg(format!("--sysroot={}/share/wasi-sysroot", prefix.display()));
+    }
+    let bindings = bindings.generate().expect("bindgen failed");
+
+    let bindings_path = out_dir.join("bindings.rs");
+    bindings
+        .write_to_file(&bindings_path)
+        .expect("failed to write bindings");
+    if is_wasm && let Ok(content) = fs::read_to_string(&bindings_path) {
+        let fn_count = content.matches("pub fn ").count();
+        if fn_count == 0 {
+            println!("cargo:warning=bindgen generated 0 functions for wasm target");
+        }
+    }
+}

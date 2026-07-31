@@ -1,0 +1,14 @@
+<!-- Copyright (C) 2023 The Android Open Source Project
+
+     Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+     https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+     <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+     option. This file may not be copied, modified, or distributed
+     except according to those terms.
+-->
+
+<dynamicConfig>
+    <entry key="media_files_url">
+          <value>https://storage.googleapis.com/android_media/external/libultrahdr/benchmark/UltrahdrBenchmarkTestRes-1.2.zip</value>
+    </entry>
+</dynamicConfig>

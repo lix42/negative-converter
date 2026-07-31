@@ -1,134 +1,98 @@
-# ISO Gain-Map HDR Output
+# Ultra HDR v1 Gain-Map JPEG Output
 
 ## Goal
 
-Write a standards-based, backward-compatible HDR still image containing an SDR
-base rendition plus an ISO 21496-1 gain map. Initially target JPEG with both
-final ISO and Android Ultra HDR v1 compatibility metadata; defer HEIC until a
-portable encoder and licensing policy satisfy the HDR spike.
+Write a backward-compatible HDR JPEG containing an ordinary Display P3 SDR base
+plus a public Ultra HDR v1 luminance gain map. Expose it explicitly as
+`--output-preset ultra-hdr-v1`; do not label it ISO-conformant or make it the
+default before the downstream final-ISO and preset tasks are complete.
 
 ## Design
 
-Combine two independently valid renderings of the mapped film image:
+Combine two independently valid renderings of the same mapped film image:
 
 ```text
-SDR Display P3 base + display-HDR rendition → gain map + ISO metadata → container
+SDR Display P3 base + display-HDR rendition
+  → common linear Display P3
+  → Ultra HDR v1 gain map + XMP/MPF/GContainer
+  → JPEG
 ```
 
-Both renditions must originate from the same ACEScg film-rendering pixels and identical
-resolved shared linear adjustments (white balance, exposure, and black/range placement).
-They diverge only in SDR-versus-HDR reference-white, tone, gamut, and transfer
-rendering.
+Both renditions originate from one ACEScg film-rendering image and identical
+resolved shared linear adjustments. They diverge only in SDR-versus-HDR tone
+and gamut rendering. Before transfer encoding, convert both to linear Display
+P3 relative to the fixed 203 cd/m² reference white. Never divide encoded
+Display P3 and PQ/BT.2020 values.
 
-Before transfer encoding, convert both renditions into linear Display P3 and
-derive an RGB gain map there. Never divide encoded Display P3 and PQ/BT.2020
-channel values: their primaries and nonlinear transfer functions are different.
-The implemented HDR renderer's pre-transfer `LinearBt2020Hdr` is therefore an
-input to a required BT.2020→Display P3 conversion, not a ready/common gain-map
-buffer.
-Encode the resulting scale/offset/gamma/headroom metadata and ensure the SDR base
-remains the default representation for unaware readers. The initial target is
-an 8-bit Display P3 JPEG base, 4:4:4 at quality 95, plus a half-resolution RGB
-gain map. These codec settings are provisional until the acceptance task freezes
-measured codec-aware bounds. Use the neutral public name `gain-map-hdr`; do not
-brand the format for one platform.
-
-Keep display/content headroom distinct from serialized gain-map parameters. For
-the initial 203/1000 policy, linear display headroom is
-`1000 / 203 = 4.926108...` and its logarithmic capacity is
-`log2(1000 / 203) = 2.300448...`. `libultrahdr`'s C API exposes capacity in
-linear scale, while Ultra HDR XMP serializes `HDRCapacityMax`, `GainMapMax`, and
-the corresponding minima in log2 units. Convert deliberately at that boundary;
-never serialize `4.926108` as an Ultra HDR XMP logarithmic capacity.
-
-Before selecting offsets or computing gain, express both linear Display P3
-renderings in reference-white-relative units. SDR/reference white is `1.0`.
-Divide HDR absolute luminance by the pinned 203 cd/m² reference white, so
-203 nits is `1.0` and 1000 nits is `4.926108...`. Express both offsets in this
-same normalized domain. Mixing absolute-nit HDR values with `[0,1]` or
-reference-white-relative SDR values is a unit error and must fail with a
-diagnostic before gain-map generation. Preserve unit/domain tags at the renderer
-boundary (or use distinct typed buffers) so this rejection is enforceable rather
-than inferred from sample magnitude.
-
-After selecting and pinning per-channel positive finite offsets, derive every
-gain sample in that common normalized linear Display P3 domain from exactly:
+Keep the canonical full-resolution RGB ratio model for the future ISO
+serializer. Legacy XMP mode cannot signal a multi-channel gain map, so derive
+this preset's one supported gain channel from Display P3 luminance:
 
 ```text
-gain_c = (HDR_c + offset_hdr,c) / (SDR_c + offset_sdr,c)
+gain = (luma(HDR) + offset_hdr) / (luma(SDR) + offset_sdr)
 ```
 
-Ultra HDR guidance suggests `1/64` offsets, but do not assume that value has
-final ISO-equivalent semantics until the licensed normative review confirms the
-mapping. Require every rendered HDR/SDR sample to be finite and nonnegative.
-Require every offset, adjusted denominator, and resulting gain to be finite and
-positive before taking a logarithm. Any violation fails loudly; do not inject an
-arbitrary epsilon, silently clamp a sample, or define `0/0`.
+Pin both offsets to `1/64` and gain gamma to `1`. Require every input, adjusted
+denominator/numerator, gain, and logarithm to be finite and valid; do not inject
+an epsilon or silently define `0/0`. Derive gain minima/maxima from
+the actual pixels, express them as log2 metadata, encode each gain into the
+public normalized logarithmic recovery representation, then downsample that
+floating recovery image to half width and half height with bilinear-or-better
+filtering. Quantize once to 8-bit grayscale using the documented nearest-integer rule.
 
-Derive per-channel gain-map minima and maxima from that exact offset-adjusted
-formula. They need not equal the global display-headroom ratio because the
-independent SDR and HDR tone maps differ. Serialize each metadata dialect from
-this one canonical scale/offset/gamma/capacity model, with explicit unit
-conversions, and require the ISO 21496-1 and Ultra HDR v1 interpretations to
-agree semantically.
+Encode an 8-bit Display P3 primary JPEG at quality 95 with 4:4:4 chroma and an
+8-bit grayscale secondary gain-map JPEG. Embed the synthesized Display P3 ICC profile
+in the primary image. Preserve normalized orientation and deterministic
+metadata; never add timestamps, random identifiers, or draft/final ISO markers.
 
-Use a narrow, audited Rust FFI around a corrected `libultrahdr` release or
-reviewed patch. Stable 1.4.0 is not acceptable unchanged: its APP2-before-JFIF
-marker ordering failed macOS ImageIO in the spike. Verify final ISO 21496-1:2025
-serialization rather than the earlier ISO/TS draft identifier, include Ultra
-HDR v1 compatibility metadata in the same file, and add the required Adobe
-gain-map license notice if that patent grant is used. Keep container code
-separate enough that final-standard HEIF/AVIF gain-map encoders can be added
-without changing the rendering model. See
-[the decision note](../../hdr-output-spike.md).
+Use a narrow audited Rust boundary around google/libultrahdr pinned at or after
+approved marker-order merge commit
+`11ac0c325bbf56ecf8be8704ff0f79fc9e1aac77`. Statically package the required
+native code and the pinned libjpeg-turbo 3.1.0 source so macOS and Linux builds
+do not depend on a machine-installed library. Keep the binding private and translate every native
+error into `NcError`; document every unsafe pointer/lifetime invariant.
 
-Before this product path becomes CLI-reachable, extend and calibrate
-`pipeline::memory` for the actual overlapping full-frame buffers. At minimum the
-shared adjusted ACEScg source remains live while each 12 B/px display rendition
-is allocated; gain-map construction may require the SDR and converted HDR
-renditions plus gain-map/codec staging simultaneously. The current
-`RunProfile::Convert` intentionally models only the shipped legacy pipeline and
-must not be reused unchanged for this path.
+The explicit preset owns its complete policy and accepts only `.jpg`/`.jpeg`.
+It rejects legacy TIFF depth/profile controls rather than silently ignoring
+them. Recipe/CLI merge, resolved reports, transactional writes, roll naming,
+and making the neutral dual-dialect `gain-map-hdr` output the default remain
+owned by `output/presets`; this task activates only the explicit single-file
+`convert` path needed to use and verify Ultra HDR v1 now.
+
+Before activation, add a gain-map-specific memory profile. It must count the
+shared adjusted ACEScg source, SDR rendition, converted HDR rendition,
+full-resolution gain ratios/recovery values, half-resolution map, quantized
+codec inputs, and native output staging that are simultaneously live. Calibrate
+the conservative model against measured peak RSS without weakening the existing
+legacy profile.
+
+Distribution documentation must include the prominent Adobe notice:
+“This product includes Gain Map technology under license by Adobe.”
 
 ## How to Verify
 
-- An independent ISO 21496-1 implementation and an independent Ultra HDR v1
-  implementation each reconstruct the canonical HDR/headroom from the same file
-  within the pinned bounds.
-- Independent metadata inspection proves both dialects express the same
-  scale/offset/gamma/capacity semantics after their specified unit conversions,
-  including log2 Ultra HDR XMP values; a deliberately conflicting dual-metadata
-  fixture proves a dual-aware decoder selects ISO 21496-1.
-- Tests prove both renditions originate from the identical mapped/shared-
-  adjusted source and that gains use the pinned offset-adjusted formula in the
-  common reference-white-relative linear domain, not encoded P3/PQ/HLG samples
-  or mixed absolute/normalized units.
-- Memory-preflight tests and measured calibration cover the gain-map path's
-  simultaneous shared source, SDR, converted common-domain HDR, gain-map, and
-  codec staging buffers before the preset is activated.
-- Equal SDR/HDR reference-white samples (`1.0`) with equal offsets yield gain
-  exactly 1. A peak fixture converts 1000 nits to `4.926108...` before the
-  formula, then computes expected gain from the actual independently tone-mapped
-  SDR sample and both offsets; it must not assert gain `4.926108...` merely from
-  display headroom.
-- Black, near-black, and zero-channel fixtures prove pinned positive offsets
-  yield finite positive gains without arbitrary epsilon handling. Negative or
-  nonfinite samples, nonpositive/nonfinite offsets or denominators, overflow,
-  and nonpositive/nonfinite gains fail before logarithm/serialization.
-- A mixed-units fixture passes absolute-nit HDR with normalized SDR and verifies
-  a stable unit/domain diagnostic with no partial output.
-- A decoder that ignores the gain map displays the correct SDR Display P3 base.
-- Metadata, orientation, dimensions, profile/CICP information, and content
-  headroom survive round trip.
-- Files render as HDR in target macOS/iOS software and in at least one supported
-  non-Apple implementation; Android 14 Ultra HDR v1, Android 15+ ISO metadata,
-  current Chromium/Safari, Firefox fallback, and an ordinary JPEG reader are
-  tested independently.
-- JFIF APP0 precedes ISO/MPF APP2 metadata, final ISO and compatibility metadata
-  independently decode through the same gain map to equivalent HDR results, and
-  the default JPEG image opens without repair.
-- Encoding is deterministic to the degree promised by the selected codec, with
-  nondeterministic metadata removed or normalized.
+- An ordinary JPEG reader displays the intended Display P3 SDR primary image.
+- libultrahdr reconstructs the HDR rendition and reports the intended
+  identical-channel offsets, gamma, gain extrema, and 203/1000 headroom.
+- Independent metadata inspection finds valid Ultra HDR v1 XMP plus MPF and
+  GContainer linkage, with no ISO or ISO/TS marker.
+- Equal SDR/HDR reference-white samples produce gain exactly 1; black,
+  near-black, saturated, odd-dimension, and independently tone-mapped peak
+  fixtures reconstruct within measured codec-aware bounds.
+- Tests pin log2 normalization, gamma, half-resolution bilinear sampling,
+  8-bit rounding, grayscale component count, ICC embedding, orientation, dimensions,
+  and JFIF/APP/MPF marker ordering.
+- Negative/nonfinite samples, invalid offsets or gamma, invalid extrema,
+  overflow, mixed units, mismatched dimensions, unsupported suffixes, native
+  errors, and partial writes fail loudly.
+- `nc convert input.tif -o output.jpg --output-preset ultra-hdr-v1` succeeds and
+  records the explicit non-ISO format. The same preset with `.tiff` fails
+  without creating output.
+- Memory-preflight tests and measured RSS cover the actual overlapping buffers.
+- Fixed same-build inputs and parameters produce byte-identical files.
+- The corrected file is exercised with current macOS ImageIO and an Android
+  Ultra HDR implementation when those environments are available; unsupported
+  readers retain the SDR fallback.
 
 ## Dependencies
 

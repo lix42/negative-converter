@@ -64,9 +64,10 @@ degenerate (e.g. finite all-black) image. Two complementary mechanisms:
 > from first principles. **(b)** `pipeline::render_split::ResolvedPrintControls::new`
 > already guards the same arithmetic — `is_normal()` on the gain **and** on each
 > `wb[c] · exposure_gain` product, since individually-valid factors can multiply to
-> `0.0` — but that is the **shared display stage**, which has no CLI-reachable consumer
-> yet, and the legacy print path above does not route through it. Treat it as a
-> reference implementation of the numeric predicate, not as coverage.
+> `0.0` — but that is the **shared display stage**, now reached by the explicit
+> `ultra-hdr-v1` preset; the legacy print path above still does not route through
+> it. Treat it as a reference implementation of the numeric predicate and Ultra
+> HDR coverage, not as coverage for the legacy defect described here.
 
 ## Design
 

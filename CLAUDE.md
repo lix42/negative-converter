@@ -96,33 +96,36 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   consumes the IR plane to mask the opaque holder before the auto rebate search.
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
-  `io/{decode,encode}.rs`,
-  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,hdr,memory}.rs`
+  `io/{decode,encode,ultra_hdr}.rs`,
+  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,hdr,gain_map,memory}.rs`
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure reconstruction→named-output core (stages
   3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
   path (`reconstruct → finish_print → color::to_output`) or `film-master`
   (`reconstruct → map_nc_film_rgb_v1 → render_split::film_master`, no colour
-  transform). It has **no CLI-reachable** display (5b) arm yet —
-  `render_split::display_source` feeds the implemented `pipeline::sdr` and
-  `pipeline::hdr` stages. SDR returns opaque rendered-linear Display P3/sRGB
+  transform). The explicitly selected, `convert`-only `ultra-hdr-v1` arm is the
+  first CLI-reachable display (5b) consumer: `stages::render_gain_map_source`
+  resolves one shared source, `pipeline::gain_map` feeds the implemented
+  `pipeline::sdr` and `pipeline::hdr` stages, and `io::ultra_hdr` writes legacy
+  XMP/MPF metadata with no ISO claim. SDR returns opaque rendered-linear Display P3/sRGB
   pixels coupled to resolved 203-nit tone/gamut metadata;
   `color::encode_rendered_sdr` derives the matching transfer/profile without a
   second gamut transform. HDR returns either opaque display-linear BT.2020
   pixels (which gain-map work must convert to common linear Display P3 before
   ratio math) or opaque in-place Rec.2100 PQ/HLG pixels coupled to the fixed
   203-nit reference-white / 1000-nit peak, shoulder, gamut, HLG OOTF, and CICP
-  contract. `output/presets` still owns product/CLI activation;
+  contract. `output/presets` still owns the remaining presets, roll integration,
+  and future default activation;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
   ACEScg mapper; `render_split` is the named-output split out of that boundary —
   `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
   controls `WB → exposure → black point → linear_range`, resolved once and
-  *borrowed* by both display branches. The `film-master` half is wired; the
-  SDR and HDR display halves are built and unit-tested but have no CLI-reachable
-  consumer until `output/presets`, so a non-default `print.linear_range` is a
-  loud usage error rather than a silently-ignored knob;
+  *borrowed* by both display branches. The `film-master` half and explicit
+  `ultra-hdr-v1` consumer are wired; a non-default `print.linear_range` is
+  accepted only by that display preset (legacy ignores it and film-master
+  rejects it);
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
@@ -170,10 +173,10 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   returns** the image, transforming those very buffers). If you add a full-frame
   buffer to any stage, update that model — **nothing tests it against the code**, so
   the gate silently under-approves until someone does. `decode` is
-  `decode_within(&Path, budget_bytes)`. The current `RunProfile::Convert` models
-  the shipped legacy pipeline only: `output/presets` must add and calibrate
-  preset-specific accounting for shared-source + display-render overlap (and
-  both renditions/gain-map staging where applicable) before display activation.
+  `decode_within(&Path, budget_bytes)`. `RunProfile::Convert` models the TIFF
+  paths; `RunProfile::UltraHdrV1` separately counts shared-source, dual-render,
+  gain-map, JPEG, native-copy, and package staging. Future presets must add and
+  calibrate their own profile before activation.
 
 ### Stack / commands
 

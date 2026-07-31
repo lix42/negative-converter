@@ -8,9 +8,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tiff::encoder::{TiffEncoder, colortype};
+use ultrahdr_sys as uhdr;
 
 /// The binary under test, provided by Cargo for integration tests.
 const NC: &str = env!("CARGO_BIN_EXE_nc");
@@ -39,6 +41,20 @@ fn write_uniform_rgb48(path: &Path, rgb: [u16; 3], w: u32, h: u32) {
         enc.write_image::<colortype::RGB16>(w, h, &data).unwrap();
     }
     std::fs::write(path, &buf).unwrap();
+}
+
+fn write_rgb48_pixels(path: &Path, width: u32, height: u32, rgb: &[[u16; 3]]) {
+    use tiff::tags::Tag;
+    assert_eq!(rgb.len(), (width * height) as usize);
+    let data = rgb.iter().flatten().copied().collect::<Vec<_>>();
+    let xmp = silverfast_xmp(XMP_NEG);
+    let mut enc = TiffEncoder::new(std::fs::File::create(path).unwrap()).unwrap();
+    let mut image = enc.new_image::<colortype::RGB16>(width, height).unwrap();
+    image
+        .encoder()
+        .write_tag(Tag::Unknown(700), xmp.as_bytes())
+        .unwrap();
+    image.write_data(&data).unwrap();
 }
 
 /// Minimal synthetic SilverFast XMP packet (the real one is ~150 KB; only the
@@ -166,6 +182,266 @@ fn is_tiff(path: &Path) -> bool {
     bytes.len() > 4
         && &bytes[0..2] == b"II"
         && matches!(u16::from_le_bytes([bytes[2], bytes[3]]), 42 | 43)
+}
+
+fn primary_jpeg_icc(bytes: &[u8]) -> Vec<u8> {
+    assert_eq!(&bytes[..2], &[0xff, 0xd8]);
+    let mut chunks = Vec::new();
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        assert_eq!(bytes[offset], 0xff);
+        let marker = bytes[offset + 1];
+        if marker == 0xda || marker == 0xd9 {
+            break;
+        }
+        let length = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        let payload = &bytes[offset + 4..offset + 2 + length];
+        if marker == 0xe2 && payload.starts_with(b"ICC_PROFILE\0") {
+            chunks.push((payload[12], payload[13], payload[14..].to_vec()));
+        }
+        offset += 2 + length;
+    }
+    assert!(!chunks.is_empty(), "primary JPEG has no ICC APP2 chunks");
+    chunks.sort_by_key(|chunk| chunk.0);
+    let total = chunks[0].1;
+    assert_eq!(chunks.len(), usize::from(total));
+    assert!(
+        chunks
+            .iter()
+            .enumerate()
+            .all(
+                |(index, (sequence, count, _))| *sequence as usize == index + 1 && *count == total
+            )
+    );
+    chunks
+        .into_iter()
+        .flat_map(|(_, _, payload)| payload)
+        .collect()
+}
+
+fn decode_ultra_hdr_pq(path: &Path, display_boost: f32) -> (u32, u32, Vec<[u16; 3]>) {
+    let bytes = std::fs::read(path).unwrap();
+    let decoder = NonNull::new(unsafe { uhdr::uhdr_create_decoder() }).unwrap();
+    let mut image = uhdr::uhdr_compressed_image_t {
+        data: bytes.as_ptr().cast_mut().cast(),
+        data_sz: bytes.len(),
+        capacity: bytes.len(),
+        cg: uhdr::uhdr_color_gamut_t::UHDR_CG_UNSPECIFIED,
+        ct: uhdr::uhdr_color_transfer_t::UHDR_CT_UNSPECIFIED,
+        range: uhdr::uhdr_color_range_t::UHDR_CR_UNSPECIFIED,
+    };
+    let ok = |status: uhdr::uhdr_error_info_t| {
+        assert_eq!(status.error_code, uhdr::uhdr_codec_err_t::UHDR_CODEC_OK);
+    };
+    unsafe {
+        ok(uhdr::uhdr_dec_set_image(decoder.as_ptr(), &mut image));
+        ok(uhdr::uhdr_dec_set_out_img_format(
+            decoder.as_ptr(),
+            uhdr::uhdr_img_fmt_t::UHDR_IMG_FMT_32bppRGBA1010102,
+        ));
+        ok(uhdr::uhdr_dec_set_out_color_transfer(
+            decoder.as_ptr(),
+            uhdr::uhdr_color_transfer_t::UHDR_CT_PQ,
+        ));
+        ok(uhdr::uhdr_dec_set_out_max_display_boost(
+            decoder.as_ptr(),
+            display_boost,
+        ));
+        ok(uhdr::uhdr_decode(decoder.as_ptr()));
+    }
+    let decoded = NonNull::new(unsafe { uhdr::uhdr_get_decoded_image(decoder.as_ptr()) }).unwrap();
+    let decoded = unsafe { decoded.as_ref() };
+    let packed = decoded.planes[uhdr::UHDR_PLANE_PACKED as usize].cast::<u32>();
+    assert!(!packed.is_null());
+    let stride = decoded.stride[0] as usize;
+    let words = unsafe { std::slice::from_raw_parts(packed, stride * decoded.h as usize) };
+    let mut pixels = Vec::with_capacity((decoded.w * decoded.h) as usize);
+    for y in 0..decoded.h as usize {
+        for x in 0..decoded.w as usize {
+            let word = words[y * stride + x];
+            pixels.push([
+                (word & 0x3ff) as u16,
+                ((word >> 10) & 0x3ff) as u16,
+                ((word >> 20) & 0x3ff) as u16,
+            ]);
+        }
+    }
+    let dimensions = (decoded.w, decoded.h);
+    unsafe { uhdr::uhdr_release_decoder(decoder.as_ptr()) };
+    (dimensions.0, dimensions.1, pixels)
+}
+
+#[test]
+fn ultra_hdr_v1_writes_a_deterministic_legacy_gain_map_jpeg() {
+    let tmp = TempDir::new("ultra-hdr-v1");
+    let first = tmp.path("first.jpg");
+    let second = tmp.path("second.jpeg");
+    for (index, output) in [&first, &second].into_iter().enumerate() {
+        let telemetry = tmp.path(&format!("telemetry-{index}.json"));
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            "ultra-hdr-v1",
+            "--film-base",
+            "1,1,1",
+            "--telemetry-file",
+            telemetry.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let report = json(&stdout);
+        assert_eq!(report["recipe"]["output"]["preset"], "ultra-hdr-v1");
+        assert_eq!(
+            report["output_render"]["encoding"],
+            "legacy-ultra-hdr-v1-xmp-mpf-jpeg"
+        );
+        let decoded = image::open(output).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (502, 462));
+        let timing: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(telemetry).unwrap()).unwrap();
+        assert!(
+            timing["timing_ms"]["color"]
+                .as_f64()
+                .is_some_and(|value| value > 0.0),
+            "gain-map SDR/HDR rendering must be included in timing_ms.color: {timing}"
+        );
+    }
+    let bytes = std::fs::read(&first).unwrap();
+    assert_eq!(&bytes[..2], &[0xff, 0xd8]);
+    assert!(
+        bytes
+            .windows(b"hdrgm:Version=\"1.0\"".len())
+            .any(|window| window == b"hdrgm:Version=\"1.0\"")
+    );
+    assert!(
+        bytes
+            .windows(b"Item:Semantic=\"GainMap\"".len())
+            .any(|window| window == b"Item:Semantic=\"GainMap\"")
+    );
+    assert!(!bytes.windows(5).any(|window| window == b"21496"));
+    let marker = |needle: &[u8]| {
+        bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap()
+    };
+    assert!(marker(b"JFIF\0") < marker(b"MPF\0"));
+    let reference = tmp.path("display-p3-reference.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        reference.to_str().unwrap(),
+        "--film-base",
+        "1,1,1",
+        "--output-profile",
+        "display-p3",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        primary_jpeg_icc(&bytes),
+        read_icc_tag(&reference),
+        "primary JPEG ICC chunks must reassemble to nc's synthesized Display P3 profile"
+    );
+    assert_eq!(bytes, std::fs::read(&second).unwrap());
+}
+
+#[test]
+fn ultra_hdr_v1_rejects_a_non_jpeg_suffix_before_writing() {
+    let tmp = TempDir::new("ultra-hdr-v1-suffix");
+    let output = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--output-preset",
+        "ultra-hdr-v1",
+        "--film-base",
+        "1,1,1",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(".jpg"), "{err}");
+    assert!(!output.exists());
+}
+
+#[test]
+fn ultra_hdr_v1_native_reconstruction_covers_odd_dimensions_and_hdr_vectors() {
+    let tmp = TempDir::new("ultra-hdr-v1-native-odd");
+    let input = tmp.path("odd.tiff");
+    let output = tmp.path("odd.jpg");
+    let row = [
+        [u16::MAX; 3],                // black positive
+        [57_343; 3],                  // 0.125 positive; ×8 exposure = reference white
+        [0; 3],                       // neutral peak
+        [57_343, u16::MAX, u16::MAX], // saturated red at reference-white scale
+        [u16::MAX / 2; 3],            // mid gray
+    ];
+    let pixels = row.into_iter().cycle().take(15).collect::<Vec<_>>();
+    write_rgb48_pixels(&input, 5, 3, &pixels);
+    let (code, _stdout, err) = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--output-preset",
+        "ultra-hdr-v1",
+        "--reconstruction",
+        "simple",
+        "--film-base",
+        "1,1,1",
+        "--print-exposure",
+        "3",
+    ]);
+    assert_eq!(code, 0, "{err}");
+
+    let headroom = 1000.0 / 203.0;
+    let (width, height, decoded) = decode_ultra_hdr_pq(&output, headroom);
+    assert_eq!((width, height), (5, 3));
+
+    // Independent ST 2084 inverse-EOTF oracle, rounded to the decoder's 10-bit
+    // packed PQ code domain. JPEG base/map loss is bounded around these anchors.
+    let pq_code = |nits: f64| {
+        let m1 = 2610.0 / 16384.0;
+        let m2 = 2523.0 / 32.0;
+        let c1 = 3424.0 / 4096.0;
+        let c2 = 2413.0 / 128.0;
+        let c3 = 2392.0 / 128.0;
+        let p = (nits / 10_000.0).powf(m1);
+        (((c1 + c2 * p) / (1.0 + c3 * p)).powf(m2) * 1023.0).round() as i32
+    };
+    let neutral_error = |pixel: [u16; 3], expected: i32| {
+        pixel
+            .into_iter()
+            .map(|value| (i32::from(value) - expected).abs())
+            .max()
+            .unwrap()
+    };
+    assert!(
+        neutral_error(decoded[0], pq_code(0.0)) <= 32,
+        "black reconstruction outside codec-aware bound: {:?}",
+        decoded[0]
+    );
+    assert!(
+        // The half-resolution map deliberately shares support with the adjacent
+        // peak before JPEG quantization; allow that bounded upward error while
+        // still rejecting a missing/flat gain reconstruction.
+        neutral_error(decoded[1], pq_code(203.0)) <= 96,
+        "reference-white reconstruction outside codec-aware bound: {:?}",
+        decoded[1]
+    );
+    assert!(
+        neutral_error(decoded[2], pq_code(1000.0)) <= 64,
+        "peak reconstruction outside codec-aware bound: {:?}",
+        decoded[2]
+    );
+    assert!(
+        decoded[3][0] > decoded[3][1] + 80 && decoded[3][0] > decoded[3][2] + 80,
+        "saturated-red reconstruction lost channel separation: {:?}",
+        decoded[3]
+    );
 }
 
 #[test]

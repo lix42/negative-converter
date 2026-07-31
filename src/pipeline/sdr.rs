@@ -46,7 +46,7 @@ pub struct RenderedSdr {
 
 impl RenderedSdr {
     /// Borrow the pre-transfer, destination-linear rendition.
-    #[allow(dead_code)] // consumed next by `output/gain-map-hdr-output`.
+    #[allow(dead_code)] // borrowed next by the pre-container gain-map seam.
     pub fn image(&self) -> &LinearImage {
         &self.image
     }
@@ -58,6 +58,7 @@ impl RenderedSdr {
     }
 
     /// Consume the typed pair at the destination-encoding boundary.
+    #[allow(dead_code)] // consumed next by output container activation.
     pub(crate) fn into_parts(self) -> (LinearImage, SdrRenderMetadata) {
         (self.image, self.metadata)
     }
