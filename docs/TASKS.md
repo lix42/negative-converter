@@ -38,14 +38,15 @@ decode → validate input semantics → film-base → preset dispatch
 
 The target `film-master` branch preserves NC's intentional film, lens,
 development, and scanner rendering in unclamped linear ACEScg. It includes
-reconstruction, the selected exponential/sigmoid density curve, and supported
-fixed/roll Dmax placement, but bypasses later print/display controls and rejects
-frame-local auto Dmax. Simple and density paths produce one typed
-`FilmRgbImage`; NC film RGB v1 interprets that rendering consistently as linear
-Rec.709/D65 and maps it into ACEScg/D60. This is film-rendering intent, not
-physical scene recovery. Optional measured correction profiles have no
-downstream blockers. Today’s `--output-hdr` remains a rendered float TIFF, not
-the future master branch.
+reconstruction and the reference-anchored sigmoid's toe/midtone/shoulder
+rendering, with fixed/roll Dmax placement, but bypasses later print/display
+controls and rejects frame-local fitting. Exponential and simple remain
+advanced/diagnostic paths pending a separate retirement decision. All paths
+produce one typed `FilmRgbImage`; NC film RGB v1 interprets that rendering
+consistently as linear Rec.709/D65 and maps it into ACEScg/D60. This is
+film-rendering intent, not physical scene recovery. Optional measured correction
+profiles have no downstream blockers. Today’s `--output-hdr` remains a rendered
+float TIFF, not the future master branch.
 
 One bullet per epic below — the name is the epic id the task list is grouped
 under, and the parenthesized paths are the modules it owns.
@@ -56,7 +57,11 @@ under, and the parenthesized paths are the modules it owns.
   frame. The two are *different quantities* (see design-spec §4) that share this
   measurement surface.
 - **color** (`pipeline/color.rs`, `pipeline/working_space.rs`) — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
-- **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged `reconstruction` recipe object into `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve; `algo::finish_print` is the stage-4 print bridge. Tone, white balance, and color-model variants are parameters of this stage.
+- **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged
+  `reconstruction` recipe object into simple or density reconstruction. The
+  reference-anchored sigmoid is the candidate product default and owns
+  floor/toe, midtone, and shoulder placement; exponential/simple remain explicit
+  advanced references. `algo::finish_print` is the stage-4 print bridge.
 - **output** (the encoders downstream of `color`) — the display renditions:
   Display P3 / SDR, BT.2020 PQ/HLG, explicit legacy Ultra HDR v1 gain-map JPEG
   (with final ISO metadata planned), AVIF, and the presets that resolve them
@@ -108,7 +113,9 @@ graph TD
   algo --> color
   film-base --> color
   color --> output
+  algo --> output
   core --> output
+  output --> algo
   output --> analysis
 ```
 
@@ -152,6 +159,8 @@ graph TD
     algo/density
     algo/sigmoid
     algo/negative-reconstruction-density-curves
+    algo/reference-anchored-sigmoid
+    algo/content-aware-sigmoid-toe
     algo/dmax-white-anchor
     algo/density-safety-bounds
     algo/auto-neutral-wb
@@ -259,6 +268,11 @@ graph TD
   io/input-data-semantics --> algo/negative-reconstruction-density-curves
   film-base/dmax-reference --> algo/negative-reconstruction-density-curves
   algo/sigmoid --> algo/negative-reconstruction-density-curves
+  algo/negative-reconstruction-density-curves --> algo/reference-anchored-sigmoid
+  film-base/dmax-reference --> algo/reference-anchored-sigmoid
+  algo/reference-anchored-sigmoid --> algo/content-aware-sigmoid-toe
+  core/roll-conversion --> algo/content-aware-sigmoid-toe
+  output/presets --> algo/content-aware-sigmoid-toe
   algo/negative-reconstruction-density-curves --> color/film-rgb-working-space
   color/management --> color/film-rgb-working-space
   color/film-rgb-working-space --> color/film-master-render-pipeline
@@ -282,6 +296,7 @@ graph TD
   output/hdr-display-rendering --> output/hdr-avif-output
   output/iso-gain-map-metadata --> output/presets
   output/hdr-avif-output --> output/presets
+  algo/reference-anchored-sigmoid --> output/presets
   core/roll-conversion --> output/presets
   core/conversion-versioning --> output/presets
   output/presets --> analysis/display-output-acceptance
@@ -334,6 +349,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/density`: `algo/interface`
 - `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
+- `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
+- `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`; no downstream blockers
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
@@ -353,7 +370,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `output/ultrahdr-dependency-externalization` (post-MVP, **deferred maintenance**; no downstream blockers): `output/gain-map-hdr-output`
 - `output/iso-gain-map-metadata` (post-MVP): `output/gain-map-hdr-output`
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
-- `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `core/roll-conversion`, `core/conversion-versioning`
+- `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `core/conversion-versioning`
 - `telemetry/perf-instrumentation` (post-MVP, **parked**): `core/pipeline-orchestration`
   — LAB criterion benches; prototyped and parked on git branch
   prototype/perf-bench-instrumentation, superseded by telemetry/perf-telemetry as
@@ -473,6 +490,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Display-range white anchor (Dmax)](tasks/algo/dmax-white-anchor.md) — shipped legacy semantics; the replacement density-curve stage owns its curve-specific placement/shape meaning
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo/sigmoid.md)
 - [x] [Negative reconstruction and density curves](tasks/algo/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
+- [ ] [Reference-anchored sigmoid calibration and redesign](tasks/algo/reference-anchored-sigmoid.md) — reproduce and quantify the shipped sigmoid's raised, narrow real-roll shadow spread, then choose the least invasive defaults/semantics/equation remedy against frozen film-master/SDR/HDR metrics
+- [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [x] [Auto neutral white balance](tasks/algo/auto-neutral-wb.md)
 - [x] [Regional (shadow/highlight) color balance](tasks/algo/regional-color-balance.md)
 - [ ] [Black & white negative support (mono color model)](tasks/algo/bw-support.md)

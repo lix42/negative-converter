@@ -336,3 +336,17 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 **Updated:** —
 
 - Goal: Ingest Negative Lab Pro (NLP) conversion outputs (the user adds them to `nc-assets`) and compare them against nc's outputs: global per-image metrics side by side, plus side-by-side downscaled thumbnails.
+
+
+## display-output-acceptance (continued)
+
+**Status:** not started
+**Updated:** 2026-07-30
+
+- 2026-07-30: Added a quantitative master/display tonal-delta gate. The
+  reference-anchored reconstruction sigmoid owns the toe; normalized display
+  outputs may differ for declared transfer/reference-white/highlight/gamut
+  reasons but fail if they introduce a second shadow-floor lift or broad
+  midtone re-grade. Numeric bounds must be established from the frozen real-scan
+  baseline before default activation rather than replaced by a visual-only
+  judgment.

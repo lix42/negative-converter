@@ -37,10 +37,12 @@ For representative color and HDR frames, execute this matrix:
    byte-identical where promised, otherwise decoded pixels within the applicable
    pinned codec bounds and identical semantic metadata.
 6. **Film-rendering fidelity** — representative stocks, lenses, development
-   processes, exponential/sigmoid curves, and scanners retain their intended
-   differences through NC film RGB v1 and across named encodings. Acceptance
-   compares those encodings with the same NC rendering, not with a physically
-   neutral scene. Optional correction profiles are outside the required matrix.
+   processes, reference-anchored sigmoid recipes, and scanners retain their
+   intended differences through NC film RGB v1 and across named encodings.
+   Exponential/simple are diagnostic comparisons, not required product modes.
+   Acceptance compares those encodings with the same NC rendering, not with a
+   physically neutral scene. Optional correction profiles are outside the
+   required matrix.
 7. **Cross-encoding consistency** — matched SDR, HDR, gain-map, and film-master
    outputs preserve hue and relative exposure within each renderer's declared
    tone/gamut policy; clipping and gamut compression are measured and reported.
@@ -49,6 +51,11 @@ For representative color and HDR frames, execute this matrix:
    `print.white_balance`/`print.linear_range` afterward, while film master
    rejects non-default values and legacy aliases follow their warned migration
    contract.
+9. **Master/display tonal delta** — using shared, non-gamut-limited patches,
+   compare normalized film-master values with the SDR/HDR render inputs and
+   decoded outputs. The sigmoid reconstruction owns the shadow toe. Display
+   defaults may adapt transfer, reference white, highlights, and gamut, but a
+   second shadow-floor lift or broad midtone re-grade fails acceptance.
 
 ### Automated oracles
 
@@ -105,6 +112,13 @@ decoder independent of nc:
   compare against each renderer's own canonical buffer and report hue-angle,
   clipping, and compression deltas; no unbounded “looks consistent” pass is
   allowed.
+- Master/display tone comparisons pin monotone neutral-ramp samples from below
+  the sigmoid toe through the midtones. Normalize only by each rendition's
+  declared reference white—never by fitted black/white points or per-image
+  exposure—and record shadow-floor, local-slope, and midtone-lightness deltas.
+  The initial task must establish reviewed numeric bounds from the frozen
+  real-scan baseline before product-default activation; “looks close” is not a
+  pass criterion.
 
 For that cross-encoding oracle, the manifest pins each rendition's declared
 reference-white luminance in nits and the shared source exposure. Decode every

@@ -1049,3 +1049,60 @@ What other epics need to know about `algo`:
   (why a naive `is_normal()` on user-supplied gains is the wrong fix here, and where a
   reference predicate already exists in `pipeline::render_split`) are in the task
   file's second `Context` block — start there rather than rediscovering it.
+
+
+## reference-anchored-sigmoid
+
+**Status:** not started
+**Updated:** 2026-07-30
+
+- 2026-07-30: Product direction decided: Dmin remains the film-base/density
+  origin, while the reconstruction sigmoid owns shadow-floor/toe placement in a
+  roll-fixed Dmax-normalized coordinate. Film-master and display outputs must
+  therefore share the same tonal foundation; display rendering must not repair a
+  raised floor with a second large grade. The default is reference-based and
+  preserves under/overexposure. Sigmoid is the candidate sole product
+  reconstruction; exponential/simple remain explicit diagnostic paths until a
+  later evidence-backed retirement decision.
+- 2026-07-31: Review clarified the unshipped work: §7.3 already provides the
+  Dmin-origin, Dmax-normalized monotone sigmoid. The remaining defect is
+  empirical—frozen real-roll conversions crowd correctly exposed photographic
+  shadows into a narrow raised interval and look pale. The task now requires a
+  pinned fixture/reference/recipe baseline and quantitative film-master/SDR/HDR
+  shadow-spread metrics before deciding whether defaults, parameter semantics,
+  or the equation itself must change. `output/presets` remains the activation
+  boundary; content-aware fitting remains excluded from the default.
+
+
+## content-aware-sigmoid-toe
+
+**Status:** not started
+**Updated:** 2026-07-30
+
+- 2026-07-30: Parked content-derived toe placement as an optional, explicit
+  follow-up rather than part of the product default. The task distinguishes
+  per-frame and roll-frozen acquisition, requires complete provenance, and
+  forbids frame-local fitting from film-master/normal product presets so nc does
+  not silently auto-correct exposure.
+
+
+## reference-anchored-sigmoid (continued)
+
+**Status:** not started
+**Updated:** 2026-07-31
+
+- 2026-07-31 (PR review terminology correction): The shipped sigmoid is
+  **Dmax-anchored**, not Dmax-normalized: its coordinate is
+  `t = contrast * (D' - Dmax)` and does not divide by Dmax. The earlier
+  2026-07-30 and 2026-07-31 entries above used “Dmax-normalized” imprecisely;
+  this entry supersedes that wording while preserving the append-only history.
+
+
+## content-aware-sigmoid-toe (continued)
+
+**Status:** not started
+**Updated:** 2026-07-31
+
+- 2026-07-31 (PR review): Added `output/presets` as a prerequisite. This task
+  promises named-preset rejection and byte-identity verification, so the preset
+  surface must exist before those contracts can be implemented or tested.

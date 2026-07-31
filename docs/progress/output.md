@@ -582,3 +582,17 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   file is present in the Git index. This is an explicit local-vendoring
   workaround; `output/ultrahdr-dependency-externalization` removes the snapshot,
   tracking guard, and verifier together once a qualifying Cargo package exists.
+
+
+## presets (continued)
+
+**Status:** not started
+**Updated:** 2026-07-30
+
+- 2026-07-30: Added `algo/reference-anchored-sigmoid` as a required product
+  prerequisite. The default recipe will use that sigmoid; output presets will
+  not silently override an explicit reconstruction selection. Display defaults
+  must preserve the reconstruction's black/midtone foundation and limit their
+  differences from film-master to declared transfer, reference-white,
+  highlight-headroom, and gamut adaptation. Exponential/simple remain advanced
+  diagnostic paths pending a separate retirement decision.
