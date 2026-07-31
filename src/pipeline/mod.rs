@@ -3,6 +3,7 @@
 
 pub mod color;
 pub mod film_base;
+pub mod gain_map;
 pub mod hdr;
 pub mod input_semantics;
 pub mod memory;

@@ -15,6 +15,7 @@ HDR spike and encoder implementation:
 | Preset | Purpose |
 |---|---|
 | `gain-map-hdr` | **Default:** backward-compatible SDR base plus ISO gain-map HDR |
+| `ultra-hdr-v1` | Explicit pre-ISO compatibility output using public Ultra HDR v1 JPEG metadata |
 | `display-p3` | wide-gamut SDR display output |
 | `compatibility` | sRGB SDR for broad legacy/web support |
 | `film-master` | unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering |
@@ -92,15 +93,15 @@ current `--output-hdr` float TIFF is already print-rendered and must be document
 as a transitional rendered float TIFF, never as an alias for `film-master`.
 
 The output path remains required and is never silently renamed. Its extension
-must match the preset's resolved container: `gain-map-hdr` accepts `.jpg` and
-`.jpeg`, while `hdr-pq` and `hdr-hlg` accept `.avif`. A mismatch is a usage
-error that reports the expected extensions. Named presets other than `custom`
-are atomic: legacy depth/profile/container controls such as `--output-hdr`,
-`--output-sdr`, `--output-profile`, and `--bigtiff` cannot accompany them, even
-when they appear equivalent. Existing legacy flags without `--output-preset`
-continue to resolve the current TIFF policy during migration. Advanced explicit
-combinations use `--output-preset custom`, are fully validated, and are recorded
-in the resolved recipe/report.
+must match the preset's resolved container: `gain-map-hdr` and
+`ultra-hdr-v1` accept `.jpg` and `.jpeg`, while `hdr-pq` and `hdr-hlg` accept
+`.avif`. A mismatch is a usage error that reports the expected extensions. Named
+presets other than `custom` are atomic: legacy depth/profile/container controls
+such as `--output-hdr`, `--output-sdr`, `--output-profile`, and `--bigtiff`
+cannot accompany them, even when they appear equivalent. Existing legacy flags
+without `--output-preset` continue to resolve the current TIFF policy during
+migration. Advanced explicit combinations use `--output-preset custom`, are
+fully validated, and are recorded in the resolved recipe/report.
 
 This task extends the shipped `nc roll` batch-apply scaffold. Today, automatic
 names are `<stem>_positive.tiff`, manifest entries may provide explicit outputs,
@@ -168,7 +169,7 @@ preserve misleading terminology.
 
 ## Dependencies
 
-- [ISO gain-map HDR output](gain-map-hdr-output.md)
+- [Final ISO gain-map metadata](iso-gain-map-metadata.md)
 - [HDR AVIF output](hdr-avif-output.md)
 - [Roll conversion](../core/roll-conversion.md)
 - [Conversion versioning and baseline comparison](../core/conversion-versioning.md)

@@ -1,0 +1,43 @@
+// Copyright 2023 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "external_libultrahdr_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["external_libultrahdr_license"],
+}
+
+cc_binary {
+    name: "ultrahdr_app",
+    host_supported: true,
+    srcs: [
+        "ultrahdr_app.cpp",
+    ],
+    shared_libs: [
+        "libbase",
+        "libimage_io",
+        "libjpeg",
+        "liblog",
+    ],
+    static_libs: [
+        "libjpegdecoder",
+        "libjpegencoder",
+        "libultrahdr",
+    ],
+    target: {
+        android: {
+            shared_libs: [
+                "libEGL",
+                "libGLESv3",
+            ],
+        },
+    },
+}

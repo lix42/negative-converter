@@ -1,0 +1,8 @@
+# build output directories
+build
+build*
+
+# downloaded dependencies
+third_party/googletest
+third_party/benchmark
+tests/data

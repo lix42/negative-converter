@@ -596,8 +596,9 @@ impl<'de> Deserialize<'de> for WbSource {
 /// `highlight_compress` is deliberately **not** applied in the shared stage:
 /// each named display renderer resolves its own knee from the same amount.
 /// SDR resolves `0.5 + 0.25 / (1 + amount)` in `[0,1]`; HDR applies the same
-/// normalized position across `[1, 1000/203]`. The legacy no-preset render
-/// remains the only CLI-reachable consumer today.
+/// normalized position across `[1, 1000/203]`. The legacy no-preset render and
+/// the explicit `ultra-hdr-v1` display path are CLI-reachable today; only the
+/// latter goes through the shared stage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrintParams {
@@ -620,9 +621,9 @@ pub struct PrintParams {
     ///
     /// This is the replacement home for `simple` reconstruction's removed
     /// `clip_low`/`clip_high` endpoints (design-spec §7.1) and is distinct from
-    /// the density print `black_point`. Only the shared display stage consumes it,
-    /// so until a named display preset lands a non-default value is rejected
-    /// loudly by `cli::validate` rather than silently ignored.
+    /// the density print `black_point`. Only the shared display stage consumes it:
+    /// `ultra-hdr-v1` accepts a non-default value, while the legacy TIFF path and
+    /// `film-master` reject it loudly rather than silently ignoring it.
     pub linear_range: [f32; 2],
 }
 
@@ -1061,12 +1062,13 @@ impl EncodeReport {
 /// a preset resolves a whole coherent policy, so it can never be a bag of
 /// independent bools. Serializes kebab-case (`"legacy"` / `"film-master"`).
 ///
-/// **Only two variants are accepted today.** The remaining planned preset names
+/// **Only three variants are accepted today.** The remaining planned preset names
 /// (`gain-map-hdr`, `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`,
-/// `custom`) need the SDR/HDR display renderers and the container work owned by
-/// `output/presets`; [`parse`](Self::parse) rejects them with a pinned
-/// "does not accept yet" message rather than a generic unknown-value error, and
-/// rejects the pre-release name `scene-master` as an unreleased-schema break.
+/// `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, `custom`) need the SDR/HDR
+/// display renderers and the container work owned by `output/presets`;
+/// [`parse`](Self::parse) rejects them with a pinned "does not accept yet"
+/// message rather than a generic unknown-value error, and rejects the
+/// pre-release name `scene-master` as an unreleased-schema break.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputPreset {
@@ -1094,6 +1096,12 @@ pub enum OutputPreset {
     /// source. A linear export that *wants* a creative / print / display
     /// adjustment is the (not-yet-accepted) `custom` workflow.
     FilmMaster,
+    /// **`ultra-hdr-v1`** — an explicitly legacy Ultra HDR v1 JPEG: an
+    /// SDR Display P3 base image plus a luminance gain-map JPEG and XMP/MPF
+    /// metadata. This name deliberately does not claim ISO 21496-1 conformance;
+    /// the later `gain-map-hdr` default is activated only after the separate ISO
+    /// metadata task is complete.
+    UltraHdrV1,
 }
 
 impl OutputPreset {
@@ -1105,6 +1113,7 @@ impl OutputPreset {
         match s.trim().to_ascii_lowercase().as_str() {
             "legacy" => Ok(OutputPreset::Legacy),
             "film-master" => Ok(OutputPreset::FilmMaster),
+            "ultra-hdr-v1" => Ok(OutputPreset::UltraHdrV1),
             // The pre-release name for the same branch. It was renamed *before*
             // release because "scene" wrongly implied physical scene-linear
             // recovery; nc is unreleased, so this is a schema break, not an alias.
@@ -1116,15 +1125,18 @@ impl OutputPreset {
                     .into(),
             )),
             planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "hdr-pq" | "hdr-hlg"
-            | "custom") => Err(NcError::Usage(format!(
-                "output preset `{planned}` is a planned name that this build does not \
+            | "hdr-linear-tiff" | "hdr-pq-tiff" | "hdr-hlg-tiff" | "custom") => {
+                Err(NcError::Usage(format!(
+                    "output preset `{planned}` is a planned name that this build does not \
                  accept yet (it needs the display renderers / container work owned by \
                  `output/presets`). Accepted today: `legacy` (the transitional TIFF \
-                 path, the default) and `film-master` (unclamped linear ACEScg float \
-                 TIFF)."
-            ))),
+                 path, the default), `film-master` (unclamped linear ACEScg float \
+                 TIFF), and `ultra-hdr-v1` (legacy XMP gain-map JPEG)."
+                )))
+            }
             other => Err(NcError::Usage(format!(
-                "unknown output preset `{other}` — accepted: `legacy`, `film-master`"
+                "unknown output preset `{other}` — accepted: `legacy`, `film-master`, \
+                 `ultra-hdr-v1`"
             ))),
         }
     }
@@ -1144,6 +1156,7 @@ impl OutputPreset {
         match self {
             OutputPreset::Legacy => "legacy",
             OutputPreset::FilmMaster => "film-master",
+            OutputPreset::UltraHdrV1 => "ultra-hdr-v1",
         }
     }
 }
@@ -1179,6 +1192,11 @@ impl<'de> Deserialize<'de> for OutputPreset {
 /// (unclamped, possibly > 1.0) float mean over the **finite** samples, with
 /// non-finite samples excluded so one `NaN` cannot swallow the whole statistic —
 /// `EncodeReport::non_finite` is where that fault is reported.
+///
+/// For a lossy JPEG output this is the normalized 8-bit primary-image buffer
+/// handed to the compressor, not a decoder-dependent measurement after JPEG
+/// reconstruction. That keeps the comparison basis deterministic without
+/// pretending the codec preserves exact samples.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct OutputStats {
     /// Mean written sample value per channel `[r, g, b]`. Zero for an empty image.
@@ -1234,10 +1252,15 @@ impl OutputParams {
     /// - `film-master` is **always** [`OutDepth::F32`] — the master is unclamped
     ///   float linear ACEScg by definition, not by an `output.hdr` switch (which
     ///   must stay at its default under the preset).
+    /// - `ultra-hdr-v1` resolves [`OutDepth::U16`] only for optional IR TIFF
+    ///   export; its primary image is fixed 8-bit JPEG.
     /// - legacy: `hdr = false` → [`OutDepth::U16`], `true` → [`OutDepth::F32`].
     pub fn depth(&self) -> OutDepth {
         match self.preset {
             OutputPreset::FilmMaster => OutDepth::F32,
+            // Used only by the optional IR TIFF export. The primary image is an
+            // 8-bit JPEG whose depth is fixed by the preset.
+            OutputPreset::UltraHdrV1 => OutDepth::U16,
             OutputPreset::Legacy => {
                 if self.hdr {
                     OutDepth::F32
@@ -1760,6 +1783,10 @@ mod tests {
             OutputPreset::parse("film-master").unwrap(),
             OutputPreset::FilmMaster
         );
+        assert_eq!(
+            OutputPreset::parse("ultra-hdr-v1").unwrap(),
+            OutputPreset::UltraHdrV1
+        );
         // Keywords, so case/whitespace-insensitive like `OutputSpace::parse`.
         assert_eq!(
             OutputPreset::parse(" Film-Master ").unwrap(),
@@ -1767,6 +1794,7 @@ mod tests {
         );
         assert_eq!(OutputPreset::default(), OutputPreset::Legacy);
         assert!(OutputPreset::FilmMaster.is_named());
+        assert!(OutputPreset::UltraHdrV1.is_named());
         assert!(!OutputPreset::Legacy.is_named());
 
         // The pre-release name is an unreleased-schema break, NOT an alias: the
@@ -1786,6 +1814,9 @@ mod tests {
             "compatibility",
             "hdr-pq",
             "hdr-hlg",
+            "hdr-linear-tiff",
+            "hdr-pq-tiff",
+            "hdr-hlg-tiff",
             "custom",
         ] {
             let msg = OutputPreset::parse(planned).unwrap_err().to_string();

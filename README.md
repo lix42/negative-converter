@@ -5,7 +5,8 @@ images.
 
 It reads high-bit-depth scanner files (SilverFast HDR/HDRi first), runs a
 deterministic negative→positive pipeline in a 32-bit float linear working space,
-and writes a TIFF (16-bit or 32-bit float).
+and writes TIFF (16-bit or 32-bit float) or an explicitly selected legacy
+Ultra HDR v1 gain-map JPEG.
 
 ## Design goal: built for agents
 
@@ -42,10 +43,39 @@ nc convert in.tiff -o out.tiff --reconstruction density --output-hdr \
 
 # Inspect a scan and emit machine-readable JSON.
 nc inspect in.tiff --report json
+
+# Backward-compatible SDR JPEG with legacy Ultra HDR v1 gain-map metadata.
+nc convert in.tiff -o out.jpg --output-preset ultra-hdr-v1 \
+  --film-base 0.92,0.55,0.42
 ```
 
 See the design spec for the complete command and parameter reference.
 
+## Building
+
+The Rust build also compiles the pinned libultrahdr and libjpeg-turbo sources
+statically. A fresh build machine needs CMake, C and C++ compilers, and
+libclang for bindgen (plus NASM for libjpeg-turbo SIMD on supported targets).
+For example:
+
+```sh
+# Debian/Ubuntu
+sudo apt-get install build-essential cmake clang libclang-dev nasm
+
+# macOS with Homebrew (Xcode Command Line Tools are also required)
+brew install cmake llvm nasm
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+```
+
+Runtime deployment does not require a separate libultrahdr or libjpeg
+installation. The complete IJG attribution, Modified BSD terms, and Adobe Gain
+Map notice are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+Binary release packaging must also include the exact libultrahdr, image_io,
+modp_b64, libjpeg-turbo, and Adobe license files listed in that notice.
+
 ## License
 
 TBD.
+
+Third-party notices and license terms are collected in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

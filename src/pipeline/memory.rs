@@ -95,9 +95,11 @@
 //! ## Calibration (macOS/aarch64, `/usr/bin/time -l` peak RSS, 2026-07-27)
 //!
 //! Measured on `largest.tif` (10368x7200 = 74.65 MP HDRi, the largest scan on
-//! hand) and a standard roll frame (5184x3599 = 18.66 MP HDRi). Units: measured
-//! peaks and model outputs in decimal GB (that is what `time -l` reports against);
-//! budgets and the allowance in GiB/MiB.
+//! hand), a standard roll frame (5184x3599 = 18.66 MP HDRi), and the Ultra HDR
+//! gain-map calibration scan (5184x3600 = 18.66 MP HDRi). Units: measured peaks
+//! and model outputs in decimal GB (that is what `time -l` reports against);
+//! budgets and the allowance in GiB/MiB. The calibration conversions used an
+//! explicit film base, so their render/encode peaks carry no sampled rectangle.
 //!
 //! Every row is model-vs-measured for the *same* invocation; the model must never
 //! come in under measured. The sampling rows are what the film-base phase was
@@ -114,10 +116,11 @@
 //! | `estimate --base-region` (auto-interior rect) 74.65 MP | 2.217 GB | 2.119 GB | +4.6% |
 //! | `estimate --base-region` (full frame) 74.65 MP | 2.538 GB | 2.398 GB | +5.8% |
 //! | `convert --base-region` (full frame) 74.65 MP | 4.427 GB | 3.743 GB | +18.3% |
-//! | `convert` u16 18.66 MP | 0.832 GB | 0.681 GB | +22.2% |
+//! | `convert` u16 18.66 MP | 0.950 GB | 0.681 GB | +39.4% |
+//! | `ultra-hdr-v1` 18.66 MP (explicit base, no IR export) | 1.851 GB | 1.681 GB | +10.1% |
 //!
 //! Two sources of slack are visible and deliberate. Small frames run looser
-//! (+22% at 18.66 MP) because [`ALLOWANCE_FIXED_BYTES`] stops being negligible —
+//! (+39.4% for the u16 18.66 MP run) because [`ALLOWANCE_FIXED_BYTES`] stops being negligible —
 //! harmless, since they are nowhere near any plausible budget. And `inspect` on
 //! these assets measures far under its estimate (1.502 GB vs 2.217 GB) because the
 //! model charges the `auto` path's interior sample while the detector actually
@@ -125,6 +128,11 @@
 //! sampling). The model cannot know that in advance, so it charges the sample it
 //! would take. That is the conservative direction, and it will tighten on its own
 //! when `film-base/content-fallback` makes the auto path succeed.
+//!
+//! No Ultra HDR run with `--export-ir` has been measured. Its optional export
+//! therefore retains the TIFF model's conservative 2 B/px u16 staging term;
+//! tests pin that structural increment without claiming it as a calibrated RSS
+//! observation.
 //!
 //! Measured overhead over the *accounted* buffers peaked at **12.9%** on the
 //! no-sampling rows, which is why [`ALLOWANCE_PERCENT`] sits above it rather than
@@ -217,6 +225,12 @@ pub enum RunProfile {
         /// `f32` writes the working buffer verbatim.
         depth: OutDepth,
         /// Whether `--export-ir` will stage an IR plane for writing too.
+        export_ir: bool,
+    },
+    /// `ultra-hdr-v1`: both display renditions and the full-resolution gain
+    /// buffers coexist before the two JPEGs are packaged.
+    UltraHdrV1 {
+        /// Whether a u16 IR TIFF is staged before the primary JPEG.
         export_ir: bool,
     },
     /// `inspect` / `estimate`: decode, then sample — no render, no encode.
@@ -620,6 +634,30 @@ pub fn estimate_peak(
                 sum(sum(mul(image, 2)?, quantize)?, sampled)?,
             )
         }
+        RunProfile::UltraHdrV1 { export_ir } => {
+            // Decoded + shared adjusted ACEScg, then SDR, BT.2020 HDR,
+            // common-P3 HDR, and full-resolution ratios (four f32 RGB buffers).
+            let display_buffers = mul(pixels, 4 * WORKING_CHANNELS * F32_BYTES)?;
+            let render = sum(mul(image, 2)?, display_buffers)?;
+
+            // Decoded + retained SDR/common-HDR/gain f32 buffers, plus u8 base,
+            // half-resolution u8 gain, conservative raw-sized JPEG/package
+            // buffers, and the optional u16 IR staging plane.
+            let retained = sum(image, mul(pixels, 3 * WORKING_CHANNELS * F32_BYTES)?)?;
+            // 20 B/px conservatively covers u8 base/map inputs, both compressed
+            // JPEGs, libultrahdr's owned input copies and destination, plus the
+            // Rust copy made before the native encoder is released.
+            let byte_staging = mul(pixels, 20)?;
+            let ir_export = if export_ir && shape.ir_present {
+                mul(pixels, 2)?
+            } else {
+                0
+            };
+            (
+                sum(render, sampled)?,
+                sum(sum(sum(retained, byte_staging)?, ir_export)?, sampled)?,
+            )
+        }
     };
 
     let accounted_bytes = decode_bytes
@@ -896,6 +934,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ultra_hdr_profile_counts_the_overlapping_display_and_gain_buffers() {
+        let no_ir = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::UltraHdrV1 { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(no_ir.render_bytes, 7_200);
+        assert_eq!(no_ir.encode_bytes, 6_800);
+
+        let with_ir_no_export = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::UltraHdrV1 { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let with_ir = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::UltraHdrV1 { export_ir: true },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(with_ir.render_bytes, 8_000);
+        assert_eq!(with_ir.encode_bytes, 7_400);
+        assert_eq!(with_ir.encode_bytes - with_ir_no_export.encode_bytes, 200);
+        // No separate Ultra HDR + IR-export RSS run has been recorded. Until it
+        // is, the optional term remains the same conservative 2 B/px u16 plane
+        // staging used by the TIFF export path; this assertion prevents it from
+        // silently growing into an invented calibration claim.
+    }
+
     /// The largest scan on hand (`largest.tif`), the calibration reference.
     fn big() -> ImageShape {
         shape(10368, 7200, true)
@@ -1081,15 +1151,48 @@ mod tests {
         // we have documented numbers for — which is what makes a model change
         // deliberate.
         let standard = shape(5184, 3599, true); // a roll frame, 18.66 MP HDRi
-        for (shape, profile, accounted, estimated) in [
+        let ultra_hdr = shape(5184, 3600, true); // measured Ultra HDR scan, 18.66 MP HDRi
+        for (shape, profile, sampling, accounted, estimated) in [
             // 74.65 MP: encode 38 B/px, decode-only 18 B/px (explicit base).
-            (big(), convert_u16(), 2_836_684_800u64, 3_396_405_248u64),
-            (big(), RunProfile::DecodeOnly, 1_343_692_800, 1_679_464_448),
+            (
+                big(),
+                convert_u16(),
+                SamplePlan::none(),
+                2_836_684_800u64,
+                3_396_405_248u64,
+            ),
+            (
+                big(),
+                RunProfile::DecodeOnly,
+                SamplePlan::none(),
+                1_343_692_800,
+                1_679_464_448,
+            ),
             // 18.66 MP.
-            (standard, convert_u16(), 708_974_208, 949_538_066),
-            (standard, RunProfile::DecodeOnly, 335_829_888, 520_422_086),
+            (
+                standard,
+                convert_u16(),
+                SamplePlan::none(),
+                708_974_208,
+                949_538_066,
+            ),
+            (
+                standard,
+                RunProfile::DecodeOnly,
+                SamplePlan::none(),
+                335_829_888,
+                520_422_086,
+            ),
+            // Recorded gain-map run used an explicit film base and no IR export.
+            (
+                ultra_hdr,
+                RunProfile::UltraHdrV1 { export_ir: false },
+                SamplePlan::none(),
+                1_492_992_000,
+                1_851_158_528,
+            ),
         ] {
-            let e = estimate_peak(&shape, profile, SamplePlan::none()).unwrap();
+            let e = estimate_peak(&shape, profile, sampling).unwrap();
             assert_eq!(e.accounted_bytes, accounted, "{profile:?}");
             assert_eq!(e.estimated_peak_bytes, estimated, "{profile:?}");
         }
@@ -1112,9 +1215,10 @@ mod tests {
         // Documentation of intent, not a live check: both sides are frozen
         // literals, so this can never fail on any target. The regression pin on the
         // model's own output is `estimate_pins_the_model_output_for_the_calibration_shapes`.
-        // Every measured run used an explicit `--film-base`, so `SamplePlan::none()`
-        // is the sampling that matches them.
+        // Every measured conversion used an explicit `--film-base`; keep the
+        // corresponding no-sampling plan alongside each frozen case.
         let standard = shape(5184, 3599, true); // a roll frame, 18.66 MP HDRi
+        let ultra_hdr = shape(5184, 3600, true); // recorded gain-map calibration scan
         let export_ir_u16 = RunProfile::Convert {
             depth: OutDepth::U16,
             export_ir: true,
@@ -1123,16 +1227,32 @@ mod tests {
             depth: OutDepth::F32,
             export_ir: false,
         };
-        let cases: [(ImageShape, RunProfile, u64); 6] = [
-            (big(), RunProfile::DecodeOnly, 1_503_330_304),
-            (big(), convert_u16(), 3_145_760_768),
-            (big(), export_ir_u16, 3_145_711_616),
-            (big(), hdr_out, 2_697_887_744),
-            (standard, convert_u16(), 681_164_800),
-            (standard, RunProfile::DecodeOnly, 328_286_208),
+        let cases: [(ImageShape, RunProfile, SamplePlan, u64); 7] = [
+            (
+                big(),
+                RunProfile::DecodeOnly,
+                SamplePlan::none(),
+                1_503_330_304,
+            ),
+            (big(), convert_u16(), SamplePlan::none(), 3_145_760_768),
+            (big(), export_ir_u16, SamplePlan::none(), 3_145_711_616),
+            (big(), hdr_out, SamplePlan::none(), 2_697_887_744),
+            (standard, convert_u16(), SamplePlan::none(), 681_164_800),
+            (
+                standard,
+                RunProfile::DecodeOnly,
+                SamplePlan::none(),
+                328_286_208,
+            ),
+            (
+                ultra_hdr,
+                RunProfile::UltraHdrV1 { export_ir: false },
+                SamplePlan::none(),
+                1_681_408_000,
+            ),
         ];
-        for (shape, profile, measured) in cases {
-            let e = estimate_peak(&shape, profile, SamplePlan::none()).unwrap();
+        for (shape, profile, sampling, measured) in cases {
+            let e = estimate_peak(&shape, profile, sampling).unwrap();
             assert!(
                 e.estimated_peak_bytes >= measured,
                 "{profile:?} at {}x{}: estimate {} under measured {measured}",

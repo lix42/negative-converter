@@ -1,0 +1,16 @@
+{
+  "algorithm": "sha256(path-length || path || content-length || content), sorted paths",
+  "schema_version": 1,
+  "snapshots": {
+    "libjpeg_turbo": {
+      "files": 555,
+      "revision": "20ade4dea9589515a69793e447a6c6220b464535",
+      "sha256": "f5fb87946e6d6877b31184cb77ff78b0cc132f9de87f0fd7c735f97839f0acaa"
+    },
+    "libultrahdr_without_bundled_libjpeg_turbo": {
+      "files": 219,
+      "revision": "11ac0c325bbf56ecf8be8704ff0f79fc9e1aac77",
+      "sha256": "4d8e4918954967b23e70a28e79dd9c9869996bf4f357360fdd97dbc91712661c"
+    }
+  }
+}

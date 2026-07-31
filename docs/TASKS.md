@@ -14,7 +14,8 @@ Step-1 (MVP) plan for the `nc` CLI negative→positive converter. See
 
 ### Overview
 A command-line tool (`nc`) that reads a film-negative scan (SilverFast HDR/HDRi
-first), converts it to a positive image, and writes a TIFF. "AI-friendly" means
+first), converts it to a positive image, and writes a TIFF or explicitly selected
+`ultra-hdr-v1` gain-map JPEG. "AI-friendly" means
 **every conversion parameter is a CLI flag** and the tool is deterministic and
 scriptable with JSON recipes/reports — not that ML processes the image.
 
@@ -22,10 +23,17 @@ scriptable with JSON recipes/reports — not that ML processes the image.
 Pure-function pipeline stages, orchestrated by the CLI layer:
 
 ```
-decode → validate input semantics → film-base → negative reconstruction
-       → density curve → FilmRgbImage → NC film RGB v1 → linear ACEScg
-         ├→ film-master encode
-         └→ shared print controls → SDR/HDR render/profile → encode
+decode → validate input semantics → film-base → preset dispatch
+  ├→ legacy: stages::render
+  │    → tagged reconstruction (simple | density, including density curve)
+  │    → FilmRgbImage → finish_print → output ICC → TIFF encode
+  ├→ film-master: stages::render
+  │    → tagged reconstruction (simple | density, including density curve)
+  │    → FilmRgbImage → NC film RGB v1 → linear ACEScg → TIFF encode
+  └→ ultra-hdr-v1: stages::render_gain_map_source
+       → tagged reconstruction (simple | density, including density curve)
+       → FilmRgbImage → NC film RGB v1 → linear ACEScg → shared print controls
+       → SDR/HDR + gain map → JPEG package
 ```
 
 The target `film-master` branch preserves NC's intentional film, lens,
@@ -50,8 +58,9 @@ under, and the parenthesized paths are the modules it owns.
 - **color** (`pipeline/color.rs`, `pipeline/working_space.rs`) — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
 - **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged `reconstruction` recipe object into `simple` or `density` reconstruction, with density selecting an exponential (default) or sigmoid curve; `algo::finish_print` is the stage-4 print bridge. Tone, white balance, and color-model variants are parameters of this stage.
 - **output** (the encoders downstream of `color`) — the display renditions:
-  Display P3 / SDR, BT.2020 PQ/HLG, ISO gain-map JPEG, AVIF, and the presets that
-  resolve them together.
+  Display P3 / SDR, BT.2020 PQ/HLG, explicit legacy Ultra HDR v1 gain-map JPEG
+  (with final ISO metadata planned), AVIF, and the presets that resolve them
+  together.
 - **core** (`cli.rs`, `main.rs`, `types.rs`, `pipeline/stages.rs`) — clap subcommands (`convert`/`inspect`/`estimate`/`params`/`roll`), recipe load/merge, JSON report, exit codes, the roll/batch workflow, the shared types, and the pure algorithm→output-color render core the CLI drives.
 - **telemetry** (`src/telemetry.rs`) — that module and the opt-in upload stack. Operational, never a conversion knob.
 - **analysis** (`scripts/`) — the real-scan verification harness, the `nctool` Python toolkit, the asset manifest, and NLP comparison. Verifies the pipeline; is not part of it.
@@ -163,6 +172,8 @@ graph TD
     output/sdr-display-rendering
     output/hdr-display-rendering
     output/gain-map-hdr-output
+    output/ultrahdr-dependency-externalization
+    output/iso-gain-map-metadata
     output/hdr-avif-output
     output/presets
   end
@@ -266,8 +277,10 @@ graph TD
   output/hdr-output-spike --> output/hdr-display-rendering
   output/sdr-display-rendering --> output/gain-map-hdr-output
   output/hdr-display-rendering --> output/gain-map-hdr-output
+  output/gain-map-hdr-output --> output/ultrahdr-dependency-externalization
+  output/gain-map-hdr-output --> output/iso-gain-map-metadata
   output/hdr-display-rendering --> output/hdr-avif-output
-  output/gain-map-hdr-output --> output/presets
+  output/iso-gain-map-metadata --> output/presets
   output/hdr-avif-output --> output/presets
   core/roll-conversion --> output/presets
   core/conversion-versioning --> output/presets
@@ -337,8 +350,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `output/sdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/display-p3-output`, `output/hdr-output-spike`
 - `output/hdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/hdr-output-spike`
 - `output/gain-map-hdr-output` (post-MVP): `output/sdr-display-rendering`, `output/hdr-display-rendering`
+- `output/ultrahdr-dependency-externalization` (post-MVP, **deferred maintenance**; no downstream blockers): `output/gain-map-hdr-output`
+- `output/iso-gain-map-metadata` (post-MVP): `output/gain-map-hdr-output`
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
-- `output/presets` (post-MVP): `output/gain-map-hdr-output`, `output/hdr-avif-output`, `core/roll-conversion`, `core/conversion-versioning`
+- `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `core/roll-conversion`, `core/conversion-versioning`
 - `telemetry/perf-instrumentation` (post-MVP, **parked**): `core/pipeline-orchestration`
   — LAB criterion benches; prototyped and parked on git branch
   prototype/perf-bench-instrumentation, superseded by telemetry/perf-telemetry as
@@ -474,7 +489,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 
 - [x] [Color management](tasks/color/management.md)
 - [x] [NC Film RGB working-space mapping](tasks/color/film-rgb-working-space.md) — map every film rendering through versioned NC film RGB v1 into typed linear ACEScg/D60
-- [x] [Film-master and shared display pipeline](tasks/color/film-master-render-pipeline.md) — route intentional ACEScg film rendering to `film-master` or shared WB → exposure → black/range adjustments before SDR/HDR; the shared display stage is built and unit-tested but has **no CLI consumer** until `output/{sdr,hdr}-display-rendering`
+- [x] [Film-master and shared display pipeline](tasks/color/film-master-render-pipeline.md) — route intentional ACEScg film rendering to `film-master` or shared WB → exposure → black/range adjustments before SDR/HDR; `ultra-hdr-v1` is the first CLI consumer, while the convenient display aliases/default remain deferred to `output/presets`
 - [x] [Post-reconstruction characterization runtime](tasks/color/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `algo/negative-reconstruction-density-curves`, `color/film-rgb-working-space`, `color/film-master-render-pipeline`, and `color/optional-color-correction-profiles`
 - [ ] [Optional color-correction profiles](tasks/color/optional-color-correction-profiles.md) — **optional / deferred** measured neutralization with explicit selection and provenance; blocks no output task
 - [ ] [Scanner ICC before-density experiment](tasks/color/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of the superseded characterization proposal and the normal NC film RGB mapping
@@ -489,7 +504,9 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [HDR still-output spike](tasks/output/hdr-output-spike.md) — decided ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy; licensed-normative-text check waived at spike level and re-homed to the encoder tasks as a pre-merge gate (2026-07-24)
 - [x] [SDR display rendering](tasks/output/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
 - [x] [Display-HDR rendering](tasks/output/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
-- [ ] [ISO gain-map HDR output](tasks/output/gain-map-hdr-output.md) — write a backward-compatible Display P3 JPEG base plus ISO 21496-1 and Ultra HDR v1 gain-map metadata
+- [x] [Ultra HDR v1 gain-map JPEG output](tasks/output/gain-map-hdr-output.md) — write an explicit backward-compatible Display P3 JPEG plus public Ultra HDR v1 gain-map metadata
+- [ ] [Externalize the Ultra HDR native dependency](tasks/output/ultrahdr-dependency-externalization.md) — **deferred maintenance**: replace the checked-in native snapshot with an exact published Cargo dependency once it contains the required marker-order fix and supports a network-free, static build; blocks no output work
+- [ ] [Final ISO gain-map metadata](tasks/output/iso-gain-map-metadata.md) — add verified ISO 21496-1:2025 metadata to the same JPEG and prove dual-dialect agreement
 - [ ] [HDR AVIF output](tasks/output/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
 - [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
 

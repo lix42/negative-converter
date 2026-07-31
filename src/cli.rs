@@ -22,12 +22,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::algo::density;
 use crate::io::decode::{DecodeInfo, decode_within, probe};
-use crate::io::encode;
+use crate::io::{encode, ultra_hdr};
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
 use crate::pipeline::memory::{self, MemoryReport, RunProfile, SamplePlan};
-use crate::pipeline::{film_base, stages, working_space};
+use crate::pipeline::{film_base, gain_map, stages, working_space};
 use crate::telemetry;
 use crate::types::{
     BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams, DmaxSource, EncodeReport,
@@ -202,7 +202,7 @@ pub struct EstimateArgs {
 pub struct ConvertArgs {
     /// Input negative scan (SilverFast HDR/HDRi TIFF).
     pub input: PathBuf,
-    /// Output positive TIFF.
+    /// Output positive path (TIFF for legacy/master, JPEG for Ultra HDR v1).
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
     /// Reconstruction type (default `density`).
@@ -528,8 +528,9 @@ pub struct PrintOverrides {
 /// reconstruction now ends at the direct unclamped positive `1 − scan/Dmin`;
 /// its old inversion white balance and clip-range remap are **not**
 /// reconstruction parameters — they return downstream (as explicit
-/// `print.white_balance` and `print.linear_range`) when named output presets
-/// land. Since their defaults were the exact identity, the default simple
+/// `print.white_balance` and `print.linear_range`). The replacements are already
+/// consumed by `ultra-hdr-v1`, but warned alias acceptance remains deliberately
+/// deferred to the complete `output/presets` migration. Since their defaults were the exact identity, the default simple
 /// output is unchanged; a *customized* value can no longer be expressed, so the
 /// flags are kept hidden solely to emit a migration error (nc is unreleased —
 /// no aliases, no silent behavior change).
@@ -565,9 +566,10 @@ pub struct SimpleOverrides {
 #[derive(Args, Debug, Default)]
 pub struct OutputOverrides {
     /// Named output policy: `legacy` (default — the transitional TIFF path, where
-    /// the print controls run before the output ICC transform) or `film-master`
+    /// the print controls run before the output ICC transform), `film-master`
     /// (unclamped 32-bit float linear ACEScg TIFF taken straight from the NC film
-    /// RGB v1 mapping, bypassing every print/display control). Recipe key
+    /// RGB v1 mapping, bypassing every print/display control), or `ultra-hdr-v1`
+    /// (legacy gain-map JPEG through the shared display stages). Recipe key
     /// `output.preset`. A named preset is atomic: it resolves container, depth, and
     /// profile itself, so it rejects a non-default `--output-hdr` /
     /// `--output-profile` / `--bigtiff` (from a flag or the recipe alike; a value that
@@ -576,10 +578,12 @@ pub struct OutputOverrides {
     /// cannot produce. On top
     /// of that, `film-master` rejects the frame-local measurements
     /// `--auto-d-max`/`--auto-balance-range` plus every non-default
-    /// downstream control. `--output-hdr` is a *rendered* float TIFF and is never
+    /// downstream control; `ultra-hdr-v1` consumes those controls instead.
+    /// `--output-hdr` is a *rendered* float TIFF and is never
     /// an alias for `film-master`. The remaining planned preset names
     /// (`gain-map-hdr`, `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`,
-    /// `custom`) are not accepted yet.
+    /// `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, `custom`) are not
+    /// accepted yet.
     #[arg(long = "output-preset", value_name = "PRESET")]
     pub output_preset: Option<String>,
     /// Write a 32-bit float TIFF (full HDR, no precision loss) instead of the
@@ -873,6 +877,13 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
             },
             "print-rendered positive in the selected output colour space; the \
              transitional float form is already print-rendered and is not a film master",
+        ),
+        OutputPreset::UltraHdrV1 => (
+            true,
+            true,
+            "legacy-ultra-hdr-v1-xmp-mpf-jpeg",
+            "independently rendered SDR Display P3 base and HDR rendition, paired \
+             by a single-channel luminance legacy Ultra HDR v1 gain map; not ISO 21496-1",
         ),
     };
     OutputRenderResult {
@@ -1746,12 +1757,24 @@ fn validate_explicit_film_base(base: &[f32; 3]) -> Result<()> {
 /// pair silently omits the flag-presence rule and reinstates the bug where
 /// `--output-sdr` next to a named preset writes an f32 master. `roll` legitimately
 /// calls `validate` directly: it has no output flags at all, so there is nothing for
-/// the extra rule to see. (`output/presets` is the next orchestrator here.)
+/// the extra rule to see. `output/presets` must preserve the same rule when it
+/// adds roll-aware activation for the remaining named policies.
 pub fn validate_convert(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
     // Flag-shape first: "these two requests contradict each other" is a clearer
     // diagnosis than whatever value rule the same config might also trip.
     reject_output_sdr_with_named_preset(cfg, args)?;
-    validate(cfg)
+    validate(cfg)?;
+    if cfg.output.preset == OutputPreset::UltraHdrV1
+        && !args
+            .output
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
+    {
+        return Err(NcError::Usage(
+            "--output-preset ultra-hdr-v1 requires an output path ending in .jpg or .jpeg".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validate a resolved config at the CLI boundary so the pure stages can trust
@@ -1993,21 +2016,19 @@ fn linear_range_is_default(cfg: &ResolvedConfig) -> bool {
 ///    *frame-local measurements* — `auto` `Dmax` and an actually-consulted `auto`
 ///    `balance_range` — which normalize per frame and break the cross-frame
 ///    consistency a master exists to preserve.
-/// 3. **A non-default `print.linear_range` has no consumer yet.** Only the shared
-///    display stage applies it (`pipeline::render_split`), and no display preset is
-///    accepted yet; the legacy path's frozen ordering does not include it. A knob
-///    that would be silently ignored is a loud error here.
+/// 3. **A non-default `print.linear_range` is display-only.** `ultra-hdr-v1`
+///    consumes it through the shared display stage (`pipeline::render_split`),
+///    while the legacy path's frozen ordering does not include it. A knob that
+///    legacy would silently ignore is a loud error here.
 fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
     let usage = NcError::Usage;
     let preset = cfg.output.preset;
 
-    if !linear_range_is_default(cfg) && preset != OutputPreset::FilmMaster {
+    if !linear_range_is_default(cfg) && preset == OutputPreset::Legacy {
         let [lo, hi] = cfg.print.linear_range;
         return Err(usage(format!(
             "--linear-range / print.linear_range ({lo},{hi}) is applied only by the \
-             shared display stage of a named display preset, and no display preset is \
-             accepted by this build yet (`output/sdr-display-rendering` / \
-             `output/hdr-display-rendering` own the branch renderers). The legacy \
+             shared display stage of a named display preset. The legacy \
              no-preset TIFF path keeps its frozen ordering and does not apply it, so \
              the value would be silently ignored — it is rejected instead. Leave it at \
              the default `0,1`."
@@ -2446,8 +2467,8 @@ fn reject_deprecated_input_flags(o: &InputOverrides) -> Result<()> {
 /// Migration errors for the removed algorithm selector and simple-reconstruction
 /// controls. nc is unreleased, so these flags survive only as hidden args that
 /// emit actionable guidance — not as aliases *in this build*; design-spec §7.1/§9
-/// tie alias activation to the named display presets, which are not accepted yet
-/// (see the comment on the simple controls below). `reject_legacy_recipe_keys` is
+/// tie alias activation to the complete `output/presets` migration (see the
+/// comment on the simple controls below). `reject_legacy_recipe_keys` is
 /// the recipe-side mirror.
 fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
     if let Some(name) = &args.algorithm {
@@ -2466,12 +2487,10 @@ fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
     // concrete replacement flag instead of promising a future one.
     //
     // They stay **rejections in this build**. Design-spec §7.1/§9 do specify them as
-    // *warned aliases* — but only under the preset migration that lands with the named
-    // display presets, and neither replacement has a consumer here: `film-master`
-    // bypasses print controls and no display preset is accepted, so an alias could only
-    // emit a migration warning and then hard-error on the same invocation. One precise
-    // rejection beats warn-then-fail. `output/{sdr,hdr}-display-rendering` own the
-    // switch to alias behaviour; when they do, the alias must still warn that it
+    // *warned aliases* — but only under the complete `output/presets` migration.
+    // `ultra-hdr-v1` now consumes both replacements; deferral instead keeps help,
+    // warnings, recipe provenance, roll handling, and the version boundary atomic.
+    // `output/presets` owns the switch to alias behaviour; when it lands, the alias must still warn that it
     // preserves the requested *numbers* and not the legacy pixels (per-channel gains do
     // not commute with the working-space matrix).
     for (flag, present, replacement) in [
@@ -2719,6 +2738,31 @@ fn sample_plan(source: &FilmBaseSource) -> SamplePlan {
 // frame identity, the config, the run's memory budget, and the two
 // report-provenance out-params; a struct wrapping a handful of one-off values
 // would only obscure the call sites.
+enum FrameRender {
+    Tiff(stages::Rendered),
+    UltraHdr {
+        render: Box<gain_map::GainMapRender>,
+        convert: stages::ConvertReport,
+        timings: stages::StageTimings,
+    },
+}
+
+impl FrameRender {
+    fn convert(&self) -> stages::ConvertReport {
+        match self {
+            Self::Tiff(rendered) => rendered.convert,
+            Self::UltraHdr { convert, .. } => *convert,
+        }
+    }
+
+    fn timings(&self) -> stages::StageTimings {
+        match self {
+            Self::Tiff(rendered) => rendered.timings,
+            Self::UltraHdr { timings, .. } => *timings,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn convert_frame(
     command: &'static str,
@@ -2769,9 +2813,15 @@ fn convert_frame(
     // gate — it never touches a pixel, so the output stays deterministic.
     let mem = preflight_memory(
         input,
-        RunProfile::Convert {
-            depth: cfg.output.depth(),
-            export_ir: cfg.input.export_ir.is_some(),
+        if cfg.output.preset == OutputPreset::UltraHdrV1 {
+            RunProfile::UltraHdrV1 {
+                export_ir: cfg.input.export_ir.is_some(),
+            }
+        } else {
+            RunProfile::Convert {
+                depth: cfg.output.depth(),
+                export_ir: cfg.input.export_ir.is_some(),
+            }
         },
         sample_plan(&cfg.film_base.source),
         budget,
@@ -2910,13 +2960,34 @@ fn convert_frame(
     // Clear any stale lcms2 flag so only errors from *this* render are counted.
     let _ = cms_error_occurred();
     // Stages 3–4 — reconstruction → legacy print → output color transform.
-    let rendered = stages::render(
-        &image,
-        &base.base,
-        &cfg.reconstruction,
-        &cfg.print,
-        &cfg.output,
-    )?;
+    let rendered = if cfg.output.preset == OutputPreset::UltraHdrV1 {
+        let source =
+            stages::render_gain_map_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
+        let convert = source.convert;
+        let mut timings = source.timings;
+        let display_started = Instant::now();
+        let render = gain_map::render(
+            &source.shared,
+            gain_map::GainMapConfig::ultra_hdr_v1(cfg.print.highlight_compress),
+        )?;
+        // Both independent SDR/HDR display renders plus the common-domain gain
+        // construction are color work. Keep them out of encode_ms so stage
+        // totals account for every pixel operation even when telemetry is off.
+        timings.color_ms += elapsed_ms(display_started);
+        FrameRender::UltraHdr {
+            render: Box::new(render),
+            convert,
+            timings,
+        }
+    } else {
+        FrameRender::Tiff(stages::render(
+            &image,
+            &base.base,
+            &cfg.reconstruction,
+            &cfg.print,
+            &cfg.output,
+        )?)
+    };
     // lcms2 transform/profile failures reach us only through the global handler
     // (`transform_in_place` is infallible), so check the flag it sets.
     if cms_error_occurred() {
@@ -2924,12 +2995,13 @@ fn convert_frame(
             "color management (lcms2) reported a runtime error; see stderr".into(),
         ));
     }
-    report.dmax = rendered.convert.dmax;
-    report.white_balance = rendered.convert.white_balance;
-    report.balance_range = rendered.convert.balance_range;
+    let convert = rendered.convert();
+    report.dmax = convert.dmax;
+    report.white_balance = convert.white_balance;
+    report.balance_range = convert.balance_range;
     report.reconstruction_result = Some(reconstruction_result(
         &cfg.reconstruction,
-        rendered.convert.dmax,
+        convert.dmax,
         dmax_setting,
     ));
     // Stamp the pinned working-space interpretation (design-spec §8). NC film RGB
@@ -2945,6 +3017,7 @@ fn convert_frame(
     // Report an `auto` BigTIFF promotion (an automatic decision the user didn't
     // explicitly request).
     if cfg.output.bigtiff == BigTiff::Auto
+        && let FrameRender::Tiff(rendered) = &rendered
         && encode::plans_bigtiff(&cfg.output, &rendered.image, rendered.icc.len())
     {
         push_warning_buf(
@@ -2959,9 +3032,9 @@ fn convert_frame(
     let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
         let stage_started = Instant::now();
-        // Same `depth()` the primary encode uses, so the sidecar's container tracks the
-        // output's: 16-bit for the legacy default, f32 for legacy `--output-hdr` **and**
-        // for `film-master` (which resolves f32 without touching `output.hdr`). The IR
+        // Use the preset's resolved `depth()` for the IR TIFF: 16-bit for the legacy
+        // default and `ultra-hdr-v1` (whose primary is a fixed 8-bit JPEG), f32 for
+        // legacy `--output-hdr` and `film-master` (which resolves f32 without touching `output.hdr`). The IR
         // *samples* are unchanged either way — the plane is carried, never converted —
         // so the only difference is quantization headroom. Documented in design-spec §9.
         encode::export_ir(&image, cfg.output.depth(), path)?;
@@ -2972,7 +3045,18 @@ fn convert_frame(
 
     // Stage 5 — encode + effective-recipe sidecar.
     let stage_started = Instant::now();
-    let outcome = encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?;
+    let render_timings = rendered.timings();
+    let outcome = match rendered {
+        FrameRender::Tiff(rendered) => {
+            encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?
+        }
+        FrameRender::UltraHdr { render, .. } => ultra_hdr::encode(*render, output)?,
+    };
+    if cms_error_occurred() {
+        return Err(NcError::Other(
+            "color management (lcms2) reported a runtime error; see stderr".into(),
+        ));
+    }
     let encode_ms = elapsed_ms(stage_started);
     let loss = outcome.loss;
     report.loss = Some(loss);
@@ -3029,8 +3113,8 @@ fn convert_frame(
             total: 0.0,
             decode: decode_ms,
             film_base: film_base_ms,
-            algorithm: rendered.timings.algorithm_ms,
-            color: rendered.timings.color_ms,
+            algorithm: render_timings.algorithm_ms,
+            color: render_timings.color_ms,
             encode: encode_ms,
             ir_export: ir_export_ms,
         },
@@ -3662,6 +3746,14 @@ fn load_manifest(path: &Path) -> Result<RollManifest> {
 /// `input.export_ir` path — which every frame would overwrite — is nonsensical.
 /// Reject it loudly rather than silently clobbering one IR file N times.
 fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
+    if cfg.output.preset == OutputPreset::UltraHdrV1 {
+        return Err(NcError::Usage(
+            "output.preset = \"ultra-hdr-v1\" is currently supported only by \
+             `nc convert`; roll naming, collision handling, and preset-specific \
+             memory calibration are owned by the later output/presets task"
+                .into(),
+        ));
+    }
     if cfg.input.export_ir.is_some() {
         return Err(NcError::Usage(
             "input.export_ir (--export-ir) is not supported in roll mode: it names a \
@@ -5967,11 +6059,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_non_default_linear_range_because_nothing_applies_it_yet() {
-        // Only the shared display stage applies the range placement, and no display
-        // preset is accepted by this build; the legacy path keeps its frozen ordering
-        // and `film-master` bypasses print controls entirely. So *every* branch would
-        // silently ignore a non-default value — reject it loudly instead.
+    fn linear_range_is_consumed_only_by_the_display_preset() {
+        // The legacy path keeps its frozen ordering and `film-master` bypasses
+        // print controls entirely. Ultra HDR reaches the shared display stage,
+        // so it is the first preset that legitimately consumes this value.
         //
         // The two branches are rejected by *different* rules, so assert each rule's own
         // distinctive wording: both messages name `linear_range`, which means a
@@ -5987,10 +6078,10 @@ mod tests {
             },
             ..ResolvedConfig::default()
         };
-        // Legacy → the "no consumer yet" rule.
+        // Legacy → the "no consumer" rule.
         let msg = validate_err(&cfg_with(OutputPreset::Legacy));
         assert!(msg.contains("linear_range"), "{msg}");
-        assert!(msg.contains("no display preset is"), "{msg}");
+        assert!(msg.contains("legacy no-preset TIFF"), "{msg}");
         // film-master → the print-control bypass sweep, which is a different reason.
         let msg = validate_err(&cfg_with(OutputPreset::FilmMaster));
         assert!(msg.contains("linear_range"), "{msg}");
@@ -5998,9 +6089,27 @@ mod tests {
             msg.contains("bypasses all print and display controls"),
             "{msg}"
         );
+        validate(&cfg_with(OutputPreset::UltraHdrV1)).unwrap();
         // The default pair is of course fine on both branches.
         validate(&ResolvedConfig::default()).unwrap();
         validate(&film_master_cfg()).unwrap();
+    }
+
+    #[test]
+    fn ultra_hdr_preset_is_convert_only_and_requires_a_jpeg_suffix() {
+        let cfg = ResolvedConfig {
+            output: OutputParams {
+                preset: OutputPreset::UltraHdrV1,
+                ..OutputParams::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        let mut args = parse_convert(&["--output-preset", "ultra-hdr-v1"]);
+        assert!(validate_convert(&cfg, &args).is_err());
+        args.output = PathBuf::from("out.JPEG");
+        validate_convert(&cfg, &args).unwrap();
+        let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
+        assert!(err.contains("convert"), "{err}");
     }
 
     #[test]
@@ -6531,9 +6640,9 @@ mod tests {
     #[test]
     fn removed_simple_flags_name_their_replacement_print_controls() {
         // In *this* build the removed simple controls are rejections, not the warned
-        // aliases design-spec §7.1/§9 specify: alias activation is tied to the named
-        // display presets, which are not accepted yet, so an alias could only warn and
-        // then hard-error on the same run. The message must name the concrete
+        // aliases design-spec §7.1/§9 specify: `ultra-hdr-v1` consumes the replacement
+        // controls, but alias activation remains tied to the complete output/presets
+        // migration. The message must name the concrete
         // replacement, which exists, and must not promise identical pixels —
         // per-channel gains and an affine range placement do not commute with the
         // working-space matrix.

@@ -211,15 +211,16 @@ detector proposes as possible rebate.
 
 ## 5. Output formats
 
-- **Current implemented container:** TIFF (BigTIFF when size requires 64-bit
-  offsets).
-- **Current implemented preset selection:** `--output-preset <legacy|film-master>`
-  / recipe key `output.preset` (default `legacy`). Exactly **two** names are
+- **Current implemented containers:** TIFF (BigTIFF when size requires 64-bit
+  offsets) and, for the explicit `ultra-hdr-v1` preset, gain-map JPEG.
+- **Current implemented preset selection:**
+  `--output-preset <legacy|film-master|ultra-hdr-v1>` / recipe key
+  `output.preset` (default `legacy`). Exactly **three** names are
   accepted today; every other planned name below is rejected with a
   "does not accept yet" message, and the pre-release `scene-master` is rejected as an
   unreleased-schema break (no alias). `legacy` **is** the no-preset state, so it
-  stays compatible with the legacy depth/profile/container flags; `film-master` is
-  a *named* preset and therefore atomic.
+  stays compatible with the legacy depth/profile/container flags;
+  `film-master` and `ultra-hdr-v1` are *named* presets and therefore atomic.
 - **Current implemented bit depth:**
   - default (no preset, no `--output-hdr`) → 16-bit integer TIFF (standard
     archival positive).
@@ -232,7 +233,9 @@ detector proposes as possible rebate.
     and **no** working→output transform, print control, or display rendering. The
     depth follows from the preset, not from `output.hdr` (which must stay at its
     default under a named preset).
-- **Current color selection:** the output color space is a CLI
+  - `--output-preset ultra-hdr-v1` → fixed 8-bit Display P3 SDR primary JPEG plus
+    a half-resolution grayscale gain-map JPEG and legacy Ultra HDR v1 metadata.
+- **Current legacy-TIFF color selection:** the output color space is a CLI
   option (`--output-profile`). The default depends on output depth:
   - 16-bit (default) output → **sRGB** (standard, display-ready positive).
   - float (`--output-hdr`) output → provisionally transformed/tagged **linear
@@ -242,8 +245,10 @@ detector proposes as possible rebate.
     piecewise sRGB TRC and a synthesized ICC v4 profile. As shipped it, like every
     output space, transforms *from* the linear Rec.709 working space: a lossless
     Rec.709→P3 primaries remap — Rec.709 ⊂ P3, no gamut compression — plus the sRGB
-    TRC. Consuming already-rendered linear-P3 values as a pure transfer-encode is
-    the target state once `sdr-display-rendering` lands.)
+    TRC. The shipped `ultra-hdr-v1` path instead takes rendered-linear Display P3
+    from the SDR stage and applies the matching transfer encoding without a second
+    gamut transform. The general `display-p3` preset adopts that same boundary when
+    `output/presets` activates it.)
   Either default can be overridden explicitly. Output is tagged with the embedded
   ICC profile for the chosen space.
 - **Working-space intent:** the current implementation treats reconstructed
@@ -263,6 +268,7 @@ detector proposes as possible rebate.
   rejected with a "not accepted yet" message):
   - `legacy` ⇧ — the no-preset transitional TIFF path (the default);
   - `film-master` ⇧ — unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering;
+  - `ultra-hdr-v1` ⇧ — explicit legacy Display P3 gain-map JPEG (convert only);
   - `gain-map-hdr` — future default, backward-compatible display HDR;
   - `display-p3` — wide-gamut SDR;
   - `compatibility` — sRGB SDR;
@@ -344,14 +350,16 @@ own parameter struct and can be unit-tested in isolation.
 
 The diagram below depicts the **target / replacement** architecture (tagged
 reconstruction, NC film RGB v1 working-space mapping, and the film-master /
-display-render split). The **current shipped** pipeline implements: decode +
-input-semantics resolution, film-base / `Dmin` estimation, the tagged
-reconstruction to typed `FilmRgbImage` (`algo::reconstruct`), and TIFF encode —
-then branches on the resolved `output.preset` (`pipeline::stages::render`):
+display-render split). The **current shipped** pipeline implements decode,
+input-semantics resolution, and film-base / `Dmin` estimation before preset
+dispatch. Dispatch then selects a container-specific stage entrypoint; that
+entrypoint invokes tagged `algo::reconstruct` (including the selected density
+curve) and owns the resulting `FilmRgbImage` boundary:
 
-- `legacy` (default, no preset) — the legacy print render applied *after* the
-  typed boundary but before the working→output ICC transform
-  (`algo::finish_print` → `pipeline::color::to_output`). Its pixels are frozen until
+- `legacy` (default, no preset) — `pipeline::stages::render` owns
+  `reconstruct → FilmRgbImage → finish_print → output ICC transform → TIFF`.
+  The legacy print render sits *after* the typed boundary but before the
+  working→output ICC transform. Its pixels are frozen until
   the output-preset migration, pinned by two complementary tests:
   `pipeline::stages::golden` freezes the **pre-colour-transform** values bit-for-bit
   (it calls `reconstruct_and_print` directly, so it never crosses the preset
@@ -359,16 +367,21 @@ then branches on the resolved `output.preset` (`pipeline::stages::render`):
   `stages::legacy_preset_render_is_the_frozen_reconstruct_print_colour_sequence`
   pins that the no-preset branch of `render` is still exactly that sequence composed
   with `color::to_output`.
-- `film-master` — stage 4 (`working_space::map_nc_film_rgb_v1`) followed by
-  `render_split::film_master`, encoded directly as unclamped f32 with the ACEScg
-  profile attached and no transform.
+- `film-master` — `pipeline::stages::render` owns
+  `reconstruct → FilmRgbImage → NC film RGB v1 → linear ACEScg → TIFF`; the
+  unclamped f32 buffer carries the ACEScg profile and receives no output transform.
+- `ultra-hdr-v1` — `pipeline::stages::render_gain_map_source` owns
+  `reconstruct → FilmRgbImage → NC film RGB v1 → linear ACEScg → shared print
+  controls`. The orchestrator then feeds that one adjusted source to the SDR and
+  HDR renderers and packages their half-resolution luminance gain map with the
+  Display P3 base as an explicitly legacy XMP/MPF JPEG (no ISO claim).
 
 Stage 5b's **shared print controls** (`render_split::display_source`) and both
 pure display renderers are implemented and unit-tested: `pipeline::sdr`
 produces rendered-linear Display P3/sRGB, while `pipeline::hdr` produces
-display-linear BT.2020 plus in-place Rec.2100 PQ/HLG encoding. They have no
-CLI-reachable consumer yet: no display preset is accepted, so a non-default
-`print.linear_range` is a loud usage error rather than a silently-ignored knob.
+display-linear BT.2020 plus in-place Rec.2100 PQ/HLG encoding. `ultra-hdr-v1`
+consumes both renderers and accepts non-default `print.linear_range`; the legacy
+TIFF path still rejects that control because its frozen ordering does not apply it.
 See the "Architecture" section of `CLAUDE.md` for the current-vs-target framing.
 
 ```
@@ -542,14 +555,13 @@ black/white remap. In the shipped pipeline, stage 3 ends at unclamped
 Inversion WB and clip remapping move after the ACEScg boundary to the downstream
 shared WB/black/range-placement contract. **As shipped**, both replacement homes
 now exist — explicit `print.white_balance` and `print.linear_range` /
-`--linear-range LOW,HIGH` — but no *display* preset is accepted yet and
-`film-master` bypasses print controls, so a non-default range is still not
-applicable: the old flags and `simple.*` recipe keys remain **rejected with a
-migration error** that names the concrete replacement, and a non-default
-`print.linear_range` is itself rejected rather than silently ignored (their
-defaults were the exact identity, so the default simple output is unchanged).
-Preset migration — activated with the display renderers, not with `film-master` —
-then resolves `--invert-white-balance` to explicit
+`--linear-range LOW,HIGH` — and the explicit `ultra-hdr-v1` display preset
+consumes them. The legacy TIFF path still rejects a non-default
+`print.linear_range`, and `film-master` bypasses print controls. The old flags and
+`simple.*` recipe keys remain **rejected with a migration error** that names the
+concrete replacement; convenient alias acceptance is deferred to the complete
+output-preset migration so its warnings, provenance, roll handling, and version
+boundary land together. That migration resolves `--invert-white-balance` to explicit
 `print.white_balance` and clip endpoints to
 `print.linear_range = [low, high]` / atomic `--linear-range LOW,HIGH`. Range
 merge starts from the recipe pair or `[0,1]`; the atomic flag replaces both
@@ -798,7 +810,7 @@ no interactive prompts.
 
 | Command | Purpose |
 |---|---|
-| `nc convert` | The main pipeline: negative file → positive TIFF. |
+| `nc convert` | The main pipeline: negative file → positive TIFF, or explicit `ultra-hdr-v1` gain-map JPEG. |
 | `nc roll` | Convert a batch of frames from one shared, frozen recipe (the batch-**apply** scaffold). Per-frame outputs into `--out-dir` + a roll-level JSON report. Single-frame `convert` is unchanged; roll is additive. |
 | `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
 | `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. `--d-max-region` additionally measures the roll-fixed display-white anchor `Dmax` from a fully-exposed reference frame, emitting reuse-ready `--d-max` / `reconstruction.curve.dmax` forms. |
@@ -886,10 +898,11 @@ preset migration still adds is the *alias acceptance*, not the keys. Legacy
 `simple.invert_white_balance`, `simple.clip_low`, and `simple.clip_high` are to be
 accepted solely as warned input aliases during the preset migration described in
 §9; they are not part of `reconstruction` and are currently rejected with a
-migration error (as are the flags), because neither replacement has a consumer in
-this build — `film-master` bypasses print controls and no display preset is accepted,
-so an alias could only warn and then hard-error on the same run. Legacy no-preset
-TIFF calls retain their current pixel ordering until migration.
+migration error (as are the flags). The replacements now have an explicit display
+consumer in `ultra-hdr-v1`, but alias acceptance remains deliberately deferred to
+the complete `output/presets` migration so help, warnings, recipe provenance, roll
+handling, and the behavioral-version boundary land together. Legacy no-preset TIFF
+calls retain their current pixel ordering until migration.
 
 ### Reports & determinism
 
@@ -1254,12 +1267,12 @@ object (§8). Names are binding and unknown keys are rejected
 (`deny_unknown_fields`).
 
 ### Input / decode
-- `--export-ir <path>` — write the IR plane to a separate file (HDRi only).
-  Recipe key `input.export_ir`. The sidecar is written at the **same resolved output
-  depth as the primary image** (`OutputParams::depth()`), so it is 16-bit for the
-  default, and 32-bit float for both legacy `--output-hdr` and `--output-preset
-  film-master` — the preset resolves f32 without `output.hdr` being set, so the IR
-  container follows even though the flag was not passed. The IR *samples* never
+- `--export-ir <path>` — write the IR plane to a separate TIFF (HDRi only).
+  Recipe key `input.export_ir`. For TIFF primaries the sidecar follows the resolved
+  output depth (`OutputParams::depth()`): 16-bit for the legacy default and 32-bit
+  float for legacy `--output-hdr` or `--output-preset film-master`. The explicit
+  `ultra-hdr-v1` exception has a fixed 8-bit JPEG primary but exports the IR plane
+  as a 16-bit TIFF. The IR *samples* never
   change: the plane is carried through the pipeline untouched (Step-1 rule: preserve,
   don't consume), so only the quantization headroom differs.
 - `--film-type <silver|chromogenic|unknown>` ⇒ `input.film_type` (default
@@ -1572,11 +1585,11 @@ false-positive on legitimate high-contrast conversions).
   finite `low < high` **and** a representable span (two individually-finite
   endpoints whose difference overflows would silently collapse every sample). A
   negative `LOW` is legal, so a leading `-` is accepted.
-  **Shipped state:** only the shared display stage applies it and no display preset
-  is accepted yet (both branch renderers are implemented but not activated),
-  while the legacy no-preset path keeps its frozen
-  ordering and `film-master` bypasses print controls entirely — so a non-default
-  value is currently a **loud usage error** rather than a silently-ignored knob.
+  **Shipped state:** the shared display stage applies it for the explicit
+  `ultra-hdr-v1` preset. The legacy no-preset path keeps its frozen ordering and
+  therefore rejects a non-default value, while `film-master` bypasses and rejects
+  all print controls. Remaining alias/default activation belongs to
+  `output/presets`.
 - White balance — a single mutually-exclusive choice, recipe key
   `print.white_balance` (default `{ "explicit": [1, 1, 1] }` = neutral; see
   §7.2). The two flags conflict (passing both is a usage error); whichever is
@@ -1616,9 +1629,11 @@ false-positive on legitimate high-contrast conversions).
   a migration error that names the concrete replacement) and the matching `simple.*`
   recipe keys are rejected too, because they are not simple reconstruction
   parameters in the film-preserving pipeline. Preset migration is to accept them as
-  warned aliases — activated with the named *display* presets, not with
-  `film-master`, since until then neither replacement has a consumer and an alias
-  could only warn and then hard-error on the same run:
+  warned aliases with the named *display* presets, not with `film-master`. Although
+  `ultra-hdr-v1` now consumes the replacement fields directly, alias activation
+  remains deferred to the complete `output/presets` migration so help text,
+  warnings, provenance, roll handling, and the conversion-version boundary land
+  atomically:
   inversion WB maps to explicit `print.white_balance`, while clip endpoints map
   to `print.linear_range` / atomic `--linear-range LOW,HIGH`. Resolve the recipe
   pair or `[0,1]` first. The atomic flag replaces both endpoints and conflicts
@@ -1635,7 +1650,8 @@ false-positive on legitimate high-contrast conversions).
 
 ### Output / encode (current terminal stage; target stages 5–6)
 - `-o, --output <path>` (required)
-- `--output-preset <legacy|film-master>` — the atomic output **policy** choice;
+- `--output-preset <legacy|film-master|ultra-hdr-v1>` — the atomic output
+  **policy** choice;
   recipe key `output.preset` (default `legacy`). One mutually-exclusive enum field,
   never parallel bools: a preset resolves a whole coherent container/depth/profile
   policy plus which branch of the ACEScg boundary runs.
@@ -1663,6 +1679,13 @@ false-positive on legitimate high-contrast conversions).
     explicit/roll, or `none` (unity placement); sigmoid — `fixed` or explicit/roll
     (`none` is rejected for the S-curve regardless of preset); `simple` has no
     `Dmax`.
+  - `ultra-hdr-v1` is an explicitly legacy, non-default gain-map JPEG accepted
+    by `convert` only. It writes an 8-bit Display P3 SDR primary plus a
+    half-resolution grayscale Ultra HDR v1 gain-map JPEG and legacy XMP/MPF/
+    GContainer metadata. It requires a `.jpg`/`.jpeg` output, consumes the shared
+    post-ACEScg print controls, and makes no ISO 21496-1 claim. The canonical
+    internal gain model remains RGB; the legacy serializer derives the
+    single-channel Display P3 luminance gain that XMP mode can signal.
   - Every other planned name (`gain-map-hdr`, `display-p3`, `compatibility`,
     `hdr-pq`, `hdr-hlg`, `custom`) is rejected with a distinct "not accepted yet"
     message rather than a generic unknown-value error, and the pre-release
@@ -1713,8 +1736,10 @@ explicitly reset recipe values to defaults, and the resolved report records the
 effective values/provenance and that no display transfer ran. A selected
 `correction.profile` is not a downstream creative/print/display control:
 corrected output remains `film-master` and records mandatory profile
-identity/hash/scope provenance. Of those names only `film-master` is accepted by
-the current CLI (see `--output-preset` above); the rest are not yet.
+identity/hash/scope provenance. Of the policies in this migration list,
+`film-master` is already accepted; the current CLI also accepts the separate
+explicit `ultra-hdr-v1` compatibility preset described above. The remaining
+convenient display policies and default migration are not yet accepted.
 `nc roll` migration is part of the preset task: automatic names use
 each resolved container suffix, manifest/per-frame overrides validate
 independently, and each sidecar derives from its final image path. The single roll

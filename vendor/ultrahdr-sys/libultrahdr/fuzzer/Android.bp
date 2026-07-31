@@ -1,0 +1,77 @@
+// Copyright 2023 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+package {
+    // See: http://go/android-license-faq
+    // A large-scale-change added 'default_applicable_licenses' to import
+    // all of the 'license_kinds' from "external_libultrahdr_license"
+    // to get the below license kinds:
+    //   SPDX-license-identifier-Apache-2.0
+    default_applicable_licenses: ["external_libultrahdr_license"],
+}
+
+cc_defaults {
+    name: "ultrahdr_fuzzer_defaults",
+    host_supported: true,
+    shared_libs: [
+        "libimage_io",
+        "libjpeg",
+    ],
+    static_libs: [
+        "libjpegdecoder",
+        "libjpegencoder",
+        "libultrahdr",
+        "liblog",
+    ],
+    target: {
+        darwin: {
+            enabled: false,
+        },
+        android: {
+            cflags: ["-DUHDR_ENABLE_GLES"],
+            shared_libs: [
+                "libEGL",
+                "libGLESv3",
+            ],
+        },
+    },
+    fuzz_config: {
+        cc: [
+            "android-media-fuzzing-reports@google.com",
+        ],
+        description: "The fuzzers target the APIs of jpeg hdr",
+        service_privilege: "constrained",
+        users: "multi_user",
+        fuzzed_code_usage: "future_version",
+        vector: "local_no_privileges_required",
+    },
+}
+
+cc_fuzz {
+    name: "ultrahdr_enc_fuzzer",
+    defaults: ["ultrahdr_fuzzer_defaults"],
+    srcs: [
+        "ultrahdr_enc_fuzzer.cpp",
+    ],
+}
+
+cc_fuzz {
+    name: "ultrahdr_dec_fuzzer",
+    defaults: ["ultrahdr_fuzzer_defaults"],
+    srcs: [
+        "ultrahdr_dec_fuzzer.cpp",
+    ],
+}
+
+cc_fuzz {
+    name: "ultrahdr_legacy_fuzzer",
+    defaults: ["ultrahdr_fuzzer_defaults"],
+    srcs: [
+        "ultrahdr_legacy_fuzzer.cpp",
+    ],
+}
