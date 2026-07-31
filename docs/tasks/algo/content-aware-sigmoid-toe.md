@@ -10,7 +10,7 @@ silently correcting exposure.
 
 Add one tagged toe-source choice rather than parallel booleans:
 
-- `reference` (default): the fixed Dmin/Dmax-normalized behavior from
+- `reference` (default): the fixed Dmin-origin, Dmax-anchored behavior from
   `reference-anchored-sigmoid`;
 - `frame`: derive the statistic independently for one frame;
 - `roll`: derive once from an explicitly selected roll calibration set and
@@ -56,3 +56,4 @@ the required reference task to accumulate content-analysis code.
 
 - [Reference-anchored sigmoid reconstruction](reference-anchored-sigmoid.md)
 - [Roll conversion](../core/roll-conversion.md)
+- [Output presets and guidance](../output/presets.md)

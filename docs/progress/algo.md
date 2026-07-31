@@ -1084,3 +1084,25 @@ What other epics need to know about `algo`:
   per-frame and roll-frozen acquisition, requires complete provenance, and
   forbids frame-local fitting from film-master/normal product presets so nc does
   not silently auto-correct exposure.
+
+
+## reference-anchored-sigmoid (continued)
+
+**Status:** not started
+**Updated:** 2026-07-31
+
+- 2026-07-31 (PR review terminology correction): The shipped sigmoid is
+  **Dmax-anchored**, not Dmax-normalized: its coordinate is
+  `t = contrast * (D' - Dmax)` and does not divide by Dmax. The earlier
+  2026-07-30 and 2026-07-31 entries above used “Dmax-normalized” imprecisely;
+  this entry supersedes that wording while preserving the append-only history.
+
+
+## content-aware-sigmoid-toe (continued)
+
+**Status:** not started
+**Updated:** 2026-07-31
+
+- 2026-07-31 (PR review): Added `output/presets` as a prerequisite. This task
+  promises named-preset rejection and byte-identity verification, so the preset
+  surface must exist before those contracts can be implemented or tested.

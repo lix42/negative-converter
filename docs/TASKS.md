@@ -115,6 +115,7 @@ graph TD
   color --> output
   algo --> output
   core --> output
+  output --> algo
   output --> analysis
 ```
 
@@ -271,6 +272,7 @@ graph TD
   film-base/dmax-reference --> algo/reference-anchored-sigmoid
   algo/reference-anchored-sigmoid --> algo/content-aware-sigmoid-toe
   core/roll-conversion --> algo/content-aware-sigmoid-toe
+  output/presets --> algo/content-aware-sigmoid-toe
   algo/negative-reconstruction-density-curves --> color/film-rgb-working-space
   color/management --> color/film-rgb-working-space
   color/film-rgb-working-space --> color/film-master-render-pipeline
@@ -348,7 +350,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
 - `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
-- `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`; no downstream blockers
+- `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`; no downstream blockers
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
