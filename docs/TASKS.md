@@ -56,7 +56,10 @@ under, and the parenthesized paths are the modules it owns.
   with CLI override, and measure the roll-fixed `Dmax` anchor from a reference
   frame. The two are *different quantities* (see design-spec §4) that share this
   measurement surface.
-- **color** (`pipeline/color.rs`, `pipeline/working_space.rs`) — map typed NC film RGB v1 into linear ACEScg, then transform/render it for the selected output; optional correction is explicit.
+- **color** (`pipeline/color.rs`, `pipeline/working_space.rs`, planned
+  `pipeline/colorimetry.rs`) — map typed NC film RGB v1 into linear ACEScg,
+  centralize auditable color-space definitions and derived coefficients, then
+  transform/render it for the selected output; optional correction is explicit.
 - **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged
   `reconstruction` recipe object into simple or density reconstruction. The
   reference-anchored sigmoid is the candidate product default and owns
@@ -109,11 +112,13 @@ graph TD
   algo --> film-base
   io --> color
   io --> algo
+  io --> output
   film-base --> algo
   algo --> color
   film-base --> color
   color --> output
   algo --> output
+  output --> color
   core --> output
   output --> algo
   output --> analysis
@@ -174,6 +179,7 @@ graph TD
     color/post-reconstruction-color-characterization
     color/optional-color-correction-profiles
     color/scanner-profile-before-density-experiment
+    color/colorimetry-source-of-truth
   end
   subgraph output
     output/display-p3-output
@@ -184,6 +190,7 @@ graph TD
     output/ultrahdr-dependency-externalization
     output/iso-gain-map-metadata
     output/hdr-avif-output
+    output/lossless-hdr-tiff
     output/presets
   end
   subgraph telemetry
@@ -293,9 +300,14 @@ graph TD
   output/hdr-display-rendering --> output/gain-map-hdr-output
   output/gain-map-hdr-output --> output/ultrahdr-dependency-externalization
   output/gain-map-hdr-output --> output/iso-gain-map-metadata
+  output/gain-map-hdr-output --> color/colorimetry-source-of-truth
   output/hdr-display-rendering --> output/hdr-avif-output
+  output/hdr-display-rendering --> output/lossless-hdr-tiff
+  color/colorimetry-source-of-truth --> output/lossless-hdr-tiff
+  io/transactional-output-writes --> output/lossless-hdr-tiff
   output/iso-gain-map-metadata --> output/presets
   output/hdr-avif-output --> output/presets
+  output/lossless-hdr-tiff --> output/presets
   algo/reference-anchored-sigmoid --> output/presets
   core/roll-conversion --> output/presets
   core/conversion-versioning --> output/presets
@@ -362,6 +374,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `color/post-reconstruction-color-characterization` (post-MVP, **closed—superseded**; the deps below are decision history, not a live prerequisite set): `io/input-data-semantics`, `color/management`, `film-base/dmax-reference`
 - `color/optional-color-correction-profiles` (post-MVP, **optional / deferred**): `color/film-rgb-working-space`, `color/film-master-render-pipeline`; no downstream blockers
 - `color/scanner-profile-before-density-experiment` (post-MVP, **deferred experiment**): `io/input-data-semantics`, `color/management`
+- `color/colorimetry-source-of-truth` (post-MVP, **deferred refactor**): `output/gain-map-hdr-output`
 - `output/display-p3-output` (post-MVP): `color/management`
 - `output/hdr-output-spike` (post-MVP, spike): `color/management`
 - `output/sdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/display-p3-output`, `output/hdr-output-spike`
@@ -370,7 +383,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `output/ultrahdr-dependency-externalization` (post-MVP, **deferred maintenance**; no downstream blockers): `output/gain-map-hdr-output`
 - `output/iso-gain-map-metadata` (post-MVP): `output/gain-map-hdr-output`
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
-- `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `core/conversion-versioning`
+- `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`, `io/transactional-output-writes`
+- `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `output/lossless-hdr-tiff`, `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `core/conversion-versioning`
 - `telemetry/perf-instrumentation` (post-MVP, **parked**): `core/pipeline-orchestration`
   — LAB criterion benches; prototyped and parked on git branch
   prototype/perf-bench-instrumentation, superseded by telemetry/perf-telemetry as
@@ -502,9 +516,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   miss, with a false-positive guard validated on real scans.
 
 ### color — [progress](progress/color.md)
-> `pipeline/color.rs` and `pipeline/working_space.rs`: ICC transforms, the
-> versioned NC film RGB v1 → linear ACEScg mapping, the film-master branch, and
-> the optional measured-correction work.
+> `pipeline/color.rs`, `pipeline/working_space.rs`, and the planned
+> `pipeline/colorimetry.rs`: ICC transforms, the versioned NC film RGB v1 →
+> linear ACEScg mapping, auditable color-space definitions and derived
+> coefficients, the film-master branch, and the optional measured-correction
+> work.
 
 - [x] [Color management](tasks/color/management.md)
 - [x] [NC Film RGB working-space mapping](tasks/color/film-rgb-working-space.md) — map every film rendering through versioned NC film RGB v1 into typed linear ACEScg/D60
@@ -512,12 +528,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Post-reconstruction characterization runtime](tasks/color/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `algo/negative-reconstruction-density-curves`, `color/film-rgb-working-space`, `color/film-master-render-pipeline`, and `color/optional-color-correction-profiles`
 - [ ] [Optional color-correction profiles](tasks/color/optional-color-correction-profiles.md) — **optional / deferred** measured neutralization with explicit selection and provenance; blocks no output task
 - [ ] [Scanner ICC before-density experiment](tasks/color/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of the superseded characterization proposal and the normal NC film RGB mapping
+- [ ] [Colorimetry source of truth and update workflow](tasks/color/colorimetry-source-of-truth.md) — **deferred refactor after gain-map**: centralize standards provenance and pinned derived coefficients, migrate existing transforms, and make future color-space updates reproducible before lossless HDR TIFF work
 
 ### output — [progress](progress/output.md)
 > The display renditions and encoders downstream of `color`: the color-accurate
 > SDR path first, then standards-based HDR rendering, a backward-compatible
-> gain-map output, and the presets that resolve them together. These define the
-> intended product default that `analysis` verifies.
+> gain-map output, lossless HDR TIFF interchange/display encodings, and the
+> presets that resolve them together. These define the intended product default
+> that `analysis` verifies.
 
 - [x] [Display P3 output](tasks/output/display-p3-output.md) — synthesize and embed a standards-conforming Display P3 ICC profile for the SDR/base rendition
 - [x] [HDR still-output spike](tasks/output/hdr-output-spike.md) — decided ISO HDR/gain-map container, encoder, metadata, reference-white, and cross-platform strategy; licensed-normative-text check waived at spike level and re-homed to the encoder tasks as a pre-merge gate (2026-07-24)
@@ -527,6 +545,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Externalize the Ultra HDR native dependency](tasks/output/ultrahdr-dependency-externalization.md) — **deferred maintenance**: replace the checked-in native snapshot with an exact published Cargo dependency once it contains the required marker-order fix and supports a network-free, static build; blocks no output work
 - [ ] [Final ISO gain-map metadata](tasks/output/iso-gain-map-metadata.md) — add verified ISO 21496-1:2025 metadata to the same JPEG and prove dual-dialect agreement
 - [ ] [HDR AVIF output](tasks/output/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
+- [ ] [Lossless HDR TIFF outputs](tasks/output/lossless-hdr-tiff.md) — preserve display-linear BT.2020 as 32-bit float TIFF and Rec.2100 PQ/HLG as losslessly stored 16-bit TIFF code values with truthful signaling
 - [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
 
 ### telemetry — [progress](progress/telemetry.md)

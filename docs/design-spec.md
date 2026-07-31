@@ -62,8 +62,8 @@ The deterministic core owns the image science. Any future ML assistance (see
 - ML/AI assistance of any kind (auto-crop, neutral-patch detection, inpainting).
 - Batch/roll preset management UI, GUI, scanner ICC profiling workflow.
 - Output formats other than TIFF in Step 1. The post-MVP display-output roadmap
-  now targets ISO gain-map HDR in JPEG, single-rendition HDR in AVIF, plus
-  PNG/EXR as appropriate.
+  now targets ISO gain-map HDR in JPEG, single-rendition HDR in AVIF, lossless
+  linear/PQ/HLG HDR interchange in TIFF, plus PNG/EXR as appropriate.
 
 ## 3. Design principles
 
@@ -270,10 +270,13 @@ detector proposes as possible rebate.
   - `film-master` ⇧ — unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering;
   - `ultra-hdr-v1` ⇧ — explicit legacy Display P3 gain-map JPEG (convert only);
   - `gain-map-hdr` — future default, backward-compatible display HDR;
-  - `display-p3` — wide-gamut SDR;
-  - `compatibility` — sRGB SDR;
-  - `hdr-pq` — single-rendition BT.2020 / Rec.2100 PQ;
-  - `hdr-hlg` — explicit HLG/broadcast-oriented output;
+  - `display-p3` — 16-bit losslessly stored wide-gamut SDR TIFF;
+  - `compatibility` — 16-bit losslessly stored sRGB SDR TIFF;
+  - `hdr-pq` — single-rendition BT.2020 / Rec.2100 PQ AVIF;
+  - `hdr-hlg` — explicit HLG/broadcast-oriented AVIF;
+  - `hdr-linear-tiff` — 32-bit float display-linear BT.2020 HDR interchange TIFF;
+  - `hdr-pq-tiff` — losslessly stored 16-bit BT.2020 / Rec.2100 PQ TIFF;
+  - `hdr-hlg-tiff` — losslessly stored 16-bit BT.2020 / Rec.2100 HLG TIFF;
   - `custom` — expert-selected format/profile policy.
   A preset resolves container, bit depth, primaries/profile, transfer function,
   tone/gamut mapping, and metadata together. The current `--output-hdr` name is
@@ -1687,11 +1690,12 @@ false-positive on legitimate high-contrast conversions).
     internal gain model remains RGB; the legacy serializer derives the
     single-channel Display P3 luminance gain that XMP mode can signal.
   - Every other planned name (`gain-map-hdr`, `display-p3`, `compatibility`,
-    `hdr-pq`, `hdr-hlg`, `custom`) is rejected with a distinct "not accepted yet"
-    message rather than a generic unknown-value error, and the pre-release
-    `scene-master` is rejected as an unreleased-schema break naming the rename —
-    **not** an alias. The flag and the recipe key share one parser, so a name gets
-    the same diagnosis wherever it appears.
+    `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`,
+    `custom`) is rejected with a distinct "not accepted yet" message rather than
+    a generic unknown-value error, and the pre-release `scene-master` is rejected
+    as an unreleased-schema break naming the rename — **not** an alias. The flag
+    and the recipe key share one parser, so a name gets the same diagnosis
+    wherever it appears.
 - `--output-hdr` — current transitional flag: write a 32-bit float unclamped
   **rendered** TIFF after the current print controls, never the `film-master`
   preset (which is a *different* flag — see `--output-preset`) or Rec.2100 display
@@ -1721,8 +1725,12 @@ false-positive on legitimate high-contrast conversions).
 
 Planned `output/presets` replaces the depth-only default with `gain-map-hdr` and
 explicit `display-p3`, `compatibility`, `film-master`, `hdr-pq`, `hdr-hlg`, and
-`custom` policies. `film-master` encodes NC film RGB v1 mapped unclamped linear
-ACEScg before print/display controls and rejects frame-local auto Dmax.
+`hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, and `custom` policies.
+`display-p3` and `compatibility` are 16-bit losslessly stored TIFF; `hdr-pq` and
+`hdr-hlg` are AVIF, while the three explicitly suffixed HDR TIFF policies provide
+linear-float or losslessly stored PQ/HLG interchange. `film-master` encodes NC
+film RGB v1 mapped unclamped linear ACEScg before print/display controls and
+rejects frame-local auto Dmax.
 Exponential accepts supported `none` or fixed/roll placement, sigmoid uses fixed
 Dmax for curve shaping, and simple has none. Named display presets use the SDR/HDR render
 branches. The output path stays required; its suffix must match the
@@ -2236,15 +2244,21 @@ the NLP feature comparison, Phase 6).
     yield gain 1. A peak sample enters as `4.926108...`, but its gain still uses
     the actual independently tone-mapped SDR sample and offsets and is not
     assumed to equal display headroom. Once verified,
-    `gain-map-hdr` becomes the default; explicit presets retain Display P3 SDR,
-    sRGB compatibility, linear ACEScg film master, PQ, HLG, and custom workflows.
+    `gain-map-hdr` becomes the default; explicit presets retain 16-bit TIFF
+    Display P3 SDR and sRGB compatibility, linear ACEScg film master, PQ/HLG
+    AVIF, linear/PQ/HLG HDR TIFF interchange, and custom workflows.
     `nc roll` naming/manifests migrate with presets so suffixes derive from each
     resolved container and per-image sidecars derive from final image paths. One
     roll report remains on stdout or explicit `--report-file`, collision-checked
     against all batch inputs/outputs/sidecars. Core full-size TIFF/resource verification remains independently runnable;
     final gain-map/preset metadata, faithful film-rendering consistency, and
     cross-device behavior are a separate gate.
-    Tracked: `gain-map-hdr-output`, `hdr-avif-output`, `output/presets`,
+    The standards-derived matrices, luma coefficients, primaries, and transfer
+    definitions are consolidated and made auditable before the lossless HDR TIFF
+    encoders add another profile/signaling surface. The TIFF task owns exact
+    float/code-value round trips and truthful signaling/interoperability claims.
+    Tracked: `gain-map-hdr-output`, `hdr-avif-output`,
+    `colorimetry-source-of-truth`, `lossless-hdr-tiff`, `output/presets`,
     `display-output-acceptance`.
 
 ## 13. Open questions

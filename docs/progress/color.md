@@ -902,3 +902,20 @@ What other epics need to know about `color`:
   of its `## input-data-semantics` section: they lost their heading in the flat
   log before the epic split, so it carried them there verbatim. Read them before
   starting.
+
+
+## colorimetry-source-of-truth
+
+**Status:** not started / deferred refactor
+**Updated:** 2026-07-30
+
+- 2026-07-30: Added as accepted technical debt after the gain-map implementation
+  introduced more standards-based matrices and luma coefficients. The task will
+  add a central colorimetry module, migrate existing transforms without changing
+  pixels, and establish a deterministic, CI-checked workflow for future
+  color-space updates. It depends on `output/gain-map-hdr-output` so the
+  gain-map surface is stable before consolidation, and it blocks no output task.
+- 2026-07-30: **Dependency update:** it still does not block the in-progress
+  gain-map implementation, but `output/lossless-hdr-tiff` now deliberately
+  depends on it so future BT.2020 TIFF profiles and encoder adapters reuse the
+  audited definitions instead of deepening the same debt.
