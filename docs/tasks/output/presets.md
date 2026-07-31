@@ -27,18 +27,30 @@ A preset is an atomic policy choice, not a nickname for one ICC profile. It
 resolves container, depth, primaries/profile, transfer function, tone/gamut
 mapping, and required metadata.
 
+The product-default recipe uses the reference-anchored sigmoid reconstruction.
+Its toe establishes the common shadow-floor placement before the film-master /
+display split. Output presets do not silently replace an explicit reconstruction
+choice, but exponential and simple are advanced/custom diagnostic paths rather
+than members of the normal product guidance. Do not remove those paths in this
+task; public-surface retirement requires separate acceptance evidence and a
+migration decision.
+
 `film-master` branches directly from NC film RGB v1 mapped linear ACEScg and bypasses
 white balance, exposure, black/range placement, highlight compression, SDR/HDR tone
 mapping, and display gamut mapping. It preserves the intentional film, lens,
 development, scanner, reconstruction, and curve rendering; it is not a physical
 scene-linear recovery. Named display presets use the SDR or HDR rendering
-branches. A linear master with creative, print, or display adjustments belongs
-to `custom` and records every adjustment. The mandatory preset implementation
-covers the uncorrected path and does not depend on correction profiles. The
-later optional correction task may produce the same accepted `AcesCgImage` type
-and feed it into the unchanged split; that task owns the rule that corrected
-output remains `film-master`, its identity/hash/scope provenance, and rejection
-of bypassed print/display controls.
+branches. Their neutral defaults preserve the sigmoid's black and midtone
+placement: display rendering may perform the declared transfer, reference-white,
+highlight-headroom, and gamut adaptation, but must not compensate for a raised
+reconstruction floor or introduce a second large creative grade. A linear
+master with creative, print, or display adjustments belongs to `custom` and
+records every adjustment. The mandatory preset implementation covers the
+uncorrected path and does not depend on correction profiles. The later optional
+correction task may produce the same accepted `AcesCgImage` type and feed it into
+the unchanged split; that task owns the rule that corrected output remains
+`film-master`, its identity/hash/scope provenance, and rejection of bypassed
+print/display controls.
 
 The bypass is strict, not silent: after recipe/CLI merge, `film-master` rejects
 any non-default white balance, exposure, black/white point, highlight, SDR/HDR tone,
@@ -124,7 +136,8 @@ preserve misleading terminology.
 ## How to Verify
 
 - With an output path but no output-selection options, resolution selects
-  `gain-map-hdr` and records every effective setting.
+  `gain-map-hdr` with reference-anchored sigmoid reconstruction and records every
+  effective setting.
 - Each preset resolves to the documented container, depth, color encoding,
   rendering path, and metadata; explicit conflicts fail loudly.
 - Path-extension tests cover every container, including a mismatched
@@ -141,6 +154,10 @@ preserve misleading terminology.
   preserves exposure, sigmoid uses fixed Dmax for curve shaping, simple exposes
   no Dmax, and the report records the curve and placement without claiming a
   physical-scene or display-white mapping.
+- A shared-source fixture proves film-master, SDR, and HDR start from the same
+  reference-anchored sigmoid result. After declared output normalization, neutral
+  display defaults do not re-establish black or substantially reshape midtones;
+  unavoidable highlight/gamut adaptation is measured separately.
 - Merge/conflict tests cover every downstream control from recipe and CLI,
   flags-win resets to defaults, complete resolved-report provenance, and the
   absence of a silent-ignore option.
@@ -171,5 +188,6 @@ preserve misleading terminology.
 
 - [Final ISO gain-map metadata](iso-gain-map-metadata.md)
 - [HDR AVIF output](hdr-avif-output.md)
+- [Reference-anchored sigmoid reconstruction](../algo/reference-anchored-sigmoid.md)
 - [Roll conversion](../core/roll-conversion.md)
 - [Conversion versioning and baseline comparison](../core/conversion-versioning.md)
