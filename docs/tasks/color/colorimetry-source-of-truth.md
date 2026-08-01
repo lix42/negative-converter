@@ -14,7 +14,7 @@ that it does not introduce another generation of duplicated coefficients.
 
 ## Design
 
-Add `src/pipeline/colorimetry.rs` as the single source of truth for the
+Add `src/pipeline/colorimetry/` as the single source of truth for the
 project's standards-based RGB colorimetry. Give the module small explicit data
 types for chromaticities, white points, RGB primaries, 3×3 matrices, and named
 color-space definitions. Cover every space and adaptation currently used by the
@@ -104,6 +104,12 @@ Little CMS where ICC transforms are the intended mechanism.
 - The refactor does not change the current pipeline fingerprint. Any discovered
   numerical correction is reported and moved to a separately reviewed
   behavioral task.
+
+**As built:** the module is a directory rather than one file, because the
+generated audit artifact and the `#[cfg(test)]` derivation want their own files:
+`definitions.rs` (category 1), `pinned.rs` (category 2), `derive.rs`,
+`audit.rs`, `tests.rs`, and the generated `derived-artifacts.txt`. The module
+path `pipeline::colorimetry` is unchanged.
 
 ## Dependencies
 

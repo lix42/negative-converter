@@ -6,6 +6,9 @@
 
 use serde::Serialize;
 
+use crate::pipeline::colorimetry::pinned::{
+    ACESCG_TO_DISPLAY_P3, ACESCG_TO_SRGB, DISPLAY_P3_LUMA, SRGB_LUMA,
+};
 use crate::pipeline::render_split::SharedDisplaySource;
 use crate::types::{LinearImage, NcError, Result};
 
@@ -157,9 +160,12 @@ fn destination_rgb(aces: [f32; 3], gamut: SdrGamut) -> ([f32; 3], [f32; 3]) {
         SdrGamut::DisplayP3 => ACESCG_TO_DISPLAY_P3,
         SdrGamut::SRgb => ACESCG_TO_SRGB,
     };
+    // Both vectors are `colorimetry::pinned` constants, not literals. The P3 one
+    // used to be spelled out here as well as in `gain_map`, so a colour-space
+    // update could have moved one copy and left the other silently stale.
     let weights = match gamut {
-        SdrGamut::DisplayP3 => [0.228_974_57, 0.691_738_55, 0.079_286_91],
-        SdrGamut::SRgb => [0.212_639, 0.715_169, 0.072_192],
+        SdrGamut::DisplayP3 => DISPLAY_P3_LUMA,
+        SdrGamut::SRgb => SRGB_LUMA,
     };
     (mul(matrix, aces), weights)
 }
@@ -241,18 +247,10 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-// AP1/D60 → XYZ, Bradford D60→D65, then XYZ → destination RGB. Pinned
-// constants make the renderer independent of an installed ICC/CMM.
-const ACESCG_TO_SRGB: [[f32; 3]; 3] = [
-    [1.705_051, -0.621_792_14, -0.083_258_875],
-    [-0.130_256_41, 1.140_804_8, -0.010_548_319],
-    [-0.024_003_357, -0.128_968_98, 1.152_972_3],
-];
-const ACESCG_TO_DISPLAY_P3: [[f32; 3]; 3] = [
-    [1.379_214_2, -0.308_864_15, -0.070_349_984],
-    [-0.069_334_86, 1.082_296_7, -0.012_961_888],
-    [-0.002_159_009_7, -0.045_459_326, 1.047_618_4],
-];
+// AP1/D60 → XYZ, Bradford D60→D65, then XYZ → destination RGB. Reviewed,
+// checked-in constants keep the renderer independent of an installed ICC/CMM;
+// they are defined once in `colorimetry::pinned` (imported above), together with
+// their standards provenance and the tests that re-derive them.
 
 #[cfg(test)]
 mod tests {

@@ -67,6 +67,36 @@ What other epics need to know about `color`:
   display preset is accepted, a non-default `print.linear_range` is a loud usage
   error rather than a silently-ignored knob. `output/{sdr,hdr}-display-rendering`
   are its consumers.
+- **`pipeline/colorimetry/` is the single source of truth for every
+  standards-based matrix and luma vector.** No stage may define its own: import
+  from `colorimetry::pinned`. The runtime **never derives** — the binary64
+  derivation and the audit harness are `#[cfg(test)]`, so rendering stays
+  independent of an installed ICC/CMM and of any per-run computation. Product
+  policy (reference white, peak nits, shoulder, gain-map offsets) still belongs
+  to the stage that owns it, but must refer to a *named* space rather than
+  restate its colorimetry. Changing anything there follows
+  [`docs/colorimetry-maintenance.md`](../colorimetry-maintenance.md);
+  `NC_COLORIMETRY_REGEN=1 cargo test colorimetry::audit` regenerates the audit
+  artifact and **only** that — it never rewrites the runtime literals, so it
+  cannot silently move pixels. Four things downstream epics will trip on:
+  **(a)** two Bradford conventions coexist on purpose — the frozen
+  `nc-film-rgb-v1` mapping needs Lindbloom's published inverse and new artifacts
+  must use the exact one; **(b)** the three luma vectors have three different
+  provenances and three different verification rules — `BT2020_LUMA` is a
+  normative table (deliberately *not* matching a derivation), `DISPLAY_P3_LUMA`
+  is an exact derivation, and `SRGB_LUMA` is the derivation rounded to six
+  decimals (43 ulps out, with its own allowance); **(c)** the pinned-vs-derived
+  check tolerance is ±1 `f32` ulp, measured against the fact that the
+  chromaticities' own three-decimal rounding moves entries ~3,500 ulps;
+  **(d) `pinned.rs` is not the only runtime consumer of a definition** —
+  `pipeline::color` feeds `REC709`, `DISPLAY_P3`, `ACESCG`, and `PROPHOTO`
+  straight into Little CMS, so editing one of those four is a pixel change even
+  with `pinned.rs` untouched and every audit ulp at 0, and nothing automated
+  catches it (the drift gate stops before lcms2; the audit only compares pinned
+  artifacts). `output/lossless-hdr-tiff` depends on this epic so BT.2020 TIFF
+  profiles reuse these definitions instead of adding a third generation of
+  duplicated coefficients — and **(d) applies directly to it**, since a BT.2020
+  output profile would add a fifth lcms2-consumed space.
 - **Note:** the log entries for `scanner-profile-before-density-experiment` are
   stranded at the tail of the `input-data-semantics` section in
   [`io.md`](io.md) — they lost their heading in the flat log before this epic
@@ -906,8 +936,8 @@ What other epics need to know about `color`:
 
 ## colorimetry-source-of-truth
 
-**Status:** not started / deferred refactor
-**Updated:** 2026-07-30
+**Status:** done
+**Updated:** 2026-07-31
 
 - 2026-07-30: Added as accepted technical debt after the gain-map implementation
   introduced more standards-based matrices and luma coefficients. The task will
@@ -919,3 +949,219 @@ What other epics need to know about `color`:
   gain-map implementation, but `output/lossless-hdr-tiff` now deliberately
   depends on it so future BT.2020 TIFF profiles and encoder adapters reuse the
   audited definitions instead of deepening the same debt.
+- 2026-07-31: **Coefficient inventory.** Six runtime artifacts to centralize:
+  `working_space::NC_FILM_RGB_V1_TO_ACESCG` (f64), `sdr::ACESCG_TO_SRGB`,
+  `sdr::ACESCG_TO_DISPLAY_P3`, `hdr::ACESCG_TO_BT2020`,
+  `gain_map::BT2020_TO_DISPLAY_P3` (all f32 3×3), plus `hdr::BT2020_LUMA` and
+  `gain_map::DISPLAY_P3_LUMA`. Separately, `color.rs` repeats the Display P3
+  primaries + D65 white twice (lines ~184 and ~299) in the lcms2 profile
+  builders. The `PIPELINE_FINGERPRINTS` drift gate covers `film_base::estimate`,
+  `reconstruct_and_print` on the golden vectors, and the default recipe JSON —
+  none of which this refactor touches, so the fingerprint must not move.
+- 2026-07-31: **The two luma vectors are different *kinds* of number and must not
+  be centralized alike.** `BT2020_LUMA = [0.2627, 0.6780, 0.0593]` is the
+  normative tabulated vector from the standard; deriving it from the BT.2020
+  primaries instead gives `[0.262700212, 0.677998072, 0.059301716]`, agreeing only
+  to ~2e-6. `DISPLAY_P3_LUMA` is the opposite: a full-precision *derived* value
+  that reproduces the P3 NPM Y row exactly. So BT.2020's belongs in the
+  standard-definitions category and P3's in the derived-artifacts category, and
+  the check mode must apply the matching rule to each.
+- 2026-07-31: **The tree contains two different Bradford conventions** — the
+  first thing the re-derivation surfaced. `NC_FILM_RGB_V1_TO_ACESCG` reproduces
+  to **1.1e-16** using Lindbloom's *published 7-decimal* inverse cone matrix and
+  is off by **9.1e-8** using the exact inverse; the four display matrices are the
+  reverse, matching the **exact-inverse** derivation. A single centralized
+  `bradford()` therefore cannot reproduce all of them, so both conventions must be
+  named explicitly, with the Lindbloom-published one documented as retained
+  *solely* so the frozen v1 mapping re-derives exactly.
+- 2026-07-31: **Phase 0 (can the pinned f32 literals be reproduced exactly?) —
+  answered: no, and the check mode must be tolerance-based.** Swept the
+  derivation space in binary64 (adjugate vs Gauss-Jordan inverse, left vs right
+  composition association, four 3-term summation orders, Bradford vs CAT02):
+  **33 of 36 entries reproduce bit-exactly and every variant gives the same 33**.
+  The three residuals are `ACESCG_TO_SRGB[2][1]`, `ACESCG_TO_DISPLAY_P3[2][0]`,
+  and `BT2020_TO_DISPLAY_P3[0][2]`, each exactly **−1 f32 ulp**.
+  - Accumulation order is *not* the cause. The sweep moves the f64 result by only
+    ~5 f64 ulp (~1e-17), while reaching the f32 rounding boundary needs 3.7e-10
+    absolute / ~3e-9 relative — seven orders of magnitude more. The residual is a
+    source-data difference, most consistent with the original values having been
+    composed from intermediate matrices rounded to ~9–10 significant digits. No
+    derivation script or note was committed with #61/#62/#63, so the exact
+    historical route is unrecoverable from the repo.
+  - **This is not a coefficient correction and does not warrant a behavioral
+    task.** The published chromaticities are specified to three decimals, so their
+    own rounding (±5e-4) moves matrix entries by up to **4.2e-4 — 3,544× one f32
+    ulp**. A 1-ulp disagreement sits three orders of magnitude below the precision
+    the standards themselves define; neither value is "more correct", and re-pinning
+    the three entries would *itself* be the unreviewed pixel change this task
+    forbids. Record it as a measured, bounded deviation instead.
+  - **Decision:** pinned literals move verbatim, and check mode asserts agreement
+    with the canonical f64 derivation within **±1 f32 ulp**, with the three
+    boundary entries named individually and this measurement cited as the
+    justification the task's How-to-Verify asks for.
+- 2026-07-31: **Shipped.** `src/pipeline/colorimetry/` is now the single source
+  of truth, split by the four categories the task asked for:
+  `definitions.rs` (standard source data with provenance),
+  `pinned.rs` (the reviewed literals the runtime multiplies by),
+  `derive.rs` (binary64 derivation), `audit.rs` (the check/regen harness), and
+  `tests.rs` (tolerances + independent anchors). `derive`/`audit`/`tests` are
+  **`#[cfg(test)]`**, which is what structurally guarantees "the runtime never
+  derives" — stronger than a comment, and it avoids a `dead_code` allow on the
+  math.
+- 2026-07-31: **Migrated consumers, verbatim.** `working_space`, `sdr`, `hdr`,
+  `gain_map` now import from `colorimetry::pinned`; no stage keeps a private
+  copy. `color.rs` gained `lcms_inputs(ColorSpace)` so all five lcms2 profile
+  builders reference a named definition — that removed the file's duplicated
+  Display P3 primaries + D65 white (two copies, nothing keeping them in step).
+  `PROPHOTO` was added to the definitions for the `--output-profile prophoto`
+  builder; it has no pinned matrix because Little CMS does that colorimetry.
+  PQ/HLG constants moved into `definitions::transfer` — safe because every PQ
+  constant is a ratio of small integers and so is exactly representable at both
+  widths.
+- 2026-07-31: **Bit-identity verified two ways, same machine.** A temporary
+  `#[cfg(test)]` probe dumped raw `to_bits()` for 21 stage renditions
+  (working-space mapping; SDR sRGB/P3 × three highlight-compress values; HDR
+  linear × three, plus PQ and HLG; gain-map SDR/HDR-P3/ratio × three) before and
+  after — byte-identical. End-to-end, five outputs were checksummed before and
+  after: legacy TIFF, film-master, `ultra-hdr-v1` on both the 48-bit and 64-bit
+  fixtures, and an explicit `--output-profile display-p3` TIFF — all identical.
+  The probe was deleted afterwards rather than committed: those paths run
+  `powf`, so a checked-in bit-exact gate would be red on the other CI target
+  (CLAUDE.md's cross-platform caveat). `PIPELINE_FINGERPRINTS` is untouched, as
+  expected — the gate covers `film_base::estimate`, `reconstruct_and_print`, and
+  the default recipe JSON, none of which this refactor reaches.
+- 2026-07-31: **The maintenance command is a test-harness with a regen mode**
+  (`NC_COLORIMETRY_REGEN=1 cargo test colorimetry::audit`), so CI exercises
+  check mode through the existing `cargo test` gate — no new binary (the crate
+  stays single-bin), no new CI step, no Python. **Regeneration rewrites only
+  `derived-artifacts.txt`, never `pinned.rs`.** That asymmetry is deliberate: a
+  generator that edits runtime coefficients could silently change pixels,
+  whereas this one can only produce a reviewable diff. Because the artifact
+  records shipped values too, editing a literal without regenerating also fails
+  the check, so staleness is caught in both directions. The derivation is pure
+  IEEE-754 `+ - * /` with no transcendentals, so the artifact is cross-platform
+  stable and safe as a CI gate.
+- 2026-07-31: **Fixed a test that could not fail.**
+  `gain_map::bt2020_to_p3_matrix_matches_independent_primary_vectors` claimed
+  "independently calculated" reference vectors that were in fact the matrix's own
+  columns to the same digits — it could only ever restate the literal. It now
+  re-derives from the named definitions, and genuine independence lives in
+  `colorimetry::tests`: an externally published matrix, plus chromaticities
+  recovered from the transformed primaries and checked against the standards'
+  published values. `hdr`'s colored-vector test was left alone — its expected
+  values are a real independent derivation, not the matrix columns.
+- 2026-07-31: Wrote `docs/colorimetry-maintenance.md` (the 7-step workflow, the
+  representation-only vs pixel-change decision, and the two coexisting Bradford
+  conventions). All four gates green.
+- 2026-07-31: **Review round: `ulps_f32` overflowed on straddle-zero
+  comparisons.** It subtracted raw IEEE-754 bit patterns, which are
+  sign-magnitude and therefore not ordered across the sign. Any pair spanning
+  zero exceeded `i32` — `f32::MIN_POSITIVE` against its negation needs
+  2_147_483_648, one past `i32::MAX` — so it panicked in a debug build (how
+  `cargo test` runs) and wrapped to nonsense in release. Reachable, not
+  theoretical: `BT2020_TO_DISPLAY_P3[2][0]`, `ACESCG_TO_DISPLAY_P3[2][0]`, and
+  `ACESCG_TO_BT2020[1][0]` all sit near zero, so a standards revision flipping
+  one across zero would make the audit *panic* instead of reporting the
+  difference it exists to report. Fixed with a monotonic ordered key returning
+  `i64` (`-0.0` and `+0.0` key alike; `MAX_ULPS` widened to match).
+  **Side effect worth recording:** raw-bit subtraction was also sign-*inverted*
+  for two negative values, so the three known deviations were being reported as
+  −1 when the derivation is genuinely one ulp *above* the shipped literal. They
+  now read **+1**. Magnitudes, every runtime literal in `pinned.rs`, and all
+  source definitions are unchanged; the regenerated `derived-artifacts.txt` diff
+  is exactly those three signs. Output stayed bit-identical (legacy TIFF and
+  ultra-hdr-v1 checksums both unmoved).
+- 2026-07-31: **Review round 2: an "independent" oracle that was not, and two
+  transfer constants still outside the source of truth.**
+  `colorimetry::tests::transformed_primaries_recover_the_standards_chromaticities`
+  compared the recovered chromaticities against `definitions::BT2020.primaries`
+  — the same const its own derivation chain runs on — while its comment claimed
+  the expected numbers were "read straight off the standards". It did catch a
+  typo in `definitions.rs` left *un*-accompanied by a re-pin, but the documented
+  maintenance flow is "edit the definition, then re-pin the matrix", and in that
+  flow the definition and the pinned matrix move together, so a shared typo
+  validated itself. The expected values are now BT.2020-2 chromaticities
+  re-typed as literals in the test, with a comment saying plainly that pointing
+  them back at the const would destroy the independence the task requires.
+  **Demonstrated rather than asserted:** perturbing the BT.2020 red primary to
+  `x = 0.718`, re-pinning `BT2020_TO_DISPLAY_P3` to the new derivation, and
+  regenerating `derived-artifacts.txt` — so definition, pinned literal, and
+  audit all agreed with each other — leaves the new test failing
+  (`recovered (0.718000, 0.292000), standard says (0.708, 0.292)`), while the
+  previous `BT2020.primaries` form *passes* the identical perturbation. All
+  three files were restored afterwards and re-checksummed.
+  Separately, `hdr.rs`'s HLG OETF constant `a` and `color.rs`'s sRGB type-4
+  parametric TRC parameters were the last standards-based transfer constants
+  living in a stage. They moved to `definitions::transfer::hlg::OETF_A` and
+  `definitions::transfer::srgb::{G,A,B,C,D}` as `f64` with provenance. The HLG
+  narrowing is safe by bit pattern (`0.178_832_77` as `f32` and
+  `0.178_832_77_f64 as f32` are both `3e371ff0`), and the sRGB parameters are
+  kept as the standard's quotients (`1.0 / 1.055`, `0.055 / 1.055`,
+  `1.0 / 12.92`) rather than pre-evaluated decimals, so the `f64` values handed
+  to Little CMS are unchanged. `b` and `c` stay derived from `a` inside
+  `hlg_oetf` — that is the standard's own formulation. The test-only
+  `srgb_encode` helper in `color.rs` was deliberately **not** pointed at the new
+  definitions and now carries a comment saying so: it is the independent oracle
+  for the very curve those parameters build, and it states the standard's encode
+  direction, which is not the form type 4 stores. `derived-artifacts.txt` is
+  unchanged (transfer constants are not in the audit catalog), all four gates
+  are green (500 + 126 tests), `cargo test hlg` passes its 4 tests, and the
+  legacy TIFF and `ultra-hdr-v1` checksums are both unmoved.
+- 2026-07-31: **Round 3 review — Codex's remaining P2 partially rejected, with
+  evidence.** It reported ACEScg→Display P3 as "vulnerable to self-validating
+  definition errors" because this module has no direct independent vector for it.
+  The gap in *knowledge* was real; the vulnerability was not. Tested by tampering
+  `DISPLAY_P3` and driving the full self-validating scenario — regenerate the
+  audit artifact *and* re-pin every affected matrix so definition, derivation and
+  pin all agree:
+  - A **realistic** single-digit typo (`0.680 → 0.690`) is caught, by
+    `color::display_p3_colorants_match_icc_registry_reference` and
+    `display_p3_decodes_to_registered_d65_encoding` — genuinely external
+    ICC-registry anchors that live in `pipeline::color`, not in
+    `colorimetry::tests`, which is why the review missed them.
+  - A **sub-rounding** perturbation (`0.680 → 0.6805`, finer than the three
+    decimals the standard specifies) slips through everything except two
+    behaviour goldens. That is not a defect: the standard does not define the
+    value to that precision.
+  - The same experiment exposed something the round-2 fix does *not* cover:
+    `transformed_primaries_recover_the_standards_chromaticities` anchors the
+    **source** space only. The destination NPM appears in both the pinned matrix
+    and the recovery step and cancels
+    (`NPM_dst · NPM_dst⁻¹ · NPM_src == NPM_src`), so a mistyped *destination*
+    primary is invisible to it.
+  Fix applied was documentation, not machinery: `colorimetry/tests.rs` now
+  carries a per-space table of where each external anchor lives, states the
+  source/destination asymmetry, and warns that deleting `color`'s two ICC-registry
+  tests would remove Display P3's only real anchor. Adding a redundant vector
+  would have implied coverage that the cancellation makes impossible to get from
+  a recovery test.
+- 2026-07-31: **Ship-time review round — two more real findings, both from
+  Codex, both fixed.**
+  - **`sdr.rs` still hard-coded two luma vectors** at `destination_rgb`, and one
+    of them (`[0.228_974_57, 0.691_738_55, 0.079_286_91]`) was a byte-for-byte
+    duplicate of `pinned::DISPLAY_P3_LUMA` — precisely the duplication this task
+    exists to remove, in a module the task names as migrated. Two inventory
+    greps missed it because they searched for named `const` declarations and
+    these were inline array literals inside a `match`; the same grep-shaped blind
+    spot hid the HLG OETF coefficient earlier. **Lesson: inventory a source-of-
+    truth migration by reading the consuming functions, not by grepping for
+    `const`.**
+  - The sRGB vector `[0.212_639, 0.715_169, 0.072_192]` turned out to be a
+    **third provenance kind**: not the normative BT.709 table (`0.2126, 0.7152,
+    0.0722`) and not the exact derivation, but the derivation **rounded to six
+    decimals** — 0 / −6 / **43** ulps out. It is now `pinned::SRGB_LUMA`, moved
+    verbatim, with its own `SRGB_LUMA_MAX_ULPS = 43` allowance rather than
+    relaxing the shared ±1 bound, and a test that pins the 6-dp relationship
+    itself so the gap cannot silently drift. Re-pinning to the exact derivation
+    would be a pixel change: the sRGB SDR branch multiplies by it.
+  - **The maintenance doc's "representation-only" rule was unsound.** It let a
+    reader conclude "ulps all 0 ⇒ no pixel change", but `pipeline::color` feeds
+    `definitions::{REC709, DISPLAY_P3, ACESCG, PROPHOTO}` straight into Little
+    CMS, so changing one of those four moves ICC bytes and lcms2-transformed
+    pixels with `pinned.rs` untouched and every ulp at 0. Nothing automated
+    catches it — the drift gate stops before lcms2 and the audit only compares
+    pinned artifacts. Step 4 now carries an explicit warning that those four
+    spaces are always a pixel change regardless of the ulp column, and step 5
+    requires the before/after comparison for them too.
+  - Pixels re-verified after both fixes: legacy TIFF and `ultra-hdr-v1` on both
+    fixtures still byte-identical to a pristine `b8ce1d7` build.

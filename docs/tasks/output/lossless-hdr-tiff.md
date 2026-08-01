@@ -79,7 +79,7 @@ transitional rendered float TIFF and is neither the linear-BT.2020 output nor a
 PQ/HLG signal.
 
 The source color-space definitions and pinned derived artifacts come from
-`pipeline/colorimetry.rs`; do not introduce another copy of BT.2020 primaries,
+`pipeline/colorimetry/`; do not introduce another copy of BT.2020 primaries,
 luma weights, matrices, or transfer constants while adding the profiles and
 encoder adapters.
 

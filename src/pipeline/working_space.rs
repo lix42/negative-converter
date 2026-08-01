@@ -18,10 +18,13 @@
 //! 2. **Primary transform + chromatic adaptation** into **linear ACEScg (AP1)
 //!    at the ACES white point (~D60)**, via the Bradford CAT.
 //!
-//! The composed 3×3 matrix is pinned as [`NC_FILM_RGB_V1_TO_ACESCG`] and applied
-//! per pixel. A future mapping change requires a **new identifier** and a
-//! behavioral-version decision by `conversion-versioning`; it must never
-//! silently alter v1.
+//! The composed 3×3 matrix is pinned as
+//! [`colorimetry::pinned::NC_FILM_RGB_V1_TO_ACESCG`] and applied per pixel. A
+//! future mapping change requires a **new identifier** and a behavioral-version
+//! decision by `conversion-versioning`; it must never silently alter v1.
+//!
+//! [`colorimetry::pinned::NC_FILM_RGB_V1_TO_ACESCG`]:
+//!     crate::pipeline::colorimetry::pinned::NC_FILM_RGB_V1_TO_ACESCG
 //!
 //! ## Typed boundary
 //! [`AcesCgImage`] has private fields and a module-private constructor, so
@@ -51,6 +54,7 @@
 //! policy: `io::encode` counts them, they are never silently swallowed here).
 
 use crate::algo::FilmRgbImage;
+use crate::pipeline::colorimetry::pinned::NC_FILM_RGB_V1_TO_ACESCG;
 use crate::types::LinearImage;
 
 /// The pinned identifier this mapping records in the convert report
@@ -58,40 +62,13 @@ use crate::types::LinearImage;
 /// silent edit to v1.
 pub const WORKING_MAPPING_ID: &str = "nc-film-rgb-v1";
 
-/// NC film RGB v1: linear Rec.709/D65 → linear ACEScg (AP1)/D60, Bradford CAT.
-///
-/// `out[i] = Σ_j M[i][j] · in[j]` with `in = [r, g, b]`. Pinned as `f64`
-/// constants; derived once (and re-verified in-crate by
-/// `matrix_matches_independent_bradford_derivation`) from:
-/// - **source** linear Rec.709 primaries `R(0.640,0.330) G(0.300,0.600)
-///   B(0.150,0.060)`, white **D65** `(0.3127, 0.3290)`;
-/// - **destination** ACEScg **AP1** primaries `R(0.713,0.293) G(0.165,0.830)
-///   B(0.128,0.044)`, white **ACES ~D60** `(0.32168, 0.33767)` — the same
-///   primaries/white the `AcesCg` output profile carries (`pipeline::color`);
-/// - **adaptation** the Lindbloom **Bradford** cone-response CAT, D65 → ACES white;
-/// - **operation order** `M = NPM_AP1⁻¹ · CAT(D65→D60) · NPM_Rec709`.
-///
-/// Each row sums to ~1.0, so a neutral (equal-RGB) input maps to a neutral
-/// ACEScg value — the white point is correctly adapted. These specific values
-/// coincide with the published sRGB-linear → ACEScg Bradford matrix
-/// (colour-science / OpenColorIO ACES), an external cross-check.
-const NC_FILM_RGB_V1_TO_ACESCG: [[f64; 3]; 3] = [
-    [
-        0.613_097_395_458_146,
-        0.339_523_075_654_473_1,
-        0.047_379_528_684_925_34,
-    ],
-    [
-        0.070_193_747_370_320_72,
-        0.916_353_970_053_562,
-        0.013_452_331_311_908_228,
-    ],
-    [
-        0.020_615_576_583_812_915,
-        0.109_569_734_502_356_13,
-        0.869_814_637_185_856_3,
-    ],
-];
+// NC film RGB v1's 3×3 matrix — `out[i] = Σ_j M[i][j] · in[j]` for
+// `in = [r, g, b]` — is `colorimetry::pinned::NC_FILM_RGB_V1_TO_ACESCG`,
+// imported above. Its standards provenance, the chromatic-adaptation convention
+// it was pinned with (Bradford with Lindbloom's *published* inverse, which this
+// frozen mapping needs and new artifacts must not use), and the tests that
+// re-derive it all live there. Each row sums to ~1.0, so a neutral input maps to
+// a neutral ACEScg value.
 
 /// The intentional film rendering after NC film RGB v1 interpretation: unclamped
 /// linear **ACEScg (AP1) at D60**, with the IR plane carried through untouched.
@@ -217,113 +194,30 @@ mod tests {
         DensityCurve, DensityParams, ExponentialParams, FilmBase, Reconstruction, SigmoidParams,
     };
 
-    // -- test-only f64 linear algebra, independent of the pinned const ---------
+    // -- derivation helpers ----------------------------------------------------
     //
-    // These helpers re-derive the mapping matrix from first principles (primaries
-    // + Bradford CAT) so the const can be checked against an *independent*
-    // computation, and produce binary64 reference vectors for the golden fixtures.
+    // The f64 linear algebra that used to be duplicated here now lives in
+    // `colorimetry::derive`, which is also what the audit harness and the
+    // standards-provenance tests use. Keeping one implementation is the point of
+    // the colorimetry module: a second copy could drift and then "verify" the
+    // wrong thing.
 
-    type M3 = [[f64; 3]; 3];
-    type V3 = [f64; 3];
+    type M3 = crate::pipeline::colorimetry::derive::Matrix3;
 
-    fn matmul(a: M3, b: M3) -> M3 {
-        let mut o = [[0.0; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                for k in 0..3 {
-                    o[i][j] += a[i][k] * b[k][j];
-                }
-            }
-        }
-        o
+    fn matvec(a: &M3, v: [f64; 3]) -> [f64; 3] {
+        crate::pipeline::colorimetry::derive::transform(*a, v)
     }
 
-    fn matvec(a: &M3, v: V3) -> V3 {
-        let mut o = [0.0; 3];
-        for i in 0..3 {
-            for k in 0..3 {
-                o[i] += a[i][k] * v[k];
-            }
-        }
-        o
-    }
-
-    fn inverse(m: M3) -> M3 {
-        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-        let cof = |a: f64, b: f64, c: f64, d: f64| a * d - b * c;
-        [
-            [
-                cof(m[1][1], m[1][2], m[2][1], m[2][2]) / det,
-                -cof(m[0][1], m[0][2], m[2][1], m[2][2]) / det,
-                cof(m[0][1], m[0][2], m[1][1], m[1][2]) / det,
-            ],
-            [
-                -cof(m[1][0], m[1][2], m[2][0], m[2][2]) / det,
-                cof(m[0][0], m[0][2], m[2][0], m[2][2]) / det,
-                -cof(m[0][0], m[0][2], m[1][0], m[1][2]) / det,
-            ],
-            [
-                cof(m[1][0], m[1][1], m[2][0], m[2][1]) / det,
-                -cof(m[0][0], m[0][1], m[2][0], m[2][1]) / det,
-                cof(m[0][0], m[0][1], m[1][0], m[1][1]) / det,
-            ],
-        ]
-    }
-
-    fn white_xyz(x: f64, y: f64) -> V3 {
-        [x / y, 1.0, (1.0 - x - y) / y]
-    }
-
-    /// Normalized primary matrix (rgb → XYZ) for `primaries` + `white`.
-    fn npm(primaries: [(f64, f64); 3], white: V3) -> M3 {
-        let col = |(x, y): (f64, f64)| [x / y, 1.0, (1.0 - x - y) / y];
-        let (r, g, b) = (col(primaries[0]), col(primaries[1]), col(primaries[2]));
-        let mprim: M3 = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
-        let s = matvec(&inverse(mprim), white);
-        let mut out = [[0.0; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                out[i][j] = mprim[i][j] * s[j];
-            }
-        }
-        out
-    }
-
-    /// Bradford chromatic-adaptation matrix `src → dst` (Lindbloom cone matrix).
-    fn bradford_cat(src: V3, dst: V3) -> M3 {
-        const MA: M3 = [
-            [0.8951000, 0.2664000, -0.1614000],
-            [-0.7502000, 1.7135000, 0.0367000],
-            [0.0389000, -0.0685000, 1.0296000],
-        ];
-        const MA_INV: M3 = [
-            [0.9869929, -0.1470543, 0.1599627],
-            [0.4323053, 0.5183603, 0.0492912],
-            [-0.0085287, 0.0400428, 0.9684867],
-        ];
-        let rs = matvec(&MA, src);
-        let rd = matvec(&MA, dst);
-        let d: M3 = [
-            [rd[0] / rs[0], 0.0, 0.0],
-            [0.0, rd[1] / rs[1], 0.0],
-            [0.0, 0.0, rd[2] / rs[2]],
-        ];
-        matmul(MA_INV, matmul(d, MA))
-    }
-
-    /// Re-derive NC film RGB v1 from the pinned colorimetry, independently of the
-    /// shipping const.
+    /// Re-derive NC film RGB v1 from the named source definitions, independently
+    /// of the shipping const.
+    ///
+    /// Uses the **published-inverse** Bradford convention, which is the one v1
+    /// was pinned with; see `colorimetry::definitions::BRADFORD_PUBLISHED_INVERSE`.
     fn derived_matrix() -> M3 {
-        let rec709 = [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)];
-        let ap1 = [(0.713, 0.293), (0.165, 0.830), (0.128, 0.044)];
-        let d65 = white_xyz(0.3127, 0.3290);
-        let aces = white_xyz(0.32168, 0.33767);
-        matmul(
-            inverse(npm(ap1, aces)),
-            matmul(bradford_cat(d65, aces), npm(rec709, d65)),
-        )
+        use crate::pipeline::colorimetry::definitions::{
+            ACESCG, BRADFORD_PUBLISHED_INVERSE, REC709,
+        };
+        crate::pipeline::colorimetry::derive::rgb_to_rgb(REC709, ACESCG, BRADFORD_PUBLISHED_INVERSE)
     }
 
     // -- fixtures --------------------------------------------------------------

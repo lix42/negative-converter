@@ -35,6 +35,7 @@ use lcms2::{
     CIExyY, CIExyYTRIPLE, ColorSpaceSignature, Intent, PixelFormat, Profile, ToneCurve, Transform,
 };
 
+use crate::pipeline::colorimetry::definitions::{self, ColorSpace, transfer};
 use crate::pipeline::sdr::{RenderedSdr, SdrGamut, SdrRenderMetadata};
 use crate::types::{LinearImage, NcError, OutDepth, OutputParams, Result};
 
@@ -179,14 +180,15 @@ pub fn encode_rendered_sdr(
 ) -> Result<(LinearImage, Vec<u8>, SdrRenderMetadata)> {
     let (mut image, metadata) = rendered.into_parts();
     let (linear, output) = match metadata.gamut {
-        SdrGamut::DisplayP3 => (
-            synth(
-                xyy(0.3127, 0.3290),
-                [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)],
-                1.0,
-            )?,
-            build_profile(&OutputSpace::DisplayP3)?,
-        ),
+        SdrGamut::DisplayP3 => {
+            // Linear P3 as the *source* space: the renderer already converted to
+            // the P3 gamut, so this transform only applies the destination curve.
+            let (white, primaries) = lcms_inputs(definitions::DISPLAY_P3);
+            (
+                synth(white, primaries, 1.0)?,
+                build_profile(&OutputSpace::DisplayP3)?,
+            )
+        }
         SdrGamut::SRgb => (working_profile()?, build_profile(&OutputSpace::SRgb)?),
     };
     transform_in_place(&mut image, &linear, &output)?;
@@ -225,6 +227,22 @@ fn xyy(x: f64, y: f64) -> CIExyY {
     CIExyY { x, y, Y: 1.0 }
 }
 
+/// Little CMS profile inputs for a colour space named in
+/// [`colorimetry::definitions`](crate::pipeline::colorimetry::definitions).
+///
+/// Every profile builder below goes through this rather than repeating
+/// chromaticities. Before it existed, the Display P3 primaries and D65 white were
+/// written out twice in this file, with nothing keeping the two copies in step.
+/// Transfer curves are deliberately *not* part of this — they stay with the
+/// builder, because the same primaries serve different curves.
+fn lcms_inputs(space: ColorSpace) -> (CIExyY, [(f64, f64); 3]) {
+    let [red, green, blue] = space.primaries.as_array();
+    (
+        xyy(space.white.x, space.white.y),
+        [(red.x, red.y), (green.x, green.y), (blue.x, blue.y)],
+    )
+}
+
 /// Synthesize an RGB profile from a white point, primaries `[r, g, b]` and one
 /// tone curve shared by all three channels. Little CMS builds an ICC v4 profile
 /// here: the PCS is D50, so a non-D50 `white` (Rec.709/ACES D65/D60) is
@@ -257,18 +275,17 @@ fn synth(white: CIExyY, primaries: [(f64, f64); 3], gamma: f64) -> Result<Profil
 /// transform inverts it to encode linear values, so a linear value maps to its
 /// exact sRGB-encoded counterpart (e.g. linear 0.5 → 0.735357).
 fn srgb_trc() -> Result<ToneCurve> {
-    // Type 4 params [g, a, b, c, d] for the standard sRGB curve.
-    ToneCurve::new_parametric(4, &[2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045])
+    // Type 4 params [g, a, b, c, d] for the standard sRGB curve, from the single
+    // definition in `colorimetry::definitions::transfer::srgb`.
+    use transfer::srgb;
+    ToneCurve::new_parametric(4, &[srgb::G, srgb::A, srgb::B, srgb::C, srgb::D])
         .map_err(|e| NcError::Other(format!("failed to build sRGB tone curve: {e}")))
 }
 
 /// The linear Rec.709 / D65 working-space profile (see module docs).
 fn working_profile() -> Result<Profile> {
-    synth(
-        xyy(0.3127, 0.3290),
-        [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)],
-        1.0,
-    )
+    let (white, primaries) = lcms_inputs(definitions::REC709);
+    synth(white, primaries, 1.0)
 }
 
 /// Build the lcms2 profile for an output space.
@@ -278,28 +295,25 @@ fn build_profile(space: &OutputSpace) -> Result<Profile> {
         OutputSpace::SRgb => Ok(Profile::new_srgb()),
         // ProPhoto / ROMM RGB: D50, gamma 1.8. Modeled as pure 1.8 — the small
         // ROMM linear toe near black is omitted (the common simplification).
-        OutputSpace::ProPhoto => synth(
-            xyy(0.3457, 0.3585),
-            [(0.7347, 0.2653), (0.1596, 0.8404), (0.0366, 0.0001)],
-            1.8,
-        ),
+        OutputSpace::ProPhoto => {
+            let (white, primaries) = lcms_inputs(definitions::PROPHOTO);
+            synth(white, primaries, 1.8)
+        }
         // ACEScg: AP1 primaries, ACES white (~D60), linear.
-        OutputSpace::AcesCg => synth(
-            xyy(0.32168, 0.33767),
-            [(0.713, 0.293), (0.165, 0.830), (0.128, 0.044)],
-            1.0,
-        ),
+        OutputSpace::AcesCg => {
+            let (white, primaries) = lcms_inputs(definitions::ACESCG);
+            synth(white, primaries, 1.0)
+        }
         // Display P3 SDR: P3 primaries, D65 encoding white, piecewise sRGB TRC.
         // Little CMS Bradford-adapts the D65 colorants to the D50 PCS and writes
         // the `chromaticAdaptationTag`; D50 is the media white, D65 the encoding
         // white (colorants verified against the ICC-registry Display P3 reference
         // by the tests). Synthesized cross-platform — no dependency on macOS's
         // system `Display P3.icc`.
-        OutputSpace::DisplayP3 => synth_curve(
-            xyy(0.3127, 0.3290),
-            [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)],
-            &srgb_trc()?,
-        ),
+        OutputSpace::DisplayP3 => {
+            let (white, primaries) = lcms_inputs(definitions::DISPLAY_P3);
+            synth_curve(white, primaries, &srgb_trc()?)
+        }
         OutputSpace::Custom(path) => {
             let bytes = std::fs::read(path).map_err(|e| {
                 NcError::Usage(format!("cannot read ICC profile {}: {e}", path.display()))
@@ -629,6 +643,13 @@ mod tests {
 
     /// The standard piecewise sRGB OETF (linear → encoded), used to compute the
     /// expected encoded value independently of Little CMS's parametric curve.
+    ///
+    /// The constants below are deliberately **not** sourced from
+    /// `definitions::transfer::srgb`, and must not be "centralized" onto it: this
+    /// is the independent oracle for the curve `srgb_trc` builds from those very
+    /// parameters. Pointing it at them would make a mistyped parameter agree with
+    /// itself and the check would stop checking anything. They are also the
+    /// standard's *encode* direction, which is not the form type 4 stores.
     fn srgb_encode(l: f32) -> f32 {
         if l <= 0.003_130_8 {
             12.92 * l

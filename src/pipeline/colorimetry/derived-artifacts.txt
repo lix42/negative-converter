@@ -1,0 +1,100 @@
+# @generated — do not edit by hand.
+#
+# Canonical binary64 derivation of every pinned colorimetry artifact, with the
+# shipped literal's distance from it. Produced from the source definitions in
+# src/pipeline/colorimetry/definitions.rs.
+#
+#   check:      cargo test colorimetry::audit
+#   regenerate: NC_COLORIMETRY_REGEN=1 cargo test colorimetry::audit
+#
+# A non-zero ulp distance is not automatically a bug. The chromaticities these
+# matrices derive from are specified to three decimals, and perturbing one
+# primary by its own rounding moves entries ~3,500x further than one f32 ulp.
+# See docs/colorimetry-maintenance.md before changing a shipped literal — that
+# is a pixel change and needs a pipeline-version decision.
+
+[NC_FILM_RGB_V1_TO_ACESCG]
+  rec709/d65 -> acescg/aces-white, cone=bradford-lindbloom-published-inverse
+  compared as f64
+  [0][0] derived=0.613097395458146        shipped=0.613097395458146        absdiff=0.000e0
+  [0][1] derived=0.3395230756544731       shipped=0.3395230756544731       absdiff=0.000e0
+  [0][2] derived=0.04737952868492534      shipped=0.04737952868492534      absdiff=0.000e0
+  [1][0] derived=0.07019374737032072      shipped=0.07019374737032072      absdiff=0.000e0
+  [1][1] derived=0.916353970053562        shipped=0.916353970053562        absdiff=0.000e0
+  [1][2] derived=0.013452331311908228     shipped=0.013452331311908228     absdiff=0.000e0
+  [2][0] derived=0.020615576583812915     shipped=0.020615576583812915     absdiff=0.000e0
+  [2][1] derived=0.10956973450235613      shipped=0.10956973450235613      absdiff=0.000e0
+  [2][2] derived=0.8698146371858563       shipped=0.8698146371858563       absdiff=0.000e0
+
+[ACESCG_TO_SRGB]
+  acescg/aces-white -> rec709/d65, cone=bradford
+  compared as f32
+  [0][0] derived=1.705050992657984        shipped=1.705051         ulps=0
+  [0][1] derived=-0.6217921206570051      shipped=-0.62179214      ulps=0
+  [0][2] derived=-0.08325887200097865     shipped=-0.083258875     ulps=0
+  [1][0] derived=-0.13025641750704345     shipped=-0.13025641      ulps=0
+  [1][1] derived=1.1408047365754017       shipped=1.1408048        ulps=0
+  [1][2] derived=-0.010548319068358014    shipped=-0.010548319     ulps=0
+  [2][0] derived=-0.024003356804618032    shipped=-0.024003357     ulps=0
+  [2][1] derived=-0.1289689760649706      shipped=-0.12896898      ulps=1
+  [2][2] derived=1.1529723328695893       shipped=1.1529723        ulps=0
+
+[ACESCG_TO_DISPLAY_P3]
+  acescg/aces-white -> display-p3/d65, cone=bradford
+  compared as f32
+  [0][0] derived=1.3792141282533428       shipped=1.3792142        ulps=0
+  [0][1] derived=-0.30886414467371137     shipped=-0.30886415      ulps=0
+  [0][2] derived=-0.07034998357963101     shipped=-0.070349984     ulps=0
+  [1][0] derived=-0.06933485838138227     shipped=-0.06933486      ulps=0
+  [1][1] derived=1.082296746002349        shipped=1.0822967        ulps=0
+  [1][2] derived=-0.012961887620966839    shipped=-0.012961888     ulps=0
+  [2][0] derived=-0.002159009513570314    shipped=-0.0021590097    ulps=1
+  [2][1] derived=-0.0454593248373156      shipped=-0.045459326     ulps=0
+  [2][2] derived=1.0476183343508862       shipped=1.0476184        ulps=0
+
+[ACESCG_TO_BT2020]
+  acescg/aces-white -> bt2020/d65, cone=bradford
+  compared as f32
+  [0][0] derived=1.0258247476660105       shipped=1.0258248        ulps=0
+  [0][1] derived=-0.02005319083821491     shipped=-0.020053191     ulps=0
+  [0][2] derived=-0.005771556827795621    shipped=-0.005771557     ulps=0
+  [1][0] derived=-0.002234369519976033    shipped=-0.0022343695    ulps=0
+  [1][1] derived=1.00458650188848         shipped=1.0045865        ulps=0
+  [1][2] derived=-0.0023521323685036476   shipped=-0.0023521325    ulps=0
+  [2][0] derived=-0.0050133514680892775   shipped=-0.0050133513    ulps=0
+  [2][1] derived=-0.02529007181078518     shipped=-0.025290072     ulps=0
+  [2][2] derived=1.0303034232788748       shipped=1.0303035        ulps=0
+
+[BT2020_TO_DISPLAY_P3]
+  bt2020/d65 -> display-p3/d65, no adaptation (shared white)
+  compared as f32
+  [0][0] derived=1.3435782525843325       shipped=1.3435782        ulps=0
+  [0][1] derived=-0.2821796705261357      shipped=-0.28217968      ulps=0
+  [0][2] derived=-0.061398582058196205    shipped=-0.061398584     ulps=1
+  [1][0] derived=-0.06529745278911947     shipped=-0.065297455     ulps=0
+  [1][1] derived=1.075787915848574        shipped=1.0757879        ulps=0
+  [1][2] derived=-0.010490463059454988    shipped=-0.010490463     ulps=0
+  [2][0] derived=0.0028217872617010515    shipped=0.0028217873     ulps=0
+  [2][1] derived=-0.019598494524494185    shipped=-0.019598495     ulps=0
+  [2][2] derived=1.016776707262793        shipped=1.0167767        ulps=0
+
+[DISPLAY_P3_LUMA]
+  luminance row of display-p3/d65 normalized primary matrix (derived)
+  compared as f32
+  [0]    derived=0.2289745640697487       shipped=0.22897457       ulps=0
+  [1]    derived=0.6917385218365062       shipped=0.69173855       ulps=0
+  [2]    derived=0.079286914093745        shipped=0.07928691       ulps=0
+
+[SRGB_LUMA]
+  luminance row of rec709/d65 normalized primary matrix, SHIPPED ROUNDED TO 6 DECIMALS
+  compared as f32
+  [0]    derived=0.21263900587151024      shipped=0.212639         ulps=0
+  [1]    derived=0.715168678767756        shipped=0.715169         ulps=-6
+  [2]    derived=0.07219231536073371      shipped=0.072192         ulps=43
+
+[BT2020_LUMA]
+  bt2020 non-constant-luminance luma, TABULATED by the standard (not derived)
+  compared as f32
+  [0]    derived=0.2627                   shipped=0.2627           ulps=0
+  [1]    derived=0.678                    shipped=0.678            ulps=0
+  [2]    derived=0.0593                   shipped=0.0593           ulps=0

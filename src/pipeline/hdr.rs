@@ -8,6 +8,8 @@
 
 use serde::Serialize;
 
+use crate::pipeline::colorimetry::definitions::transfer;
+use crate::pipeline::colorimetry::pinned::{ACESCG_TO_BT2020, BT2020_LUMA};
 use crate::pipeline::render_split::SharedDisplaySource;
 use crate::types::{LinearImage, NcError, Result};
 
@@ -18,8 +20,12 @@ pub const TARGET_PEAK_NITS: f32 = 1000.0;
 /// Linear capacity above reference white: `1000 / 203`.
 pub const LINEAR_HEADROOM: f32 = TARGET_PEAK_NITS / REFERENCE_WHITE_NITS;
 
-const HLG_SYSTEM_GAMMA: f32 = 1.2;
-const BT2020_LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
+// The renderer works in f32; every constant below (and the HLG OETF's `a`, in
+// `hlg_oetf`) is narrowed from the single f64 definition in `colorimetry`. The PQ
+// constants are ratios of small integers and so are exactly representable in both
+// widths, 1.2 narrows to the same f32 either way, and the OETF constant's f64 and
+// f32 spellings share a bit pattern — the casts cannot perturb a rendered value.
+const HLG_SYSTEM_GAMMA: f32 = transfer::HLG_SYSTEM_GAMMA as f32;
 
 /// Rec.2100 transfer function selected for the encoded HDR pixels.
 #[allow(dead_code)] // variants become product-reachable with `output/presets`.
@@ -367,12 +373,12 @@ fn pq_encode_nits(nits: f32) -> f32 {
     if nits <= 0.0 {
         return 0.0;
     }
-    let m1 = 2610.0 / 16_384.0;
-    let m2 = 2523.0 / 32.0;
-    let c1 = 3424.0 / 4096.0;
-    let c2 = 2413.0 / 128.0;
-    let c3 = 2392.0 / 128.0;
-    let power = (nits / 10_000.0).powf(m1);
+    let m1 = transfer::pq::M1 as f32;
+    let m2 = transfer::pq::M2 as f32;
+    let c1 = transfer::pq::C1 as f32;
+    let c2 = transfer::pq::C2 as f32;
+    let c3 = transfer::pq::C3 as f32;
+    let power = (nits / transfer::pq::PEAK_NITS as f32).powf(m1);
     ((c1 + c2 * power) / (1.0 + c3 * power)).powf(m2)
 }
 
@@ -394,7 +400,9 @@ fn hlg_oetf(scene_linear: f32) -> f32 {
     } else if scene_linear <= 1.0 / 12.0 {
         (3.0 * scene_linear).sqrt()
     } else {
-        const A: f32 = 0.178_832_77;
+        // `b` and `c` are defined by the standard in terms of `a`, so they are
+        // derived here rather than recorded as separate definitions.
+        const A: f32 = transfer::hlg::OETF_A as f32;
         let b = 1.0 - 4.0 * A;
         let c = 0.5 - A * (4.0 * A).ln();
         A * (12.0 * scene_linear - b).ln() + c
@@ -413,13 +421,14 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-// AP1/D60 → XYZ, Bradford D60→D65, then XYZ → BT.2020. Pinned constants
-// keep rendering independent of an installed ICC profile or CMM.
-const ACESCG_TO_BT2020: [[f32; 3]; 3] = [
-    [1.025_824_8, -0.020_053_191, -0.005_771_557],
-    [-0.002_234_369_5, 1.004_586_5, -0.002_352_132_5],
-    [-0.005_013_351_4, -0.025_290_072, 1.030_303_5],
-];
+// AP1/D60 → XYZ, Bradford D60→D65, then XYZ → BT.2020, plus the BT.2020 luma
+// weights. Both are defined once in `colorimetry::pinned` (imported above) with
+// their standards provenance; reviewed checked-in constants keep rendering
+// independent of an installed ICC profile or CMM.
+//
+// Note the two have different provenance *kinds*: the matrix is derived from
+// primaries, while the luma vector is transcribed from BT.2020's table and
+// deliberately does not match a derivation.
 
 #[cfg(test)]
 mod tests {
