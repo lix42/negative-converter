@@ -3,8 +3,8 @@ name: review-fix-loop
 description: >-
   Run the two-engine review → fix → converge loop on a feature worktree's
   uncommitted changes. Use when a worktree's implementation is done and needs
-  review before a PR: fan out independent reviewers (Codex + pr-review-toolkit
-  lenses), aggregate and verify their findings, route the real ones to a single
+  review before a PR: run two independent reviewers (Codex + an in-session
+  review), aggregate and verify their findings, route the real ones to a single
   fix agent, and re-run until clean — leaving everything uncommitted for the
   user's manual review. Invoke as `/review-fix-loop <worktree-path-or-task>`.
 ---
@@ -18,16 +18,23 @@ blind), genuine issues go to **one** fix agent, and the loop repeats until the
 review is clean or LOW-only. Nothing is committed — the user does the final
 manual review and merge.
 
-This is the Claude Code variant, built on the Codex plugin plus the
-pr-review-toolkit engines. A tool-agnostic variant lives at
+This is the Claude Code variant, built on the Codex plugin plus an **in-session
+review you perform yourself**. A tool-agnostic variant lives at
 `.agents/skills/review-fix-loop/` and intentionally diverges — do not symlink
 them together.
 
-**Why two engines.** Codex and the pr-review-toolkit lenses catch different
-classes of bug. In practice Codex has caught issues every pr-review lens missed
-(a `+inf` non-finite laundering, a JSONL atomic-append race, a case-only path
-collision), and the pr-review builds have disproved a Codex false-positive P0.
-Running both, and verifying before acting, is the point — do not drop one.
+**Why two engines.** A different model reviewing the same diff catches a
+different class of bug. In practice Codex has caught issues the in-session
+review missed (a `+inf` non-finite laundering, a JSONL atomic-append race, a
+case-only path collision), and in-session builds have disproved a Codex
+false-positive P0. Running both, and verifying before acting, is the point — do
+not drop one. The engines are also asymmetric in a useful way: Codex sees the
+diff cold with no conversation history, while the in-session review has the
+session's context — so it knows *why* the code is shaped the way it is, and is
+correspondingly better at spotting a change that contradicts an intent it has
+seen and worse at noticing an assumption it has already absorbed. That is the
+blind spot Codex covers. "A reviewer that has the session context" is the
+second engine's whole job description, and you are one.
 
 ## Inputs
 
@@ -62,7 +69,10 @@ Write a 2–3 sentence framing of *what the change does* — you will paste it i
 every reviewer prompt so they share context. Note new files/modules, new types,
 new CLI knobs (four-coupled-spots), new error paths, and which docs changed.
 
-## Step 2 — Launch reviewers in parallel (all background, all review-only)
+## Step 2 — Run both engines (review-only)
+
+Start Codex **first** as a background job, then do the in-session review
+yourself while it works — that keeps the two overlapping instead of serialized.
 
 **Codex** (independent engine) — run from *inside* the worktree so it reviews the
 right git state. The portable way is the plugin **command** `/codex:review`,
@@ -90,37 +100,60 @@ custom framing/focus, use the **`/codex:adversarial-review`** command instead
 the reviewer model, the Codex CLI is too old / its default model needs a switch
 (see CLAUDE.md "Codex review on a worktree").
 
-**pr-review-toolkit lenses** — spawn each as a named background `Agent` (so it's
-addressable for follow-up rounds via `SendMessage`). Pick the lenses the diff
-warrants:
+**In-session review** (second engine) — **you** review the working diff, with
+this session's context. Nothing to install and nothing to invoke.
 
-| Lens (`subagent_type`) | Run when |
+**Do not try to call `/code-review`.** It is marked
+`disable-model-invocation`: an agent cannot run it through the Skill tool and
+will just get `Skill code-review cannot be used with Skill tool due to
+disable-model-invocation`. Only the *user* can type it. If the user wants the
+built-in specifically, they type `/code-review` themselves and paste (or leave
+in-session) its findings for Step 3 to aggregate — treat that as a bonus third
+input, not a prerequisite. The loop must run without it.
+
+Doing the review yourself, hold to the same bar a dedicated reviewer would:
+
+- **Cover the untracked files.** Like `git diff HEAD`, a working-diff review
+  drifts toward the modified files — and on a feature branch the new module *is*
+  the change. Walk every `??` path from Step 1 explicitly.
+- **Read the worktree's `CLAUDE.md` first**, and review against the Step 1
+  framing. Go slower and deeper on a dense or safety-critical diff.
+- **Report by severity with file:line**, and mark anything you could not settle
+  as a *lead*, not a finding. A lead goes to Step 3 for verification and never
+  straight to the fix agent. (User-supplied `/code-review` output uses
+  `CONFIRMED` / `PLAUSIBLE` for the same distinction — `PLAUSIBLE` is a lead.)
+
+**Optional built-in adjacents** — these *are* agent-invocable. Use one only when
+the diff clearly warrants it, and still review-only:
+
+| Command | Run when |
 |---|---|
-| `pr-review-toolkit:code-reviewer` | always (general quality + CLAUDE.md compliance) |
-| `pr-review-toolkit:pr-test-analyzer` | tests changed / new behavior needs coverage |
-| `pr-review-toolkit:silent-failure-hunter` | error handling / warnings / fallbacks touched |
-| `pr-review-toolkit:type-design-analyzer` | new or changed types |
-| `pr-review-toolkit:comment-analyzer` | docs/comments/design-spec changed |
-| `pr-review-toolkit:code-simplifier` | optional final polish, after it's otherwise clean |
+| `/security-review` | the change touches input parsing, file writes, or anything attacker-reachable |
+| `/simplify` | optional final polish, *after* the loop is otherwise clean — it does quality only and explicitly does not hunt bugs, so it never substitutes for the review pass |
 
-Every reviewer prompt must include: the worktree **path**; scope = **all
-uncommitted changes, no GitHub PR** — the `git diff HEAD` *plus the untracked
-files listed by `git status --short`* (name the new files explicitly so they're
-reviewed, not just the modified ones); the shared change-framing; a **per-lens
-focus**; "read the worktree's CLAUDE.md first"; "report findings **by severity**
-with file:line"; and **"do NOT modify any files — review only."** Only the fix
-agent edits.
+**Standing rule for every reviewer**, whichever engine: scope is **all
+uncommitted changes, no GitHub PR** — `git diff HEAD` *plus* the untracked files
+from `git status --short`; findings reported **by severity with file:line**; and
+**do NOT modify any files — review only.** Only the fix agent edits.
 
 ## Step 3 — Aggregate and VERIFY
 
-When all reviewers report, consolidate into one severity-ranked list
-(Critical / High / Important / Medium / Low), deduping overlaps.
+When both engines have reported — your in-session review written up, Codex's
+background job collected — consolidate into one severity-ranked list (Critical /
+High / Important / Medium / Low), deduping overlaps. Note where the two engines
+agree: independent convergence on the same line is the strongest signal
+available here.
 
 **Verify each non-trivial finding against the actual code before acting.**
 Reviewers produce false positives (a Codex "won't compile" P0 was wrong — a
 `Copy` field destructure, not a move). Read the cited lines; if a finding is
 wrong, reject it and say why — do not forward it to the fix agent. Confirm real
 ones with a concrete failure scenario (inputs → wrong output).
+
+This step is not optional for your own findings either — self-verification comes
+from the same engine that raised them, and the same goes for a `CONFIRMED`
+verdict in user-supplied `/code-review` output. Cross-engine verification is
+what this step buys.
 
 ## Step 4 — Route real findings to ONE fix agent
 
@@ -157,8 +190,15 @@ that the worktree remains **uncommitted, awaiting their manual review** before P
 
 ## Invariants (do not break)
 
-- Reviewers **never** modify files; only the fix agent does.
+- Reviewers **never** modify files; only the fix agent does. That includes the
+  in-session pass: review, write up, hand off — **do not fix as you read.** Fixes
+  go through the single fix agent in Step 4, so one actor owns the tree and the
+  gate run.
 - **Verify before forwarding** — a rejected false-positive is a good outcome.
 - Everything stays **uncommitted**; the user does the final review and merge.
-- Two engines, always — Codex *and* pr-review — because they miss different things.
-- Name every agent so later rounds resume it with context (`SendMessage` by name).
+- Two engines, always — Codex *and* the in-session review — because they miss
+  different things, and because one of them has this session's context and the
+  other deliberately does not.
+- Name every agent you spawn so later rounds resume it with context
+  (`SendMessage` by name). The in-session review has no name to resume; redoing
+  it re-reviews the current tree, which is what a later round wants anyway.

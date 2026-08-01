@@ -10,22 +10,22 @@
 
 use serde::Serialize;
 
+use crate::pipeline::colorimetry::pinned::{BT2020_TO_DISPLAY_P3, DISPLAY_P3_LUMA};
 use crate::pipeline::hdr::{LINEAR_HEADROOM, LinearBt2020Hdr, REFERENCE_WHITE_NITS, render_linear};
 use crate::pipeline::render_split::SharedDisplaySource;
 use crate::pipeline::sdr::{RenderedSdr, SdrGamut, render as render_sdr};
 use crate::types::{LinearImage, NcError, Result};
 
-const DISPLAY_P3_LUMA: [f32; 3] = [0.228_974_57, 0.691_738_55, 0.079_286_91];
 const ULTRA_HDR_V1_OFFSET: f32 = 1.0 / 64.0;
 
-// BT.2020/D65 → XYZ/D65 → Display P3/D65. The renderer inputs and output are
-// both display-linear and reference-white-relative; no chromatic adaptation or
-// transfer function belongs at this boundary.
-const BT2020_TO_DISPLAY_P3: [[f32; 3]; 3] = [
-    [1.343_578_2, -0.282_179_68, -0.061_398_584],
-    [-0.065_297_455, 1.075_787_9, -0.010_490_463],
-    [0.002_821_787_3, -0.019_598_495, 1.016_776_7],
-];
+// BT.2020/D65 → XYZ/D65 → Display P3/D65, and the Display P3 luma weights. Both
+// are defined once in `colorimetry::pinned` (imported above). The renderer inputs
+// and output are both display-linear and reference-white-relative; no chromatic
+// adaptation or transfer function belongs at this boundary, and the pinned matrix
+// was derived with the adaptation term skipped for exactly that reason.
+//
+// `ULTRA_HDR_V1_OFFSET` stays here: it is **product/format policy**, not
+// colorimetry, and policy belongs with the stage that owns it.
 
 /// Fixed construction inputs which are part of the encoded format policy, not
 /// user-facing conversion controls.
@@ -609,32 +609,31 @@ mod tests {
     }
 
     #[test]
-    fn bt2020_to_p3_matrix_matches_independent_primary_vectors() {
-        // Independently calculated from the BT.2020 primaries in ITU-R
-        // BT.2020-2 and the Display P3 primaries/D65 white point in SMPTE
-        // RP 431-2: form each normalized-primary RGB→XYZ matrix, then multiply
-        // inverse(P3→XYZ) × (BT.2020→XYZ). These are the resulting matrix
-        // columns, not values derived by this test from BT2020_TO_DISPLAY_P3.
-        let references = [
-            (
-                [1.0, 0.0, 0.0],
-                [1.343_578_2, -0.065_297_455, 0.002_821_787_3],
-            ),
-            (
-                [0.0, 1.0, 0.0],
-                [-0.282_179_68, 1.075_787_9, -0.019_598_495],
-            ),
-            (
-                [0.0, 0.0, 1.0],
-                [-0.061_398_584, -0.010_490_463, 1.016_776_7],
-            ),
-        ];
-        for (bt2020, expected_p3) in references {
-            let actual_p3 = mul(BT2020_TO_DISPLAY_P3, bt2020);
-            for channel in 0..3 {
-                close(actual_p3[channel], expected_p3[channel]);
+    fn bt2020_to_p3_matrix_matches_the_derivation_from_named_primaries() {
+        // This test used to quote "independently calculated" reference vectors
+        // that were in fact this matrix's own columns to the same digits — so it
+        // could only ever restate the literal, never contradict it. It now
+        // re-derives the matrix in binary64 from the named source definitions.
+        //
+        // Genuine independence lives in `colorimetry::tests`, which anchors the
+        // same matrix on chromaticities recovered from the standards and on an
+        // externally published matrix. Here the job is narrower and still worth
+        // doing: prove *this stage* is multiplying by the matrix the colorimetry
+        // module says it should, for the D65→D65 no-adaptation composition.
+        use crate::pipeline::colorimetry::definitions::{BRADFORD, BT2020, DISPLAY_P3};
+        use crate::pipeline::colorimetry::derive::rgb_to_rgb;
+
+        let derived = rgb_to_rgb(BT2020, DISPLAY_P3, BRADFORD);
+        for channel in 0..3 {
+            let mut unit = [0.0_f32; 3];
+            unit[channel] = 1.0;
+            let actual = mul(BT2020_TO_DISPLAY_P3, unit);
+            for row in 0..3 {
+                close(actual[row], derived[row][channel] as f32);
             }
-            assert_ne!(actual_p3, bt2020);
+            // A primary must actually move: BT.2020 is wider than P3, so no
+            // column can come through unchanged.
+            assert_ne!(actual, unit);
         }
     }
 

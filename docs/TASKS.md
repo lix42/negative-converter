@@ -56,8 +56,8 @@ under, and the parenthesized paths are the modules it owns.
   with CLI override, and measure the roll-fixed `Dmax` anchor from a reference
   frame. The two are *different quantities* (see design-spec §4) that share this
   measurement surface.
-- **color** (`pipeline/color.rs`, `pipeline/working_space.rs`, planned
-  `pipeline/colorimetry.rs`) — map typed NC film RGB v1 into linear ACEScg,
+- **color** (`pipeline/color.rs`, `pipeline/working_space.rs`,
+  `pipeline/colorimetry/`) — map typed NC film RGB v1 into linear ACEScg,
   centralize auditable color-space definitions and derived coefficients, then
   transform/render it for the selected output; optional correction is explicit.
 - **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged
@@ -516,8 +516,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   miss, with a false-positive guard validated on real scans.
 
 ### color — [progress](progress/color.md)
-> `pipeline/color.rs`, `pipeline/working_space.rs`, and the planned
-> `pipeline/colorimetry.rs`: ICC transforms, the versioned NC film RGB v1 →
+> `pipeline/color.rs`, `pipeline/working_space.rs`, and
+> `pipeline/colorimetry/`: ICC transforms, the versioned NC film RGB v1 →
 > linear ACEScg mapping, auditable color-space definitions and derived
 > coefficients, the film-master branch, and the optional measured-correction
 > work.
@@ -528,7 +528,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Post-reconstruction characterization runtime](tasks/color/post-reconstruction-color-characterization.md) — **closed—superseded**; retained as decision history and replaced by `algo/negative-reconstruction-density-curves`, `color/film-rgb-working-space`, `color/film-master-render-pipeline`, and `color/optional-color-correction-profiles`
 - [ ] [Optional color-correction profiles](tasks/color/optional-color-correction-profiles.md) — **optional / deferred** measured neutralization with explicit selection and provenance; blocks no output task
 - [ ] [Scanner ICC before-density experiment](tasks/color/scanner-profile-before-density-experiment.md) — **deferred / lower priority**: compare raw density ratios with applying the same scanner ICC to image and Dmin first; independent of the superseded characterization proposal and the normal NC film RGB mapping
-- [ ] [Colorimetry source of truth and update workflow](tasks/color/colorimetry-source-of-truth.md) — **deferred refactor after gain-map**: centralize standards provenance and pinned derived coefficients, migrate existing transforms, and make future color-space updates reproducible before lossless HDR TIFF work
+- [x] [Colorimetry source of truth and update workflow](tasks/color/colorimetry-source-of-truth.md) — **deferred refactor after gain-map**: centralize standards provenance and pinned derived coefficients, migrate existing transforms, and make future color-space updates reproducible before lossless HDR TIFF work
 
 ### output — [progress](progress/output.md)
 > The display renditions and encoders downstream of `color`: the color-accurate

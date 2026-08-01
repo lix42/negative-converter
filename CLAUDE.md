@@ -98,6 +98,8 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode,ultra_hdr}.rs`,
   `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,hdr,gain_map,memory}.rs`
+  plus `pipeline/colorimetry/` — the **single source of truth for every
+  standards-based matrix and luma vector**; see the colorimetry note below
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
   render; `stages::render` is the pure reconstruction→named-output core (stages
   3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
@@ -142,6 +144,48 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `--report`, they're operational, so they live only on the CLI arg struct, are
   **not** recipe keys, and must never perturb the deterministic image output.
   How-to lives in the `perf-telemetry` skill; record shape in design-spec §9.
+- **Every standards-based coefficient lives in `pipeline/colorimetry/`, and the
+  runtime never derives one.** `definitions.rs` holds the *source data*
+  (primaries, white points, cone-response matrices, PQ/HLG constants,
+  normatively tabulated vectors) with provenance; `pinned.rs` holds the reviewed
+  literals the renderer multiplies by; `derive.rs` (the binary64 math) and
+  `audit.rs` (the check/regen harness) are **`#[cfg(test)]`**, so rendering
+  cannot start deriving per run. Never add a matrix or luma literal to a stage —
+  import it. Product policy (reference white, peak nits, shoulder, gain-map
+  offsets) stays with its stage and refers to a *named* space instead of
+  restating colorimetry. Workflow for changing any of it:
+  `docs/colorimetry-maintenance.md`; `NC_COLORIMETRY_REGEN=1 cargo test
+  colorimetry::audit` regenerates `derived-artifacts.txt` (and **only** that —
+  it never rewrites `pinned.rs`, so a generator run can never silently move
+  pixels). When migrating a coefficient *into* it, inventory by reading the
+  consuming functions, not by grepping for `const` — two hid as inline literals
+  (an HLG OETF coefficient spelled `0.178_832_77`, which digit separators keep
+  out of a naive grep, and two luma vectors inline in a `match` arm). Four
+  gotchas that have already cost time:
+  - **`pinned.rs` is not the only runtime consumer of a definition.**
+    `pipeline::color` feeds `definitions::{REC709, DISPLAY_P3, ACESCG, PROPHOTO}`
+    straight into Little CMS, so editing one of those four changes ICC bytes and
+    every lcms2-transformed pixel *even with `pinned.rs` untouched and every
+    audit `ulps` at 0*. Nothing automated catches it: `PIPELINE_FINGERPRINTS`
+    stops before lcms2 and the audit only compares pinned artifacts. Treat those
+    four as a pixel change regardless of the ulp column.
+  - **Two Bradford conventions coexist deliberately.** `BRADFORD` (exact `f64`
+    inverse) is canonical; `BRADFORD_PUBLISHED_INVERSE` (Lindbloom's printed
+    7-decimal inverse) exists *only* because `NC_FILM_RGB_V1_TO_ACESCG` was
+    pinned with it — re-deriving v1 with the canonical one shifts it 9.1e-8, a
+    pixel change to a frozen identifier. A test fails if you collapse them.
+  - **The three luma vectors have three different provenances, and each has its
+    own verification rule.** `BT2020_LUMA` is transcribed from a normative table
+    and deliberately does *not* match a derivation from its own primaries (~2e-6,
+    ~17 ulps) — the standard rounds and encoders use the rounded form.
+    `DISPLAY_P3_LUMA` *is* an exact derivation. `SRGB_LUMA` is the derivation
+    **rounded to six decimals** (0/−6/43 ulps), so it carries its own
+    `SRGB_LUMA_MAX_ULPS = 43` instead of relaxing the shared ±1 bound. Tests pin
+    each relationship; don't "correct" one to match another.
+  - **The check tolerance is ±1 `f32` ulp and that is measured, not lazy.** Three
+    shipped entries sit exactly one ulp off the canonical derivation for reasons
+    unrecoverable from the repo. For scale, the chromaticities are specified to
+    three decimals, so their own ±5e-4 rounding moves entries ~3,500 ulps.
 - **Peak memory is gated before decode, and `pipeline/memory.rs` owns the model.**
   Every command that decodes runs `memory::preflight` on a metadata-only
   `io::decode::probe` (never `read_image` — `decode` only returns dimensions after

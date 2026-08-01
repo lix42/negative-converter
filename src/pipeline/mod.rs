@@ -2,6 +2,7 @@
 //! transforms, and the stage wiring that threads them together.
 
 pub mod color;
+pub mod colorimetry;
 pub mod film_base;
 pub mod gain_map;
 pub mod hdr;
