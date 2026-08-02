@@ -94,7 +94,9 @@ concerns applying a *colour* transform before density conversion; this task conc
   or manufacturer-tabulated Status M value exists.
 - Reuse per-stock reference data from
   [film-stock profiles](../algo/film-stock-profiles.md) rather than keeping a second
-  copy. Neither task blocks the other.
+  copy — which is why that task is a prerequisite. Duplicating datasheet values across
+  two modules is exactly the silent-drift risk the `pipeline/colorimetry/` pattern
+  exists to prevent.
 - The diagnostic *measurement* on real scans is performed by
   [reference-anchored sigmoid](../algo/reference-anchored-sigmoid.md)'s baseline
   harness, which is why this task depends on it: this task productises the result
@@ -102,9 +104,15 @@ concerns applying a *colour* transform before density conversion; this task conc
 
 ## How to Verify
 
-- On the committed fixture rolls, tier 1 reports measured `−log10(scan)` per channel
-  beside the nominal published `D-min`, and the report **explicitly states** that the
-  comparison cannot establish absolute scale without an open-gate reference.
+- Tier 1's logic is covered by a **synthetic committed fixture** (a known scan value in,
+  the expected `−log10(scan)` out), so a clean checkout can verify it with no assets.
+- On the **external** real rolls — which live in the machine-local, uncommitted
+  `../nc-assets` and must be identified by their `manifest.json` entry (roll + frame +
+  `sha256`), not assumed present — tier 1 reports measured `−log10(scan)` per channel
+  beside the nominal published `D-min`, driven through the
+  `scripts/real-scan-verify/` harness. The report **explicitly states** that the
+  comparison cannot establish absolute scale without an open-gate reference. This half
+  cannot run in CI and must skip with a clear message when the assets are absent.
 - The report does not classify the cross-channel spread as a scale error, and contains
   no correction derived from it.
 - Tier 2, if implemented, recovers a known offset and slope per channel from a
@@ -119,4 +127,7 @@ concerns applying a *colour* transform before density conversion; this task conc
 ## Dependencies
 
 - [Input data semantics and validation](input-data-semantics.md)
-- [Reference-anchored sigmoid calibration and redesign](../algo/reference-anchored-sigmoid.md)
+- [Film-stock profiles](../algo/film-stock-profiles.md) — supplies the per-stock nominal
+  reference densities this task must not duplicate
+
+`algo/reference-anchored-sigmoid` is now **transitive** via `algo/film-stock-profiles`.

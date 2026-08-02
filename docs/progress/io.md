@@ -737,3 +737,14 @@ What other epics need to know about `io`:
 - **Tier 2 needs a calibrated transmission step wedge, not a photographed grey card.** A
   photographed card's developed density depends on illumination, exposure, processing and
   the characteristic curve, so it is not a known density and cannot pin offset+slope.
+- 2026-08-02 (local Codex branch review, two further findings accepted):
+  `algo/film-stock-profiles` is now a **real prerequisite**, not a coordination note. The
+  verification needs the per-stock nominal `D-min` while this task's own spec forbids
+  keeping a second copy — duplicating datasheet values across two modules is the exact
+  silent-drift risk the `pipeline/colorimetry/` pattern exists to prevent.
+  `algo/reference-anchored-sigmoid` becomes transitive through it.
+- Verification no longer claims "committed fixture rolls" — **there are none.** Real rolls
+  live in the machine-local, uncommitted `../nc-assets` and must be identified through
+  `manifest.json` (roll + frame + `sha256`) and driven via `scripts/real-scan-verify/`;
+  that half cannot run in CI and skips when assets are absent. Tier 1's *logic* is covered
+  by a synthetic committed fixture so a clean checkout can still verify it.

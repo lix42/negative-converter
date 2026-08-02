@@ -281,7 +281,7 @@ graph TD
   algo/negative-reconstruction-density-curves --> algo/reference-anchored-sigmoid
   film-base/dmax-reference --> algo/reference-anchored-sigmoid
   algo/reference-anchored-sigmoid --> algo/film-stock-profiles
-  algo/reference-anchored-sigmoid --> io/scanner-density-calibration
+  algo/film-stock-profiles --> io/scanner-density-calibration
   io/input-data-semantics --> io/scanner-density-calibration
   algo/reference-anchored-sigmoid --> algo/content-aware-sigmoid-toe
   core/roll-conversion --> algo/content-aware-sigmoid-toe
@@ -350,13 +350,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `io/transactional-output-writes` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/memory-preflight` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/streaming-tiled-io` (post-MVP, **evaluate-first**): `io/memory-preflight`, `analysis/real-scan-verification`
-- `io/scanner-density-calibration` (post-MVP): `io/input-data-semantics`, `algo/reference-anchored-sigmoid`
-  — the dependency is on *productising*, not on measuring: the sigmoid task runs its own
-  diagnostic checks in its baseline harness, so it is never blocked on this task and
-  cannot be left validating defaults against a scale only this task could have measured.
-  Tier 1 (unexposed frame) is non-calibrating; tier 2 needs a calibrated transmission
-  step wedge. Coordinates with `algo/film-stock-profiles` for per-stock reference data;
-  neither blocks the other
+- `io/scanner-density-calibration` (post-MVP): `io/input-data-semantics`, `algo/film-stock-profiles`
+  — `algo/reference-anchored-sigmoid` is now transitive via `algo/film-stock-profiles`.
+  The registry is a real prerequisite: this task's verification needs the per-stock
+  nominal `D-min` and its own spec forbids keeping a second copy. Note the sigmoid task
+  runs its *own* diagnostic checks inside its baseline harness, so it is never blocked
+  here and cannot end up validating defaults against a scale only this task could have
+  measured. Tier 1 (unexposed frame) is non-calibrating; tier 2 needs a calibrated
+  transmission step wedge
 - `film-base/estimation`: `core/project-foundation`
 - `film-base/auto-base-redesign` (post-MVP): `film-base/estimation`
 - `film-base/auto-base-neutral-stock` (post-MVP): `film-base/auto-base-redesign`
