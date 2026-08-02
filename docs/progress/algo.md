@@ -1106,3 +1106,30 @@ What other epics need to know about `algo`:
 - 2026-07-31 (PR review): Added `output/presets` as a prerequisite. This task
   promises named-preset rejection and byte-identity verification, so the preset
   surface must exist before those contracts can be implemented or tested.
+
+
+## film-stock-profiles
+
+**Status:** not started
+**Updated:** 2026-08-02
+
+- Goal: A selectable registry of known film stocks carrying the per-stock reference
+  densities reconstruction needs, sourced from manufacturer datasheets with
+  provenance, with a generic C-41 fallback so naming a stock stays a refinement
+  rather than a requirement.
+- 2026-08-02 (filed during `reference-anchored-sigmoid` planning): the seed data
+  already exists — the Kodak *Judging Negative Exposures* aim tables plus the
+  Spectral-Dye-Density charts give, per stock, the grey-card and diffuse-white aim
+  densities (Status M, red, absolute) and per-channel `D-min`. Measured: Ektar 100
+  0.82 / 1.18, Δ 0.36, `D-min` red ≈0.20; Portra 160 0.84 / 1.20, Δ 0.36, ≈0.17;
+  Gold 200 0.95 / 1.35, Δ 0.40, ≈0.22 (E-4046 / E-4051 / E-7022).
+- Two decisions recorded up front: the professional C-41 aims cluster tightly enough
+  that a **generic profile is viable**, so stock selection must never be a
+  precondition; and the data's shape should follow `pipeline/colorimetry/` (source
+  data with provenance / pinned literals / `#[cfg(test)]` audit) rather than
+  inventing a second convention for reference data.
+- Deliberately **not** made a dependency of `film-base/dense-base-dmax-plausibility`,
+  which wants the C-41-calibrated plausibility floor made stock-relative: that task
+  can loosen its floor without a registry, and a false edge would kill real
+  parallelism. The two must still be coordinated so stock-awareness isn't solved
+  twice.

@@ -690,3 +690,34 @@ What other epics need to know about `io`:
 **Updated:** —
 
 - Goal: Ensure a failed or interrupted `nc convert` never leaves a **partial or inconsistent artifact set** on disk.
+
+
+## scanner-density-calibration
+
+**Status:** not started
+**Updated:** 2026-08-02
+
+- Goal: Establish what a scanner's numbers mean in **absolute** density, so
+  manufacturer-published densities are directly usable by reconstruction.
+  `input-data-semantics` resolved transfer and meaning but not absolute
+  normalisation — this closes that gap.
+- 2026-08-02 (filed during `algo/reference-anchored-sigmoid` planning): two tiers,
+  split by what they ask of the user. **Tier 1** uses only an unexposed frame, which
+  the workflow already requires for `Dmin`: compute `−log10(scan)` per channel
+  *without* dividing by `Dmin` and compare to the stock's published `D-min` (Ektar
+  100: R ≈0.20 / G ≈0.56 / B ≈0.77). **Tier 2** adds a grey card or step wedge for a
+  full offset+slope profile, and must stay strictly optional.
+- **Known limit of tier 1, to be stated in its report rather than glossed:** one
+  known density fixes a zero point, not a slope — and nc already anchors at the base
+  by construction (`D = −log10(scan/Dmin)`), so a base measurement adds no new zero
+  point. Its real value is supplying *three* known densities at once (one per
+  channel, spanning ≈0.57 on Ektar), so a compressed spread is a slope signal. The
+  irreducible ambiguity: a mismatch may be a wrong scale **or** a scanner filter
+  whose spectral response differs from Status M. Report the ambiguity; don't pick.
+- **A mismatch is not fatal.** Datasheets give the *relationship* between landmarks
+  (mid-grey → diffuse white, Δ ≈ 0.36); a locally measured Δ gives the scale. Off
+  scale just means deriving contrast from the measured Δ — a different number, same
+  method. So the profile is a correction to apply, never a gate on conversion.
+- Distinct from `color/scanner-profile-before-density-experiment`, which is about a
+  *colour* transform before density conversion; this is about the *density scale*.
+  Don't conflate them.
