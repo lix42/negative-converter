@@ -721,3 +721,19 @@ What other epics need to know about `io`:
 - Distinct from `color/scanner-profile-before-density-experiment`, which is about a
   *colour* transform before density conversion; this is about the *density scale*.
   Don't conflate them.
+- 2026-08-02 (PR #68 Codex review, three findings accepted): **Tier 1 is a
+  non-calibrating diagnostic, not a calibration.** `io::decode::normalize_u16` divides
+  16-bit samples by 65535, so a scan value is a code-value ratio against *full scale*,
+  not `I/I₀`. Scanner exposure and per-channel gains put an arbitrary offset between
+  `−log10(scan)` and published `D-min`, so a perfectly linear scan can disagree with the
+  datasheet for reasons that have nothing to do with scale. Absolute density needs a
+  **same-settings open-gate reference measurement**.
+- **The cross-channel-spread-as-slope argument was wrong and is removed.** The three
+  channel readings are one point on three *different* response curves, each with its own
+  gain and spectral sensitivity — not three points on one curve. A compressed spread can
+  come from channel gains alone, and no channel has a second point from which a slope is
+  identifiable; deriving a correction from it would corrupt colour. Slope needs a second
+  known density *per channel*.
+- **Tier 2 needs a calibrated transmission step wedge, not a photographed grey card.** A
+  photographed card's developed density depends on illumination, exposure, processing and
+  the characteristic curve, so it is not a known density and cannot pin offset+slope.

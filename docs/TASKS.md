@@ -351,9 +351,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `io/memory-preflight` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/streaming-tiled-io` (post-MVP, **evaluate-first**): `io/memory-preflight`, `analysis/real-scan-verification`
 - `io/scanner-density-calibration` (post-MVP): `io/input-data-semantics`, `algo/reference-anchored-sigmoid`
-  — tier 1 (unexposed frame only) needs no new user action; tier 2 (grey card / step
-  wedge) does. Coordinates with `algo/film-stock-profiles`, which supplies the
-  per-stock reference densities, but neither blocks the other
+  — the dependency is on *productising*, not on measuring: the sigmoid task runs its own
+  diagnostic checks in its baseline harness, so it is never blocked on this task and
+  cannot be left validating defaults against a scale only this task could have measured.
+  Tier 1 (unexposed frame) is non-calibrating; tier 2 needs a calibrated transmission
+  step wedge. Coordinates with `algo/film-stock-profiles` for per-stock reference data;
+  neither blocks the other
 - `film-base/estimation`: `core/project-foundation`
 - `film-base/auto-base-redesign` (post-MVP): `film-base/estimation`
 - `film-base/auto-base-neutral-stock` (post-MVP): `film-base/auto-base-redesign`
@@ -485,12 +488,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   exit code 6; peak on the 74.65 MP `largest.tif` 3.808 → 3.146 GB and 975 → 681 MB
   at 18.66 MP (decimal GB/MB, a 30% cut), output byte-identical. Re-measurement
   feeds `io/streaming-tiled-io` STEP 0 (still a conditional GO).
-- [ ] [Scanner density calibration](tasks/io/scanner-density-calibration.md) — establish
-  what the scanner's numbers mean in *absolute* density by comparing a measured unexposed
-  frame against the film's published `D-min` (tier 1, no new user action), optionally
-  extended to a grey card / step wedge for a full offset+slope profile (tier 2). Closes
-  the open question `algo/reference-anchored-sigmoid` raises: whether our density scale
-  matches Status M, which sets whether the datasheet-derived contrast is usable as-is.
+- [ ] [Scanner density calibration](tasks/io/scanner-density-calibration.md) — turn the
+  density-scale question into a shipped, reusable scanner profile. Tier 1 (unexposed
+  frame only, no new user action) is a **non-calibrating diagnostic**: a scan value is a
+  code-value ratio against full scale, so absolute density needs a same-settings
+  open-gate reference. Tier 2 needs a **calibrated transmission step wedge** (a
+  photographed grey card is not a known density). `algo/reference-anchored-sigmoid`
+  performs the first diagnostic measurement inside its own baseline harness and does not
+  wait on this task; this task productises the result.
 - [ ] [Streaming / tiled I/O](tasks/io/streaming-tiled-io.md) — memory-safety review
   Phase B (expensive, **evaluate-first**): strip/tile decode + streaming encode.
   STEP 0 gate — evaluate from measured peak whether this is needed at all; if data
@@ -531,9 +536,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Regional (shadow/highlight) color balance](tasks/algo/regional-color-balance.md)
 - [ ] [Film-stock profiles](tasks/algo/film-stock-profiles.md) — a selectable registry of
   known stocks carrying the per-stock reference densities that reconstruction needs
-  (mid-grey and diffuse-white aims, `D-min`), sourced from manufacturer datasheets with
-  provenance, with a generic C-41 fallback so stock selection stays a refinement rather
-  than a requirement
+  (the manufacturer-tabulated mid-grey and diffuse-white aims and their difference),
+  sourced from datasheets with provenance, with a generic C-41 fallback so stock
+  selection stays a refinement rather than a requirement. Measured roll `film_base`
+  stays authoritative — a published `D-min` is a nominal diagnostic, never a substitute
 - [ ] [Black & white negative support (mono color model)](tasks/algo/bw-support.md)
 - [ ] [Density safety bounds](tasks/algo/density-safety-bounds.md) — from the
   density-safety review: physical bounds on `density_scale`/`offset`/`gamma` (the

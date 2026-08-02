@@ -16,13 +16,36 @@ published. From the Kodak datasheet research done under
 
 - the *Judging Negative Exposures* aim densities — grey card and the lightest step
   of a paper grey scale (≈ diffuse white), Status M, red channel, **absolute**
-  (base+fog included);
-- `D-min` per channel, read from the Spectral-Dye-Density chart;
-- therefore the derived mid-grey-above-base offset and the mid→white `Δ`.
+  (base+fog included). These are **tabulated by the manufacturer**, so they are the
+  authoritative half.
+- the mid→white difference `Δ` derived from them (base-independent, since a
+  difference cancels base+fog);
+- a **nominal** `D-min`, for diagnostics only — see the two constraints below.
 
-Measured examples (2026-08-02): Ektar 100 aim 0.82 / 1.18, `Δ` 0.36, `D-min` red
-≈0.20; Portra 160 0.84 / 1.20, `Δ` 0.36, `D-min` red ≈0.17; Gold 200 0.95 / 1.35,
-`Δ` 0.40, `D-min` red ≈0.22.
+Tabulated aims: Ektar 100 0.82 / 1.18 (`Δ` 0.36), Portra 160 0.84 / 1.20 (`Δ` 0.36),
+Portra 400 0.82 / 1.18 (`Δ` 0.36), Gold 200 0.95 / 1.35 (`Δ` 0.40).
+
+**Constraint 1 — measured roll `film_base` stays authoritative; published `D-min` is
+nominal only.** This repo already defines `Dmin` as a property of stock **plus
+development plus scanner settings**
+([estimate-reuse-output](../film-base/estimate-reuse-output.md)). Base fog and the
+characteristic curve shift with processing, storage and the individual roll, so
+selecting a stock must never substitute a nominal standard-process base for the
+measured one — that would misplace tones on a real roll. Store published `D-min` as a
+reference/diagnostic value and keep measured `film_base`, and any measured offset,
+authoritative in the render path.
+
+**Constraint 2 — the chart-read `D-min` figures are not Status M densities.** Status M
+is a prescribed **broadband spectral response**, not a wavelength one can pick off a
+curve. Deriving a Status M channel density requires converting the spectral-density
+curve to transmittance, integrating against that channel's response, and then taking
+the logarithm; single-wavelength sampling can be materially wrong where the dye spectra
+overlap. The values read on 2026-08-02 (Ektar red ≈0.20, Portra 160 ≈0.17, Gold 200
+≈0.22 — and the Portra 160 midscale read of 0.73 against a tabulated 0.79–0.89, which
+is probably this effect showing up) are therefore **provisional**. Before any of them
+becomes ground truth for this registry or for
+[scanner density calibration](../io/scanner-density-calibration.md), either perform the
+proper spectral integration or obtain a manufacturer-tabulated Status M measurement.
 
 **A generic default is viable and matters.** The professional C-41 aims cluster
 tightly (0.82 / 1.18 / `Δ` 0.36 across Ektar 100, Portra 160 and Portra 400), so an
@@ -57,9 +80,10 @@ raises a loud, `--strict`-promotable warning.
 - Land the registry only *after* `reference-anchored-sigmoid` settles which
   parameters are stock-dependent. Building it earlier risks storing fields nothing
   reads.
-- Chart-read values are ±0.05 and sensitive to the assumed Status M wavelength.
-  Prefer the authoritative aim-table number minus a chart-read `D-min` over two
-  chart reads, and record which numbers are which.
+- Prefer the **tabulated** aim numbers over anything read off a chart, and record which
+  is which. Per Constraint 2, a chart read is not a Status M density at all — the ±0.05
+  reading precision is the smaller of the two problems, so do not treat "read more
+  carefully" as a fix.
 - The aim tables are red-channel only. Per-channel placement is unresolved; do not
   invent per-channel numbers the datasheets do not state.
 - Coordinate with

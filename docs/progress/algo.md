@@ -1133,3 +1133,17 @@ What other epics need to know about `algo`:
   can loosen its floor without a registry, and a false edge would kill real
   parallelism. The two must still be coordinated so stock-awareness isn't solved
   twice.
+- 2026-08-02 (PR #68 Codex review, two findings accepted): **measured roll `film_base`
+  stays authoritative; a published `D-min` is nominal only.** The repo already defines
+  `Dmin` as stock + development + scanner settings
+  (`film-base/estimate-reuse-output`), and base fog shifts with processing, storage and
+  the individual roll — so letting a stock selection substitute a nominal
+  standard-process base would misplace tones on a real roll.
+- **The chart-read `D-min` values are provisional, not Status M densities.** Status M is
+  a prescribed broadband response: a Status M channel density requires converting the
+  spectral-density curve to transmittance, integrating against that channel's response,
+  then taking the log. Single-wavelength sampling can be materially wrong where dye
+  spectra overlap — the Portra 160 midscale read of 0.73 against a tabulated 0.79–0.89
+  is likely this effect. The manufacturer-*tabulated* aims (and their difference Δ) are
+  the authoritative half; chart reads must not become ground truth for the registry or
+  for `io/scanner-density-calibration` until properly integrated or tabulated.
