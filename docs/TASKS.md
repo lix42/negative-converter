@@ -110,6 +110,7 @@ graph TD
   algo --> analysis
   film-base --> analysis
   algo --> film-base
+  algo --> io
   io --> color
   io --> algo
   io --> output
@@ -145,6 +146,7 @@ graph TD
     io/transactional-output-writes
     io/memory-preflight
     io/streaming-tiled-io
+    io/scanner-density-calibration
   end
   subgraph film-base
     film-base/estimation
@@ -171,6 +173,7 @@ graph TD
     algo/auto-neutral-wb
     algo/regional-color-balance
     algo/bw-support
+    algo/film-stock-profiles
   end
   subgraph color
     color/management
@@ -277,6 +280,9 @@ graph TD
   algo/sigmoid --> algo/negative-reconstruction-density-curves
   algo/negative-reconstruction-density-curves --> algo/reference-anchored-sigmoid
   film-base/dmax-reference --> algo/reference-anchored-sigmoid
+  algo/reference-anchored-sigmoid --> algo/film-stock-profiles
+  algo/film-stock-profiles --> io/scanner-density-calibration
+  io/input-data-semantics --> io/scanner-density-calibration
   algo/reference-anchored-sigmoid --> algo/content-aware-sigmoid-toe
   core/roll-conversion --> algo/content-aware-sigmoid-toe
   output/presets --> algo/content-aware-sigmoid-toe
@@ -344,6 +350,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `io/transactional-output-writes` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/memory-preflight` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/streaming-tiled-io` (post-MVP, **evaluate-first**): `io/memory-preflight`, `analysis/real-scan-verification`
+- `io/scanner-density-calibration` (post-MVP): `io/input-data-semantics`, `algo/film-stock-profiles`
+  — `algo/reference-anchored-sigmoid` is now transitive via `algo/film-stock-profiles`.
+  The registry is a real prerequisite: this task's verification needs the per-stock
+  nominal `D-min` and its own spec forbids keeping a second copy. Note the sigmoid task
+  runs its *own* diagnostic checks inside its baseline harness, so it is never blocked
+  here and cannot end up validating defaults against a scale only this task could have
+  measured. Tier 1 (unexposed frame) is non-calibrating; tier 2 needs a calibrated
+  transmission step wedge
 - `film-base/estimation`: `core/project-foundation`
 - `film-base/auto-base-redesign` (post-MVP): `film-base/estimation`
 - `film-base/auto-base-neutral-stock` (post-MVP): `film-base/auto-base-redesign`
@@ -363,6 +377,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
 - `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
 - `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`; no downstream blockers
+- `algo/film-stock-profiles` (post-MVP): `algo/reference-anchored-sigmoid`
+  — deliberately **not** a dependency of `film-base/dense-base-dmax-plausibility`
+  (that task can loosen its floor without a full registry; a false edge would kill
+  real parallelism), but the two must be coordinated so stock-awareness is not
+  solved twice
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
@@ -470,6 +489,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   exit code 6; peak on the 74.65 MP `largest.tif` 3.808 → 3.146 GB and 975 → 681 MB
   at 18.66 MP (decimal GB/MB, a 30% cut), output byte-identical. Re-measurement
   feeds `io/streaming-tiled-io` STEP 0 (still a conditional GO).
+- [ ] [Scanner density calibration](tasks/io/scanner-density-calibration.md) — turn the
+  density-scale question into a shipped, reusable scanner profile. Tier 1 (unexposed
+  frame only, no new user action) is a **non-calibrating diagnostic**: a scan value is a
+  code-value ratio against full scale, so absolute density needs a same-settings
+  open-gate reference. Tier 2 needs a **calibrated transmission step wedge** (a
+  photographed grey card is not a known density). `algo/reference-anchored-sigmoid`
+  performs the first diagnostic measurement inside its own baseline harness and does not
+  wait on this task; this task productises the result.
 - [ ] [Streaming / tiled I/O](tasks/io/streaming-tiled-io.md) — memory-safety review
   Phase B (expensive, **evaluate-first**): strip/tile decode + streaming encode.
   STEP 0 gate — evaluate from measured peak whether this is needed at all; if data
@@ -508,6 +535,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [x] [Auto neutral white balance](tasks/algo/auto-neutral-wb.md)
 - [x] [Regional (shadow/highlight) color balance](tasks/algo/regional-color-balance.md)
+- [ ] [Film-stock profiles](tasks/algo/film-stock-profiles.md) — a selectable registry of
+  known stocks carrying the per-stock reference densities that reconstruction needs
+  (the manufacturer-tabulated mid-grey and diffuse-white aims and their difference),
+  sourced from datasheets with provenance, with a generic C-41 fallback so stock
+  selection stays a refinement rather than a requirement. Measured roll `film_base`
+  stays authoritative — a published `D-min` is a nominal diagnostic, never a substitute
 - [ ] [Black & white negative support (mono color model)](tasks/algo/bw-support.md)
 - [ ] [Density safety bounds](tasks/algo/density-safety-bounds.md) — from the
   density-safety review: physical bounds on `density_scale`/`offset`/`gamma` (the

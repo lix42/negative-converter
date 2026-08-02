@@ -690,3 +690,61 @@ What other epics need to know about `io`:
 **Updated:** —
 
 - Goal: Ensure a failed or interrupted `nc convert` never leaves a **partial or inconsistent artifact set** on disk.
+
+
+## scanner-density-calibration
+
+**Status:** not started
+**Updated:** 2026-08-02
+
+- Goal: Establish what a scanner's numbers mean in **absolute** density, so
+  manufacturer-published densities are directly usable by reconstruction.
+  `input-data-semantics` resolved transfer and meaning but not absolute
+  normalisation — this closes that gap.
+- 2026-08-02 (filed during `algo/reference-anchored-sigmoid` planning): two tiers,
+  split by what they ask of the user. **Tier 1** uses only an unexposed frame, which
+  the workflow already requires for `Dmin`: compute `−log10(scan)` per channel
+  *without* dividing by `Dmin` and compare to the stock's published `D-min` (Ektar
+  100: R ≈0.20 / G ≈0.56 / B ≈0.77). **Tier 2** adds a grey card or step wedge for a
+  full offset+slope profile, and must stay strictly optional.
+- **Known limit of tier 1, to be stated in its report rather than glossed:** one
+  known density fixes a zero point, not a slope — and nc already anchors at the base
+  by construction (`D = −log10(scan/Dmin)`), so a base measurement adds no new zero
+  point. Its real value is supplying *three* known densities at once (one per
+  channel, spanning ≈0.57 on Ektar), so a compressed spread is a slope signal. The
+  irreducible ambiguity: a mismatch may be a wrong scale **or** a scanner filter
+  whose spectral response differs from Status M. Report the ambiguity; don't pick.
+- **A mismatch is not fatal.** Datasheets give the *relationship* between landmarks
+  (mid-grey → diffuse white, Δ ≈ 0.36); a locally measured Δ gives the scale. Off
+  scale just means deriving contrast from the measured Δ — a different number, same
+  method. So the profile is a correction to apply, never a gate on conversion.
+- Distinct from `color/scanner-profile-before-density-experiment`, which is about a
+  *colour* transform before density conversion; this is about the *density scale*.
+  Don't conflate them.
+- 2026-08-02 (PR #68 Codex review, three findings accepted): **Tier 1 is a
+  non-calibrating diagnostic, not a calibration.** `io::decode::normalize_u16` divides
+  16-bit samples by 65535, so a scan value is a code-value ratio against *full scale*,
+  not `I/I₀`. Scanner exposure and per-channel gains put an arbitrary offset between
+  `−log10(scan)` and published `D-min`, so a perfectly linear scan can disagree with the
+  datasheet for reasons that have nothing to do with scale. Absolute density needs a
+  **same-settings open-gate reference measurement**.
+- **The cross-channel-spread-as-slope argument was wrong and is removed.** The three
+  channel readings are one point on three *different* response curves, each with its own
+  gain and spectral sensitivity — not three points on one curve. A compressed spread can
+  come from channel gains alone, and no channel has a second point from which a slope is
+  identifiable; deriving a correction from it would corrupt colour. Slope needs a second
+  known density *per channel*.
+- **Tier 2 needs a calibrated transmission step wedge, not a photographed grey card.** A
+  photographed card's developed density depends on illumination, exposure, processing and
+  the characteristic curve, so it is not a known density and cannot pin offset+slope.
+- 2026-08-02 (local Codex branch review, two further findings accepted):
+  `algo/film-stock-profiles` is now a **real prerequisite**, not a coordination note. The
+  verification needs the per-stock nominal `D-min` while this task's own spec forbids
+  keeping a second copy — duplicating datasheet values across two modules is the exact
+  silent-drift risk the `pipeline/colorimetry/` pattern exists to prevent.
+  `algo/reference-anchored-sigmoid` becomes transitive through it.
+- Verification no longer claims "committed fixture rolls" — **there are none.** Real rolls
+  live in the machine-local, uncommitted `../nc-assets` and must be identified through
+  `manifest.json` (roll + frame + `sha256`) and driven via `scripts/real-scan-verify/`;
+  that half cannot run in CI and skips when assets are absent. Tier 1's *logic* is covered
+  by a synthetic committed fixture so a clean checkout can still verify it.
