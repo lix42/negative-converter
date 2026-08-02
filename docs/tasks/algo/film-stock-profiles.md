@@ -58,9 +58,11 @@ complaint.
 **Data shape follows `pipeline/colorimetry/`.** That module is the established
 pattern in this repo for reference data that must not drift silently: source data
 with provenance, separately pinned literals the runtime reads, and a `#[cfg(test)]`
-audit. Reuse the split rather than inventing a second convention. Every number
-carries its publication id (E-4046, E-4051, E-7022, …) and, where it came off a
-chart rather than a table, the fact that it is a chart reading with its precision.
+audit. Reuse the split rather than inventing a second convention. Every number carries
+its publication id (E-4046, E-4050, E-4051, E-7022, …) and its **kind**:
+`tabulated` (authoritative) or `chart-read` (provisional — not a Status M density at
+all, per Constraint 2, so this is a different-quantity marker and not merely a precision
+note).
 
 **Knob shape.** One enum field, per the project convention that mutually exclusive
 knobs are never parallel fields — e.g. `FilmStock { Generic (default) | Ektar100 |
@@ -103,8 +105,9 @@ raises a loud, `--strict`-promotable warning.
 - An unknown stock name fails loudly with exit 2 and lists the accepted names.
 - A per-frame stock override under `nc roll` raises the roll warning and `--strict`
   promotes it.
-- Every registry number is covered by a test asserting it against its recorded
-  publication id, so a typo cannot ship silently.
+- Every **tabulated** registry number is covered by a test asserting it against its
+  recorded publication id, so a typo cannot ship silently; every **chart-read** number
+  is marked provisional and a test asserts no render path consumes one.
 - `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo build`, `cargo test` pass.
 
