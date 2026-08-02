@@ -1,0 +1,20 @@
+{
+  "roll": "Portra160-2026-07-22",
+  "dmin": {
+    "frame": "20260722-nikon-1097.tif",
+    "region": "1555,1080,2074,1440",
+    "base": {
+      "r": 0.49988556,
+      "g": 0.24776074,
+      "b": 0.14920272
+    },
+    "warnings": ""
+  },
+  "dmax": {
+    "frame": "20260722-nikon-1096.tif",
+    "region": "1555,1080,2074,1440",
+    "scalar": 1.3816013,
+    "warnings": ""
+  },
+  "note": "center 40% region excludes film holder; scalars frozen for deterministic apply"
+}

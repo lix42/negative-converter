@@ -1147,3 +1147,40 @@ What other epics need to know about `algo`:
   is likely this effect. The manufacturer-*tabulated* aims (and their difference Δ) are
   the authoritative half; chart reads must not become ground truth for the registry or
   for `io/scanner-density-calibration` until properly integrated or tabulated.
+||||||| parent of 866a026 (Freeze fixture Dmin/Dmax for the sigmoid baseline (Phase 0))
+## reference-anchored-sigmoid (Phase 0)
+
+**Status:** in progress
+**Updated:** 2026-08-02
+
+- 2026-08-02: **Phase 0 complete — fixture Dmin/Dmax frozen for all three fixture rolls**
+  via `harness.sh freeze`, which now reads its roll triples from the asset manifest:
+
+  | Roll | Dmin (r,g,b) | Dmax | note |
+  |---|---|---|---|
+  | `2026-07-24-Gold200` | 0.6001831, 0.27512017, 0.14776836 | 1.2758015 | new; no estimator warning |
+  | `Ektar` | 0.51679254, 0.2768597, 0.18973067 | 1.2933096 | reproduced bit-identically |
+  | `Portra160-2026-07-22` | 0.49988556, 0.24776074, 0.14920272 | **1.3816013** | re-frozen; see below |
+
+- **The Portra160 re-freeze was necessary and material.** The committed `Portra160.json`
+  named Dmin/Dmax frames `20260720-nikon-1059` / `1058`, neither of which is in the
+  current `Portra160-2026-07-22` roll (manifest: unexposed 1097 / leader 1096) — the
+  recipes predate an asset reorganisation. Re-freezing from the manifest's frames gives
+  Dmax **1.3816** against the stale **1.3352**, a 0.046 shift. Reusing the old value
+  would have anchored the entire baseline comparison on a different piece of film.
+- `Ektar`, `Portra400-leica-flaw` and `phoenix` reproduced bit-identically, which both
+  validates harness determinism and confirms the defect was specific to Portra160.
+- Gold200 raised **no** plausibility warning (Dmax 1.2758 is above the C-41 `≳1.0`
+  floor), so the `film-base/dense-base-dmax-plausibility` risk did not materialise here.
+- **Stale artifacts left in place, flagged not fixed:** `Portra160.json` and
+  `Portra400.json` name rolls that no longer exist under those names. `Portra160.json`
+  now sits beside `Portra160-2026-07-22.json` with a *different* Dmax, which is a trap
+  for the next reader — recommend deleting both stale files, but that removes another
+  task's committed artifacts so it is the user's call, not a side effect of this task.
+- Three `*.hdr.json` files show as modified with **no value change** — the harness now
+  emits the `output` block after `reconstruction` instead of before. Committed so a
+  future re-freeze shows a clean diff.
+- α recomputed against the frozen anchors: Ektar 0.479, Portra160 0.485, Gold200 0.572
+  (mean ≈ 0.51). Config 3's sweep covers 0.5/0.6/0.65, so it still spans the range —
+  and per the PR #68 review the numerator is a provisional chart read, so this must not
+  be used to narrow the sweep.
