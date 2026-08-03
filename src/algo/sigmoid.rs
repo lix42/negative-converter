@@ -264,7 +264,7 @@ pub(super) fn apply_curve(
     // `simple.rs`). `Explicit` is CLI-validated positive, so this only fires
     // on `none` (config/programmatic) or a degenerate `Auto` measurement.
     let resolved = resolve_dmax(&density.density, params.dmax);
-    let Some(anchor) = resolved.filter(|a| a.is_finite() && *a > 0.0) else {
+    let Some(reference) = resolved.filter(|a| a.is_finite() && *a > 0.0) else {
         return Err(NcError::Other(anchor_error(
             resolved,
             params.dmax,
@@ -276,7 +276,17 @@ pub(super) fn apply_curve(
         toe,
         shoulder,
         dmax: _,
+        anchor: placement,
     } = *params;
+    // The reference is not necessarily the anchor: `AnchorPlacement` decides which tone is
+    // pinned and where. `WhiteAtDmax` is the identity (anchor == reference); the mid-grey
+    // form places the anchor *above* the reference, so white lands beyond it and the shoulder
+    // compresses what exceeds it — which is what a print shoulder is for.
+    let anchor = placement.anchor(reference, contrast);
+    debug_assert!(
+        anchor.is_finite() && anchor > 0.0,
+        "placement must yield a positive finite anchor from a positive finite reference"
+    );
     let film = super::density::apply_curve(density, move |d| {
         s_curve(d, contrast, toe, shoulder, anchor)
     });
@@ -288,8 +298,8 @@ mod tests {
     use super::*;
     use crate::algo::{finish_print, reconstruct};
     use crate::types::{
-        BalanceRange, DensityCurve, DensityParams, ExponentialParams, FilmBase, LinearImage,
-        PrintParams, Reconstruction, WbSource,
+        AnchorPlacement, BalanceRange, DensityCurve, DensityParams, ExponentialParams, FilmBase,
+        LinearImage, PrintParams, Reconstruction, WbSource,
     };
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
@@ -555,6 +565,9 @@ mod tests {
                 toe: 0.0,
                 shoulder: 0.0,
                 dmax,
+                // WhiteAtDmax preserves this test's meaning: the given `dmax` IS the
+                // anchor, which is what its pinned curve values were captured against.
+                anchor: AnchorPlacement::WhiteAtDmax,
             }),
             PrintParams::default(),
         )
@@ -649,6 +662,7 @@ mod tests {
                 toe: 0.0,
                 shoulder: 0.0,
                 dmax,
+                anchor: AnchorPlacement::WhiteAtDmax,
             }),
             PrintParams::default(),
         )
