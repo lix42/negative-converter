@@ -104,10 +104,15 @@ def main():
             f'p05 {b["p05"]:.4f} · p95 {b["p95"]:.4f} · spread {b["spread"]:.4f}<br>'
             f'{b["x"]},{b["y"]},{b["bw"]},{b["bh"]}</span></figcaption></figure>'
             for c, lbl, col in CATS if (b := f["boxes"].get(c)))
-        evs = [("-2", "m20"), ("-1.5", "m15"), ("-1", "m10"), ("-0.5", "m05"), ("0", "p00")]
+        # Two-sided sweep. An earlier downward-only range (-2 … 0) had every frame pick
+        # EV 0 — the boundary — which means the optimum was at or beyond it and the range
+        # was simply wrong. Upward variants clip 7–26 % of highlights at contrast 2.0,
+        # which is itself a finding: exposure is the wrong knob for a raised floor.
+        evs = [("-2", "m20"), ("-1.5", "m15"), ("-1", "m10"), ("-0.5", "m05"),
+               ("0", "p00"), ("+0.5", "p05x"), ("+1", "p10x"), ("+1.5", "p15x")]
         variants = "".join(
             f'<figure class="v"><img src="{mark}-{tok}.jpg" alt="{mark} EV {ev}" loading="lazy">'
-            f'<figcaption><b>EV {ev.replace("-", "−")}</b></figcaption></figure>'
+            f'<figcaption><b>EV {ev.replace("-", "\u2212")}</b></figcaption></figure>'
             for ev, tok in evs)
 
         secs.append(f"""
@@ -170,7 +175,7 @@ section {{ border-top: 1px solid #2a2e36; padding: 22px 0; }}
 figure {{ margin: 0; }}
 .crop {{ aspect-ratio: 328 / 342; outline: 2.5px solid; outline-offset: -2.5px; border-radius: 4px; }}
 figcaption {{ font-size: 12px; margin-top: 6px; color: #c7ccd3; }}
-.variants {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }}
+.variants {{ display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; }}
 .variants img {{ width: 100%; height: auto; border-radius: 5px; display: block; }}
 figure.v figcaption {{ text-align: center; font-size: 12.5px; margin-top: 5px; }}
 .slider {{ margin-top: 12px; font-size: 13px; color: #9aa0a8; }}

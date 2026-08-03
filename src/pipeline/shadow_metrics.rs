@@ -36,10 +36,34 @@ const DECODE_BUDGET_BYTES: u64 = 6 * 1024 * 1024 * 1024;
 /// conservative: it costs picture area rather than risking a contaminated patch.
 const INTERIOR_INSET: f32 = 0.12;
 
-/// Tiles across the interior's short and long axis. 12 × 8 gives 96 candidates per
-/// frame — enough to rank meaningfully, few enough to print.
-const TILES_X: u32 = 12;
-const TILES_Y: u32 = 8;
+/// Tiles across the interior's long and short axis.
+///
+/// **Sized deliberately small.** An earlier 12 × 8 grid produced 328 × 342 patches —
+/// 6.3 % × 9.5 % of the frame — and the user review showed they routinely straddled
+/// several objects ("dark branch *and* distant forest", "2/3 shadow *and* background
+/// forest", "all three are a forest/sky mix"), which makes a patch's *semantics*
+/// unstatable. 32 × 22 gives ~123 × 124 patches: about a quarter of the area, small
+/// enough to sit on one surface. Override with `NC_TILES=<x>x<y>` when a frame needs a
+/// different granularity.
+const TILES_X_DEFAULT: u32 = 32;
+const TILES_Y_DEFAULT: u32 = 22;
+
+/// Minimum separation between reported candidates, in tiles (Chebyshev distance).
+///
+/// With small tiles the top-ranked candidates are otherwise near-duplicates of one
+/// another — adjacent tiles on the same surface — so the "top 3" would offer one choice,
+/// not three. Suppressing neighbours makes them genuinely distinct alternatives.
+const MIN_SEPARATION_TILES: u32 = 3;
+
+fn tile_grid() -> (u32, u32) {
+    match std::env::var("NC_TILES").ok().and_then(|s| {
+        let (x, y) = s.split_once('x')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    }) {
+        Some((x, y)) if x > 0 && y > 0 => (x, y),
+        _ => (TILES_X_DEFAULT, TILES_Y_DEFAULT),
+    }
+}
 
 /// The three fixture rolls, locked with the user. Each names its frozen recipe stem
 /// under `scripts/real-scan-verify/recipes/` — the recipe supplies the roll's `Dmin`
@@ -177,16 +201,17 @@ fn tone(px: &[f32]) -> f32 {
 
 /// Tile the frame interior and compute each tile's tone statistics.
 fn tiles(density: &[f32], width: u32, height: u32) -> Vec<Tile> {
+    let (tiles_x, tiles_y) = tile_grid();
     let inset_x = (width as f32 * INTERIOR_INSET) as u32;
     let inset_y = (height as f32 * INTERIOR_INSET) as u32;
     let iw = width - 2 * inset_x;
     let ih = height - 2 * inset_y;
-    let tw = iw / TILES_X;
-    let th = ih / TILES_Y;
+    let tw = iw / tiles_x;
+    let th = ih / tiles_y;
 
-    let mut out = Vec::with_capacity((TILES_X * TILES_Y) as usize);
-    for ty in 0..TILES_Y {
-        for tx in 0..TILES_X {
+    let mut out = Vec::with_capacity((tiles_x * tiles_y) as usize);
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
             let x0 = inset_x + tx * tw;
             let y0 = inset_y + ty * th;
             let mut tones = Vec::with_capacity((tw * th) as usize);
@@ -216,11 +241,28 @@ fn tiles(density: &[f32], width: u32, height: u32) -> Vec<Tile> {
     out
 }
 
-/// Print the top `n` candidates under a ranking, as paste-ready `x,y,w,h` plus stats.
-fn report(label: &str, mut cands: Vec<&Tile>, n: usize, dmax: f32) {
+/// Print the top `n` *spatially distinct* candidates, as paste-ready `x,y,w,h` plus stats.
+///
+/// Non-maximum suppression matters here: with small tiles the top-ranked cells are
+/// near-duplicates of each other on one surface, so an unfiltered "top 3" would offer a
+/// single choice dressed as three. Expects `cands` sorted best-first.
+fn report(label: &str, cands: Vec<&Tile>, n: usize, dmax: f32) {
     println!("    {label}:");
-    cands.truncate(n);
+    let mut picked: Vec<&Tile> = Vec::with_capacity(n);
     for t in cands {
+        if picked.len() >= n {
+            break;
+        }
+        let too_close = picked.iter().any(|p| {
+            let dx = p.x.abs_diff(t.x) / t.w.max(1);
+            let dy = p.y.abs_diff(t.y) / t.h.max(1);
+            dx < MIN_SEPARATION_TILES && dy < MIN_SEPARATION_TILES
+        });
+        if !too_close {
+            picked.push(t);
+        }
+    }
+    for t in picked {
         println!(
             "      {:>5},{:>5},{:>4},{:>4}   D'p50 {:>7.4}  p05 {:>7.4}  p95 {:>7.4}  spread {:>6.4}  ({:>5.1}% of Dmax)",
             t.x,
@@ -380,11 +422,12 @@ fn characterise_reference_frames() {
                 // Gradient: mean tile p50 of each half. A fogged-from-one-edge leader
                 // shows up here even when the overall range looks tight.
                 let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
-                let mid_x = TILES_X / 2;
-                let mid_y = TILES_Y / 2;
+                let (tiles_x, tiles_y) = tile_grid();
+                let mid_x = tiles_x / 2;
+                let mid_y = tiles_y / 2;
                 let (mut l, mut rt, mut top, mut bot) = (vec![], vec![], vec![], vec![]);
                 for (i, t) in ts.iter().enumerate() {
-                    let (tx, ty) = (i as u32 % TILES_X, i as u32 / TILES_X);
+                    let (tx, ty) = (i as u32 % tiles_x, i as u32 / tiles_x);
                     if tx < mid_x {
                         l.push(t.p50)
                     } else {
@@ -444,7 +487,8 @@ mod tests {
         let (w, h) = (240u32, 160u32);
         let density: Vec<f32> = (0..(w * h * 3)).map(|i| (i % 97) as f32 / 97.0).collect();
         let ts = tiles(&density, w, h);
-        assert_eq!(ts.len() as u32, TILES_X * TILES_Y);
+        let (gx, gy) = tile_grid();
+        assert_eq!(ts.len() as u32, gx * gy);
         let inset_x = (w as f32 * INTERIOR_INSET) as u32;
         let inset_y = (h as f32 * INTERIOR_INSET) as u32;
         for t in &ts {

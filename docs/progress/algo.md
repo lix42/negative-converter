@@ -1291,3 +1291,45 @@ What other epics need to know about `algo`:
 - WB deliberately left neutral despite the visible blue cast: auto-WB is frame-local, and
   injecting a per-frame correction into a comparison whose purpose is reading per-frame
   differences would confound it.
+- 2026-08-03 (Phase 1 round 1 reviewed; tool improved per user feedback):
+  - **Patches were too coarse.** The 12 × 8 grid gave 328 × 342 patches (6.3 % × 9.5 % of
+    frame) and the user's answers showed they straddled objects — "dark branch *and*
+    distant forest", "2/3 shadow *and* background forest", and for P1 all three boxes were
+    "a mix of dark forest and bright sky". A patch whose semantics cannot be stated is
+    useless for the Δ calibration. Grid is now 32 × 22 → ~123 × 124 (a quarter the area),
+    overridable via `NC_TILES=<x>x<y>`, plus **non-maximum suppression**
+    (`MIN_SEPARATION_TILES = 3`) so the reported top-3 are spatially distinct rather than
+    three adjacent cells of one surface.
+  - **Consequence, flagged to the user:** the boxes moved, so round-1 answers no longer
+    describe them (E1's white went from the lake at 2262,1115 to 2713,555). Round 1 is not
+    wasted — its *general* observations stand (P1 is all forest/sky mixture; P2 has no
+    large shadow area; P4's white is a specular tractor highlight) — but the per-box
+    yes/no answers must be re-collected against the new geometry.
+  - **My sweep was one-sided, and that was a measurement error.** All ten frames picked
+    EV 0, the boundary of a −2…0 range, which means the optimum sat at or beyond it. Now
+    two-sided (−2 … +1.5), and `EVS` is overridable.
+  - **Upward EV clips heavily and that is itself a finding:** at contrast 2.0, EV 0 clips
+    *nothing* on E1 while +0.5 clips 11.6 % and P3 reaches 20.1 %. Raising exposure buys
+    brighter midtones only by blowing 7–26 % of highlights, because the shoulder has
+    already packed content against white. **Exposure is the wrong knob for a raised
+    floor** — an argument for changing the curve's shape (configs 3/4/8) over recalibrating
+    defaults.
+  - **Why the boundary preference happens at all:** with white pinned at Dmax, raising
+    contrast pivots the line *around white*, pushing everything below it down. So more
+    contrast darkens midtones and needs +EV to compensate — the two knobs fight. A
+    mid-anchored or diffuse-white-anchored form would not have that interaction.
+  - **The same-illumination constraint on Δ** (missed until the user's descriptions
+    exposed it): the datasheet says the grey card and the paper grey scale each *"receiv[e]
+    same illumination as subject"*, so Δ = 0.36 is defined for white and mid under the
+    **same light**. The proposal ranks on density alone and has no notion of illumination,
+    so it will pair a sunlit white with a shadowed mid and put the lighting difference
+    straight into Δ — very likely much of the 0.085–0.850 scatter. P3 is the clearest
+    casualty: its white (window ledge in sunshine) is the best in the set, but its mid
+    (sofa in shadow) makes the pair invalid.
+  - Patch-quality triage from round 1: genuine diffuse whites on only **G1** (painted
+    garage door), **G2** (white flower) and **P3** (window ledge); bad mids on G1 (blue
+    sky) and P4 (parking lot in shade); **P1 unusable for patch metrics entirely.** So
+    Check A may rest on one or two frames — far too thin, which independently confirms the
+    user's own point that a grey card in frame (not merely more frames) is what is needed.
+  - User asks the tool be kept and reused for config comparison beyond this task; `EVS`
+    and `NC_TILES` are the first steps toward that.

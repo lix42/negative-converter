@@ -86,9 +86,11 @@ done <<<"$FRAMES"
 # the row doubles as a preview of the leading remedy. The full-frame image above each row
 # stays at the shipped contrast 1.0, giving a direct contrast comparison.
 #
-# The sweep runs downward: at contrast 2.0, EV 0 clips nothing on these frames while
-# EV +1 clips ~14%, so upward variants would just be visibly blown.
-EVS="-2:m20 -1.5:m15 -1:m10 -0.5:m05 0:p00"
+# The sweep is TWO-SIDED. A downward-only range was a measurement error: every frame
+# picked EV 0, the boundary, which means the optimum sat at or beyond it. Upward variants
+# clip 7-26% of highlights at contrast 2.0 -- itself a finding, since it shows exposure is
+# the wrong knob for a raised floor. Override the set with EVS="<ev>:<token> ...".
+EVS=${EVS:-"-2:m20 -1.5:m15 -1:m10 -0.5:m05 0:p00 0.5:p05x 1:p10x 1.5:p15x"}
 echo "rendering exposure variants (contrast 2.0)"
 while IFS='|' read -r mark roll stem frame; do
   [ -n "$mark" ] || continue
@@ -102,7 +104,7 @@ while IFS='|' read -r mark roll stem frame; do
     || echo "  $mark EV $ev FAILED" >&2
     rm -f "$TMP/v.tif" "$TMP/v.tif.json"
   done
-  echo "  $mark  5 variants"
+  echo "  $mark  $(echo $EVS | wc -w | tr -d ' ') variants"
 done <<<"$FRAMES"
 
 python3 "$HERE/build_patch_review.py" "$RAW" "$OUT/index.html"
