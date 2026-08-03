@@ -14,8 +14,9 @@
 //! ## Curve (per channel, in log₁₀-output space)
 //!
 //! ```text
-//! t = contrast·(D' − Dmax)                       the straight line (log₁₀ of it)
-//! F = −contrast·Dmax                             paper-black floor (the line's value at D' = 0)
+//! A = anchor.anchor(reference, contrast)         the D' that renders to 1.0 (see below)
+//! t = contrast·(D' − A)                          the straight line (log₁₀ of it)
+//! F = −contrast·A                                paper-black floor (the line's value at D' = 0)
 //! p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skip if toe = 0)
 //! v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skip if shoulder = 0)
 //! lin = 10^v
@@ -49,17 +50,19 @@
 //!   `shoulder = 0` there is no roll-off and highlights follow the (toe-shaped)
 //!   line, which *can* exceed `1.0` (like the exponential curve).
 //! - **Black (shadows):** with `toe > 0`, `lin` approaches the paper-black floor
-//!   `10^(−contrast·Dmax)` as `D' → −∞` (the shoulder's effect on the floor is
-//!   negligible for realistic params; the floor is exactly `10^(−contrast·Dmax)`
+//!   `10^(−contrast·A)` as `D' → −∞` (the shoulder's effect on the floor is
+//!   negligible for realistic params; the floor is exactly `10^(−contrast·A)`
 //!   when `shoulder = 0`).
-//! - **Reduction:** `toe = shoulder = 0` skips both knees and reproduces the
-//!   exponential curve **bit-for-bit** (`10^(contrast·(D'−Dmax))`), so the
-//!   exponential stays the debuggable straight-line reference.
+//! - **Reduction:** `toe = shoulder = 0` *and* `anchor = WhiteAtDmax` skips both
+//!   knees and reproduces the exponential curve **bit-for-bit**
+//!   (`10^(contrast·(D'−Dmax))`), so the exponential stays the debuggable
+//!   straight-line reference. Under the default mid-grey placement the reduced
+//!   curve is the same line *offset*, since `A ≠ Dmax`.
 //! - **Monotonic:** a composition of two monotone-increasing soft knees.
 //!
-//! **A positive anchor is required.** The S-curve is anchored on `[0, Dmax]` —
-//! both the white knee and the black floor (`F = −contrast·Dmax`) derive from a
-//! *positive* `Dmax` — so `curve.dmax = none` (unity placement, no anchor) and a
+//! **A positive anchor is required.** Both the white knee and the black floor
+//! (`F = −contrast·A`) derive from a *positive* anchor — so `curve.dmax = none`
+//! (unity placement, no reference) and a
 //! degenerate non-positive `Auto` anchor (an all-non-finite buffer, or a wrong
 //! film base that pushes most corrected densities negative) are both unusable:
 //! with `anchor ≤ 0` the floor sits at or above display white and every sample
@@ -70,6 +73,21 @@
 //! gotcha pattern). The anchor is resolved by the same
 //! [`resolve_dmax`](super::density::resolve_dmax) (`Auto` percentile /
 //! `Explicit`) as the exponential curve — one measurement, not a second one.
+//!
+//! **`dmax` supplies the *reference* density;
+//! [`AnchorPlacement`](crate::types::AnchorPlacement) decides which
+//! tone that reference places.** For the exponential curve the two coincide —
+//! `Dmax` *is* the density rendering to `1.0`. Here they are separate, because
+//! pinning display white at a leader-measured reference put midtones 2.5–3.6
+//! stops too dark once the contrast became photographic: steepening the slope
+//! pivots the line about the pinned point, dragging everything below it down.
+//! The default `MidAtDmaxFraction(0.5)` instead pins mid-grey at half the
+//! reference (`A = f·R + 0.745/contrast`) and lets white land above it, where the
+//! shoulder compresses the excess; `WhiteAtDmax` (`A = R`) is the previous rule,
+//! kept as an explicit diagnostic. Mid-placement is also half as sensitive to a
+//! reference error (`dA/dR = f`), which matters because a leader's density
+//! records how the roll was loaded rather than the film. Either way the anchor is
+//! a **roll-level** placement — nothing here reads frame content.
 //!
 //! **Interaction with `--highlight-compress`:** the print render's soft-clip
 //! also compresses highlights, but in linear space *after* exposure/WB; the

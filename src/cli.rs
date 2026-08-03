@@ -30,10 +30,10 @@ use crate::pipeline::memory::{self, MemoryReport, RunProfile, SamplePlan};
 use crate::pipeline::{film_base, gain_map, stages, working_space};
 use crate::telemetry;
 use crate::types::{
-    BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams, DmaxSource, EncodeReport,
-    FilmBase, FilmBaseParams, FilmBaseSource, FilmType, InputParams, MeaningAssertion, NcError,
-    OutputParams, OutputPreset, OutputStats, PrintParams, Reconstruction, ReconstructionType,
-    Result, TransferAssertion, WbSource,
+    AnchorPlacement, BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams,
+    DmaxSource, EncodeReport, FilmBase, FilmBaseParams, FilmBaseSource, FilmType, InputParams,
+    MeaningAssertion, NcError, OutputParams, OutputPreset, OutputStats, PrintParams,
+    Reconstruction, ReconstructionType, Result, TransferAssertion, WbSource,
 };
 use crate::version::{self, Identity};
 
@@ -461,6 +461,24 @@ pub struct SigmoidOverrides {
     /// Shoulder (highlight) knee width in log10 density units; 0 disables it.
     #[arg(long)]
     pub sigmoid_shoulder: Option<f32>,
+    /// Pin mid-grey (18%) at fraction F of the reference density, letting display
+    /// white fall above it — the default anchoring rule, F 0.5. Raising F renders
+    /// the roll darker, lowering it brighter. Mutually exclusive with
+    /// `--sigmoid-white-at-d-max`.
+    #[arg(
+        long = "sigmoid-mid-fraction",
+        value_name = "F",
+        conflicts_with = "sigmoid_white_at_d_max"
+    )]
+    pub sigmoid_mid_fraction: Option<f32>,
+    /// Pin display white *at* the reference density instead of placing mid-grey
+    /// (the pre-2026-08 rule). Kept as an explicit diagnostic: at a photographic
+    /// contrast it renders midtones 2.5–3.6 stops dark, because steepening the
+    /// slope pivots the line about white. Sensible only when the reference is
+    /// itself a diffuse white — and measuring that off frame content is
+    /// per-frame exposure correction, which the default must not do.
+    #[arg(long = "sigmoid-white-at-d-max")]
+    pub sigmoid_white_at_d_max: bool,
 }
 
 /// Auto white-balance modes for `--auto-wb` — the CLI face of the two
@@ -1459,6 +1477,8 @@ fn active_density_domain_flag(args: &ConvertArgs) -> Option<&'static str> {
         ("--sigmoid-contrast", s.sigmoid_contrast.is_some()),
         ("--sigmoid-toe", s.sigmoid_toe.is_some()),
         ("--sigmoid-shoulder", s.sigmoid_shoulder.is_some()),
+        ("--sigmoid-mid-fraction", s.sigmoid_mid_fraction.is_some()),
+        ("--sigmoid-white-at-d-max", s.sigmoid_white_at_d_max),
         ("--d-max", x.d_max.is_some()),
         ("--fixed-d-max", x.fixed_d_max),
         ("--auto-d-max", x.auto_d_max),
@@ -1614,13 +1634,16 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
                 }
             }
 
-            // sigmoid flags ⇒ `reconstruction.curve.{contrast, toe, shoulder}` —
-            // sigmoid only; under exponential they are invalid, not inert.
+            // sigmoid flags ⇒ `reconstruction.curve.{contrast, toe, shoulder,
+            // anchor}` — sigmoid only; under exponential they are invalid, not
+            // inert.
             let sig = &args.sigmoid;
             let sigmoid_flag = [
                 ("--sigmoid-contrast", sig.sigmoid_contrast.is_some()),
                 ("--sigmoid-toe", sig.sigmoid_toe.is_some()),
                 ("--sigmoid-shoulder", sig.sigmoid_shoulder.is_some()),
+                ("--sigmoid-mid-fraction", sig.sigmoid_mid_fraction.is_some()),
+                ("--sigmoid-white-at-d-max", sig.sigmoid_white_at_d_max),
             ]
             .into_iter()
             .find_map(|(name, present)| present.then_some(name));
@@ -1634,6 +1657,15 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
                     }
                     if let Some(v) = sig.sigmoid_shoulder {
                         s.shoulder = v;
+                    }
+                    // Anchor placement is one mutually-exclusive rule (like
+                    // `dmax` below), so whichever flag is given replaces the
+                    // resolved placement entirely rather than editing a field of
+                    // it. clap enforces the exclusivity.
+                    if let Some(f) = sig.sigmoid_mid_fraction {
+                        s.anchor = AnchorPlacement::MidAtDmaxFraction(f);
+                    } else if sig.sigmoid_white_at_d_max {
+                        s.anchor = AnchorPlacement::WhiteAtDmax;
                     }
                 }
                 DensityCurve::Exponential(_) => {
@@ -1912,6 +1944,25 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
                          clip/non-finite counters)",
                         s.toe, s.shoulder
                     )));
+                }
+                // Mid-grey's placement fraction: finite and in (0, 1]. At 0 the
+                // anchor stops depending on the reference at all (mid-grey pinned
+                // at the density origin — the film base — rendering the whole
+                // frame above mid-grey); negative pushes it below the base, where
+                // no sample exists. Above 1 mid-grey sits *past* the roll's
+                // display-white reference, which is not a photographic rendering
+                // of anything. F = 1 is the legal edge: mid-grey lands on the
+                // reference and white above it.
+                if let AnchorPlacement::MidAtDmaxFraction(f) = s.anchor {
+                    finite("--sigmoid-mid-fraction", &[f])?;
+                    if f <= 0.0 || f > 1.0 {
+                        return Err(usage(format!(
+                            "--sigmoid-mid-fraction ({f}) must be in (0, 1] — it \
+                             places mid-grey at that fraction of the roll's \
+                             reference density (0.5 renders mid-grey halfway up \
+                             the roll's range; 1 puts it on the reference itself)"
+                        )));
+                    }
                 }
             }
         }
@@ -5361,6 +5412,115 @@ mod tests {
         assert_eq!(s.contrast, 2.0);
         assert_eq!(s.toe, 0.05);
         assert_eq!(s.shoulder, 0.4);
+    }
+
+    #[test]
+    fn merge_sigmoid_anchor_placement_flags() {
+        // The placement is one rule, so each flag replaces the whole variant. A
+        // missing merge arm here would be invisible: the default placement is
+        // already `MidAtDmaxFraction(0.5)`, so `--sigmoid-mid-fraction 0.5` would
+        // "work" by accident — hence asserting a *different* fraction.
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&[
+                "--density-curve",
+                "sigmoid",
+                "--sigmoid-mid-fraction",
+                "0.65",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            sigmoid_of(&cfg).anchor,
+            AnchorPlacement::MidAtDmaxFraction(0.65)
+        );
+
+        let cfg = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--density-curve", "sigmoid", "--sigmoid-white-at-d-max"]),
+        )
+        .unwrap();
+        assert_eq!(sigmoid_of(&cfg).anchor, AnchorPlacement::WhiteAtDmax);
+
+        // Absent flags keep the recipe's placement (the flags-win merge never
+        // clobbers with a default), and `--sigmoid-white-at-d-max` is the escape
+        // hatch back from a recipe fraction.
+        let recipe: ResolvedConfig = serde_json::from_str(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.6}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sigmoid_of(&merge(recipe, &parse_convert(&["--sigmoid-contrast", "2.0"])).unwrap())
+                .anchor,
+            AnchorPlacement::MidAtDmaxFraction(0.6)
+        );
+        let recipe: ResolvedConfig = serde_json::from_str(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.6}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            sigmoid_of(&merge(recipe, &parse_convert(&["--sigmoid-white-at-d-max"])).unwrap())
+                .anchor,
+            AnchorPlacement::WhiteAtDmax
+        );
+
+        // Both placement flags are sigmoid-only: under a resolved exponential
+        // curve they are a usage error naming the offending flag, not inert.
+        for flag in [
+            ["--sigmoid-mid-fraction", "0.6"].as_slice(),
+            ["--sigmoid-white-at-d-max"].as_slice(),
+        ] {
+            let err = merge(ResolvedConfig::default(), &parse_convert(flag)).unwrap_err();
+            assert!(err.to_string().contains(flag[0]), "{err}");
+        }
+        // And they are mutually exclusive at the clap layer.
+        assert!(
+            Cli::try_parse_from([
+                "nc",
+                "convert",
+                "in.tiff",
+                "-o",
+                "out.tiff",
+                "--density-curve",
+                "sigmoid",
+                "--sigmoid-mid-fraction",
+                "0.6",
+                "--sigmoid-white-at-d-max",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_sigmoid_mid_fraction() {
+        // (0, 1]: 0 detaches the anchor from the reference entirely (mid-grey on
+        // the film base), negative places it below the base, above 1 places
+        // mid-grey past display white.
+        for bad in [0.0, -0.5, 1.01, 2.0, f32::NAN, f32::INFINITY] {
+            let cfg = sigmoid_cfg(SigmoidParams {
+                anchor: AnchorPlacement::MidAtDmaxFraction(bad),
+                ..SigmoidParams::default()
+            });
+            assert!(
+                matches!(validate(&cfg), Err(NcError::Usage(_))),
+                "fraction {bad} should fail"
+            );
+        }
+        // The default, the inclusive upper edge, and a very small positive
+        // fraction are all accepted.
+        for good in [0.5, 1.0, 1e-3] {
+            validate(&sigmoid_cfg(SigmoidParams {
+                anchor: AnchorPlacement::MidAtDmaxFraction(good),
+                ..SigmoidParams::default()
+            }))
+            .unwrap();
+        }
+        // `WhiteAtDmax` carries no value, so nothing to range-check.
+        validate(&sigmoid_cfg(SigmoidParams {
+            anchor: AnchorPlacement::WhiteAtDmax,
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
     }
 
     #[test]
