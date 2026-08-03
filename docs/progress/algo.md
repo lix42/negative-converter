@@ -36,6 +36,17 @@ What other epics need to know about `algo`:
   scalar `Dmax` from `film-base`; sigmoid *requires* a positive anchor and rejects
   `none`. `DmaxSource::None` is the bit-exact scene-referred escape hatch and is
   a density-only feature.
+- **For sigmoid, `Dmax` is the *reference*, not the anchor** (since
+  `reference-anchored-sigmoid`, 2026-08-03). `curve.anchor`
+  (`AnchorPlacement`) says which tone the reference places: the default
+  `MidAtDmaxFraction(0.5)` pins **mid-grey** at half the reference and lets white
+  land above it, `WhiteAtDmax` is the old rule kept as a diagnostic. Consequences
+  for other epics: the two coincide only under `WhiteAtDmax`, so the paper-black
+  floor is `10^(−contrast·A)` and the reduce-to-exponential identity holds only
+  there; a per-stock rule is a **third variant**, not a new field; and the default
+  sigmoid contrast/shoulder are now `≈2.0687`/`0.6`, derived from manufacturer aim
+  densities rather than chosen. Drift fingerprints did **not** move — the default
+  recipe still selects `exponential`, so `output/presets` still owns that bump.
 - **Mutually exclusive knobs are one enum, never parallel fields** — `WbSource`,
   `BalanceRange`, `DmaxSource`, the tagged `Reconstruction`/`DensityCurve`. This
   is what makes the flags-win merge sound and provenance representable.
@@ -1582,6 +1593,54 @@ What other epics need to know about `algo`:
   work under the parameter-tuning task — but it is the honest way to get what the clamp was
   reaching for.
 
+### 2026-08-03 — Phase 4: the remedy, and why it stopped at step 2
+
+- **Remedies 1 and 2 sufficed; §7.3's equation is character-for-character unchanged.**
+  Recorded because the task mandated that order and the outcome is the answer to "why did
+  the less invasive options suffice": the defect was never in the curve, it was in *which
+  tone the curve pins*. Recalibrating alone could not fix it — at contrast 1.0 the floor is
+  72/255, and raising contrast with white pinned drags midtones down, because steepening a
+  line pivots it about the pinned point. Two coupled changes were needed, not one.
+- **Defaults recalibrated:** `contrast 1.0 → 0.745/0.36 ≈ 2.0687`, `shoulder 0.2 → 0.6`,
+  `toe` unchanged. Both derived, with the derivation in the doc comments so a future reader
+  can re-check rather than trust: the contrast from the manufacturers' own mid-to-white aim
+  delta (film gamma 0.52 / system gamma 1.07 as independent corroboration), the shoulder
+  from where its bend begins (`D′ ≈ 0.70`, essentially mid-grey).
+- **Anchor reparameterized** — the substantive change. `curve.dmax` was overloaded: the
+  roll's *reference* density **and** the density rendering to `1.0`. Now `curve.dmax` is the
+  reference and `curve.anchor` (`AnchorPlacement`) says which tone it places, defaulting to
+  `{"mid-at-dmax-fraction": 0.5}` — candidate 3's form, `A = f·R + 0.745/contrast`.
+- **`AnchorPlacement` is an enum, not a bool + f32**, for the same reason `DmaxSource` and
+  `FilmBaseSource` are: independent fields can encode illegal combinations that a flags-win
+  merge then silently mis-resolves. The two CLI flags conflict at the clap layer and each
+  replaces the whole variant.
+- **Golden impact, verified rather than predicted.** The two sigmoid goldens moved and were
+  recaptured with the reasoning at the site — the default vector's base pixel 0.0115 →
+  0.00177 (≈28/255 → ≈6/255, an actual black), its dense highlight 0.448 → 0.946. The
+  **auto-WB golden gain dropped 2.2304 → 1.0574**, which is worth keeping: the estimator
+  samples the rendered positive, so WB had been partly compensating for the broken curve.
+  Both drift fingerprints are **unmoved**, as predicted — the default recipe still selects
+  `exponential`, so `output/presets` still owns the bump when it flips the default curve.
+- **Candidate 8 could not ship here, and that is a dependency fact rather than a
+  reversal.** Its per-stock offsets *are* `algo/film-stock-profiles`, and they currently
+  rest on chart reads PR #68 established are not true Status M densities. So the user's
+  routing lands in two pieces: this task ships the no-stock arm (3) plus the opt-in escape
+  hatch, and the stock arm is a **third `AnchorPlacement` variant** when the registry
+  exists. Recording the seam explicitly so the next task does not re-litigate the design.
+- **`NOMINAL_DMAX` deliberately left at 2.0.** The measured rolls cluster near 1.36 with
+  Phoenix excluded, but the user is adding samples and asked for that calculation to wait.
+  Safe to defer *because* of the mid placement: `dA/dR = f`, so the fallback's error is now
+  halved (fixed default gives `A = 1.36` against a measured ≈1.01, where the old rule gave
+  2.0 against 1.3).
+- **Two doc claims were conditional on the old rule and are now qualified, not left
+  quietly false:** the paper-black floor is `10^(−contrast·A)`, and "zero knees reduce to
+  the exponential curve bit-for-bit" holds only under `white-at-dmax` — under the default
+  placement it is the same line *offset*. The existing reduction test already pinned that
+  variant explicitly, which is why it stayed green and the staleness was invisible to CI.
+- **Gate:** `fmt` clean, `clippy --all-targets -D warnings` clean, 507 binary + 126
+  integration tests green, drift gate 4/4. End-to-end on `tests/fixtures/hdr-48bit.tif`:
+  both flags reach the resolved report, each changes the image, and the emitted recipe fed
+  back through `--params` reproduces the render bit-identically.
 
 ## auto-anchor-interior-measurement
 
