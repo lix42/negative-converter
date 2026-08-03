@@ -564,51 +564,91 @@ fn datasheet_delta(roll: &str) -> f32 {
 /// One candidate: a label, whether it could ever ship, and the resolved (anchor, contrast).
 struct Candidate {
     label: &'static str,
-    shippable: bool,
-    /// `None` when the rule cannot be evaluated for this frame (e.g. an invalid white).
-    resolved: Option<(f32, f32)>,
+    /// Whether this form could be the *default*. A `false` here does not mean "rejected" —
+    /// the content-driven forms are legitimate as an **explicit opt-in mode**
+    /// (`algo/content-aware-sigmoid-toe`); they simply cannot be the default, because
+    /// deriving the anchor from frame content silently corrects exposure.
+    default_eligible: bool,
+    /// The anchor rule. `Auto` is the shipped content-driven measurement
+    /// (`DmaxSource::Auto`, the 99.5th percentile of corrected densities) — resolved per
+    /// frame by `reconstruct`, so its value is read back from the report rather than
+    /// computed here.
+    anchor: AnchorRule,
+    contrast: f32,
 }
 
-/// Build the candidate set for one frame. `white_measured` is the frame's own diffuse-white
-/// patch — used only by the *diagnostic* forms, which is precisely why they cannot ship.
-fn candidates(roll: &str, roll_dmax: f32, white_measured: Option<f32>) -> Vec<Candidate> {
+enum AnchorRule {
+    Explicit(f32),
+    Auto,
+}
+
+/// Build the candidate set for one frame.
+///
+/// Two corrections over the first version, both from user review:
+///
+/// - **The content-driven forms use the shipped `DmaxSource::Auto`**, not a semantically
+///   confirmed white patch. Requiring a *valid* white was incoherent: a content-driven mode
+///   has no knowledge of what is a real white — it measures the brightest content and
+///   adapts. Gating on validity also meant they resolved on 2 frames only, making their
+///   statistics useless. `Auto` is exactly that measurement and is already shipped.
+/// - **Black-pinning is tested at targets consistent with the contrast.** The first attempt
+///   used NLP's 0.00061 at contrast 2.0, which implies an anchor of 1.607 — above every
+///   roll's Dmax, so nothing reached white and the whole frame rendered dark. That rejected
+///   my parameter, not the form. 0.002 and 0.005 give anchors of 1.349 and 1.151.
+fn candidates(roll: &str, roll_dmax: f32) -> Vec<Candidate> {
     let ds_c = MID_OUTPUT_DECADES / datasheet_delta(roll);
-    let mid = |m: f32, c: f32| Some((m + MID_OUTPUT_DECADES / c, c));
+    // mid pinned at `m` -> 0.18  =>  A = m + 0.745/c
+    let mid = |m: f32, c: f32| AnchorRule::Explicit(m + MID_OUTPUT_DECADES / c);
+    // black pinned at `t` at D'=0  =>  A = -log10(t)/c
+    let black = |t: f32, c: f32| AnchorRule::Explicit(-t.log10() / c);
     vec![
         Candidate {
-            label: "1 baseline: white@Dmax, c=1.0",
-            shippable: true,
-            resolved: Some((roll_dmax, 1.0)),
+            label: "1  white@Dmax, c=1.0 (shipped)",
+            default_eligible: true,
+            anchor: AnchorRule::Explicit(roll_dmax),
+            contrast: 1.0,
         },
         Candidate {
-            label: "2 white@Dmax, c=2.0",
-            shippable: true,
-            resolved: Some((roll_dmax, 2.0)),
+            label: "2  white@Dmax, c=2.0",
+            default_eligible: true,
+            anchor: AnchorRule::Explicit(roll_dmax),
+            contrast: 2.0,
         },
         Candidate {
-            label: "3 mid@0.5*Dmax, c=2.0",
-            shippable: true,
-            resolved: mid(0.5 * roll_dmax, 2.0),
+            label: "3  mid@0.5*Dmax, c=2.0",
+            default_eligible: true,
+            anchor: mid(0.5 * roll_dmax, 2.0),
+            contrast: 2.0,
         },
         Candidate {
-            label: "4 white@measured (DIAGNOSTIC)",
-            shippable: false,
-            resolved: white_measured.map(|w| (w, 2.0)),
+            label: "4  auto (content-driven), c=2.0",
+            default_eligible: false,
+            anchor: AnchorRule::Auto,
+            contrast: 2.0,
         },
         Candidate {
-            label: "5 black@0.00061, c=2.0",
-            shippable: true,
-            resolved: Some((-(0.000_61f32.log10()) / 2.0, 2.0)),
+            label: "5a black@0.002, c=2.0",
+            default_eligible: true,
+            anchor: black(0.002, 2.0),
+            contrast: 2.0,
         },
         Candidate {
-            label: "7 white@measured, c=0.745/D (DIAGNOSTIC)",
-            shippable: false,
-            resolved: white_measured.map(|w| (w, ds_c)),
+            label: "5b black@0.005, c=2.0",
+            default_eligible: true,
+            anchor: black(0.005, 2.0),
+            contrast: 2.0,
         },
         Candidate {
-            label: "8 mid@Dmin+datasheet, c=0.745/D",
-            shippable: true,
-            resolved: mid(datasheet_mid_above_base(roll), ds_c),
+            label: "7  auto (content-driven), c=0.745/D",
+            default_eligible: false,
+            anchor: AnchorRule::Auto,
+            contrast: ds_c,
+        },
+        Candidate {
+            label: "8  mid@Dmin+datasheet, c=0.745/D",
+            default_eligible: true,
+            anchor: mid(datasheet_mid_above_base(roll), ds_c),
+            contrast: ds_c,
         },
     ]
 }
@@ -708,15 +748,6 @@ fn measure_candidates() {
                 )
             })
         };
-        let white_measured = f["patches"]["white"]["valid"]
-            .as_bool()
-            .unwrap_or(false)
-            .then(|| {
-                f["patches"]["white"]["measured_dprime_p50"]
-                    .as_f64()
-                    .unwrap() as f32
-            });
-
         println!(
             "\n=== {mk}  {roll}  Dmax {dmax:.4}   valid patches: shadow {} mid {} white {}",
             rect("shadow").is_some(),
@@ -728,29 +759,32 @@ fn measure_candidates() {
             "candidate", "anchor", "contrast", "mid->0.18", "shadow", "clip%"
         );
 
-        for cand in candidates(roll, dmax, white_measured) {
-            // Mark shippability in the output: a diagnostic-only form can win on numbers
-            // and still be disqualified, so the distinction must be visible in the table.
-            let ship = if cand.shippable {
+        for cand in candidates(roll, dmax) {
+            // `[explicit-mode only]` is not a rejection: a content-driven form is a valid
+            // opt-in mode (`algo/content-aware-sigmoid-toe`), it just cannot be the default.
+            let tag = if cand.default_eligible {
                 ""
             } else {
-                "  [cannot ship]"
+                "  [explicit-mode only]"
             };
-            let Some((anchor, contrast)) = cand.resolved else {
-                println!("    {:<42}{:>10}{ship}", cand.label, "n/a (invalid white)");
-                continue;
-            };
+            let contrast = cand.contrast;
             let recon = Reconstruction::Density {
                 density: DensityParams::default(),
                 curve: DensityCurve::Sigmoid(SigmoidParams {
                     contrast,
                     toe: 0.2,
                     shoulder: 0.2,
-                    dmax: DmaxSource::Explicit(anchor),
+                    dmax: match cand.anchor {
+                        AnchorRule::Explicit(a) => DmaxSource::Explicit(a),
+                        AnchorRule::Auto => DmaxSource::Auto,
+                    },
                 }),
             };
             let print = PrintParams::default();
-            let (film, _) = crate::algo::reconstruct(&image, &base, &recon).unwrap();
+            let (film, report) = crate::algo::reconstruct(&image, &base, &recon).unwrap();
+            // For `Auto` the anchor is measured inside `reconstruct`; read it back so the
+            // printed value is the one actually used rather than a guess.
+            let anchor = report.dmax.unwrap_or(f32::NAN);
             let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
             let shared = crate::pipeline::render_split::display_source(aces, &print).unwrap();
             let sdr = crate::pipeline::sdr::render(
@@ -766,7 +800,7 @@ fn measure_candidates() {
 
             let mid_s = rect("mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
             let sh_s = rect("shadow").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
-            let key = format!("{}{}", cand.label, ship);
+            let key = format!("{}{}", cand.label, tag);
             let e = agg.entry(key).or_default();
             if let Some(m) = mid_s {
                 e.0.push(m);

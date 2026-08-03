@@ -1495,3 +1495,30 @@ What other epics need to know about `algo`:
   the frame-local behaviour the default must not have. Also only comparable at equal contrast,
   since low contrast compresses between-frame differences (candidate 1's small sd is that
   artifact, not a merit).
+- 2026-08-03 (**two of my rejections were wrong; user caught both**):
+  - **Candidate 5 (black-pinned) was rejected on my parameter, not its form.** Pinning black
+    at NLP's 0.00061 with c=2.0 implies an anchor of `−log10(0.00061)/2 = 1.607` — *above*
+    every roll's Dmax (1.28–1.38) — so nothing reached white and the frame rendered dark. My
+    stated reason ("pinning black alone leaves everything unplaced at any fixed contrast") was
+    simply false: fixed contrast is exactly what candidate 2 does. Retested at targets
+    consistent with the contrast — 0.002 → anchor 1.349, 0.005 → anchor 1.151. Black-pinning
+    is as legitimate as white- or mid-pinning: another rule for the same single anchor, and
+    **Dmax-free**. Results: 5a needs +3.04 EV (shadow 9/255), 5b +1.71 EV (shadow 20/255).
+  - **Gating the content-driven candidates on a *semantically valid* white was incoherent.**
+    A content-driven mode has no knowledge of what a real white is — it measures the brightest
+    content and adapts. Requiring validity also meant they resolved on 2 frames only, making
+    their statistics worthless. They now use the shipped `DmaxSource::Auto` (99.5th percentile
+    of corrected densities), so they resolve on all ten and test *shipped* behaviour. Verdict
+    changes from "diagnostic only" to **"explicit-mode only"** — a legitimate opt-in mode
+    (`algo/content-aware-sigmoid-toe`), just never the default.
+  - **And that immediately found a real defect: `Auto` is dominated by the film holder.** It
+    resolves to **2.23–2.37** on every frame against a roll Dmax of 1.28–1.38, because the
+    opaque holder has near-zero transmission and therefore enormous corrected density, so it
+    owns the 99.5th percentile of a full-frame scan. Candidates 4 and 7 render everything to
+    0/255 — that is holder contamination, not content adaptation, so it is **not** a verdict on
+    the form. A content-driven mode must measure the *interior*, which is what `film-base`'s
+    rebate detection exists for. This also explains why `--auto-d-max` was demoted to opt-in.
+- Added `scripts/sigmoid-baseline/candidate-review.sh` + `build_candidate_review.py`: renders
+  all 8 candidate forms × 10 frames (80 images) through the display path with **no exposure
+  applied**, and builds a comparison page with the same click lightbox. The anchor rules live
+  in one place so renders and page cannot disagree.
