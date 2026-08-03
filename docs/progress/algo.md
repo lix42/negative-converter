@@ -1263,3 +1263,13 @@ What other epics need to know about `algo`:
   judgement the page asks for. Output goes to `../temp/patch-review` (throwaway), never
   into `../nc-assets` or the repo, and it is **not** published as an Artifact: these are
   the user's personal photographs and publishing would upload them to an external host.
+- 2026-08-02 (review-page bug, fixed): the magnified crops rendered as solid black. Cause
+  was HTML, not CSS geometry — the crop's inline style used `url("X.jpg")` with **double
+  quotes inside a double-quoted `style` attribute**, so the attribute terminated at
+  `url(` and the remainder was parsed as junk attributes. Fixed to single quotes, with a
+  comment at the site since the failure mode (black box) does not point at quoting.
+  Verified in Chrome by inverting the CSS background math to recover the displayed source
+  region: all 30 crops resolve to their declared rectangle within ~1 px, aspect 0.959
+  (= 328/342), `background-size` 1580.49 % (= 5184/328), no crop left without a
+  background. Verification used JS introspection only — no screenshots — so no sample
+  pixels entered an agent context.

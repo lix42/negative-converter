@@ -67,8 +67,12 @@ def crop_style(f, b, jpg):
     zx = W / b["bw"] * 100
     px = b["x"] / (W - b["bw"]) * 100 if W > b["bw"] else 0
     py = b["y"] / (H - b["bh"]) * 100 if H > b["bh"] else 0
-    return (f'background-image:url("{jpg}");background-size:{zx:.3f}% auto;'
-            f'background-position:{px:.4f}% {py:.4f}%;background-repeat:no-repeat')
+    # Single quotes inside the CSS url() are load-bearing: this string goes into a
+    # double-quoted HTML `style` attribute, and double quotes here would terminate the
+    # attribute at `url(` — leaving the crop with no background at all (it renders as a
+    # black box, which is exactly how this bug presented).
+    return (f"background-image:url('{jpg}');background-size:{zx:.3f}% auto;"
+            f"background-position:{px:.4f}% {py:.4f}%;background-repeat:no-repeat")
 
 
 def main():
