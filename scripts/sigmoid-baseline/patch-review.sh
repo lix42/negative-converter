@@ -107,6 +107,6 @@ while IFS='|' read -r mark roll stem frame; do
   echo "  $mark  $(echo $EVS | wc -w | tr -d ' ') variants"
 done <<<"$FRAMES"
 
-python3 "$HERE/build_patch_review.py" "$RAW" "$OUT/index.html"
+EVS="$EVS" python3 "$HERE/build_patch_review.py" "$RAW" "$OUT/index.html"
 echo
 echo "open: file://$(cd "$OUT" && pwd -P)/index.html"

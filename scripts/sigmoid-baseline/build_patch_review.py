@@ -7,6 +7,7 @@ magnified crop of each rectangle (pure CSS `background-position`, so one JPEG pe
 serves both views). Every frame carries a stable mark (G1..P4) and its own question
 block so a later discussion can name a specific box.
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -61,6 +62,22 @@ def parse(raw: str):
     return frames
 
 
+DEFAULT_EVS = ("-2:m20 -1.5:m15 -1:m10 -0.5:m05 0:p00 "
+               "0.5:p05x 1:p10x 1.5:p15x")
+
+
+def parse_evs():
+    """Read the EV/token pairs from $EVS, matching the render script's own list."""
+    out = []
+    for pair in os.environ.get("EVS", DEFAULT_EVS).split():
+        ev, _, tok = pair.partition(":")
+        if not tok:
+            continue
+        ev = ev.strip()
+        out.append((ev if ev.startswith("-") else ("+" + ev if float(ev) > 0 else ev), tok))
+    return out
+
+
 def crop_style(f, b, jpg):
     """Magnified crop via background-position — no separate crop files needed."""
     W, H = f["w"], f["h"]
@@ -104,16 +121,15 @@ def main():
             f'p05 {b["p05"]:.4f} · p95 {b["p95"]:.4f} · spread {b["spread"]:.4f}<br>'
             f'{b["x"]},{b["y"]},{b["bw"]},{b["bh"]}</span></figcaption></figure>'
             for c, lbl, col in CATS if (b := f["boxes"].get(c)))
-        # Two-sided sweep. An earlier downward-only range (-2 … 0) had every frame pick
-        # EV 0 — the boundary — which means the optimum was at or beyond it and the range
-        # was simply wrong. Upward variants clip 7–26 % of highlights at contrast 2.0,
-        # which is itself a finding: exposure is the wrong knob for a raised floor.
-        evs = [("-2", "m20"), ("-1.5", "m15"), ("-1", "m10"), ("-0.5", "m05"),
-               ("0", "p00"), ("+0.5", "p05x"), ("+1", "p10x"), ("+1.5", "p15x")]
-        # Click (not hover) opens a single shared lightbox. Hover was unusable: a
-        # centred thumbnail is covered by its own popover so you cannot move to the next
-        # one, and the gaps between thumbnails make the overlay flicker as the pointer
-        # crosses them. One shared modal also makes prev/next possible.
+        # The EV set comes from the same `EVS` the render script used, so the two cannot
+        # drift into referencing images that were never rendered. Format "ev:token", e.g.
+        # EVS="-1:m10 0:p00 2:p20x". Falls back to the default two-sided sweep.
+        #
+        # The sweep has twice been bounded too low: a -2..0 range had every frame pick 0,
+        # and a -2..+1.5 range had six of ten pick +1.5. A unanimous or near-unanimous
+        # boundary choice means the optimum lies outside the range, not at its edge.
+        evs = parse_evs()
+
         variants = "".join(
             f'<figure class="v" data-src="{mark}-{tok}.jpg" '
             f'data-label="{mark} \u00b7 EV {ev.replace("-", "\u2212")} \u00b7 contrast 2.0">'
@@ -185,7 +201,7 @@ figure.v {{ cursor: zoom-in; }}
               background: rgba(255,255,255,.14); color: #fff; }}
 #lb button:hover {{ background: rgba(255,255,255,.26); }}
 #lbPrev {{ left: 2vw; }} #lbNext {{ right: 2vw; }}
-.variants {{ display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; }}
+.variants {{ display: grid; grid-template-columns: repeat({len(parse_evs())}, 1fr); gap: 10px; }}
 .variants img {{ width: 100%; height: auto; border-radius: 5px; display: block; }}
 figure.v figcaption {{ text-align: center; font-size: 12.5px; margin-top: 5px; }}
 @media (max-width: 720px) {{ .variants {{ grid-template-columns: repeat(2, 1fr); }} }}

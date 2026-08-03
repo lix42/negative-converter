@@ -1357,3 +1357,39 @@ What other epics need to know about `algo`:
 - User asks for a **separate task** to improve this tool properly rather than continuing to
   patch it inline. Not filed yet: `docs/TASKS.md` is currently modified on the open PR #68
   branch, so adding another task now would conflict. File it once #68 merges.
+- 2026-08-03 (Phase 1 round 2 answers; sweep extended a **second** time):
+  - **My sweep was bounded too low twice.** A −2…0 range had all ten frames pick 0; a
+    −2…+1.5 range had six of ten pick +1.5. A near-unanimous boundary choice means the
+    optimum lies *outside* the range. Now −1…+3.5, and the generator reads the same `EVS`
+    list the render script uses so the two cannot drift into referencing unrendered images.
+  - **The deficit is quantified and it is large.** At contrast 2.0 with white pinned at
+    Dmax, a measured mid-tone lands at `10^(2·(D′−Dmax))`: E1's 0.5418 → 0.031 linear
+    (50/255), needing **+2.52 EV** to reach 0.18; E2 needs **+3.57 EV**. So the shipped
+    anchor places midtones 2.5–3.6 stops too dark once contrast is photographic — which is
+    exactly why every frame wanted more exposure than I offered.
+  - **The datasheet chain closes on itself.** With white pinned at *diffuse* white and
+    `contrast = 0.745/Δ = 2.07`, a mid-grey sitting Δ below white lands at
+    `10^(2.07·−0.36) = 0.18` — mid-grey, exactly, by construction. So the entire observed
+    EV deficit is attributable to anchoring on Dmax rather than diffuse white, and configs
+    4/7/8 predict **zero** exposure compensation. Sharp and falsifiable.
+  - **Content exceeds the leader Dmax.** G3's auto white measures `D′` 1.3265 against
+    Dmax 1.2758, and P3's 1.5062 against 1.3816 — real photographic content sits *above*
+    the anchor. The leader-derived Dmax does not even bound the frame, which is an
+    independent blow to it beyond the same-stock inconsistency already recorded.
+  - Testing "chosen EV == the diffuse-white pin" gave mean |diff| 1.50 EV — **not** a clean
+    confirmation, but the residual is structured, not random: it is ≤0.5 EV on the frames
+    whose white is genuinely diffuse and below Dmax (E1 +0.27, E3 +0.50, G2 +0.41) and
+    breaks down precisely where the patch is invalid — G3 −1.84 and P3 −2.33, the two
+    super-Dmax speculars. The test is also censored, since six answers sat at my +1.5 cap.
+    Re-run once the extended sweep is answered.
+  - **Confirmed patch semantics (round 2).** Genuine diffuse whites on only **G2** (white
+    lily) and **P4** (white painted sign); P3's window ledge is white but sunlit and
+    super-Dmax. Speculars: E2 and E3 ("sunshine reflected on leaves"), P4's earlier tractor
+    highlight. Sky: G3, P1. Fog: E1, P2. **E1's white is contaminated by a scanning dust
+    speck** — dust blocks light, so it is dense in the negative and renders as a false
+    highlight; IR-based dust removal is a roadmap item, and that patch must move.
+  - **User pushback on G1's mid being blue sky, partially accepted:** sky luminance can sit
+    near mid-grey, so it is defensible as an *exposure* reference. It is still poor for Δ,
+    which needs a spectrally *neutral* surface — strongly blue sky has very unequal
+    per-channel densities, and sky luminance varies with angle to the sun and haze.
+  - P1's blue cast: agreed out of scope. The frozen recipe uses neutral WB deliberately.
