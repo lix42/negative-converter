@@ -1215,3 +1215,39 @@ What other epics need to know about `algo`:
 - Gold200's stock confirmed by the user as **Kodak Gold 200** (E-7022), retroactively
   validating the use of that datasheet's aims (0.95 / 1.35, Δ 0.40) — previously inferred
   from the folder name.
+- 2026-08-02 (**Phase 2 harness landed; Phase 1 proposal run**): added
+  `src/pipeline/shadow_metrics.rs`, declared `#[cfg(test)] pub mod` in
+  `pipeline/mod.rs`. Two `#[ignore]`d entry points — `propose_patches` and
+  `characterise_reference_frames` — plus 4 always-on unit tests for the geometry and
+  statistics. Skips with a message when `../nc-assets` is absent, so the full suite
+  (126 tests) stays green with no assets and CI needs none.
+- **Harness bug caught by its own first run:** it globbed the roll directory and so
+  proposed "shadow" and "diffuse white" patches on the *leader* and *unexposed* frames,
+  where both are meaningless. Now reads `role` from the manifest and proposes only over
+  `real` frames; leader/unexposed get their own characterisation pass. Also note the two
+  `#[ignore]`d tests interleave stdout when run together — use `--test-threads=1` or the
+  roll headers are misattributed.
+- **Leaders are uniform — no fogging gradient.** Interior tile `D′` range across the
+  leader: Gold200 0.024, Ektar 0.039, Portra160 0.067; L−R / T−B gradients ≤ 0.024.
+  Their median `D′` is 99.9 / 100.1 / 100.3 % of the frozen Dmax, confirming the anchor
+  is that frame's own level. **This refutes a speculation in the plan** — non-uniformity
+  is *not* additional evidence for the leader problem, because there is none. The case
+  rests entirely on the cross-roll comparison: a uniform field at an *uncontrolled level*.
+- Unexposed frames sit at `D′` 0.016–0.026 over the interior (the base was frozen from a
+  centre 40% region, so the wider interior reads marginally denser) with in-tile spread
+  0.024–0.040. That spread is the **measurement noise floor** — any patch spread below
+  ~0.04 is grain, not texture. Real-frame candidates ran 0.15–0.98, comfortably above it.
+- **The decisive measurement: diffuse white lands at 41–93 % of the leader Dmax (median
+  ~66 %), never near 100 %.** Density headroom above the brightest textured diffuse
+  candidate is 0.09–0.81 (median ≈ 0.43). At contrast 1.0 that is ~0.43 decades of range
+  reserved for densities no photograph in the set contains — the saturation-as-white
+  hypothesis, measured on real frames rather than inferred from a datasheet.
+- Mid-tone sits at 11–58 % of Dmax across frames: the genuine exposure spread the task
+  must preserve, and a usable signal for the exposure-spacing metric.
+- **Check A is not evaluable from auto-proposed patches, as expected.** The implied
+  mid→white Δ scatters 0.085–0.850 against the datasheet's 0.36, because the proposal's
+  "mid-tone" is the frame's *median tile* (not a mid-grey surface) and its "diffuse
+  white" is the brightest textured tile (not necessarily a diffuse reflector). Suggestive
+  detail: the three frames whose Δ lands nearest 0.36 (0.303, 0.347, 0.435) are the ones
+  whose mid-tone sits at 37–46 % of Dmax, i.e. the normally-exposed-looking ones. Δ is
+  printed labelled "orientation only, NOT Check A".
