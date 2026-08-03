@@ -53,6 +53,11 @@ ROWS
 # `--density-curve sigmoid` deliberately: it is the curve under investigation, and its
 # shoulder avoids the ~10% highlight clipping the frozen exponential recipe produces —
 # clipped highlights would defeat the "is this a diffuse white?" judgement the page asks.
+#
+# White balance is left NEUTRAL (as the frozen recipe has it) even though these frames
+# carry a visible blue cast. Auto-WB would be a *frame-local* operation, and the point of
+# the exposure comparison below is to read per-frame differences — injecting a per-frame
+# correction would confound exactly what is being measured.
 echo "rendering previews -> $OUT"
 while IFS='|' read -r mark roll stem frame; do
   [ -n "$mark" ] || continue
@@ -65,6 +70,39 @@ while IFS='|' read -r mark roll stem frame; do
     echo "  $mark  $frame  FAILED" >&2
   fi
   rm -f "$TMP/$mark.tif" "$TMP/$mark.tif.json"
+done <<<"$FRAMES"
+
+# Exposure variants, for judging under/over.
+#
+# Why real renders rather than a CSS `filter: brightness()`: CSS filters operate on
+# *encoded* sRGB values, so `brightness(2)` is not "+1 stop" — it is a non-photometric
+# curve, and a variant chosen that way would not map back to any pipeline number. These
+# use the real `--print-exposure` knob (a true 2^EV linear gain), so whichever variant
+# reads as correctly exposed converts directly into an EV offset.
+#
+# Rendered at `--sigmoid-contrast 2.0`, not the shipped 1.0, because the raised black
+# floor is *why* exposure is hard to judge — with no black reference a frame reads as
+# neither under nor over. 2.0 is the datasheet-derived value (0.745 / Δ 0.36 ≈ 2.07), so
+# the row doubles as a preview of the leading remedy. The full-frame image above each row
+# stays at the shipped contrast 1.0, giving a direct contrast comparison.
+#
+# The sweep runs downward: at contrast 2.0, EV 0 clips nothing on these frames while
+# EV +1 clips ~14%, so upward variants would just be visibly blown.
+EVS="-2:m20 -1.5:m15 -1:m10 -0.5:m05 0:p00"
+echo "rendering exposure variants (contrast 2.0)"
+while IFS='|' read -r mark roll stem frame; do
+  [ -n "$mark" ] || continue
+  for pair in $EVS; do
+    ev=${pair%%:*}; tok=${pair##*:}
+    "$NC" convert "$A/rolls/$roll/$frame" -o "$TMP/v.tif" \
+       --params "$REC/$stem.json" --density-curve sigmoid \
+       --sigmoid-contrast 2.0 --print-exposure="$ev" >/dev/null 2>&1 \
+    && sips -Z 1000 -s format jpeg -s formatOptions 82 "$TMP/v.tif" \
+       --out "$OUT/$mark-$tok.jpg" >/dev/null 2>&1 \
+    || echo "  $mark EV $ev FAILED" >&2
+    rm -f "$TMP/v.tif" "$TMP/v.tif.json"
+  done
+  echo "  $mark  5 variants"
 done <<<"$FRAMES"
 
 python3 "$HERE/build_patch_review.py" "$RAW" "$OUT/index.html"

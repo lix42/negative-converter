@@ -104,19 +104,43 @@ def main():
             f'p05 {b["p05"]:.4f} · p95 {b["p95"]:.4f} · spread {b["spread"]:.4f}<br>'
             f'{b["x"]},{b["y"]},{b["bw"]},{b["bh"]}</span></figcaption></figure>'
             for c, lbl, col in CATS if (b := f["boxes"].get(c)))
+        evs = [("-2", "m20"), ("-1.5", "m15"), ("-1", "m10"), ("-0.5", "m05"), ("0", "p00")]
+        variants = "".join(
+            f'<figure class="v"><img src="{mark}-{tok}.jpg" alt="{mark} EV {ev}" loading="lazy">'
+            f'<figcaption><b>EV {ev.replace("-", "−")}</b></figcaption></figure>'
+            for ev, tok in evs)
+
         secs.append(f"""
 <section id="{mark}">
   <h2><span class="mark">{mark}</span> {roll} · <span class="mono">{f['file']}</span></h2>
   <p class="meta">Frozen Dmax <b>{f['dmax']:.4f}</b> · interior tile D′ min {f['tmin']:.3f} / med {f['tmed']:.3f} / max {f['tmax']:.3f} · {f['w']}×{f['h']}</p>
   <div class="full"><img src="{jpg}" alt="{mark}">{boxes}</div>
   <div class="crops">{crops}</div>
+  <h3 style="margin-top:20px">Exposure variants — real <span class="mono">--print-exposure</span> at <span class="mono">--sigmoid-contrast 2.0</span></h3>
+  <p class="meta">The full frame above is the <b>shipped</b> contrast 1.0; these are contrast 2.0
+     (the datasheet-derived ≈2.07), which restores a black reference so exposure becomes judgeable.
+     Which one reads as correctly exposed?</p>
+  <div class="variants">{variants}</div>
+  <div class="slider">
+    <label>Free-form eyeball (non-photometric, does <b>not</b> map to a pipeline knob):
+      brightness <input type="range" min="0.4" max="2.2" step="0.05" value="1"
+        oninput="this.closest('section').querySelectorAll('.variants img,.full img').forEach(i=>{{i.dataset.b=this.value;i.style.filter='brightness('+this.value+') contrast('+(i.dataset.c||1)+')'}});this.nextElementSibling.textContent=(+this.value).toFixed(2)"><output>1.00</output>
+      &nbsp; contrast <input type="range" min="0.6" max="2.4" step="0.05" value="1"
+        oninput="this.closest('section').querySelectorAll('.variants img,.full img').forEach(i=>{{i.dataset.c=this.value;i.style.filter='brightness('+(i.dataset.b||1)+') contrast('+this.value+')'}});this.nextElementSibling.textContent=(+this.value).toFixed(2)"><output>1.00</output>
+    </label>
+  </div>
   <div class="qs">
     <h3>Questions for {mark}</h3>
     <ol>
       <li><b>{mark}-white</b> — is the <span style="color:#ff5d5d">red</span> box a <b>diffuse</b> reflector (cloud, white garment, painted wall) rather than a specular glint, a light source, or open sky? &nbsp; <i>yes / no — if no, where should it go?</i></li>
       <li><b>{mark}-mid</b> — is the <span style="color:#ffd23f">yellow</span> box a plausible <b>mid-grey-equivalent</b> surface? It was picked purely as the frame's median tile, which is a statistical accident, not a grey card. &nbsp; <i>yes / no</i></li>
       <li><b>{mark}-shadow</b> — is the <span style="color:#4ea3ff">blue</span> box <b>textured deep shadow</b> rather than a flat black hole or something non-photographic? &nbsp; <i>yes / no</i></li>
-      <li><b>{mark}-exposure</b> — how was this frame exposed? &nbsp; <i>correct / under / over</i></li>
+      <li><b>{mark}-exposure</b> — in the variant row above, <b>which EV reads as correctly
+          exposed?</b> Answer with the EV label (e.g. &ldquo;{mark}: −0.5&rdquo;). This replaces the
+          under/over question, which was genuinely hard to answer: at the shipped contrast the
+          raised black floor leaves no black reference, so a frame reads as neither. It is the
+          <i>relative</i> answers across frames that classify exposure — a frame needing more
+          positive EV than its neighbours was thinner, i.e. underexposed.</li>
     </ol>
   </div>
 </section>""")
@@ -146,6 +170,13 @@ section {{ border-top: 1px solid #2a2e36; padding: 22px 0; }}
 figure {{ margin: 0; }}
 .crop {{ aspect-ratio: 328 / 342; outline: 2.5px solid; outline-offset: -2.5px; border-radius: 4px; }}
 figcaption {{ font-size: 12px; margin-top: 6px; color: #c7ccd3; }}
+.variants {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }}
+.variants img {{ width: 100%; height: auto; border-radius: 5px; display: block; }}
+figure.v figcaption {{ text-align: center; font-size: 12.5px; margin-top: 5px; }}
+.slider {{ margin-top: 12px; font-size: 13px; color: #9aa0a8; }}
+.slider input {{ vertical-align: middle; width: 150px; }}
+.slider output {{ font-family: ui-monospace, monospace; font-size: 12px; }}
+@media (max-width: 720px) {{ .variants {{ grid-template-columns: repeat(2, 1fr); }} }}
 .qs {{ margin-top: 18px; background: #1b1f26; border-left: 3px solid #2d6cdf;
        padding: 12px 16px; border-radius: 0 6px 6px 0; }}
 .qs ol {{ margin: 0; padding-left: 20px; }}

@@ -1273,3 +1273,21 @@ What other epics need to know about `algo`:
   (= 328/342), `background-size` 1580.49 % (= 5184/328), no crop left without a
   background. Verification used JS introspection only — no screenshots — so no sample
   pixels entered an agent context.
+- 2026-08-02 (exposure question reworked, at the user's request): "correct / under / over"
+  proved genuinely hard to answer, and the reason is diagnostic — **at the shipped contrast
+  the raised black floor leaves no black reference, so a frame reads as neither under nor
+  over.** The question is now "which EV variant reads as correctly exposed?", answered from
+  a row of five real renders per frame.
+- Implemented as **real `--print-exposure` renders, not a CSS `filter: brightness()`**. CSS
+  filters act on *encoded* sRGB, so `brightness(2)` is not one stop; it is a non-photometric
+  curve and a variant chosen that way would not map back to any pipeline value. The real
+  knob is a true `2^EV` linear gain, so the chosen variant converts directly into an EV
+  offset — and it is the *relative* answers across frames that classify exposure.
+- The row renders at `--sigmoid-contrast 2.0` (the datasheet-derived ≈2.07) while the
+  full frame above stays at the shipped 1.0, so the page also shows the contrast comparison
+  directly. Sweep runs downward (−2 … 0) because at contrast 2.0, EV 0 clips **nothing** on
+  these frames while EV +1 clips ~14 %. A brightness/contrast slider is included for
+  free-form looking, labelled non-photometric so it is not mistaken for a candidate setting.
+- WB deliberately left neutral despite the visible blue cast: auto-WB is frame-local, and
+  injecting a per-frame correction into a comparison whose purpose is reading per-frame
+  differences would confound it.
