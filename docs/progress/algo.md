@@ -1550,3 +1550,35 @@ What other epics need to know about `algo`:
     highlights** (G3: 8's 1.13 anchor beats 3's 1.01 on a sky-heavy frame; P3 likewise),
     **contrast governs shadows** (E2: 2 > 1 on a dark forest frame where the pale floor is most
     objectionable), and **the shoulder is what relaxes the conflict between them**.
+- 2026-08-03 (**shoulder verdict: ≈0.6, with a mechanism, not a preference**). User read:
+  0.2 sharper in the regular range but obvious highlight loss; 0.6 and 1.0 both avoid most of
+  the loss; 1.0 only beats 0.6 on P3; 0.6 sharper than 1.0. Verdict **0.6 > 1.0 > 0.2**.
+  Quantified — local contrast per 0.05 density on c8 (A=1.03, c=2.069):
+
+  | `D′` | region | sh 0.2 | sh 0.6 | sh 1.0 |
+  |---|---|---|---|---|
+  | 0.67 | mid-grey | 0.0430 | 0.0393 | 0.0308 |
+  | 0.85 | upper mid | **0.0995** | 0.0716 | 0.0498 |
+  | 1.20 | highlight | 0.0043 | 0.0428 | **0.0507** |
+  | 1.40 | curtain | **0.0000** | 0.0117 | **0.0298** |
+
+- **The decisive figure is where each shoulder begins eating local contrast:** `D′` 0.95
+  (sh 0.2), **0.70** (sh 0.6), **0.45** (sh 1.0). Mid-grey is at 0.67 — so **0.6 begins bending
+  right at mid-grey**, where a print shoulder belongs, while **1.0 begins well below it** and is
+  therefore no longer a highlight shoulder but a flattening of the entire upper half. That is
+  the mechanism behind "0.6 is sharper than 1.0", and it makes 0.6 principled rather than
+  merely preferred.
+- **On the user's "clamp to 1.0 when part of the image is too light":** their own instinct that
+  it belongs to a different story is correct, and the reason is precise — selecting the shoulder
+  from how much content is too light is **content-adaptive**, so two frames of one roll would
+  get different curves and their highlight relationships would stop being comparable. Same
+  category as content-driven anchoring; belongs in the explicit mode, not the default.
+- **Better resolution:** the *only* frame where 1.0 beats 0.6 is **P3** — already identified as
+  one of the two frames whose scene range exceeds SDR. So the frames that would trigger the
+  clamp are exactly the frames that should get **HDR output** instead. Do not adapt the shoulder
+  to force a high-DR scene into SDR; give it the range it needs.
+- **A legitimate reference-driven version does exist**, and should be recorded rather than lost:
+  a **per-stock** shoulder taken from datasheet curve shape (not per-frame content) would be as
+  defensible as the per-stock anchor. No datasheet shoulder data exists yet, so it is follow-up
+  work under the parameter-tuning task — but it is the honest way to get what the clamp was
+  reaching for.
