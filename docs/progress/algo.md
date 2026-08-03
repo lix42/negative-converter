@@ -1471,3 +1471,27 @@ What other epics need to know about `algo`:
     lands, it would ship a provisional value. Acceptable pre-release, and the seam is clean
     (a later parameter change is a default change + conversion-version bump, not a change of
     form) — recorded so it is a conscious decision rather than a surprise at activation.
+- 2026-08-03 (**Phase 3 measured — candidate set filtered**). Froze
+  `scripts/sigmoid-baseline/fixtures.json` (schema 1) with each patch's rectangle *and*
+  user-confirmed semantics plus validity flags, so invalid patches are skipped rather than
+  averaged in: 2/10 valid diffuse whites (G2 white lily, P4 painted sign), 7/10 valid mids,
+  9/10 valid shadows, **2 frames usable for the datasheet Δ**. Added
+  `shadow_metrics::measure_candidates`, which exploits the fact that **every anchoring form
+  reduces to one number** — the sigmoid anchor `A` (`curve.dmax`) plus a contrast — so no new
+  curve code was needed. Report: `docs/reports/sigmoid-reference-baseline.md` (+ raw output).
+- **The defect, precisely: the shipped default gets midtones nearly right and blacks badly
+  wrong.** Candidate 1 needs only 0.14 EV to place a mid-grey yet its darkest *confirmed*
+  shadow patch sits at 72/255. That is why the complaint is "pale" and not "dark", and it is
+  now reproduced on confirmed patches rather than inferred.
+- Filtering outcome: **reject 1** (black gate, 72/255); **reject 5** (black-pinned needs
+  +4.75 EV — pinning black alone leaves white and mid unplaced, and fixing that requires a
+  second pin ⇒ adaptive contrast, already rejected); **4 and 7 diagnostic-only** on the
+  frame-local argument, explicitly *not* on this data since both resolve on **2 frames only**;
+  **2 and 3 contingent** on a `film-base` Dmax fix; **support 8** — smallest residual (0.78 EV)
+  of any black-passing shippable form, Dmax-free and content-free.
+- **A gate I had backwards, now corrected in the harness output.** "Lower mid spread = more
+  reference-driven" is wrong. A reference-driven anchor applied to frames that genuinely differ
+  in exposure *should* leave spread; **low** spread means the anchor is *correcting* exposure —
+  the frame-local behaviour the default must not have. Also only comparable at equal contrast,
+  since low contrast compresses between-frame differences (candidate 1's small sd is that
+  artifact, not a merit).

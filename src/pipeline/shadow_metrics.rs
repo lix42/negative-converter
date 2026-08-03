@@ -22,7 +22,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::algo::density::to_density;
-use crate::types::{DensityParams, FilmBase};
+use crate::types::{
+    DensityCurve, DensityParams, DmaxSource, FilmBase, LinearImage, PrintParams, Reconstruction,
+    SigmoidParams,
+};
 
 /// Decode budget for the harness. It bypasses the CLI's `memory::preflight`, so it
 /// states its own ceiling rather than inheriting one — matching the shipped 6 GiB
@@ -520,4 +523,302 @@ mod tests {
         );
         assert!(pct(&b, 0.95) - pct(&b, 0.05) > pct(&a, 0.95) - pct(&a, 0.05));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: measure the candidate anchoring forms against the frozen fixtures.
+// ---------------------------------------------------------------------------
+
+/// Every candidate reduces to **one number**: the sigmoid's anchor `A` (the `curve.dmax`
+/// value), plus a contrast. That is the whole reason no new curve code is needed here —
+/// `t = contrast·(D′ − A)` is unchanged and only the rule for choosing `A` differs.
+///
+/// - white pinned at `W`            ⇒ `A = W`
+/// - mid pinned at `M` → 0.18       ⇒ `A = M + 0.745/contrast`  (since `10^(c(M−A)) = 0.18`)
+/// - black pinned at `T` (at `D′=0`) ⇒ `A = −log10(T)/contrast`
+///
+/// `MID_OUTPUT_DECADES` is `−log10(0.18)`: how far below display white mid-grey sits.
+const MID_OUTPUT_DECADES: f32 = 0.744_727_5;
+
+/// Datasheet mid-grey **above base**, per stock — **provisional**: derived from a
+/// chart-read `D-min`, which PR #68 established is not a true Status M density. Used for
+/// the reference-driven candidate; the *form* is what is under test, not these values.
+fn datasheet_mid_above_base(roll: &str) -> f32 {
+    match roll {
+        "Ektar" => 0.62,
+        "Portra160-2026-07-22" => 0.67,
+        "2026-07-24-Gold200" => 0.73,
+        other => panic!("no datasheet mid-grey recorded for {other}"),
+    }
+}
+
+/// Datasheet mid→diffuse-white Δ per stock. `contrast = 0.745/Δ` follows from wanting a
+/// mid-grey Δ below white to land exactly at 0.18.
+fn datasheet_delta(roll: &str) -> f32 {
+    match roll {
+        "2026-07-24-Gold200" => 0.40,
+        _ => 0.36,
+    }
+}
+
+/// One candidate: a label, whether it could ever ship, and the resolved (anchor, contrast).
+struct Candidate {
+    label: &'static str,
+    shippable: bool,
+    /// `None` when the rule cannot be evaluated for this frame (e.g. an invalid white).
+    resolved: Option<(f32, f32)>,
+}
+
+/// Build the candidate set for one frame. `white_measured` is the frame's own diffuse-white
+/// patch — used only by the *diagnostic* forms, which is precisely why they cannot ship.
+fn candidates(roll: &str, roll_dmax: f32, white_measured: Option<f32>) -> Vec<Candidate> {
+    let ds_c = MID_OUTPUT_DECADES / datasheet_delta(roll);
+    let mid = |m: f32, c: f32| Some((m + MID_OUTPUT_DECADES / c, c));
+    vec![
+        Candidate {
+            label: "1 baseline: white@Dmax, c=1.0",
+            shippable: true,
+            resolved: Some((roll_dmax, 1.0)),
+        },
+        Candidate {
+            label: "2 white@Dmax, c=2.0",
+            shippable: true,
+            resolved: Some((roll_dmax, 2.0)),
+        },
+        Candidate {
+            label: "3 mid@0.5*Dmax, c=2.0",
+            shippable: true,
+            resolved: mid(0.5 * roll_dmax, 2.0),
+        },
+        Candidate {
+            label: "4 white@measured (DIAGNOSTIC)",
+            shippable: false,
+            resolved: white_measured.map(|w| (w, 2.0)),
+        },
+        Candidate {
+            label: "5 black@0.00061, c=2.0",
+            shippable: true,
+            resolved: Some((-(0.000_61f32.log10()) / 2.0, 2.0)),
+        },
+        Candidate {
+            label: "7 white@measured, c=0.745/D (DIAGNOSTIC)",
+            shippable: false,
+            resolved: white_measured.map(|w| (w, ds_c)),
+        },
+        Candidate {
+            label: "8 mid@Dmin+datasheet, c=0.745/D",
+            shippable: true,
+            resolved: mid(datasheet_mid_above_base(roll), ds_c),
+        },
+    ]
+}
+
+/// Luminance of a rendered-linear Display P3 pixel, using the **pinned** luma vector.
+/// The harness defines no coefficient of its own (CLAUDE.md: import, never restate).
+fn p3_luma(px: &[f32]) -> f32 {
+    use crate::pipeline::colorimetry::pinned::DISPLAY_P3_LUMA as L;
+    L[0] * px[0] + L[1] * px[1] + L[2] * px[2]
+}
+
+/// sRGB inverse EOTF, for reporting a floor as an 8-bit code value. Presentation only —
+/// bounds are kept on the linear values, since the real transfer runs through lcms2 and is
+/// build-dependent (design-spec §8).
+fn srgb_encode(x: f32) -> f32 {
+    if x <= 0.0 {
+        0.0
+    } else if x <= 0.003_130_8 {
+        12.92 * x
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Median luminance inside a rectangle of a rendered image.
+fn patch_luma_p50(img: &LinearImage, x: u32, y: u32, w: u32, h: u32) -> f32 {
+    let mut v = Vec::with_capacity((w * h) as usize);
+    for yy in y..(y + h).min(img.height) {
+        for xx in x..(x + w).min(img.width) {
+            let i = ((yy as usize * img.width as usize) + xx as usize) * 3;
+            let l = p3_luma(&img.rgb[i..i + 3]);
+            if l.is_finite() {
+                v.push(l);
+            }
+        }
+    }
+    v.sort_by(f32::total_cmp);
+    pct(&v, 0.50)
+}
+
+/// Phase 3: for each fixture frame and candidate, report the qualitative gates.
+///
+/// Gates (per the reduced scope — filter forms, do not tune parameters):
+/// - **reaches a plausible black** — the confirmed *shadow* patch's SDR level;
+/// - **needs no per-frame correction** — how near the confirmed *mid* patch lands to 0.18
+///   with **no exposure applied**, and crucially how much that varies *between* frames;
+/// - **does not clip** — counts from the rendered SDR;
+/// - **preserves exposure spacing** — the spread of frame medians.
+///
+/// Invalid patches (per `fixtures.json`) are skipped rather than averaged in.
+#[test]
+#[ignore = "requires ../nc-assets; run with --ignored --nocapture --test-threads=1"]
+fn measure_candidates() {
+    let Some(assets) = assets_root() else {
+        eprintln!("SKIP: no ../nc-assets/manifest.json");
+        return;
+    };
+    let fx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/sigmoid-baseline/fixtures.json"))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut marks: Vec<String> = fx["frames"].as_object().unwrap().keys().cloned().collect();
+    marks.sort();
+
+    // candidate label -> (mid-luma samples, shadow-code samples)
+    let mut agg: std::collections::BTreeMap<String, (Vec<f32>, Vec<f32>)> = Default::default();
+
+    for mk in &marks {
+        let f = &fx["frames"][mk];
+        let roll = f["roll"].as_str().unwrap();
+        let dmax = f["roll_dmax"].as_f64().unwrap() as f32;
+        let base_arr = fx["rolls"][roll]["dmin"].as_array().unwrap();
+        let base = FilmBase {
+            r: base_arr[0].as_f64().unwrap() as f32,
+            g: base_arr[1].as_f64().unwrap() as f32,
+            b: base_arr[2].as_f64().unwrap() as f32,
+        };
+        let path = assets
+            .join("rolls")
+            .join(roll)
+            .join(f["file"].as_str().unwrap());
+        let Ok((image, _)) = crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES) else {
+            println!("{mk}: DECODE FAILED");
+            continue;
+        };
+
+        let rect = |c: &str| -> Option<(u32, u32, u32, u32)> {
+            let p = &f["patches"][c];
+            p["valid"].as_bool().unwrap_or(false).then(|| {
+                (
+                    p["x"].as_u64().unwrap() as u32,
+                    p["y"].as_u64().unwrap() as u32,
+                    p["w"].as_u64().unwrap() as u32,
+                    p["h"].as_u64().unwrap() as u32,
+                )
+            })
+        };
+        let white_measured = f["patches"]["white"]["valid"]
+            .as_bool()
+            .unwrap_or(false)
+            .then(|| {
+                f["patches"]["white"]["measured_dprime_p50"]
+                    .as_f64()
+                    .unwrap() as f32
+            });
+
+        println!(
+            "\n=== {mk}  {roll}  Dmax {dmax:.4}   valid patches: shadow {} mid {} white {}",
+            rect("shadow").is_some(),
+            rect("mid").is_some(),
+            rect("white").is_some()
+        );
+        println!(
+            "    {:<42}{:>10}{:>12}{:>11}{:>10}{:>9}",
+            "candidate", "anchor", "contrast", "mid->0.18", "shadow", "clip%"
+        );
+
+        for cand in candidates(roll, dmax, white_measured) {
+            // Mark shippability in the output: a diagnostic-only form can win on numbers
+            // and still be disqualified, so the distinction must be visible in the table.
+            let ship = if cand.shippable {
+                ""
+            } else {
+                "  [cannot ship]"
+            };
+            let Some((anchor, contrast)) = cand.resolved else {
+                println!("    {:<42}{:>10}{ship}", cand.label, "n/a (invalid white)");
+                continue;
+            };
+            let recon = Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Sigmoid(SigmoidParams {
+                    contrast,
+                    toe: 0.2,
+                    shoulder: 0.2,
+                    dmax: DmaxSource::Explicit(anchor),
+                }),
+            };
+            let print = PrintParams::default();
+            let (film, _) = crate::algo::reconstruct(&image, &base, &recon).unwrap();
+            let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
+            let shared = crate::pipeline::render_split::display_source(aces, &print).unwrap();
+            let sdr = crate::pipeline::sdr::render(
+                &shared,
+                crate::pipeline::sdr::SdrGamut::DisplayP3,
+                0.0,
+            )
+            .unwrap();
+            let img = sdr.image();
+
+            let clipped = img.rgb.iter().filter(|v| **v > 1.0 || **v < 0.0).count();
+            let clip_pct = 100.0 * clipped as f32 / img.rgb.len() as f32;
+
+            let mid_s = rect("mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
+            let sh_s = rect("shadow").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
+            let key = format!("{}{}", cand.label, ship);
+            let e = agg.entry(key).or_default();
+            if let Some(m) = mid_s {
+                e.0.push(m);
+            }
+            if let Some(s) = sh_s {
+                e.1.push(srgb_encode(s) * 255.0);
+            }
+
+            println!(
+                "    {:<42}{:>10.4}{:>12.3}{:>11}{:>10}{:>9.2}",
+                cand.label,
+                anchor,
+                contrast,
+                mid_s
+                    .map(|m| format!("{m:.4}"))
+                    .unwrap_or_else(|| "-".into()),
+                sh_s.map(|s| format!("{:.0}/255", srgb_encode(s) * 255.0))
+                    .unwrap_or_else(|| "-".into()),
+                clip_pct
+            );
+        }
+    }
+
+    println!("\n\n=== GATES ACROSS FRAMES (mid target 0.18; shadow wants a low code value) ===");
+    println!(
+        "{:<42}{:>9}{:>9}{:>11}{:>12}{:>11}",
+        "candidate", "mid med", "mid sd", "|EV| to .18", "shadow med", "shadow max"
+    );
+    for (label, (mids, shadows)) in &agg {
+        if mids.is_empty() {
+            continue;
+        }
+        let mut m = mids.clone();
+        m.sort_by(f32::total_cmp);
+        let med = pct(&m, 0.5);
+        let mean = mids.iter().sum::<f32>() / mids.len() as f32;
+        let sd = (mids.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / mids.len() as f32).sqrt();
+        let ev = (0.18f32 / med).log2().abs();
+        let mut s = shadows.clone();
+        s.sort_by(f32::total_cmp);
+        println!(
+            "{:<42}{:>9.4}{:>9.4}{:>11.2}{:>12.0}{:>11.0}",
+            label,
+            med,
+            sd,
+            ev,
+            pct(&s, 0.5),
+            s.last().copied().unwrap_or(f32::NAN)
+        );
+    }
+    println!("\nRead: 'mid sd' is the between-frame spread a FIXED anchor leaves — lower is more");
+    println!(
+        "reference-driven. '|EV| to .18' is the residual fixed offset the default would need."
+    );
 }
