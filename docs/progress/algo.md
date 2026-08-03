@@ -1184,3 +1184,34 @@ What other epics need to know about `algo`:
   (mean ≈ 0.51). Config 3's sweep covers 0.5/0.6/0.65, so it still spans the range —
   and per the PR #68 review the numerator is a provisional chart read, so this must not
   be used to narrow the sweep.
+- 2026-08-02 (**Evidence D upgraded from suggestive to measured**): the user restored the
+  `Portra160` and `Portra400` roll folders, so both same-stock pairs now exist. **Correction
+  to the Phase 0 entry above: those recipes were never "stale" — they were *orphaned* by the
+  folders' removal.** Re-freezing reproduced their recorded Dmax exactly (1.3352162 and
+  1.7382799), so they were correct for their rolls all along. The `Portra160-2026-07-22`
+  freeze was still necessary: that is a *different* roll of the same stock, with no recipe
+  of its own.
+- The controlled comparison — same stock, same scanner, contrasting the **base** (a genuine
+  film + development property) against the leader-derived Dmax:
+
+  | Stock | pair | base Δ (r / g / b) | leader Dmax Δ |
+  |---|---|---|---|
+  | Portra 160 | `Portra160` vs `-2026-07-22` | +0.029 / +0.027 / +0.021 | +0.046 (0.15 stops) |
+  | Portra 400 | `Portra400` vs `-leica-flaw` | **−0.0005** / +0.023 / +0.021 | **−0.295** (0.98 stops) |
+
+  The Portra 400 row is decisive: its **red base agrees to 0.0005 density** — same stock,
+  same instrument — while the leader-derived Dmax differs by a **full stop**. Both
+  quantities cannot be film properties.
+- **Framing sharpened:** "accidental" was too strong. Portra 160's leaders agree to 0.046,
+  within base-level variation. The leader is not reliably wrong, it is **uncontrolled** —
+  sometimes it lands, sometimes it is a stop out, and a single measurement cannot tell you
+  which. That is worse for an anchor than a consistent bias.
+- By-products: **±0.03 density is the cross-roll reproducibility floor** for a
+  Dmin-referenced quantity (good for config 8 — ~0.07 decades at contrast 2.2); and in
+  *both* pairs the later-dated roll carries ~+0.02 more green/blue base while red does not
+  move consistently — n = 2, so a hypothesis, but a systematic per-session per-channel shift
+  would bound how far any one-time scanner profile can be trusted
+  (`io/scanner-density-calibration`).
+- Gold200's stock confirmed by the user as **Kodak Gold 200** (E-7022), retroactively
+  validating the use of that datasheet's aims (0.95 / 1.35, Δ 0.40) — previously inferred
+  from the folder name.

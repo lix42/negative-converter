@@ -42,9 +42,14 @@ SEED_STOCK = {
     "Ektar": "Kodak Ektar 100", "phoenix": "Harman Phoenix 200",
     "Portra160": "Kodak Portra 160", "Portra160-2026-07-22": "Kodak Portra 160",
     "Portra400": "Kodak Portra 400", "Portra400-leica-flaw": "Kodak Portra 400",
+    "2026-07-24-Gold200": "Kodak Gold 200",
 }
 SEED_ROLL_NOTE = {
-    "Portra160-2026-07-22": "NLP comparison source; no in-roll unexposed/leader reference frame",
+    # The earlier "no in-roll unexposed/leader reference frame" claim was wrong: this
+    # roll has leader 20260722-nikon-1096 and unexposed 20260722-nikon-1097, confirmed
+    # by `manifest roles` on 2026-08-02. Corrected here because the seed re-applies it
+    # to every regeneration.
+    "Portra160-2026-07-22": "NLP comparison source",
 }
 SEED_SAMPLE = {
     "largest.tif": {"kind": "perf-worst-case",
