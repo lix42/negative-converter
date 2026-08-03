@@ -1522,3 +1522,31 @@ What other epics need to know about `algo`:
   all 8 candidate forms × 10 frames (80 images) through the display path with **no exposure
   applied**, and builds a comparison page with the same click lightbox. The anchor rules live
   in one place so renders and page cannot disagree.
+- 2026-08-03 (**user verdicts on the candidate forms, and a gap in my sweep**):
+  - Ranking, best to worst: **3 and 8** (both GO), then **5b** (most likely GO), **5a**
+    (unsure), **1** (maybe not go), **2** (not go). Plus two per-frame notes: on **G3, 8 > 3**;
+    on **E2, 2 > 1**.
+  - The user notes the ranking is partly exposure-driven, since exposure is the most salient
+    cue to the eye. Recorded as an honest property of the data, not a contamination — the
+    verdicts are per *form* and aggregated, which is what the reduced scope asks for.
+  - **P3 exposes a clean physical trade, and the arithmetic reproduces the user's eye
+    exactly.** Output gap between `D′` 1.40 and 1.50 (where the curtain detail lives):
+    c1 0.067, c2 0.083, c5a 0.047 (detail kept) · c5b **0.00057** ("lost some") · c3 0.00008,
+    c8 0.00003 ("lost all"). Mechanism: lowering the anchor to lift midtones and blacks puts
+    more content *above* white, where the shoulder must compress it — and at width 0.2 that
+    compression saturates and differentiation collapses.
+  - **Answer to the user's question — yes, recoverable, via the shoulder, which I never
+    varied.** All eight configs used the shipped `shoulder = 0.2`; that is a real gap. Swept on
+    c8 (A=1.03, c=2.069): shoulder 0.2 → gap 0.00003, mid 0.1799; 0.6 → 0.0164 / 0.1740;
+    **1.0 → 0.0502 / 0.1525**; 1.5 → 0.0699 / 0.1188; 2.0 → 0.0684 / 0.0887. So **0.6–1.0
+    recovers most highlight differentiation** (1.0 is comparable to c1's 0.067) for ~0.24 EV of
+    midtone cost; beyond 1.5 midtones darken for little gain.
+  - **Why the shipped default is too narrow:** 0.2 was calibrated for a regime where content
+    essentially never exceeded white (anchor at Dmax, nothing reaches it). Moving the anchor to
+    diffuse white makes the shoulder **load-bearing for the first time**, so a width chosen for
+    a decorative roll-off is inadequate. Testing 0.2 vs ~1.0 is therefore a *form-viability*
+    question, not the 2.21-vs-2.22 tuning that was deferred.
+  - Mechanism summary that now ties the three datapoints together: **anchor height governs
+    highlights** (G3: 8's 1.13 anchor beats 3's 1.01 on a sky-heavy frame; P3 likewise),
+    **contrast governs shadows** (E2: 2 > 1 on a dark forest frame where the pale floor is most
+    objectionable), and **the shoulder is what relaxes the conflict between them**.
