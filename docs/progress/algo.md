@@ -1582,3 +1582,37 @@ What other epics need to know about `algo`:
   defensible as the per-stock anchor. No datasheet shoulder data exists yet, so it is follow-up
   work under the parameter-tuning task — but it is the honest way to get what the clamp was
   reaching for.
+
+
+## auto-anchor-interior-measurement
+
+**Status:** not started
+**Updated:** 2026-08-03
+
+- Goal: make `DmaxSource::Auto` measure the picture area, not the whole scan.
+- 2026-08-03 (found by `algo/reference-anchored-sigmoid`): `Auto` takes the 99.5th percentile
+  of corrected densities over the **whole frame**, and the nearly-opaque film holder sits at the
+  `SCAN_EPSILON` floor, so its corrected density is enormous and it owns the top percentile. On
+  the three fixture rolls `Auto` resolved to **2.23–2.37** against roll Dmax 1.28–1.38, and every
+  frame rendered to 0/255. The fix is a sampling *region*, not a new statistic — `film_base`
+  already locates the rebate by marching inward, so plumb a resolved interior in via the
+  orchestrator (as the film base is). An implausible `Auto` result must fail loudly.
+
+
+## sigmoid-parameter-calibration
+
+**Status:** not started
+**Updated:** 2026-08-03
+
+- Goal: turn `reference-anchored-sigmoid`'s **provisional** parameters into calibrated ones.
+- Provisional values and their firmness: contrast ≈2.07 (firmest — derived `0.745/Δ` from
+  *tabulated* datasheet Δ); shoulder ≈0.6 (bends at `D′` 0.70 ≈ mid-grey 0.67, judged on ten
+  frames); per-stock anchor offsets (**weakest** — from chart-read `D-min` values that are not
+  true Status M densities, with systematic per-stock residuals of Ektar ≈+0.6 EV, Portra 160 ≈0,
+  Gold 200 ≈−1.0); and the `NOMINAL_DMAX = 2.0` fallback (measured rolls 0.90–1.74, ≈1.35 better).
+- **More frames will not fix this.** Per-frame exposure preference *is* frame optimisation, so
+  only central tendency is usable. It needs a **bracketed roll** (exposure labels true by
+  construction, which makes exposure-preservation verifiable rather than "consistent with"), a
+  **grey card in frame** (a real 18% reference under the same illumination as a diffuse white —
+  only 2 of 10 existing frames could even approximate the datasheet Δ), and ideally the
+  calibrated transmission step wedge.

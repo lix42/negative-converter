@@ -159,6 +159,7 @@ graph TD
     film-base/grid-verdict-enum
     film-base/dmax-reference
     film-base/dense-base-dmax-plausibility
+    film-base/dmax-anchor-reliability
   end
   subgraph algo
     algo/interface
@@ -174,6 +175,8 @@ graph TD
     algo/regional-color-balance
     algo/bw-support
     algo/film-stock-profiles
+    algo/auto-anchor-interior-measurement
+    algo/sigmoid-parameter-calibration
   end
   subgraph color
     color/management
@@ -213,6 +216,7 @@ graph TD
     analysis/conversion-metrics
     analysis/nlp-comparison
     analysis/drive-asset-migration
+    analysis/comparison-review-tooling
   end
   core/project-foundation --> io/silverfast-decode
   core/project-foundation --> io/tiff-encode
@@ -281,6 +285,15 @@ graph TD
   algo/negative-reconstruction-density-curves --> algo/reference-anchored-sigmoid
   film-base/dmax-reference --> algo/reference-anchored-sigmoid
   algo/reference-anchored-sigmoid --> algo/film-stock-profiles
+  algo/reference-anchored-sigmoid --> algo/auto-anchor-interior-measurement
+  film-base/auto-base-redesign --> algo/auto-anchor-interior-measurement
+  algo/auto-anchor-interior-measurement --> algo/content-aware-sigmoid-toe
+  algo/reference-anchored-sigmoid --> algo/sigmoid-parameter-calibration
+  algo/film-stock-profiles --> algo/sigmoid-parameter-calibration
+  io/scanner-density-calibration --> algo/sigmoid-parameter-calibration
+  film-base/dmax-reference --> film-base/dmax-anchor-reliability
+  algo/reference-anchored-sigmoid --> film-base/dmax-anchor-reliability
+  algo/reference-anchored-sigmoid --> analysis/comparison-review-tooling
   algo/film-stock-profiles --> io/scanner-density-calibration
   io/input-data-semantics --> io/scanner-density-calibration
   algo/reference-anchored-sigmoid --> algo/content-aware-sigmoid-toe
@@ -370,14 +383,30 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `film-base/grid-verdict-enum` (post-MVP): `film-base/estimate-reuse-output`, `film-base/estimation`
 - `film-base/dmax-reference` (post-MVP): `algo/dmax-white-anchor`
 - `film-base/dense-base-dmax-plausibility` (post-MVP): `film-base/dmax-reference`
+- `film-base/dmax-anchor-reliability` (post-MVP): `film-base/dmax-reference`, `algo/reference-anchored-sigmoid`
+  — follow-up on a **completed** task's contract, so a new task rather than an edit: the
+  leader-measured anchor is uncontrolled (same stock 0.295 apart while the base agrees to
+  0.0005), is exceeded by real content, and `NOMINAL_DMAX = 2.0` is a poor fallback against
+  measured rolls (0.90–1.74). `algo` candidates 2 and 3 are contingent on this
 - `algo/interface`: `core/project-foundation`
 - `algo/simple`: `algo/interface`
 - `algo/density`: `algo/interface`
 - `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
 - `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
-- `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`; no downstream blockers
+- `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`, `algo/auto-anchor-interior-measurement`; no downstream blockers
+  — the last is a hard prerequisite, not a nicety: content-driven anchoring is currently
+  unusable because `DmaxSource::Auto` measures the whole frame and the opaque holder owns the
+  top percentile
 - `algo/film-stock-profiles` (post-MVP): `algo/reference-anchored-sigmoid`
+- `algo/auto-anchor-interior-measurement` (post-MVP): `algo/reference-anchored-sigmoid`, `film-base/auto-base-redesign`
+  — `DmaxSource::Auto` measures the whole frame, so the opaque holder owns the 99.5th
+  percentile (resolves 2.23–2.37 against a roll Dmax of 1.28–1.38). Blocks every
+  content-driven mode, hence the edge into `algo/content-aware-sigmoid-toe`
+- `algo/sigmoid-parameter-calibration` (post-MVP): `algo/reference-anchored-sigmoid`, `algo/film-stock-profiles`, `io/scanner-density-calibration`
+  — turns the provisional contrast/shoulder/offset values into calibrated ones. Needs a
+  bracketed roll and a grey card, not merely more frames: per-frame exposure preference is
+  frame optimisation and cannot select a parameter
   — deliberately **not** a dependency of `film-base/dense-base-dmax-plausibility`
   (that task can loosen its floor without a full registry; a false edge would kill
   real parallelism), but the two must be coordinated so stock-awareness is not
@@ -421,6 +450,9 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `analysis/conversion-metrics` (post-MVP): `analysis/asset-manifest`
 - `analysis/nlp-comparison` (post-MVP): `analysis/conversion-metrics`
 - `analysis/drive-asset-migration` (post-MVP, in progress — move+reorg+manifest done): `analysis/asset-manifest`
+- `analysis/comparison-review-tooling` (post-MVP): `algo/reference-anchored-sigmoid`
+  — promote the ad-hoc review pages into a maintained config-comparison tool; the user asked
+  for it as a separate task rather than continued inline patching
 
 > **Post-MVP follow-ups** are recorded for continuity and are **not** blockers of
 > `core/pipeline-orchestration` / the Step-1 MVP. The `film-base` follow-ups came
@@ -518,6 +550,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Grid agreement verdict enum](tasks/film-base/grid-verdict-enum.md)
 - [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/film-base/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the replacement density-curve stage preserves scalar exponential placement and sigmoid curve shaping
 - [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/film-base/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
+- [ ] [Dmax anchor reliability](tasks/film-base/dmax-anchor-reliability.md) — follow-up on a
+  **completed** contract: the leader-measured anchor is *uncontrolled* (two rolls of one stock
+  0.295 density apart while their red base agrees to 0.0005), real content measures *above* it,
+  and leaders are uniform so it is not a fogging gradient. `NOMINAL_DMAX = 2.0` is also a poor
+  no-reference fallback against measured rolls (0.90–1.74, median ≈1.35). `algo` candidates 2
+  and 3 are contingent on this.
 
 ### algo — [progress](progress/algo.md)
 > `src/algo/`: the `reconstruct` / `finish_print` surface, negative
@@ -541,6 +579,16 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   sourced from datasheets with provenance, with a generic C-41 fallback so stock
   selection stays a refinement rather than a requirement. Measured roll `film_base`
   stays authoritative — a published `D-min` is a nominal diagnostic, never a substitute
+- [ ] [Auto anchor: measure the interior, not the holder](tasks/algo/auto-anchor-interior-measurement.md) — `DmaxSource::Auto`
+  takes the 99.5th percentile over the *whole* scan, so the nearly-opaque film holder owns it
+  (resolves 2.23–2.37 against roll Dmax 1.28–1.38) and every frame renders black. Restrict the
+  measurement to the picture area; an implausible anchor must fail loudly, not render a black
+  image. Blocks every content-driven rendering mode.
+- [ ] [Sigmoid parameter calibration](tasks/algo/sigmoid-parameter-calibration.md) — turn the
+  provisional contrast (≈2.07), shoulder (≈0.6) and per-stock anchor offsets into calibrated
+  values. Needs a **bracketed roll** (so exposure labels are true by construction) and a **grey
+  card in frame**, not merely more frames — per-frame exposure preference is frame optimisation
+  and cannot select a parameter.
 - [ ] [Black & white negative support (mono color model)](tasks/algo/bw-support.md)
 - [ ] [Density safety bounds](tasks/algo/density-safety-bounds.md) — from the
   density-safety review: physical bounds on `density_scale`/`offset`/`gamma` (the
@@ -630,3 +678,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Conversion metrics & thumbnails](tasks/analysis/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
 - [ ] [NLP vs nc comparison](tasks/analysis/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
 - [ ] [Drive asset migration](tasks/analysis/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
+- [ ] [Comparison review tooling](tasks/analysis/comparison-review-tooling.md) — promote the
+  ad-hoc review pages from `algo/reference-anchored-sigmoid` into a maintained tool for
+  comparing rendering configurations by eye: one entry point, the matrix as data rather than
+  code, HDR review for the frames whose range exceeds SDR, and build-vs-build comparison.
