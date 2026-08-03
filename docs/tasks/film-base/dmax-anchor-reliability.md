@@ -34,6 +34,15 @@ and it makes switching between `Fixed` and `Explicit` a large unexplained render
 ~1.35 is a better provisional value, but n=7 rolls is too small to fix a shipped constant, and
 Portra400's own 1.7383 is one of the suspect measurements.
 
+**Do not settle the fallback number yet** (user, 2026-08-03) — more rolls are coming, and they
+will also show whether Portra400's 1.7383 is a mistake or real. What *is* settled is the
+**method**: when the constant is finally computed, **exclude extreme cases** rather than taking a
+plain median over everything. Harman Phoenix (0.8976) is the worked example — a poor-quality
+stock with a dense, non-orange base, already known to false-alarm the plausibility floor
+(`film-base/dense-base-dmax-plausibility`). A fallback dragged down by an outlier stock is worse
+than one computed from the mainstream population it will actually be applied to. Record the
+exclusion criterion explicitly, so the choice is auditable rather than a silent judgement.
+
 **Directions to weigh, not a predetermined fix:**
 
 - **Measure something else.** A diffuse-white-referenced anchor is what
