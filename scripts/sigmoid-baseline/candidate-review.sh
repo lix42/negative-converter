@@ -24,6 +24,8 @@ OUT=${1:-$ROOT/../temp/candidate-review}
 NC=${NC:-$ROOT/target/release/nc}
 A=${A:-$ROOT/../nc-assets}
 FX="$ROOT/scripts/sigmoid-baseline/fixtures.json"
+# STUDY=--shoulder renders the two GO forms at three shoulder widths instead of all 8 forms.
+STUDY=${STUDY:-}
 
 for t in sips python3; do command -v "$t" >/dev/null || { echo "error: $t missing" >&2; exit 2; }; done
 [ -x "$NC" ] || { echo "error: no $NC — run 'cargo build --release'" >&2; exit 2; }
@@ -31,17 +33,17 @@ mkdir -p "$OUT"
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 PLAN="$TMP/plan.txt"
-python3 "$HERE/build_candidate_review.py" --plan "$FX" > "$PLAN" || exit 2
+python3 "$HERE/build_candidate_review.py" --plan "$FX" $STUDY > "$PLAN" || exit 2
 echo "rendering $(wc -l < "$PLAN" | tr -d ' ') candidate images -> $OUT"
 
 fail=0
-while IFS='|' read -r mark cid anchor contrast roll recipe file; do
+while IFS='|' read -r mark cid anchor contrast shoulder roll recipe file; do
   [ -n "$mark" ] || continue
   # `auto` selects the shipped content-driven measurement; otherwise pin the anchor.
   if [ "$anchor" = "auto" ]; then dm=(--auto-d-max); else dm=(--d-max "$anchor"); fi
   if "$NC" convert "$A/rolls/$roll/$file" -o "$TMP/v.jpg" \
        --params "$ROOT/$recipe" --density-curve sigmoid \
-       --sigmoid-contrast "$contrast" "${dm[@]}" \
+       --sigmoid-contrast "$contrast" --sigmoid-shoulder "$shoulder" "${dm[@]}" \
        --output-preset ultra-hdr-v1 >/dev/null 2>&1 \
      && sips -Z 1200 -s format jpeg -s formatOptions 82 "$TMP/v.jpg" \
        --out "$OUT/$mark-$cid.jpg" >/dev/null 2>&1; then
@@ -53,5 +55,5 @@ while IFS='|' read -r mark cid anchor contrast roll recipe file; do
 done < "$PLAN"
 echo; [ "$fail" -eq 0 ] || echo "$fail render(s) failed" >&2
 
-python3 "$HERE/build_candidate_review.py" --page "$FX" "$OUT/index.html" || exit 2
+python3 "$HERE/build_candidate_review.py" --page "$FX" "$OUT/index.html" $STUDY || exit 2
 echo "open: file://$(cd "$OUT" && pwd -P)/index.html"

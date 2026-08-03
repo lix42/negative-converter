@@ -50,24 +50,54 @@ def rules(roll, dmax):
     ]
 
 
-def plan(fx):
+SHOULDER_STUDY = [("c3", "3 · mid@0.5·Dmax"), ("c8", "8 · mid@Dmin+datasheet")]
+SHOULDERS = [0.2, 0.6, 1.0]
+
+
+def shoulder_rules(roll, dmax):
+    """The shoulder study: the two GO forms at three shoulder widths.
+
+    The shipped `shoulder = 0.2` was calibrated for a regime where content essentially
+    never exceeded white (anchor at Dmax, nothing reaches it). Moving the anchor down to
+    diffuse white makes the shoulder **load-bearing for the first time** — so this is a
+    form-viability question, not the fine-tuning that was deferred. Confirmed analytically
+    on P3: at 0.2 the output gap across the curtain's density range collapses to 0.00003,
+    while 1.0 restores 0.0502 for ~0.24 EV of midtone cost.
+    """
+    by_id = {r[0]: r for r in rules(roll, dmax)}
+    out = []
+    for cid, short in SHOULDER_STUDY:
+        _i, _l, anchor, contrast, _de, _n = by_id[cid]
+        for sh in SHOULDERS:
+            tag = f"{cid}s{str(sh).replace('.', '')}"
+            note = "shipped shoulder" if sh == 0.2 else \
+                   f"wider shoulder — recovers highlight differentiation above white"
+            out.append((tag, f"{short} · shoulder {sh}", anchor, contrast, sh, True, note))
+    return out
+
+
+def plan(fx, shoulder_study=False):
     for mk in sorted(fx["frames"]):
         f = fx["frames"][mk]
         roll = f["roll"]
         recipe = fx["rolls"][roll]["recipe"]
-        for cid, _lbl, anchor, contrast, _de, _n in rules(roll, f["roll_dmax"]):
+        rs = shoulder_rules(roll, f["roll_dmax"]) if shoulder_study else \
+             [(r[0], r[1], r[2], r[3], 0.2, r[4], r[5]) for r in rules(roll, f["roll_dmax"])]
+        for cid, _lbl, anchor, contrast, sh, _de, _n in rs:
             a = "auto" if anchor == "auto" else f"{anchor:.6f}"
-            print(f"{mk}|{cid}|{a}|{contrast:.6f}|{roll}|{recipe}|{f['file']}")
+            print(f"{mk}|{cid}|{a}|{contrast:.6f}|{sh}|{roll}|{recipe}|{f['file']}")
 
 
-def page(fx, out):
+def page(fx, out, shoulder_study=False):
     marks = sorted(fx["frames"])
     secs = []
     for mk in marks:
         f = fx["frames"][mk]
         roll = f["roll"]
         tiles = []
-        for cid, lbl, anchor, contrast, de, note in rules(roll, f["roll_dmax"]):
+        rs = shoulder_rules(roll, f["roll_dmax"]) if shoulder_study else \
+             [(r[0], r[1], r[2], r[3], 0.2, r[4], r[5]) for r in rules(roll, f["roll_dmax"])]
+        for cid, lbl, anchor, contrast, sh, de, note in rs:
             a = "auto (measured)" if anchor == "auto" else f"{anchor:.4f}"
             badge = "" if de else '<span class="tag">explicit-mode only</span>'
             tiles.append(
@@ -75,7 +105,7 @@ def page(fx, out):
                 f'data-form="{lbl}">'
                 f'<img src="{mk}-{cid}.jpg" alt="{mk} {cid}" loading="lazy">'
                 f'<figcaption><b>{lbl}</b>{badge}<br>'
-                f'<span class="mono">anchor {a} · contrast {contrast:.3f}</span><br>'
+                f'<span class="mono">anchor {a} · contrast {contrast:.3f} · shoulder {sh}</span><br>'
                 f'<span class="note">{note}</span></figcaption></figure>')
         ev = f.get("exposure_preference_ev")
         evtxt = f"your preferred EV at c=2.0: <b>{ev:+.1f}</b>" if ev is not None else \
@@ -103,7 +133,7 @@ h1 {{ font-size: 22px; margin: 0 0 6px; }} h2 {{ font-size: 17px; margin: 0 0 2p
          padding:1px 8px; border-radius:5px; margin-right:6px; }}
 .meta {{ color:#9aa0a8; font-size:13px; margin:0 0 12px; }}
 section {{ border-top:1px solid #2a2e36; padding:22px 0; }}
-.grid {{ display:grid; grid-template-columns:repeat(4, 1fr); gap:14px; }}
+.grid {{ display:grid; grid-template-columns:repeat(3, 1fr); gap:14px; }}
 @media (max-width:1000px) {{ .grid {{ grid-template-columns:repeat(2,1fr); }} }}
 figure.v {{ margin:0; cursor:zoom-in; }}
 figure.v img {{ width:100%; height:auto; border-radius:5px; display:block; }}
@@ -180,17 +210,18 @@ shipped default: judge whether its blacks are the defect you originally reported
 }})();
 </script>
 """, encoding="utf-8")
-    print(f"wrote {out} ({len(marks)} frames x 8 candidates)")
+    print(f"wrote {out} ({len(marks)} frames x {len(rules(fx['frames'][marks[0]]['roll'], 1.0)) if not shoulder_study else len(SHOULDER_STUDY) * len(SHOULDERS)} tiles)")
 
 
 def main():
     mode = sys.argv[1]
     fx = json.loads(open(sys.argv[2]).read())
+    study = "--shoulder" in sys.argv
     if mode == "--plan":
-        plan(fx)
+        plan(fx, study)
     elif mode == "--page":
         from pathlib import Path
-        page(fx, Path(sys.argv[3]))
+        page(fx, Path(sys.argv[3]), study)
     else:
         sys.exit("usage: --plan fixtures.json | --page fixtures.json out.html")
 
