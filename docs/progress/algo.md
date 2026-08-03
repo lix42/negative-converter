@@ -1147,7 +1147,6 @@ What other epics need to know about `algo`:
   is likely this effect. The manufacturer-*tabulated* aims (and their difference Δ) are
   the authoritative half; chart reads must not become ground truth for the registry or
   for `io/scanner-density-calibration` until properly integrated or tabulated.
-||||||| parent of 866a026 (Freeze fixture Dmin/Dmax for the sigmoid baseline (Phase 0))
 ## reference-anchored-sigmoid (Phase 0)
 
 **Status:** in progress
