@@ -1339,3 +1339,21 @@ What other epics need to know about `algo`:
   a fixed overlay labelled with its mark and EV. Same `src`, so it is served from cache
   rather than downloaded twice. Variant renders bumped 1000 → 1600 px so the zoom actually
   resolves detail (~45 MB total in `../temp`, throwaway).
+- 2026-08-03 (variant comparison reworked; hover replaced by a click lightbox): hover was
+  unusable for two reasons the user hit immediately — a centred thumbnail is covered by its
+  own popover, so you cannot move to the next one, and the gaps between thumbnails make the
+  overlay flicker as the pointer crosses them. Replaced with **one shared lightbox**: click a
+  variant to open, ‹ / › buttons or arrow keys to step through that frame's row (wrapping at
+  both ends), Esc or a click anywhere in the overlay except the buttons to dismiss. One
+  modal rather than 80 overlays is what makes prev/next possible at all.
+- **Verification limit, stated rather than glossed:** the interactive behaviour could *not*
+  be confirmed in the Chrome-automation sandbox. Inline scripts appear to be blocked there —
+  a capture listener saw zero clicks from a synthetic dispatch, and the page's own keydown
+  handler did not respond to a bubbling Escape, while the script text is demonstrably present
+  in the document. Structure, CSS and the handler's logic were verified (row length 8, index
+  lookup, opening resolves to `display: grid`); the event wiring is unverified here and needs
+  a human check in a normal browser. This is an artifact of the automation environment, not
+  of a local `file://` page, where inline scripts run normally.
+- User asks for a **separate task** to improve this tool properly rather than continuing to
+  patch it inline. Not filed yet: `docs/TASKS.md` is currently modified on the open PR #68
+  branch, so adding another task now would conflict. File it once #68 merges.

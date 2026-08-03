@@ -110,14 +110,15 @@ def main():
         # which is itself a finding: exposure is the wrong knob for a raised floor.
         evs = [("-2", "m20"), ("-1.5", "m15"), ("-1", "m10"), ("-0.5", "m05"),
                ("0", "p00"), ("+0.5", "p05x"), ("+1", "p10x"), ("+1.5", "p15x")]
-        # Hover shows the same file at natural size in a fixed overlay. Same `src`, so
-        # the browser serves it from cache — no second download — and the thumbnail grid
-        # stays scannable while detail is one hover away.
+        # Click (not hover) opens a single shared lightbox. Hover was unusable: a
+        # centred thumbnail is covered by its own popover so you cannot move to the next
+        # one, and the gaps between thumbnails make the overlay flicker as the pointer
+        # crosses them. One shared modal also makes prev/next possible.
         variants = "".join(
-            f'<figure class="v"><img src="{mark}-{tok}.jpg" alt="{mark} EV {ev}" loading="lazy">'
-            f'<figcaption><b>EV {ev.replace("-", "\u2212")}</b></figcaption>'
-            f'<div class="zoom"><img src="{mark}-{tok}.jpg" alt=""><span>{mark} · EV '
-            f'{ev.replace("-", "\u2212")} · contrast 2.0</span></div></figure>'
+            f'<figure class="v" data-src="{mark}-{tok}.jpg" '
+            f'data-label="{mark} \u00b7 EV {ev.replace("-", "\u2212")} \u00b7 contrast 2.0">'
+            f'<img src="{mark}-{tok}.jpg" alt="{mark} EV {ev}" loading="lazy">'
+            f'<figcaption><b>EV {ev.replace("-", "\u2212")}</b></figcaption></figure>'
             for ev, tok in evs)
 
         secs.append(f"""
@@ -129,7 +130,7 @@ def main():
   <h3 style="margin-top:20px">Exposure variants — real <span class="mono">--print-exposure</span> at <span class="mono">--sigmoid-contrast 2.0</span></h3>
   <p class="meta">The full frame above is the <b>shipped</b> contrast 1.0; these are contrast 2.0
      (the datasheet-derived ≈2.07), which restores a black reference so exposure becomes judgeable.
-     Which one reads as correctly exposed? <b>Hover any variant</b> for a full-size view.</p>
+     Which one reads as correctly exposed? <b>Click any variant</b> for a full-size view; then use \u2039 / \u203a or the arrow keys to step through the row. Click the backdrop or press Esc to close.</p>
   <div class="variants">{variants}</div>
   <div class="qs">
     <h3>Questions for {mark}</h3>
@@ -172,12 +173,18 @@ section {{ border-top: 1px solid #2a2e36; padding: 22px 0; }}
 figure {{ margin: 0; }}
 .crop {{ aspect-ratio: 328 / 342; outline: 2.5px solid; outline-offset: -2.5px; border-radius: 4px; }}
 figcaption {{ font-size: 12px; margin-top: 6px; color: #c7ccd3; }}
-figure.v {{ position: relative; }}
-.zoom {{ position: fixed; inset: 0; z-index: 60; display: none; align-content: center;
-         justify-items: center; background: rgba(8,9,11,.94); pointer-events: none; }}
-figure.v:hover .zoom {{ display: grid; }}
-.zoom img {{ max-width: 96vw; max-height: 90vh; width: auto; height: auto; border-radius: 4px; }}
-.zoom span {{ margin-top: 10px; font: 600 14px/1 ui-monospace, Menlo, monospace; color: #e8e8ea; }}
+figure.v {{ cursor: zoom-in; }}
+#lb {{ position: fixed; inset: 0; z-index: 80; display: grid; align-content: center;
+       justify-items: center; background: rgba(8,9,11,.95); }}
+#lb[hidden] {{ display: none; }}
+#lbImg {{ max-width: 88vw; max-height: 84vh; width: auto; height: auto; border-radius: 4px; }}
+#lbLabel {{ margin-top: 12px; font: 600 15px/1 ui-monospace, Menlo, monospace; color: #e8e8ea; }}
+#lbHint {{ margin-top: 6px; font-size: 12.5px; color: #9aa0a8; }}
+#lb button {{ position: fixed; top: 50%; transform: translateY(-50%); font-size: 30px;
+              line-height: 1; padding: 14px 20px; border: 0; border-radius: 8px; cursor: pointer;
+              background: rgba(255,255,255,.14); color: #fff; }}
+#lb button:hover {{ background: rgba(255,255,255,.26); }}
+#lbPrev {{ left: 2vw; }} #lbNext {{ right: 2vw; }}
 .variants {{ display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; }}
 .variants img {{ width: 100%; height: auto; border-radius: 5px; display: block; }}
 figure.v figcaption {{ text-align: center; font-size: 12.5px; margin-top: 5px; }}
@@ -223,6 +230,54 @@ manufacturer's published Δ (0.36; 0.40 for Gold 200). The Δ column below curre
 100% — the measured headroom that the plan's leading hypothesis predicts.</p>
 
 {''.join(secs)}
+
+<div id="lb" hidden>
+  <button id="lbPrev" type="button" aria-label="previous">&lsaquo;</button>
+  <img id="lbImg" alt="">
+  <div id="lbLabel"></div>
+  <div id="lbHint">&lsaquo; &rsaquo; or arrow keys \u00b7 Esc / click backdrop to close</div>
+  <button id="lbNext" type="button" aria-label="next">&rsaquo;</button>
+</div>
+<script>
+(function () {{
+  var lb = document.getElementById('lb'), img = document.getElementById('lbImg'),
+      label = document.getElementById('lbLabel');
+  var row = [], i = 0;
+
+  function show(n) {{
+    // Wrap around: the row is a closed set of exposures, so stepping past either end
+    // returning to the other is less jarring than a dead button.
+    i = (n + row.length) % row.length;
+    var f = row[i];
+    img.src = f.dataset.src;
+    label.textContent = f.dataset.label;
+  }}
+  function open(fig) {{
+    row = Array.prototype.slice.call(fig.closest('.variants').querySelectorAll('figure.v'));
+    show(row.indexOf(fig));
+    lb.hidden = false;
+  }}
+  function close() {{ lb.hidden = true; img.removeAttribute('src'); row = []; }}
+
+  document.addEventListener('click', function (e) {{
+    var fig = e.target.closest ? e.target.closest('figure.v') : null;
+    if (fig) {{ open(fig); return; }}
+    if (lb.hidden) return;
+    // Buttons must not fall through to the backdrop-dismiss below.
+    if (e.target.id === 'lbPrev') {{ show(i - 1); return; }}
+    if (e.target.id === 'lbNext') {{ show(i + 1); return; }}
+    // Anything else inside the overlay dismisses — backdrop, image, label, hint. Only the
+    // two buttons are excluded, above, so a mis-aimed click closes rather than doing nothing.
+    if (lb.contains(e.target)) close();
+  }});
+  document.addEventListener('keydown', function (e) {{
+    if (lb.hidden) return;
+    if (e.key === 'Escape') close();
+    else if (e.key === 'ArrowLeft') show(i - 1);
+    else if (e.key === 'ArrowRight') show(i + 1);
+  }});
+}})();
+</script>
 """, encoding="utf-8")
     print(f"wrote {OUT} ({len(frames)} frames)")
 
