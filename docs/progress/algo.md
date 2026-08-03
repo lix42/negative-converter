@@ -1251,3 +1251,15 @@ What other epics need to know about `algo`:
   detail: the three frames whose Δ lands nearest 0.36 (0.303, 0.347, 0.435) are the ones
   whose mid-tone sits at 37–46 % of Dmax, i.e. the normally-exposed-looking ones. Δ is
   printed labelled "orientation only, NOT Check A".
+- 2026-08-02 (Phase 1 review aid): added `scripts/sigmoid-baseline/patch-review.sh` +
+  `build_patch_review.py`, which turn the `propose_patches` output into a reviewable HTML
+  page — each `real` frame rendered as a positive with the candidate rectangles drawn on
+  it, a magnified crop per box, and per-frame questions keyed to a stable mark (G1–G3,
+  E1–E3, P1–P4) so a later discussion can name one box. Crops are pure CSS
+  `background-position` off the single per-frame JPEG, so no crop files are generated.
+- Deliberate choices there: previews render through **`--density-curve sigmoid`**, both
+  because it is the curve under investigation and because the frozen *exponential* recipe
+  clips ~10.3% of samples — blown highlights would defeat the "is this a diffuse white?"
+  judgement the page asks for. Output goes to `../temp/patch-review` (throwaway), never
+  into `../nc-assets` or the repo, and it is **not** published as an Artifact: these are
+  the user's personal photographs and publishing would upload them to an external host.
