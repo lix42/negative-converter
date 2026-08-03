@@ -50,9 +50,21 @@ P4|Portra160-2026-07-22|Portra160-2026-07-22|20260723-nikon-1127.tif
 ROWS
 )
 
-# `--density-curve sigmoid` deliberately: it is the curve under investigation, and its
-# shoulder avoids the ~10% highlight clipping the frozen exponential recipe produces —
-# clipped highlights would defeat the "is this a diffuse white?" judgement the page asks.
+# `--density-curve sigmoid` deliberately: it is the curve under investigation.
+#
+# `--output-preset ultra-hdr-v1` is also deliberate, and it corrects an earlier mistake.
+# Previews used to come from the *legacy* path (reconstruct -> finish_print ->
+# color::to_output), but the acceptance bounds are measured on `pipeline::sdr::render` —
+# different code, with a Hermite shoulder and radial gamut mapping instead of legacy's
+# linear-space soft clip. Reviewing one renderer while measuring another is not a fair
+# test. This preset's JPEG *base* IS the `pipeline::sdr` rendition, so the page now shows
+# what gets measured. It also fixes a wrong finding: the legacy path clipped 7-26% at
+# +EV, while this path reports clipped_high 0 at contrast 2.0 / EV +1.5.
+#
+# The gain map is dropped by the `sips` downscale, which is fine — these thumbnails are
+# for SDR review. The Display P3 profile survives (verified: red matrix column 0.51512).
+# Full-size HDR review is deferred until every candidate config is renderable, so the
+# comparison can be made across all of them at once rather than on this one.
 #
 # White balance is left NEUTRAL (as the frozen recipe has it) even though these frames
 # carry a visible blue cast. Auto-WB would be a *frame-local* operation, and the point of
@@ -61,15 +73,16 @@ ROWS
 echo "rendering previews -> $OUT"
 while IFS='|' read -r mark roll stem frame; do
   [ -n "$mark" ] || continue
-  if "$NC" convert "$A/rolls/$roll/$frame" -o "$TMP/$mark.tif" \
-        --params "$REC/$stem.json" --density-curve sigmoid >/dev/null 2>&1 \
-     && sips -Z 3000 -s format jpeg -s formatOptions 90 "$TMP/$mark.tif" \
+  if "$NC" convert "$A/rolls/$roll/$frame" -o "$TMP/$mark.src.jpg" \
+        --params "$REC/$stem.json" --density-curve sigmoid \
+        --output-preset ultra-hdr-v1 >/dev/null 2>&1 \
+     && sips -Z 3000 -s format jpeg -s formatOptions 90 "$TMP/$mark.src.jpg" \
         --out "$OUT/$mark.jpg" >/dev/null 2>&1; then
     echo "  $mark  $frame"
   else
     echo "  $mark  $frame  FAILED" >&2
   fi
-  rm -f "$TMP/$mark.tif" "$TMP/$mark.tif.json"
+  rm -f "$TMP/$mark.src.jpg" "$TMP/$mark.src.jpg.json"
 done <<<"$FRAMES"
 
 # Exposure variants, for judging under/over.
@@ -96,13 +109,14 @@ while IFS='|' read -r mark roll stem frame; do
   [ -n "$mark" ] || continue
   for pair in $EVS; do
     ev=${pair%%:*}; tok=${pair##*:}
-    "$NC" convert "$A/rolls/$roll/$frame" -o "$TMP/v.tif" \
+    "$NC" convert "$A/rolls/$roll/$frame" -o "$TMP/v.jpg" \
        --params "$REC/$stem.json" --density-curve sigmoid \
-       --sigmoid-contrast 2.0 --print-exposure="$ev" >/dev/null 2>&1 \
-    && sips -Z 1600 -s format jpeg -s formatOptions 85 "$TMP/v.tif" \
+       --sigmoid-contrast 2.0 --print-exposure="$ev" \
+       --output-preset ultra-hdr-v1 >/dev/null 2>&1 \
+    && sips -Z 1600 -s format jpeg -s formatOptions 85 "$TMP/v.jpg" \
        --out "$OUT/$mark-$tok.jpg" >/dev/null 2>&1 \
     || echo "  $mark EV $ev FAILED" >&2
-    rm -f "$TMP/v.tif" "$TMP/v.tif.json"
+    rm -f "$TMP/v.jpg" "$TMP/v.jpg.json"
   done
   echo "  $mark  $(echo $EVS | wc -w | tr -d ' ') variants"
 done <<<"$FRAMES"

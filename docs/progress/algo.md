@@ -1393,3 +1393,24 @@ What other epics need to know about `algo`:
     which needs a spectrally *neutral* surface — strongly blue sky has very unequal
     per-channel densities, and sky luminance varies with angle to the sun and haze.
   - P1's blue cast: agreed out of scope. The frozen recipe uses neutral WB deliberately.
+- 2026-08-03 (**review path corrected — previews now come from the measured renderer**):
+  the user asked whether the review JPEGs carry HDR. They do not (8-bit, sRGB, no gain map)
+  — but the question exposed a worse problem: previews came from the **legacy** path
+  (`reconstruct → finish_print → color::to_output`) while the acceptance bounds are measured
+  on `pipeline::sdr::render`, which is different code (Hermite shoulder + radial gamut
+  mapping vs legacy's linear-space soft clip). Reviewing one renderer while measuring
+  another is not a fair test. Previews now render with `--output-preset ultra-hdr-v1`,
+  whose JPEG **base is** the `pipeline::sdr` rendition, so the page shows what gets
+  measured. Display P3 survives the `sips` downscale (verified: red matrix column 0.51512 /
+  0.2412 / −0.00105); the gain map is dropped, which is correct for SDR thumbnails.
+  - **Correction to a previously reported finding.** "Exposure is the wrong knob because it
+    costs 7–26 % blown highlights" was measured on the **legacy** path only. On the display
+    path, contrast 2.0 at EV +1.5 reports `clipped_high: 0`. The clipping argument does not
+    transfer. What survives is the *exposure deficit* itself (midtones 2.5–3.6 stops too
+    dark), which is density arithmetic and path-independent.
+  - HDR review deferred by user decision: "we are just at the first one at our all
+    comparison, and this white-pinned one is even not the one with highest expectation."
+    Full-size gain-map files for the mixed-range frames (G3, P3) come once every candidate
+    config is renderable, so the HDR question can be judged across all of them at once.
+    Constraint to remember: `sips` cannot downscale a gain-map JPEG without destroying the
+    gain map, so HDR review needs full-size (~6.5 MB) files.
