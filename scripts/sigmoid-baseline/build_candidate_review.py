@@ -71,7 +71,8 @@ def page(fx, out):
             a = "auto (measured)" if anchor == "auto" else f"{anchor:.4f}"
             badge = "" if de else '<span class="tag">explicit-mode only</span>'
             tiles.append(
-                f'<figure class="v" data-src="{mk}-{cid}.jpg" data-label="{mk} · {lbl}">'
+                f'<figure class="v" data-src="{mk}-{cid}.jpg" data-key="{mk}-{cid}" '
+                f'data-form="{lbl}">'
                 f'<img src="{mk}-{cid}.jpg" alt="{mk} {cid}" loading="lazy">'
                 f'<figcaption><b>{lbl}</b>{badge}<br>'
                 f'<span class="mono">anchor {a} · contrast {contrast:.3f}</span><br>'
@@ -115,14 +116,14 @@ figcaption {{ font-size:12px; margin-top:6px; color:#c7ccd3; }}
 #lb[hidden] {{ display:none; }}
 #lbImg {{ max-width:88vw; max-height:84vh; border-radius:4px; }}
 #lbLabel {{ margin-top:12px; font:600 15px/1 ui-monospace,Menlo,monospace; }}
-#lbHint {{ margin-top:6px; font-size:12.5px; color:#9aa0a8; }}
+#lbHint {{ margin-top:6px; font:15px/1.4 system-ui,sans-serif; color:#c7ccd3; }}
 #lb button {{ position:fixed; top:50%; transform:translateY(-50%); font-size:30px;
               padding:14px 20px; border:0; border-radius:8px; cursor:pointer;
               background:rgba(255,255,255,.14); color:#fff; }}
 #lbPrev {{ left:2vw; }} #lbNext {{ right:2vw; }}
 .note-box {{ background:#1b1f26; border-radius:6px; padding:12px 16px; font-size:13.5px; }}
 @media (prefers-color-scheme: light) {{
-  body {{ background:#fff; color:#16181d; }} section,{{ border-color:#e3e6ea; }}
+  body {{ background:#fff; color:#16181d; }} section {{ border-color:#e3e6ea; }}
   .note-box {{ background:#f5f7f9; }} .meta,.note {{ color:#5d646d; }}
   figcaption {{ color:#3c424a; }}
 }}
@@ -149,7 +150,7 @@ shipped default: judge whether its blacks are the defect you originally reported
   <button id="lbPrev" type="button" aria-label="previous">&lsaquo;</button>
   <img id="lbImg" alt="">
   <div id="lbLabel"></div>
-  <div id="lbHint">&lsaquo; &rsaquo; or arrow keys · Esc / click backdrop to close</div>
+  <div id="lbHint"></div>
   <button id="lbNext" type="button" aria-label="next">&rsaquo;</button>
 </div>
 <script>
@@ -157,7 +158,8 @@ shipped default: judge whether its blacks are the defect you originally reported
   var lb=document.getElementById('lb'), img=document.getElementById('lbImg'),
       label=document.getElementById('lbLabel'), row=[], i=0;
   function show(n) {{ i=(n+row.length)%row.length; var f=row[i];
-    img.src=f.dataset.src; label.textContent=f.dataset.label; }}
+    img.src=f.dataset.src; label.textContent=f.dataset.key;
+    document.getElementById('lbHint').textContent=f.dataset.form; }}
   function open(fig) {{ row=Array.prototype.slice.call(
       fig.closest('.grid').querySelectorAll('figure.v')); show(row.indexOf(fig)); lb.hidden=false; }}
   function close() {{ lb.hidden=true; img.removeAttribute('src'); row=[]; }}
