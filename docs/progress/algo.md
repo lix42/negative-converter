@@ -1414,3 +1414,31 @@ What other epics need to know about `algo`:
     config is renderable, so the HDR question can be judged across all of them at once.
     Constraint to remember: `sips` cannot downscale a gain-map JPEG without destroying the
     gain map, so HDR review needs full-size (~6.5 MB) files.
+- 2026-08-03 (**first uncensored exposure comparison — reference-driven anchor beats
+  content-driven**). Round-3 EV preferences on the corrected display path, extended range
+  −1…+3.5 with no answer at the boundary: E1 +1.5, E2 +1, E3 +1.5, G1 +2.5, G2 +1.5,
+  G3 mixed (sky +0 / tree +2), P1 +2.5, P2 +2.5, P3 +1.5 (people) / +0 (window), P4 +2.5.
+- Two candidate anchors were scored against those preferences, expressing each as the
+  equivalent `--print-exposure` at contrast 2.0 (`EV = c·(Dmax − W)/log10 2`):
+
+  | | mean \|diff\| | median |
+  |---|---|---|
+  | **A** content-driven — pin the *measured* brightest diffuse patch | 0.96 EV | 0.59 |
+  | **B** reference-driven — pin the *datasheet* diffuse-white-above-base | **0.63 EV** | 0.58 |
+
+- **B wins, and its residuals are per-stock systematic rather than random:** Ektar ≈ +0.6
+  throughout, Portra 160 ≈ 0 (P1/P2/P4 all within **0.16 EV** — one constant predicting
+  three different scenes to a sixth of a stop), Gold 200 ≈ −1.0. A constant per-stock
+  offset is exactly the signature expected if each stock's derived white is off by a fixed
+  amount — which is anticipated, since they rest on the **provisional chart-read `D-min`**
+  values PR #68 flagged as not true Status M densities. The *form* is supported; the
+  constants are the uncertain part. (Correcting each stock by its mean residual would fit
+  within ~0.3 EV everywhere, but that is fitting, not prediction, so it is not validation.)
+- **This favours the shippable candidate over the diagnostic one.** A is config 4/7 —
+  frame-local content adaptation, forbidden for the default — while B is config 8, which is
+  content-free and default-eligible. A's failures are also explained by that: it stretches
+  whatever the brightest diffuse patch happens to be up to 1.0, so a frame containing no
+  true white (P2 fog, P4 sign, E2 specular leaves) is forced too bright. Frame-local
+  fitting misbehaving exactly as the plan predicted.
+- **G3 and P3 are unresolvable by any single global curve** (sky +0 vs trees +2; window +0
+  vs people +1.5) — their scene range exceeds SDR. That is the HDR question, deferred.
