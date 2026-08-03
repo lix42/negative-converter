@@ -99,7 +99,7 @@ while IFS='|' read -r mark roll stem frame; do
     "$NC" convert "$A/rolls/$roll/$frame" -o "$TMP/v.tif" \
        --params "$REC/$stem.json" --density-curve sigmoid \
        --sigmoid-contrast 2.0 --print-exposure="$ev" >/dev/null 2>&1 \
-    && sips -Z 1000 -s format jpeg -s formatOptions 82 "$TMP/v.tif" \
+    && sips -Z 1600 -s format jpeg -s formatOptions 85 "$TMP/v.tif" \
        --out "$OUT/$mark-$tok.jpg" >/dev/null 2>&1 \
     || echo "  $mark EV $ev FAILED" >&2
     rm -f "$TMP/v.tif" "$TMP/v.tif.json"

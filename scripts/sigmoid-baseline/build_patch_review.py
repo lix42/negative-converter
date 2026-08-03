@@ -110,9 +110,14 @@ def main():
         # which is itself a finding: exposure is the wrong knob for a raised floor.
         evs = [("-2", "m20"), ("-1.5", "m15"), ("-1", "m10"), ("-0.5", "m05"),
                ("0", "p00"), ("+0.5", "p05x"), ("+1", "p10x"), ("+1.5", "p15x")]
+        # Hover shows the same file at natural size in a fixed overlay. Same `src`, so
+        # the browser serves it from cache — no second download — and the thumbnail grid
+        # stays scannable while detail is one hover away.
         variants = "".join(
             f'<figure class="v"><img src="{mark}-{tok}.jpg" alt="{mark} EV {ev}" loading="lazy">'
-            f'<figcaption><b>EV {ev.replace("-", "\u2212")}</b></figcaption></figure>'
+            f'<figcaption><b>EV {ev.replace("-", "\u2212")}</b></figcaption>'
+            f'<div class="zoom"><img src="{mark}-{tok}.jpg" alt=""><span>{mark} · EV '
+            f'{ev.replace("-", "\u2212")} · contrast 2.0</span></div></figure>'
             for ev, tok in evs)
 
         secs.append(f"""
@@ -124,16 +129,8 @@ def main():
   <h3 style="margin-top:20px">Exposure variants — real <span class="mono">--print-exposure</span> at <span class="mono">--sigmoid-contrast 2.0</span></h3>
   <p class="meta">The full frame above is the <b>shipped</b> contrast 1.0; these are contrast 2.0
      (the datasheet-derived ≈2.07), which restores a black reference so exposure becomes judgeable.
-     Which one reads as correctly exposed?</p>
+     Which one reads as correctly exposed? <b>Hover any variant</b> for a full-size view.</p>
   <div class="variants">{variants}</div>
-  <div class="slider">
-    <label>Free-form eyeball (non-photometric, does <b>not</b> map to a pipeline knob):
-      brightness <input type="range" min="0.4" max="2.2" step="0.05" value="1"
-        oninput="this.closest('section').querySelectorAll('.variants img,.full img').forEach(i=>{{i.dataset.b=this.value;i.style.filter='brightness('+this.value+') contrast('+(i.dataset.c||1)+')'}});this.nextElementSibling.textContent=(+this.value).toFixed(2)"><output>1.00</output>
-      &nbsp; contrast <input type="range" min="0.6" max="2.4" step="0.05" value="1"
-        oninput="this.closest('section').querySelectorAll('.variants img,.full img').forEach(i=>{{i.dataset.c=this.value;i.style.filter='brightness('+(i.dataset.b||1)+') contrast('+this.value+')'}});this.nextElementSibling.textContent=(+this.value).toFixed(2)"><output>1.00</output>
-    </label>
-  </div>
   <div class="qs">
     <h3>Questions for {mark}</h3>
     <ol>
@@ -175,12 +172,15 @@ section {{ border-top: 1px solid #2a2e36; padding: 22px 0; }}
 figure {{ margin: 0; }}
 .crop {{ aspect-ratio: 328 / 342; outline: 2.5px solid; outline-offset: -2.5px; border-radius: 4px; }}
 figcaption {{ font-size: 12px; margin-top: 6px; color: #c7ccd3; }}
+figure.v {{ position: relative; }}
+.zoom {{ position: fixed; inset: 0; z-index: 60; display: none; align-content: center;
+         justify-items: center; background: rgba(8,9,11,.94); pointer-events: none; }}
+figure.v:hover .zoom {{ display: grid; }}
+.zoom img {{ max-width: 96vw; max-height: 90vh; width: auto; height: auto; border-radius: 4px; }}
+.zoom span {{ margin-top: 10px; font: 600 14px/1 ui-monospace, Menlo, monospace; color: #e8e8ea; }}
 .variants {{ display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; }}
 .variants img {{ width: 100%; height: auto; border-radius: 5px; display: block; }}
 figure.v figcaption {{ text-align: center; font-size: 12.5px; margin-top: 5px; }}
-.slider {{ margin-top: 12px; font-size: 13px; color: #9aa0a8; }}
-.slider input {{ vertical-align: middle; width: 150px; }}
-.slider output {{ font-family: ui-monospace, monospace; font-size: 12px; }}
 @media (max-width: 720px) {{ .variants {{ grid-template-columns: repeat(2, 1fr); }} }}
 .qs {{ margin-top: 18px; background: #1b1f26; border-left: 3px solid #2d6cdf;
        padding: 12px 16px; border-radius: 0 6px 6px 0; }}

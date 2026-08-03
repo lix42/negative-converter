@@ -1333,3 +1333,9 @@ What other epics need to know about `algo`:
     user's own point that a grey card in frame (not merely more frames) is what is needed.
   - User asks the tool be kept and reused for config comparison beyond this task; `EVS`
     and `NC_TILES` are the first steps toward that.
+- 2026-08-03 (review-page tweaks, user request): removed the CSS brightness/contrast
+  sliders (unused — and they were non-photometric anyway, so nothing is lost), and added a
+  **hover zoom** on the EV variants: hovering a thumbnail shows the same file full-size in
+  a fixed overlay labelled with its mark and EV. Same `src`, so it is served from cache
+  rather than downloaded twice. Variant renders bumped 1000 → 1600 px so the zoom actually
+  resolves detail (~45 MB total in `../temp`, throwaway).
