@@ -1442,3 +1442,32 @@ What other epics need to know about `algo`:
   fitting misbehaving exactly as the plan predicted.
 - **G3 and P3 are unresolvable by any single global curve** (sky +0 vs trees +2; window +0
   vs people +1.5) — their scene range exceeds SDR. That is the HDR question, deferred.
+- 2026-08-03 (**scope reduced by the user: filter methods, do not tune parameters**).
+  - **Bias identified in my measurement design:** asking for a preferred EV frame by frame
+    *is* per-frame optimisation, which contradicts being honest to the film. Quantified —
+    the user's preferences have stdev 0.57 EV with a **within-stock spread of 0.5–1.0 EV**,
+    and that within-stock part is what a fixed anchor cannot follow and must not chase:
+    some is real exposure variation in the negatives (which the task requires *preserving*)
+    and the rest is judgement noise. For comparison, candidate A's own frame-to-frame swing
+    is 1.43 EV across 8 distinct values — it adapts *more* than the human — while B's is
+    0.54 EV across 3 values, one per stock.
+  - **Correct use of the data is the central tendency, not the per-frame values.** Median
+    preference is +1.5 EV at contrast 2.0 = white pinned **0.452 density below Dmax**, close
+    to the median *measured* diffuse-white gap of 0.417 — two independent routes to
+    ~0.42–0.45. Candidates will no longer be scored frame-by-frame against preference. Note
+    an offset stated relative to Dmax inherits Dmax's unreliability; config 8's Dmin
+    reference does not.
+  - **Revised goal:** (1) do not seek the optimal parameter — contrast ≈2 ≫ 1.0 suffices,
+    2.21 vs 2.22 is out of scope; (2) filter which anchoring forms deserve support, with
+    **no requirement to pick a single winner** — closer to the task file's "choose the least
+    invasive remedy" than a parameter hunt; (3) parameter tuning moves to a follow-up task
+    once higher-quality, deliberately correctly-exposed samples exist (the current ten were
+    picked at random).
+  - **Consequences:** acceptance bounds become **qualitative gates** (reaches a plausible
+    black; needs no per-frame correction; preserves exposure spacing; finite/continuous/
+    monotone; no clipping) rather than numeric thresholds — defensible at n = 10, which
+    thresholds never were. And the deliverable becomes a filtered candidate set plus a
+    *provisional* parameter; since `output/presets` activates whatever default this task
+    lands, it would ship a provisional value. Acceptable pre-release, and the seam is clean
+    (a later parameter change is a default change + conversion-version bump, not a change of
+    form) — recorded so it is a conscious decision rather than a surprise at activation.
