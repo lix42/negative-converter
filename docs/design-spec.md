@@ -1748,6 +1748,10 @@ does not:
   when a symlinked output points at another artifact's path, which the up-front collision
   check cannot see because it compares the paths as given). Each is exit 5 with a message
   naming the path and the reason.
+- **Hard links are reported, not refused.** An atomic replace necessarily breaks them — the
+  other names keep the previous file's bytes — and writing through the shared inode instead
+  *is* the non-atomic behaviour this removes. So a target with `nlink > 1` converts and emits
+  a warning (report + stderr, `--strict`-promotable) rather than failing or going quiet.
 - **Temp cleanup is narrower than that.** Ordinary error paths remove the staging file;
   a signal that kills the process does **not** run destructors, so `SIGINT`/`SIGKILL`
   can leave an inert `*.nctmp` beside the output. No signal handler or startup

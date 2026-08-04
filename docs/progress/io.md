@@ -805,6 +805,30 @@ obvious until something breaks:
     after 8 such runs every name it would try is taken. Temp tokens now mix in a
     per-process OS-seeded random value (`std::hash::RandomState`, no new dependency), so
     candidates are unpredictable and stale temps cannot accumulate into a wall.
+- **Round three: two more behaviours, and two of my own tests were environment-fragile.**
+  - **Hard links.** `File::create` truncated the shared inode so every alias saw the new
+    image; a rename leaves the other names on the old bytes (measured: nlink 2 → 1, alias
+    unchanged). This one **cannot** be fixed while keeping atomicity — writing through the
+    inode is exactly what was removed — so the choice was reject or report. It reports:
+    `commit_all` returns warnings, `run_convert` pushes them through the normal channel, and
+    `--strict` promotes them (verified exit 1). Refusing would reject a reasonable output
+    path to protect an alias the user may not care about.
+  - **A `..` in a dangling symlink defeated the duplicate check.** `PathBuf` equality is
+    lexical, so `latest.bin -> sub/../ir.bin` joins to a path that *is* `<dir>/ir.bin` but
+    does not compare equal to it. The synthesized path is now lexically normalized (purely
+    lexical on purpose — the referent does not exist, so `canonicalize` is unavailable;
+    wrong for symlinked *directories*, which is documented and fine for an aliasing
+    comparison). Fixing this also corrected `/..`, which POSIX collapses to `/` and my first
+    implementation kept.
+  - **My stale-temps test failed when run alone**, and for the exact reason it was meant to
+    disprove: it seeded litter with `temp_path_for`, occupying *this* process's next
+    candidates. It passed only because earlier tests had advanced the counter. Now it seeds
+    names with a foreign pid and foreign tokens, i.e. as another process would have left
+    them. **Lesson worth keeping: run each new test alone, not just the suite** — order
+    dependence hides exactly the failure the test exists to catch.
+  - **The read-only test cannot hold under root**, which containerized CI uses: uid 0
+    ignores the mode, so the probe legitimately succeeds. It now asks the filesystem whether
+    the target is really unwritable and skips with a message instead of asserting.
 - **The `SIGINT` cleanup claim was false and is now narrowed.** Destructors do not run when
   a signal kills the process, so `Drop` cannot remove the temp there. Final-path integrity
   still holds unconditionally (the final path is never opened for writing); *temp cleanup*
