@@ -444,6 +444,148 @@ fn ultra_hdr_v1_native_reconstruction_covers_odd_dimensions_and_hdr_vectors() {
     );
 }
 
+/// Every `*.nctmp` staging file left in `dir` — the litter check that must come back
+/// empty after any failure (`io/transactional-output-writes`).
+fn staging_temps(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("temp dir readable")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "nctmp"))
+        .collect()
+}
+
+#[test]
+fn a_failing_sidecar_write_leaves_no_primary_output() {
+    // The exact scenario the output-atomicity review reproduced: `encode` succeeds,
+    // `write_sidecar` fails, and the run used to exit 5 leaving a *complete* primary
+    // TIFF with no sidecar beside it. Injected portably by putting a directory where
+    // the sidecar file has to go — a write there cannot succeed on any platform.
+    let tmp = TempDir::new("sidecar-fails");
+    let out = tmp.path("out.tiff");
+    std::fs::create_dir(sidecar_of(&out)).expect("occupy the sidecar path");
+
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_ne!(code, 0, "a sidecar write failure must fail the run: {err}");
+    assert!(
+        !out.exists(),
+        "the primary output must not exist when a later artifact failed —          this is the orphaned-TIFF regression"
+    );
+    assert!(
+        staging_temps(&tmp.0).is_empty(),
+        "a failed run must not leave staging temps: {:?}",
+        staging_temps(&tmp.0)
+    );
+}
+
+#[test]
+fn a_failing_ir_export_leaves_no_primary_output() {
+    // IR is staged before the primary, so its failure must abort the whole set. The
+    // ordering trick that used to provide this (export IR first) only ever helped
+    // because IR came first; now it holds because nothing is committed until all
+    // three artifacts exist.
+    let tmp = TempDir::new("ir-fails");
+    let out = tmp.path("out.tiff");
+    let ir = tmp.path("ir.tiff");
+    std::fs::create_dir(&ir).expect("occupy the IR path");
+
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--export-ir",
+        ir.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_ne!(code, 0, "a failing IR export must fail the run: {err}");
+    assert!(
+        !out.exists(),
+        "no primary output for an aborted artifact set"
+    );
+    assert!(
+        !sidecar_of(&out).exists(),
+        "and no sidecar either — the set is committed together"
+    );
+    assert!(
+        staging_temps(&tmp.0).is_empty(),
+        "no staging temps survive: {:?}",
+        staging_temps(&tmp.0)
+    );
+}
+
+#[test]
+fn an_interrupted_overwrite_leaves_the_previous_output_intact() {
+    // The decided contract is atomic *replace*: `nc` keeps overwriting its own
+    // output. What must never happen is a truncated new file where a valid old one
+    // was — so a run that fails after the primary is encoded must leave the previous
+    // bytes untouched, not a half-written TIFF.
+    let tmp = TempDir::new("overwrite");
+    let out = tmp.path("out.tiff");
+    let input = fixture("hdr-48bit.tif");
+    let args = [
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ];
+    let (code, _o, _e) = run(&args);
+    assert_eq!(code, 0, "first conversion should succeed");
+    let original = std::fs::read(&out).expect("first output readable");
+
+    // Now make the sidecar unwritable so the second run fails after encoding.
+    std::fs::remove_file(sidecar_of(&out)).expect("remove the first sidecar");
+    std::fs::create_dir(sidecar_of(&out)).expect("occupy the sidecar path");
+    let (code, _o, err) = run(&args);
+    assert_ne!(code, 0, "the second run must fail: {err}");
+    assert_eq!(
+        std::fs::read(&out).expect("previous output still readable"),
+        original,
+        "an interrupted overwrite must leave the OLD file intact, byte for byte"
+    );
+    assert!(staging_temps(&tmp.0).is_empty(), "no staging temps survive");
+}
+
+#[test]
+fn a_successful_run_leaves_no_staging_temps() {
+    // The success path's half of the litter check: every temp is consumed by its
+    // rename, so a normal conversion leaves exactly the artifacts and nothing else.
+    let tmp = TempDir::new("no-litter");
+    let out = tmp.path("out.tiff");
+    let ir = tmp.path("ir.tiff");
+    let report = tmp.path("report.json");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--export-ir",
+        ir.to_str().unwrap(),
+        "--report-file",
+        report.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0, "conversion should succeed: {err}");
+    for artifact in [&out, &ir, &report, &sidecar_of(&out)] {
+        assert!(artifact.exists(), "missing artifact {}", artifact.display());
+    }
+    assert!(
+        staging_temps(&tmp.0).is_empty(),
+        "a successful run must leave no temps: {:?}",
+        staging_temps(&tmp.0)
+    );
+}
+
 #[test]
 fn convert_simple_writes_tiff_sidecar_and_report() {
     let tmp = TempDir::new("simple");

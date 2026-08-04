@@ -1724,6 +1724,53 @@ false-positive on legitimate high-contrast conversions).
   changed preset/default pixels activate.
 
 ### Output / encode (current terminal stage; target stages 5–6)
+
+**How artifacts reach disk (`io/transactional-output-writes`).** Every file `nc`
+writes — the primary output, the IR export, the sidecar, `--dump-params`,
+`--report-file` — is written to a **same-directory temp**, flushed, **fsynced**, and
+only then renamed onto its final path. Two guarantees follow, and one deliberately
+does not:
+
+- **No truncated file ever appears at a final path.** The final path holds either the
+  previous content or nothing — unconditionally, including on `SIGINT`/`SIGKILL` and
+  power loss, because the final path is never opened for writing. Overwrite remains
+  **atomic replace**: `nc` keeps overwriting its own output rather than refusing, a
+  **symlinked** target is followed so the *referent* is replaced and the link survives,
+  and an existing file's **permissions are carried onto** the replacement so a `0600`
+  output does not silently widen to `0644` (mode only — not ACLs or xattrs). The staging
+  temp is created at the target's mode too, so a killed run cannot leave a wider-than-final
+  copy of the pixels behind.
+- **Three targets are refused rather than replaced**, because `rename` is more permissive
+  than the `File::create` it replaced: an existing **read-only** file (rename needs write
+  permission on the *directory*, so a deliberate `0400` output would otherwise be silently
+  overwritten), a **non-regular** file (FIFO, socket, device node — `create` opened those;
+  a rename destroys them), and **two artifacts that resolve to the same file** (possible
+  when a symlinked output points at another artifact's path, which the up-front collision
+  check cannot see because it compares the paths as given). Each is exit 5 with a message
+  naming the path and the reason.
+- **Temp cleanup is narrower than that.** Ordinary error paths remove the staging file;
+  a signal that kills the process does **not** run destructors, so `SIGINT`/`SIGKILL`
+  can leave an inert `*.nctmp` beside the output. No signal handler or startup
+  scavenging is installed, so the guarantee is stated for ordinary error paths only.
+- **One conversion's artifacts commit together.** The IR export, primary and sidecar
+  are all staged before any is renamed, so a failure in a later one leaves *no*
+  primary output — the "complete TIFF with no sidecar" case is gone. The renames are
+  pre-checked (a target occupied by a directory fails before anything is promoted) and
+  the **primary is renamed last**, because its presence is what reads as success.
+- **Not a multi-file transaction.** POSIX `rename` is atomic per *file*; a set cannot
+  be flipped as one unit. A crash between two renames, or a rename failure no cheap
+  check predicts, can still leave one final path updated and another not. This is
+  inherent and stated rather than papered over.
+
+`--dump-params` and `--report-file` are staged individually but *not* held back to
+join that set: the former is written before anything is decoded, and the latter must
+land even when `--strict` then fails the run (and under `roll` it is a roll-level
+artifact no single frame's set could hold). Telemetry is unchanged — after the
+finalized output, best-effort, never part of the set. Directory fsync (power-loss
+durability for the rename itself) is out of scope: the temp+rename pattern already
+covers a full disk, a permissions error, a crash and `SIGINT`, and the remaining gain
+would cost a Unix-only code path for output that is reproducible by re-running.
+
 - `-o, --output <path>` (required)
 - `--output-preset <legacy|film-master|ultra-hdr-v1>` — the atomic output
   **policy** choice;
@@ -2026,6 +2073,13 @@ recipe key, and the deprecated `--assume-linear` flag are **usage** errors, exit
 2; `--input-profile` (reserved, not applied) is unsupported, exit 4. `nc inspect`
 never fails on ambiguity — it reports the per-axis evidence so the file stays
 diagnosable.
+
+**Output write failures** map to exit **5**, and since
+`io/transactional-output-writes` that exit carries a stronger promise: no truncated
+artifact is left at a final path, and a failure while writing any of one conversion's
+artifacts leaves *no* primary output rather than an orphaned one (§9 Output/encode).
+A run that fails through an ordinary error path also leaves no `*.nctmp` staging files;
+a run killed by a signal may leave one, since destructors do not run then.
 
 **Memory preflight** (§9 Global, `--max-memory`) maps to exit **6**: before any
 input is decoded, every command that reads a scan estimates the run's peak
