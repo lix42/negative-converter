@@ -3276,7 +3276,12 @@ fn convert_frame(
     // path updated and another not. POSIX cannot fix that (rename is atomic per file,
     // not across a set). What can no longer happen: a truncated artifact at a final
     // path, or a complete primary output orphaned because a later step failed.
-    staged::commit_all(std::mem::take(&mut pending))?;
+    // Any facts the promotion surfaced (currently: a target with other hard links, whose
+    // aliases keep the old bytes because the replace is atomic) ride the normal warning
+    // channel, so they reach the report and `--strict` promotes them.
+    for note in staged::commit_all(std::mem::take(&mut pending))? {
+        push_warning_buf(warnings, log, note);
+    }
     // Logged only after the renames, so the message describes what is actually on
     // disk under that name rather than what was staged.
     if let Some(path) = &export_ir {
