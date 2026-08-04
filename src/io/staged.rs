@@ -273,10 +273,22 @@ fn create_exclusive(path: &Path, _mode: Option<u32>) -> std::io::Result<File> {
 /// fallback for when even the parent cannot be resolved.
 fn alias_key(target: &Path) -> PathBuf {
     match (target.parent(), target.file_name()) {
-        (Some(parent), Some(name)) => match fs::canonicalize(parent) {
-            Ok(dir) => dir.join(name),
-            Err(_) => lexically_normalize(target),
-        },
+        (Some(parent), Some(name)) => {
+            // `Path::new("ir.tiff").parent()` is `Some("")`, not `None`, and
+            // `canonicalize("")` fails — which would drop a bare relative target to the
+            // lexical fallback and leave it as `ir.tiff`, unable to match the same file
+            // spelled absolutely. Treat an empty parent as the cwd, as `cli`'s own
+            // collision key already does.
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            match fs::canonicalize(parent) {
+                Ok(dir) => dir.join(name),
+                Err(_) => lexically_normalize(target),
+            }
+        }
         _ => lexically_normalize(target),
     }
 }
@@ -1096,6 +1108,31 @@ mod tests {
         let notes = stage_bytes(&target, b"new").unwrap().commit().unwrap();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("hard links"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn the_alias_key_matches_a_bare_relative_name_against_its_absolute_spelling() {
+        // `Path::new("f").parent()` is `Some("")`, and `canonicalize("")` fails — so without
+        // treating an empty parent as the cwd, a bare relative target keeps a relative key
+        // and cannot match the same file spelled absolutely. `resolve_target` produces
+        // exactly such a path for a dangling link pointing at a bare name.
+        //
+        // Deliberately does NOT change the process cwd: that is global state, and mutating it
+        // from a test would race every other test in the binary. Comparing against
+        // `current_dir().join(..)` exercises the same code path safely.
+        let cwd = std::env::current_dir().unwrap();
+        let name = "alias-probe.bin";
+        let absolute = alias_key(&cwd.join(name));
+        assert_eq!(
+            alias_key(Path::new(name)),
+            absolute,
+            "a bare relative name must key as the cwd's entry"
+        );
+        assert_eq!(
+            alias_key(&Path::new(".").join(name)),
+            absolute,
+            "and so must the `./` spelling"
+        );
     }
 
     #[test]
