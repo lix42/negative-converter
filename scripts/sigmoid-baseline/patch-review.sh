@@ -33,6 +33,12 @@ done
 [ -f "$RAW" ] || { echo "error: no such propose output: $RAW" >&2; exit 2; }
 
 mkdir -p "$OUT"
+# Clear previous renders before writing new ones. Reusing the directory silently mixes
+# generations: a render that fails this run leaves the PREVIOUS run's JPEG in place, and
+# the page then looks complete while showing stale pixels — the worst failure mode for a
+# review page, because it is invisible.
+rm -f "$OUT"/*.jpg
+fail=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 # mark | roll | recipe stem | frame
@@ -81,6 +87,7 @@ while IFS='|' read -r mark roll stem frame; do
     echo "  $mark  $frame"
   else
     echo "  $mark  $frame  FAILED" >&2
+    fail=$((fail+1))
   fi
   rm -f "$TMP/$mark.src.jpg" "$TMP/$mark.src.jpg.json"
 done <<<"$FRAMES"
@@ -99,11 +106,18 @@ done <<<"$FRAMES"
 # the row doubles as a preview of the leading remedy. The full-frame image above each row
 # stays at the shipped contrast 1.0, giving a direct contrast comparison.
 #
-# The sweep is TWO-SIDED. A downward-only range was a measurement error: every frame
-# picked EV 0, the boundary, which means the optimum sat at or beyond it. Upward variants
-# clip 7-26% of highlights at contrast 2.0 -- itself a finding, since it shows exposure is
-# the wrong knob for a raised floor. Override the set with EVS="<ev>:<token> ...".
-EVS=${EVS:-"-2:m20 -1.5:m15 -1:m10 -0.5:m05 0:p00 0.5:p05x 1:p10x 1.5:p15x"}
+# The sweep is TWO-SIDED, and its ceiling has been raised TWICE for the same reason: a
+# range whose boundary gets picked has not bracketed the optimum, it has hidden it. First
+# -2..0 (every frame picked 0), then -2..+1.5 (four frames -- G1, P1, P2, P4 -- picked the
+# +2.5 that only a custom EVS could reach). The default now runs to +3 so the committed
+# fixture preferences are reproducible from the documented command with no EVS override.
+# Override the set with EVS="<ev>:<token> ...".
+#
+# (An earlier note here claimed upward variants "clip 7-26% of highlights at contrast 2.0".
+# That was measured on the LEGACY render path before this script moved to
+# --output-preset ultra-hdr-v1; the display path's shoulder does not clip, so the figure
+# does not describe what this script now produces.)
+EVS=${EVS:-"-2:m20 -1.5:m15 -1:m10 -0.5:m05 0:p00 0.5:p05x 1:p10x 1.5:p15x 2:p20x 2.5:p25x 3:p30x"}
 echo "rendering exposure variants (contrast 2.0)"
 while IFS='|' read -r mark roll stem frame; do
   [ -n "$mark" ] || continue
@@ -115,7 +129,7 @@ while IFS='|' read -r mark roll stem frame; do
        --output-preset ultra-hdr-v1 >/dev/null 2>&1 \
     && sips -Z 1600 -s format jpeg -s formatOptions 85 "$TMP/v.jpg" \
        --out "$OUT/$mark-$tok.jpg" >/dev/null 2>&1 \
-    || echo "  $mark EV $ev FAILED" >&2
+    || { echo "  $mark EV $ev FAILED" >&2; fail=$((fail+1)); }
     rm -f "$TMP/v.jpg" "$TMP/v.jpg.json"
   done
   echo "  $mark  $(echo $EVS | wc -w | tr -d ' ') variants"
@@ -124,3 +138,6 @@ done <<<"$FRAMES"
 EVS="$EVS" python3 "$HERE/build_patch_review.py" "$RAW" "$OUT/index.html"
 echo
 echo "open: file://$(cd "$OUT" && pwd -P)/index.html"
+# The page is still built on failure — a partial page is useful — but the exit status must
+# say so, or a scripted caller reads "review ready" from an incomplete comparison.
+[ "$fail" -eq 0 ] || { echo "$fail render(s) failed — page is incomplete" >&2; exit 1; }

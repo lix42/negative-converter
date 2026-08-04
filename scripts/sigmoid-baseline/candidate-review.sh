@@ -30,6 +30,9 @@ STUDY=${STUDY:-}
 for t in sips python3; do command -v "$t" >/dev/null || { echo "error: $t missing" >&2; exit 2; }; done
 [ -x "$NC" ] || { echo "error: no $NC — run 'cargo build --release'" >&2; exit 2; }
 mkdir -p "$OUT"
+# Clear previous renders first — see patch-review.sh: a reused directory lets a failed
+# render show the previous generation's image while the page looks complete.
+rm -f "$OUT"/*.jpg
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
 PLAN="$TMP/plan.txt"
@@ -53,7 +56,10 @@ while IFS='|' read -r mark cid anchor contrast shoulder roll recipe file; do
   fi
   rm -f "$TMP/v.jpg" "$TMP/v.jpg.json"
 done < "$PLAN"
-echo; [ "$fail" -eq 0 ] || echo "$fail render(s) failed" >&2
+echo
 
 python3 "$HERE/build_candidate_review.py" --page "$FX" "$OUT/index.html" $STUDY || exit 2
 echo "open: file://$(cd "$OUT" && pwd -P)/index.html"
+# Build the page even when renders failed (a partial comparison is still useful), but exit
+# non-zero so a caller cannot read success from a page with missing tiles.
+[ "$fail" -eq 0 ] || { echo "$fail render(s) failed — page is incomplete" >&2; exit 1; }

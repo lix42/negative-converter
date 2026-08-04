@@ -47,15 +47,32 @@ contrast, since `t = contrast·(D′ − A)` is unchanged and only the rule for 
 differs. Measured on the **display path** (`pipeline::sdr::render`, Display P3), no exposure
 applied, medians across frames:
 
-| # | Candidate | ship | mid median | \|EV\| to 0.18 | shadow median | clip |
+| # | Candidate | ship | mid median | \|EV\| to 0.18 | shadow median | sat median |
 |---|---|---|---|---|---|---|
-| 1 | white@Dmax, c=1.0 — **shipped** | yes | 0.1634 | **0.14** | **72/255** | 0.00% |
-| 2 | white@Dmax, c=2.0 | yes | 0.0267 | 2.75 | 12/255 | 0.00% |
-| 3 | mid@0.5·Dmax, c=2.0 | yes | 0.0944 | 0.93 | 30/255 | 0.00% |
-| 4 | white@measured | **no** | 0.3175 | 0.82 | 54/255 | 0.00% |
-| 5 | black@0.00061, c=2.0 | yes | 0.0067 | 4.75 | 3/255 | 0.00% |
-| 7 | white@measured, c=0.745/Δ | **no** | 0.3055 | 0.76 | 50/255 | 0.00% |
-| 8 | mid@(Dmin+datasheet), c=0.745/Δ | yes | 0.1049 | **0.78** | 27/255 | 0.00% |
+| 1 | white@Dmax, c=1.0 — **shipped** | yes | 0.1634 | **0.14** | **72/255** | 6.39% |
+| 2 | white@Dmax, c=2.0 | yes | 0.0267 | 2.75 | 12/255 | 6.82% |
+| 3 | mid@0.5·Dmax, c=2.0 | yes | 0.0944 | 0.93 | 30/255 | 8.35% |
+| 4 | auto (content-driven), c=2.0 | **no** | 0.0003 | 9.12 | 0/255 | 0.00% |
+| 5a | black@0.002, c=2.0 | yes | 0.0220 | 3.04 | 9/255 | 6.53% |
+| 5b | black@0.005, c=2.0 | yes | 0.0549 | 1.71 | 20/255 | 7.62% |
+| 7 | auto (content-driven), c=0.745/Δ | **no** | 0.0002 | 9.51 | 0/255 | 0.00% |
+| 8 | mid@(Dmin+datasheet), c=0.745/Δ | yes | 0.1049 | **0.78** | 27/255 | 8.98% |
+
+Regenerated 2026-08-03 from the committed harness, replacing an earlier table that a
+reviewer correctly identified as unreproducible: it predated splitting candidate 5 into
+5a/5b and predated switching 4/7 from a "valid white patch" gate to `DmaxSource::Auto`.
+**Rows 1, 2, 3 and 8 reproduce to the digit**, so every headline claim about the defect and
+about the two leading forms was unaffected; only 4, 5 and 7 moved.
+
+`sat median` replaced a `clip` column that read `0.00%` for every candidate — and
+**structurally had to**: `sdr::render` *errors* on any sample outside `[0, 1]`, so a
+returned image cannot contain one, and the old column was measuring nothing. The
+replacement counts samples at or above 0.999, i.e. highlight separation the shoulder has
+compressed against white. It immediately earns its place by **quantifying the one loss the
+visual review found**: mid-anchoring (3, 8) saturates ~8.4–9.0% against the shipped 6.4%,
+which is the "P3 curtain detail is gone" observation in numbers. It also shows 4/7
+saturating exactly 0.00% — not a virtue but a symptom, since their contaminated anchor
+renders the whole frame near black.
 
 **The defect, stated precisely: the shipped default gets midtones nearly right and blacks
 badly wrong.** Candidate 1 needs only 0.14 EV to place a mid-grey, yet its darkest confirmed
@@ -71,17 +88,25 @@ what an anchor other than white avoids.
 
 **Reject — candidate 1 (contrast 1.0).** Fails the black gate at 72/255. This is the defect.
 
-**Reject — candidate 5 (black-pinned at a fixed contrast).** Needs **+4.75 EV**. Pinning
-black alone leaves white and mid unplaced, so at any fixed contrast everything else lands
-arbitrarily. Making it work requires pinning a *second* point, which forces per-roll adaptive
-contrast — already rejected, since contrast is film character worth preserving.
+**Reject — candidate 5 (black-pinned at a fixed contrast).** Needs **+3.04 EV** at
+`black@0.002` and **+1.71 EV** at `black@0.005`. Pinning black alone leaves white and mid
+unplaced, so at any fixed contrast everything else lands arbitrarily — and the residual
+tracking the black target that closely *is* that arbitrariness, not a tuning opportunity.
+Making it work requires pinning a *second* point, which forces per-roll adaptive contrast —
+already rejected, since contrast is film character worth preserving. (5b was the user's
+"most likely go" on the visual review; it is rejected here as a **default**, which is a
+different question from whether it renders acceptably.)
 
 **Diagnostic only — candidates 4 and 7.** Their anchor is read from the frame's own content,
 so an underexposed frame's lower diffuse white would be silently pulled up to 1.0, correcting
 the very exposure the task requires preserving. That disqualification rests on the
-**argument**, not on this data: both resolve on **2 frames only** (they need a valid white),
-so their spread figures are uninformative and are not offered as evidence. Candidate 7
-remains valuable as the zero-free-parameter check on the datasheet derivation.
+**argument**, and the measurement adds an independent one: resolved through `DmaxSource::Auto`
+they land at **9.1–9.5 EV** off and render every frame to **0/255**, because `Auto` takes its
+percentile over the whole scan and the nearly-opaque film holder owns the top of it. That is
+a defect in `Auto` rather than in the anchoring idea — it is now
+[`algo/auto-anchor-interior-measurement`](../tasks/algo/auto-anchor-interior-measurement.md)
+— so these two rows measure the bug, not the form. Candidate 7 remains valuable as the
+zero-free-parameter check on the datasheet derivation, once `Auto` samples the picture area.
 
 **Contingent — candidates 2 and 3.** Both pass the black gate, but both reference the
 leader-measured Dmax, which three independent findings show is untrustworthy: same-stock rolls
@@ -98,6 +123,30 @@ datasheet constants: those rest on chart-read `D-min` values which PR #68 establ
 true Status M densities, and per-stock residuals against user preference were systematic
 (Ektar ≈ +0.6, Portra 160 ≈ 0, Gold 200 ≈ −1.0), not random. The *form* is supported; the
 constants need the proper spectral integration.
+
+## The leader-uniformity check, redone per channel
+
+The characterisation pass claimed per-channel percentiles but reduced each pixel to the mean
+of its channels first, so a coloured fogging gradient with channels moving in *opposite*
+directions would have cancelled and printed as uniform. That mattered because "the leader is
+uniform, so its Dmax is an uncontrolled *level* rather than a gradient" is the finding
+`film-base/dmax-anchor-reliability` rests on. Redone per channel (2026-08-03):
+
+| roll | leader R / G / B tile median | largest \|L−R\| or \|T−B\| | B tile range vs R |
+|---|---|---|---|
+| Gold 200 | 1.2242 / 1.2340 / 1.3628 | 0.0076 | 0.0658 vs 0.0177 |
+| Ektar | 1.2724 / 1.2865 / 1.3201 | 0.0089 | 0.0780 vs 0.0339 |
+| Portra 160 | 1.4402 / 1.3297 / 1.3807 | **0.0478** (B, L−R) | 0.1396 vs 0.0400 |
+
+**The conclusion survives — it was right but under-verified.** No channel-opposed gradient
+exists anywhere in the set, so nothing was cancelling; every gradient is ≤0.009 except
+Portra 160's blue. Two facts the scalar mean *was* hiding:
+
+- **Blue is the odd channel in every leader** — its tile range runs 2–4× red's and its
+  in-tile spread about 2×. Whatever a leader records, blue records it least uniformly.
+- **Portra 160's leader is the least uniform of the three** (−0.048 blue left-to-right,
+  ~3.5% of its Dmax) — and it is also the roll whose Dmax disagreed with its same-stock
+  sibling. One roll is not a pattern, but it is the right place to look first.
 
 ## Reading the spread, and a gate I initially had backwards
 

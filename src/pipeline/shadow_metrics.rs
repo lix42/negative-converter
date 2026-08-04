@@ -56,6 +56,13 @@ const TILES_Y_DEFAULT: u32 = 22;
 /// With small tiles the top-ranked candidates are otherwise near-duplicates of one
 /// another — adjacent tiles on the same surface — so the "top 3" would offer one choice,
 /// not three. Suppressing neighbours makes them genuinely distinct alternatives.
+/// A rendered SDR sample at or above this is treated as saturated — highlight separation
+/// compressed against display white. Deliberately not `1.0`: `sdr::render` guarantees
+/// `[0, 1]`, so an equality test against `1.0` would only find samples the shoulder mapped
+/// exactly to the ceiling, missing the flattened neighbourhood just below it that is the
+/// actual loss.
+const SATURATED_AT: f32 = 0.999;
+
 const MIN_SEPARATION_TILES: u32 = 3;
 
 fn tile_grid() -> (u32, u32) {
@@ -202,8 +209,25 @@ fn tone(px: &[f32]) -> f32 {
     if n == 0 { f32::NAN } else { sum / n as f32 }
 }
 
-/// Tile the frame interior and compute each tile's tone statistics.
+/// Tile the frame interior and compute each tile's tone statistics from the mean of a
+/// pixel's finite channels — the right reducer when judging a *patch* as one object.
 fn tiles(density: &[f32], width: u32, height: u32) -> Vec<Tile> {
+    tiles_of(density, width, height, None)
+}
+
+/// Per-channel variant: statistics from channel `ch` alone.
+///
+/// Required by [`characterise_reference_frames`], which asks whether a leader is *uniform*.
+/// The scalar mean cannot answer that: a coloured fogging gradient whose channels move in
+/// opposite directions **cancels** in the mean, so a non-uniform leader would read as
+/// uniform. That is not hypothetical in this data — the same-stock base comparison showed
+/// green and blue drifting ~+0.02 between scan sessions while red did not move with them.
+fn channel_tiles(density: &[f32], width: u32, height: u32, ch: usize) -> Vec<Tile> {
+    tiles_of(density, width, height, Some(ch))
+}
+
+/// `channel = None` reduces each pixel with [`tone`]; `Some(c)` reads channel `c` directly.
+fn tiles_of(density: &[f32], width: u32, height: u32, channel: Option<usize>) -> Vec<Tile> {
     let (tiles_x, tiles_y) = tile_grid();
     let inset_x = (width as f32 * INTERIOR_INSET) as u32;
     let inset_y = (height as f32 * INTERIOR_INSET) as u32;
@@ -221,7 +245,10 @@ fn tiles(density: &[f32], width: u32, height: u32) -> Vec<Tile> {
             for y in y0..y0 + th {
                 for x in x0..x0 + tw {
                     let i = ((y as usize * width as usize) + x as usize) * 3;
-                    let t = tone(&density[i..i + 3]);
+                    let t = match channel {
+                        None => tone(&density[i..i + 3]),
+                        Some(c) => density[i + c],
+                    };
                     if t.is_finite() {
                         tones.push(t);
                     }
@@ -415,46 +442,52 @@ fn characterise_reference_frames() {
                     continue;
                 };
                 let d = to_density(&image, &base, &params);
-                let ts = tiles(&d.density, d.width, d.height);
 
-                let mut p50s: Vec<f32> = ts.iter().map(|t| t.p50).collect();
-                p50s.sort_by(f32::total_cmp);
-                let mut spreads: Vec<f32> = ts.iter().map(|t| t.spread).collect();
-                spreads.sort_by(f32::total_cmp);
+                // Per channel, not on the scalar mean: channels that fog in opposite
+                // directions cancel in a mean and a non-uniform leader would print as
+                // uniform. The R row also carries the datasheet comparison, since the
+                // published aim densities are red-channel Status M figures.
+                println!("  {kind:10} {name}");
+                for (ch, label) in [(0usize, 'R'), (1, 'G'), (2, 'B')] {
+                    let ts = channel_tiles(&d.density, d.width, d.height, ch);
+                    let mut p50s: Vec<f32> = ts.iter().map(|t| t.p50).collect();
+                    p50s.sort_by(f32::total_cmp);
+                    let mut spreads: Vec<f32> = ts.iter().map(|t| t.spread).collect();
+                    spreads.sort_by(f32::total_cmp);
 
-                // Gradient: mean tile p50 of each half. A fogged-from-one-edge leader
-                // shows up here even when the overall range looks tight.
-                let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
-                let (tiles_x, tiles_y) = tile_grid();
-                let mid_x = tiles_x / 2;
-                let mid_y = tiles_y / 2;
-                let (mut l, mut rt, mut top, mut bot) = (vec![], vec![], vec![], vec![]);
-                for (i, t) in ts.iter().enumerate() {
-                    let (tx, ty) = (i as u32 % tiles_x, i as u32 / tiles_x);
-                    if tx < mid_x {
-                        l.push(t.p50)
-                    } else {
-                        rt.push(t.p50)
+                    // Gradient: mean tile p50 of each half. A fogged-from-one-edge leader
+                    // shows up here even when the overall range looks tight.
+                    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+                    let (tiles_x, tiles_y) = tile_grid();
+                    let (mid_x, mid_y) = (tiles_x / 2, tiles_y / 2);
+                    let (mut l, mut rt, mut top, mut bot) = (vec![], vec![], vec![], vec![]);
+                    for (i, t) in ts.iter().enumerate() {
+                        let (tx, ty) = (i as u32 % tiles_x, i as u32 / tiles_x);
+                        if tx < mid_x {
+                            l.push(t.p50)
+                        } else {
+                            rt.push(t.p50)
+                        }
+                        if ty < mid_y {
+                            top.push(t.p50)
+                        } else {
+                            bot.push(t.p50)
+                        }
                     }
-                    if ty < mid_y {
-                        top.push(t.p50)
-                    } else {
-                        bot.push(t.p50)
-                    }
+                    println!(
+                        "    {label}  D' tiles: min {:.4} med {:.4} max {:.4} (range {:.4})  \
+                         median in-tile spread {:.4}\n       gradient: L−R {:+.4}  T−B {:+.4}   \
+                         med/Dmax {:.1}%",
+                        p50s[0],
+                        pct(&p50s, 0.5),
+                        p50s[p50s.len() - 1],
+                        p50s[p50s.len() - 1] - p50s[0],
+                        pct(&spreads, 0.5),
+                        mean(&l) - mean(&rt),
+                        mean(&top) - mean(&bot),
+                        100.0 * pct(&p50s, 0.5) / dmax,
+                    );
                 }
-                println!(
-                    "  {kind:10} {name}  D' tiles: min {:.4} med {:.4} max {:.4} (range {:.4})  \
-                     median in-tile spread {:.4}\n              gradient: L−R {:+.4}  T−B {:+.4}   \
-                     med/Dmax {:.1}%",
-                    p50s[0],
-                    pct(&p50s, 0.5),
-                    p50s[p50s.len() - 1],
-                    p50s[p50s.len() - 1] - p50s[0],
-                    pct(&spreads, 0.5),
-                    mean(&l) - mean(&rt),
-                    mean(&top) - mean(&bot),
-                    100.0 * pct(&p50s, 0.5) / dmax,
-                );
             }
         }
     }
@@ -482,6 +515,58 @@ mod tests {
         assert!(near(tone(&[0.4, f32::NAN, 0.6]), 0.5));
         // Wholly non-finite stays NaN so the finite filter drops it.
         assert!(tone(&[f32::NAN, f32::INFINITY, f32::NAN]).is_nan());
+    }
+
+    #[test]
+    fn channel_tiles_see_a_gradient_the_scalar_mean_hides() {
+        // The exact failure the per-channel pass exists to catch: R rising left→right while
+        // B falls by the same amount. The mean is flat everywhere, so `tiles()` reports a
+        // uniform field; the per-channel view must show equal and opposite gradients.
+        let (w, h) = (240u32, 160u32);
+        let mut density = vec![0.0f32; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let t = x as f32 / (w - 1) as f32; // 0 → 1 across the frame
+                let i = ((y as usize * w as usize) + x as usize) * 3;
+                density[i] = 0.5 + t; // R rises
+                density[i + 1] = 0.5; // G flat
+                density[i + 2] = 0.5 - t; // B falls
+            }
+        }
+        let half_gradient = |ts: &[Tile]| {
+            let (tiles_x, _) = tile_grid();
+            let mid_x = tiles_x / 2;
+            let (mut l, mut r) = (vec![], vec![]);
+            for (i, t) in ts.iter().enumerate() {
+                if i as u32 % tiles_x < mid_x {
+                    l.push(t.p50)
+                } else {
+                    r.push(t.p50)
+                }
+            }
+            let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+            mean(&l) - mean(&r)
+        };
+        // The scalar mean cancels: every pixel averages to 0.5.
+        assert!(
+            half_gradient(&tiles(&density, w, h)).abs() < 1e-6,
+            "the scalar mean should hide this gradient — that is the premise"
+        );
+        let (r, g, b) = (
+            half_gradient(&channel_tiles(&density, w, h, 0)),
+            half_gradient(&channel_tiles(&density, w, h, 1)),
+            half_gradient(&channel_tiles(&density, w, h, 2)),
+        );
+        assert!(
+            r < -0.3,
+            "R gradient should be strongly negative (L<R), got {r}"
+        );
+        assert!(
+            b > 0.3,
+            "B gradient should be strongly positive (L>R), got {b}"
+        );
+        assert!(g.abs() < 1e-6, "G is flat, got {g}");
+        assert!((r + b).abs() < 1e-6, "equal and opposite, got {r} and {b}");
     }
 
     #[test]
@@ -689,13 +774,30 @@ fn patch_luma_p50(img: &LinearImage, x: u32, y: u32, w: u32, h: u32) -> f32 {
     pct(&v, 0.50)
 }
 
+/// One candidate's per-frame gate samples, accumulated across the fixture frames.
+///
+/// `mids`/`shadows` carry one entry per frame that has that patch declared valid, so their
+/// lengths differ between candidates and from `sats` — which is whole-frame and therefore
+/// recorded for every frame.
+#[derive(Default)]
+struct Gate {
+    mids: Vec<f32>,
+    shadows: Vec<f32>,
+    sats: Vec<f32>,
+}
+
 /// Phase 3: for each fixture frame and candidate, report the qualitative gates.
 ///
 /// Gates (per the reduced scope — filter forms, do not tune parameters):
 /// - **reaches a plausible black** — the confirmed *shadow* patch's SDR level;
 /// - **needs no per-frame correction** — how near the confirmed *mid* patch lands to 0.18
 ///   with **no exposure applied**, and crucially how much that varies *between* frames;
-/// - **does not clip** — counts from the rendered SDR;
+/// - **does not lose highlights to display white** — the share of rendered SDR samples
+///   pressed against the top of the range. NOT a clip count: `sdr::render` *errors* on any
+///   sample outside `[0, 1]`, so a returned image has zero out-of-range samples by
+///   construction and a clip counter here could only ever print `0.00%`. The honest
+///   question is how much content the shoulder has flattened *against* white, which is
+///   what `SATURATED_AT` measures and which can genuinely differ between candidates;
 /// - **preserves exposure spacing** — the spread of frame medians.
 ///
 /// Invalid patches (per `fixtures.json`) are skipped rather than averaged in.
@@ -715,8 +817,8 @@ fn measure_candidates() {
     let mut marks: Vec<String> = fx["frames"].as_object().unwrap().keys().cloned().collect();
     marks.sort();
 
-    // candidate label -> (mid-luma samples, shadow-code samples)
-    let mut agg: std::collections::BTreeMap<String, (Vec<f32>, Vec<f32>)> = Default::default();
+    // candidate label -> one sample per frame, per gate.
+    let mut agg: std::collections::BTreeMap<String, Gate> = Default::default();
 
     for mk in &marks {
         let f = &fx["frames"][mk];
@@ -756,7 +858,7 @@ fn measure_candidates() {
         );
         println!(
             "    {:<42}{:>10}{:>12}{:>11}{:>10}{:>9}",
-            "candidate", "anchor", "contrast", "mid->0.18", "shadow", "clip%"
+            "candidate", "anchor", "contrast", "mid->0.18", "shadow", "sat%"
         );
 
         for cand in candidates(roll, dmax) {
@@ -795,19 +897,25 @@ fn measure_candidates() {
             .unwrap();
             let img = sdr.image();
 
-            let clipped = img.rgb.iter().filter(|v| **v > 1.0 || **v < 0.0).count();
-            let clip_pct = 100.0 * clipped as f32 / img.rgb.len() as f32;
+            // Saturation, not clipping — see this test's doc comment for why a clip count
+            // is structurally impossible on this path. A sample within one part in a
+            // thousand of display white has had its highlight separation compressed away
+            // even though it is still in range.
+            let saturated = img.rgb.iter().filter(|v| **v >= SATURATED_AT).count();
+            let sat_pct = 100.0 * saturated as f32 / img.rgb.len() as f32;
 
             let mid_s = rect("mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
             let sh_s = rect("shadow").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
             let key = format!("{}{}", cand.label, tag);
             let e = agg.entry(key).or_default();
             if let Some(m) = mid_s {
-                e.0.push(m);
+                e.mids.push(m);
             }
             if let Some(s) = sh_s {
-                e.1.push(srgb_encode(s) * 255.0);
+                e.shadows.push(srgb_encode(s) * 255.0);
             }
+            // Whole-frame, so it needs no valid patch — recorded for every frame.
+            e.sats.push(sat_pct);
 
             println!(
                 "    {:<42}{:>10.4}{:>12.3}{:>11}{:>10}{:>9.2}",
@@ -819,17 +927,25 @@ fn measure_candidates() {
                     .unwrap_or_else(|| "-".into()),
                 sh_s.map(|s| format!("{:.0}/255", srgb_encode(s) * 255.0))
                     .unwrap_or_else(|| "-".into()),
-                clip_pct
+                sat_pct
             );
         }
     }
 
     println!("\n\n=== GATES ACROSS FRAMES (mid target 0.18; shadow wants a low code value) ===");
     println!(
-        "{:<42}{:>9}{:>9}{:>11}{:>12}{:>11}",
-        "candidate", "mid med", "mid sd", "|EV| to .18", "shadow med", "shadow max"
+        "{:<42}{:>9}{:>9}{:>11}{:>12}{:>11}{:>9}",
+        "candidate", "mid med", "mid sd", "|EV| to .18", "shadow med", "shadow max", "sat med"
     );
-    for (label, (mids, shadows)) in &agg {
+    for (
+        label,
+        Gate {
+            mids,
+            shadows,
+            sats,
+        },
+    ) in &agg
+    {
         if mids.is_empty() {
             continue;
         }
@@ -842,17 +958,27 @@ fn measure_candidates() {
         let mut s = shadows.clone();
         s.sort_by(f32::total_cmp);
         println!(
-            "{:<42}{:>9.4}{:>9.4}{:>11.2}{:>12.0}{:>11.0}",
+            "{:<42}{:>9.4}{:>9.4}{:>11.2}{:>12.0}{:>11.0}{:>8.2}%",
             label,
             med,
             sd,
             ev,
             pct(&s, 0.5),
-            s.last().copied().unwrap_or(f32::NAN)
+            s.last().copied().unwrap_or(f32::NAN),
+            {
+                let mut t = sats.clone();
+                t.sort_by(f32::total_cmp);
+                pct(&t, 0.5)
+            }
         );
     }
     println!("\nRead: 'mid sd' is the between-frame spread a FIXED anchor leaves — lower is more");
     println!(
         "reference-driven. '|EV| to .18' is the residual fixed offset the default would need."
+    );
+    println!(
+        "'sat med' is the median share of rendered samples at or above {SATURATED_AT} — \
+         highlight\nseparation the shoulder has compressed against display white. It is NOT \
+         a clip count; see the doc comment."
     );
 }

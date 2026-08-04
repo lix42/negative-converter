@@ -21,11 +21,16 @@ task's contract, which is why it is a new task rather than an edit.
    cannot tell you which case you have.)
 2. **Real content exceeds the anchor.** G3 measures `D′` 1.3265 against its roll Dmax of
    1.2758, and P3 1.5062 against 1.3816. The anchor does not even bound the frame.
-3. **Leaders are uniform, so it is not a fogging gradient.** Interior `D′` range across the
-   leader is 0.024 / 0.039 / 0.067 with L−R and T−B gradients ≤0.024. The leader is a uniform
-   field at an *uncontrolled level*, and grain sensitivity means "fully exposed" is arguably
-   ill-posed: insensitive grains keep responding well past where the curve looks flat, so
-   reaching true Dmax can take many stops more than a leader receives.
+3. **Leaders are uniform, so it is not a fogging gradient.** Re-verified **per channel** on
+   2026-08-03 (the first pass reduced each pixel to its channel mean, which would have let a
+   channel-opposed gradient cancel): no such gradient exists in the set, and every L−R / T−B
+   split is ≤0.009 except Portra 160's blue at −0.048. Interior tile ranges run 0.018–0.078
+   in red and green, 0.066–0.140 in blue — so **blue is the least uniform channel in every
+   leader**, and Portra 160's leader is the least uniform overall, which is also the roll
+   whose Dmax disagreed with its same-stock sibling. The leader remains a uniform field at an
+   *uncontrolled level*, and grain sensitivity means "fully exposed" is arguably ill-posed:
+   insensitive grains keep responding well past where the curve looks flat, so reaching true
+   Dmax can take many stops more than a leader receives.
 
 **And the fallback is separately wrong.** `NOMINAL_DMAX = 2.0` is the shipped default when no
 roll reference exists, while measured rolls span 0.90–1.74 (median ≈1.34, ≈1.36 excluding the

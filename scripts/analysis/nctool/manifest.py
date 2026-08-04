@@ -37,6 +37,14 @@ SEED_ROLES = {
     "Portra400": {"20260714-nikon-994": "unexposed", "20260717-nikon-1032": "leader"},
     "Portra400-leica-flaw": {"20260719-nikon-1034": "unexposed",
                              "20260719-nikon-1033": "leader"},
+    # Confirmed 2026-08-02 while freezing the sigmoid-baseline fixtures. These two rolls
+    # had no seed, so a from-scratch generation (no `prev` to inherit roles from) left every
+    # frame `real`, `manifest roles` skipped both rolls, and the committed freeze recipes
+    # became unreproducible. Seeds exist precisely to survive that case.
+    "Portra160-2026-07-22": {"20260722-nikon-1097": "unexposed",
+                             "20260722-nikon-1096": "leader"},
+    "2026-07-24-Gold200": {"20260724-leica-1130": "unexposed",
+                           "20260724-leica-1129": "leader"},
 }
 SEED_STOCK = {
     "Ektar": "Kodak Ektar 100", "phoenix": "Harman Phoenix 200",
@@ -47,8 +55,12 @@ SEED_STOCK = {
 SEED_ROLL_NOTE = {
     # The earlier "no in-roll unexposed/leader reference frame" claim was wrong: this
     # roll has leader 20260722-nikon-1096 and unexposed 20260722-nikon-1097, confirmed
-    # by `manifest roles` on 2026-08-02. Corrected here because the seed re-applies it
-    # to every regeneration.
+    # by `manifest roles` on 2026-08-02.
+    #
+    # A seed is NOT a migration: `build_manifest` prefers `prev.roll[roll].note`, so this
+    # value only applies when no prior note exists. Fixing the seed alone would have left
+    # the wrong sentence in place on every ordinary regeneration — the live manifest and
+    # `scripts/analysis/manifest.sample.json` were corrected directly for that reason.
     "Portra160-2026-07-22": "NLP comparison source",
 }
 SEED_SAMPLE = {
