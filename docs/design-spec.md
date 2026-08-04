@@ -755,7 +755,19 @@ the top end drags everything below it down. The two rules are:
 
 `0.745 = −log10(0.18)` is mid-grey's fixed distance below white on the *output*
 axis, so `f` is the only free number and it is a **roll-level** placement, never
-derived from frame content. Mid-placement is also half as sensitive to a
+derived from frame content.
+
+**Archived recipes are warned about, not silently reinterpreted.** `curve.anchor` did not
+exist before 2026-08-03, so a recipe frozen earlier omits it and picks up this build's
+default placement — a different render even with `contrast`, `toe`, `shoulder` and `dmax`
+all pinned. Loading a recipe that selects `sigmoid` without an `anchor` therefore emits a
+loud, `--strict`-promotable warning naming `"white-at-dmax"` as the way to reproduce the
+old placement. This is deliberately *not* a `reconstruction.schema_version` bump: that
+constant versions the schema **shape** and is checked for exact equality, so bumping it
+would reject every archived recipe outright, including the majority that select the
+exponential curve and are unaffected. Preserving per-version semantics instead (a
+historical default table, which would also have to cover `contrast` and `shoulder`) is
+policy owned by `core/conversion-versioning`. Mid-placement is also half as sensitive to a
 reference error (`dA/dR = f`), which matters because a leader's density records
 how the roll was loaded, not the film. `f` must be in `(0, 1]` (§9). Both rules
 keep `curve.dmax` as the normalisation reference, so the roll-fixed invariant
@@ -1096,8 +1108,14 @@ behavioral `pipeline_version` is a **separate** field owned by
 `conversion-versioning`; this build stamps none, so it is absent rather than
 guessed.
 
-For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object
-plus its resolved `anchor`;
+For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object plus two
+placement fields: `anchor` (the resolved placement *rule*, omitted entirely for the
+exponential curve, which has none) and `anchor_value` (the **derived** anchor — the
+corrected density this render mapped to `1.0`, hence the black floor at
+`10^(−contrast·anchor_value)`). `dmax.value` is the *reference*; under the default
+mid-grey placement the two differ, so reporting only the reference would document a
+number the render did not use. For the exponential curve, and for the sigmoid's
+`white-at-dmax` placement, `anchor_value` equals `dmax.value`;
 for exponential `"none"`, `dmax` is
 `{"policy":"none","value":null,"provenance":"recipe"}`; for simple,
 `reconstruction_result` is exactly `{"type":"simple"}`. `policy` is one of
@@ -1616,7 +1634,10 @@ render use `reconstruction.density` and `print`. The exact recipe keys are
   highlight separation.
 - `--sigmoid-mid-fraction <f>` / `--sigmoid-white-at-d-max` — which tone the
   reference density places (§7.3). `f` is finite and in `(0, 1]`; default
-  `0.5`. Outside that range the anchor either detaches from the reference
+  `0.5`. Under the mid-grey placement `contrast` additionally has a **lower** bound: the
+  anchor adds `0.745/contrast` to the reference, so a slope below ~`2.2e-39` overflows that
+  quotient to a non-finite anchor and is a usage error naming the flag (the bound applies
+  only to this placement — `--sigmoid-white-at-d-max` performs no division). Outside that range the anchor either detaches from the reference
   entirely (`f ≤ 0` pins mid-grey at or below the film base, rendering the whole
   frame above mid-grey) or places mid-grey past display white (`f > 1`), so both
   are usage errors rather than clamped values.
@@ -1852,10 +1873,14 @@ hard errors, so a deliberate best-effort batch remains usable: (1) a shared
 `film_base.source` other than `explicit` re-estimates Dmin per frame; (2) the
 active Dmax key set to `auto` measures Dmax per frame; (3) a per-frame override
 that sets `film_base` changes that frame's Dmin; (4) a per-frame override
-that changes the active Dmax key changes that frame's placement; and (5) a per-frame
-override that sets `output.preset` gives that frame a different output **policy** —
+that changes the active Dmax key changes that frame's placement; (5) a per-frame override
+that sets `reconstruction.curve.anchor` changes which *tone* that frame pins to the roll's
+reference density — a placement break that survives even when every frame shares one Dmax,
+and subtler than a different number because the frame renders on a different *rule*; and
+(6) a per-frame override that sets `output.preset` gives that frame a different output
+**policy** —
 a different branch out of the ACEScg boundary, so a different *image class* (unclamped
-linear master vs rendered TIFF), not merely a different rendering. (5) warns even when
+linear master vs rendered TIFF), not merely a different rendering. (5) and (6) warn even when
 the override restates the shared preset, because `frames[].status` carries no
 `output_render` block (that is a `convert`-only report field), leaving the
 `frames[].overrides` echo as the only other trace. Shared `fixed`, explicit, or

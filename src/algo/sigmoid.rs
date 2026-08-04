@@ -271,7 +271,7 @@ fn anchor_error(resolved: Option<f32>, source: DmaxSource, densities: &[f32]) ->
 pub(super) fn apply_curve(
     density: DensityImage,
     params: &SigmoidParams,
-) -> Result<(FilmRgbImage, Option<f32>)> {
+) -> Result<(FilmRgbImage, Option<f32>, Option<f32>)> {
     // One anchor measurement, shared semantics with the exponential curve. The
     // S-curve is anchored on `[0, Dmax]` — its white knee and its black floor
     // (`F = −contrast·anchor`) both derive from a *positive* anchor — so an
@@ -301,14 +301,30 @@ pub(super) fn apply_curve(
     // form places the anchor *above* the reference, so white lands beyond it and the shoulder
     // compresses what exceeds it — which is what a print shoulder is for.
     let anchor = placement.anchor(reference, contrast);
-    debug_assert!(
-        anchor.is_finite() && anchor > 0.0,
-        "placement must yield a positive finite anchor from a positive finite reference"
-    );
+    // Defense in depth, and a real error rather than an assertion: the derivation divides
+    // by `contrast`, so a positive-but-tiny slope overflows the quotient and yields a
+    // non-finite anchor. `validate` rejects that at the CLI boundary (naming the flag), but
+    // a programmatic caller or a future placement rule reaches here first — and a
+    // `debug_assert` made it a panic (exit 101) in debug and fed `inf` into `s_curve` in
+    // release, which is the quietly-wrong image this guard exists to prevent.
+    if !anchor.is_finite() || anchor <= 0.0 {
+        return Err(NcError::Other(format!(
+            "the sigmoid anchor placement derived a non-usable anchor ({anchor}) from a \
+             valid reference density ({reference}) at contrast {contrast}: the mid-grey \
+             placement adds {}/contrast to the reference, which overflows for a very small \
+             contrast. Use a photographic contrast, or the white-at-dmax placement",
+            crate::types::MID_GREY_OUTPUT_DECADES
+        )));
+    }
     let film = super::density::apply_curve(density, move |d| {
         s_curve(d, contrast, toe, shoulder, anchor)
     });
-    Ok((film, resolved))
+    // Both numbers, because they are no longer the same one: `resolved` is the roll's
+    // reference density (what a recipe freezes back as `curve.dmax`), `anchor` is the
+    // density this render actually mapped to 1.0 and therefore what sets the black floor
+    // at `10^(-contrast*anchor)`. Reporting only the reference would document a value the
+    // curve did not use.
+    Ok((film, resolved, Some(anchor)))
 }
 
 #[cfg(test)]

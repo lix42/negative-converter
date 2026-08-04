@@ -158,7 +158,7 @@ pub(super) fn reconstruct(
     // balance).
     let balance_range = regional_balance(&mut density, params)?;
 
-    let (film, dmax) = match curve {
+    let (film, dmax, curve_anchor) = match curve {
         DensityCurve::Exponential(exp) => {
             // Resolve the anchor once, from the (post-balance) corrected
             // densities. It is applied **in the exponent** — `10^(γ·(D' −
@@ -173,7 +173,10 @@ pub(super) fn reconstruct(
             let anchor = dmax.unwrap_or(0.0);
             let gamma = exp.gamma;
             let film = apply_curve(density, move |d| 10f32.powf(gamma * (d - anchor)));
-            (film, dmax)
+            // For the exponential curve the reference *is* the anchor — there is no
+            // placement rule between them — so both fields carry the same value rather
+            // than leaving the derived one null and making consumers special-case it.
+            (film, dmax, dmax)
         }
         DensityCurve::Sigmoid(sig) => sigmoid::apply_curve(density, sig)?,
     };
@@ -181,6 +184,7 @@ pub(super) fn reconstruct(
         film,
         ReconstructionReport {
             dmax,
+            curve_anchor,
             balance_range,
         },
     ))

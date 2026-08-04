@@ -74,10 +74,18 @@ pub struct GainMapSource {
 /// the recipe structs).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ConvertReport {
-    /// The resolved display-white anchor density (`Dmax`) the density curve
-    /// used, when one was applied. `None` for `simple` (no curve stage) and for
+    /// The resolved **reference** density (`curve.dmax`) — the roll calibration, and the
+    /// value to freeze back into a recipe. `None` for `simple` (no curve stage) and for
     /// the exponential curve with `dmax = none`.
+    ///
+    /// Not necessarily the density that rendered to `1.0`: the sigmoid derives its anchor
+    /// from this reference via `AnchorPlacement`. See [`Self::curve_anchor`].
     pub dmax: Option<f32>,
+    /// The **derived** anchor the curve used — the corrected density that rendered to
+    /// `1.0`, hence the black floor at `10^(−contrast·curve_anchor)`. Equal to
+    /// [`Self::dmax`] for the exponential curve and the sigmoid's `white-at-dmax`
+    /// placement; larger under the default mid-grey placement.
+    pub curve_anchor: Option<f32>,
     /// The resolved stage-4 white-balance gains `[r, g, b]` the legacy print
     /// render applied — the explicit gains, or the auto-estimated ones
     /// (`print.white_balance = gray-world | percentile`). Reported so a roll can
@@ -111,6 +119,7 @@ pub(crate) fn reconstruct_and_print(
         positive,
         ConvertReport {
             dmax: recon.dmax,
+            curve_anchor: recon.curve_anchor,
             white_balance,
             balance_range: recon.balance_range,
         },
@@ -173,6 +182,7 @@ pub fn render_gain_map_source(
     Ok(GainMapSource {
         convert: ConvertReport {
             dmax: recon.dmax,
+            curve_anchor: recon.curve_anchor,
             white_balance: Some(shared.controls.white_balance()),
             balance_range: recon.balance_range,
         },
@@ -254,6 +264,7 @@ fn render_film_master(
         icc,
         convert: ConvertReport {
             dmax: recon.dmax,
+            curve_anchor: recon.curve_anchor,
             white_balance: None,
             balance_range: recon.balance_range,
         },

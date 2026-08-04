@@ -712,8 +712,19 @@ pub struct CurveResult {
     /// The curve type that ran (`"exponential"` / `"sigmoid"`).
     #[serde(rename = "type")]
     pub curve_type: DensityCurveType,
-    /// The resolved display-white anchor.
+    /// The resolved **reference** density — the roll calibration (`curve.dmax`). Since
+    /// `algo/reference-anchored-sigmoid` this is not necessarily the density that rendered
+    /// to `1.0`; see `anchor` / `anchor_value`.
     pub dmax: DmaxResolution,
+    /// The sigmoid's anchor **placement rule** — which tone the reference pins
+    /// (design-spec §7.3). `null` for the exponential curve, which has no such rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<AnchorPlacement>,
+    /// The **derived** anchor: the corrected density this render mapped to `1.0`, which
+    /// sets the black floor at `10^(−contrast·anchor_value)`. Equal to `dmax.value` for the
+    /// exponential curve and for the sigmoid's `white-at-dmax` placement; larger under the
+    /// default mid-grey placement. Always emitted so the block is self-contained.
+    pub anchor_value: Option<f32>,
 }
 
 /// The resolved `Dmax` triple: which policy was configured, the value the curve
@@ -780,6 +791,7 @@ enum DmaxSetting {
 fn reconstruction_result(
     reconstruction: &Reconstruction,
     resolved_dmax: Option<f32>,
+    curve_anchor: Option<f32>,
     setting: DmaxSetting,
 ) -> ReconstructionResult {
     match reconstruction {
@@ -800,6 +812,17 @@ fn reconstruction_result(
                         value: resolved_dmax,
                         provenance,
                     },
+                    // The placement rule and the anchor it derived. Both are needed for
+                    // this block to be self-contained: `dmax.value` is the reference, and
+                    // for the default sigmoid placement the density that actually rendered
+                    // to 1.0 is a *different* number. Without them a consumer has to
+                    // re-derive the anchor from the echoed recipe to know what the render
+                    // did — which is what "diagnostics" is supposed to spare them.
+                    anchor: match curve {
+                        DensityCurve::Sigmoid(sig) => Some(sig.anchor),
+                        DensityCurve::Exponential(_) => None,
+                    },
+                    anchor_value: curve_anchor,
                 },
             }
         }
@@ -1145,6 +1168,10 @@ struct LoadedRecipe {
     /// carried one. Provenance only — never applied, only compared (see
     /// [`pipeline_version_warning`]).
     meta_pipeline_version: Option<u32>,
+    /// Whether the recipe explicitly selects the sigmoid curve but omits
+    /// `reconstruction.curve.anchor` — the witness behind
+    /// [`sigmoid_anchor_default_warning`].
+    sigmoid_anchor_absent: bool,
 }
 
 /// The sidecar document written beside every converted frame:
@@ -1197,6 +1224,7 @@ fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
             cfg: ResolvedConfig::default(),
             curve_dmax_present: false,
             meta_pipeline_version: None,
+            sigmoid_anchor_absent: false,
         }),
         Some(p) => {
             let txt = std::fs::read_to_string(p)
@@ -1243,6 +1271,7 @@ fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
                 cfg,
                 curve_dmax_present,
                 meta_pipeline_version,
+                sigmoid_anchor_absent: body.is_some_and(selects_sigmoid_without_anchor),
             })
         }
     }
@@ -1362,6 +1391,43 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
 /// default render it was captured under has changed, so the pixels will not match
 /// the original output. Loud (and `--strict`-promotable) rather than silent — that
 /// mismatch is exactly what `pipeline_version` exists to make visible.
+fn selects_sigmoid_without_anchor(v: &serde_json::Value) -> bool {
+    let Some(curve) = v.get("reconstruction").and_then(|r| r.get("curve")) else {
+        return false;
+    };
+    curve.get("type").and_then(|t| t.as_str()) == Some("sigmoid") && curve.get("anchor").is_none()
+}
+
+/// Warn that an archived sigmoid recipe will not reproduce its original render.
+///
+/// The same situation as [`pipeline_version_warning`], one level down: the parameters
+/// still apply, but a **default changed underneath them**. `reconstruction.curve.anchor`
+/// was introduced by `algo/reference-anchored-sigmoid` (2026-08-03) with a default of
+/// mid-grey placement, replacing the previous white-at-Dmax behavior, so a recipe frozen
+/// before that date renders differently even with `contrast`, `toe`, `shoulder` and `dmax`
+/// all pinned.
+///
+/// Why a warning and not a `reconstruction.schema_version` bump: that constant versions the
+/// **schema shape** and is checked for *exact* equality, so bumping it would reject every
+/// archived recipe outright — including the overwhelming majority that select the
+/// exponential curve and are wholly unaffected by this change. Preserving the old semantics
+/// per schema version is the other option, and it is a real design (a per-version default
+/// table), but it would have to cover `contrast` and `shoulder` too — they moved in the same
+/// commit and have the identical property — and that policy belongs with
+/// `core/conversion-versioning`, not improvised here. What is not acceptable is silence, so
+/// this says so loudly and `--strict` promotes it.
+fn sigmoid_anchor_default_warning(anchor_absent: bool) -> Option<String> {
+    anchor_absent.then(|| {
+        "the loaded recipe selects the sigmoid curve without \
+         `reconstruction.curve.anchor`, so it takes this build's default placement \
+         (mid-grey at half the reference density). Recipes frozen before 2026-08-03 were \
+         produced when the anchor pinned display *white* at the reference, so this render \
+         will not match the original even with contrast/toe/shoulder/dmax pinned. Add an \
+         explicit `anchor` (`\"white-at-dmax\"` to reproduce the old placement) to pin it."
+            .to_string()
+    })
+}
+
 fn pipeline_version_warning(loaded_version: Option<u32>) -> Option<String> {
     let recorded = loaded_version?;
     (recorded != version::PIPELINE_VERSION).then(|| {
@@ -1443,10 +1509,24 @@ fn sets_curve_dmax(v: &serde_json::Value) -> bool {
         .is_some()
 }
 
+/// Whether a recipe/override JSON object explicitly carries
+/// `reconstruction.curve.anchor` — the witness behind `roll`'s fourth roll-consistency
+/// warning. The anchor *placement* is a roll-level rule by design (design-spec §7.3): it
+/// decides which tone the roll's reference density pins, so a per-frame override changes
+/// that frame's tonal placement while every other frame keeps the roll's. A raw-JSON probe
+/// like [`sets_curve_dmax`] for the same reason — a restating override is still a
+/// per-frame assertion.
+fn sets_curve_anchor(v: &serde_json::Value) -> bool {
+    v.get("reconstruction")
+        .and_then(|r| r.get("curve"))
+        .and_then(|c| c.get("anchor"))
+        .is_some()
+}
+
 /// Whether a recipe/override JSON object explicitly carries `output.preset` — the
-/// witness behind `roll`'s third roll-consistency warning. A raw-JSON probe like
-/// [`sets_curve_dmax`], not a resolved-value comparison, because an override that
-/// *restates* the shared preset is still a per-frame assertion of the output policy
+/// witness behind `roll`'s roll-consistency warning for the output policy. A raw-JSON
+/// probe like [`sets_curve_dmax`], not a resolved-value comparison, because an override
+/// that *restates* the shared preset is still a per-frame assertion of the output policy
 /// and the roll report has no other place to surface it.
 fn sets_output_preset(v: &serde_json::Value) -> bool {
     v.get("output").and_then(|o| o.get("preset")).is_some()
@@ -1955,6 +2035,26 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
                 // reference and white above it.
                 if let AnchorPlacement::MidAtDmaxFraction(f) = s.anchor {
                     finite("--sigmoid-mid-fraction", &[f])?;
+                    // The placement adds `MID_GREY_OUTPUT_DECADES / contrast` to the
+                    // reference, so a positive-but-tiny contrast overflows that quotient to
+                    // +inf and the derived anchor is non-finite — which `apply_curve` can
+                    // only report at runtime, and which a debug build turned into a panic
+                    // (exit 101) rather than a usage error. Reject the slope here, where the
+                    // message can name the flag. The bound is far below any photographic
+                    // slope (the shipped default is ≈2.07) and exists only to keep the
+                    // derivation finite.
+                    if !(crate::types::MID_GREY_OUTPUT_DECADES / s.contrast).is_finite() {
+                        return Err(usage(format!(
+                            "--sigmoid-contrast ({}) is too small to place the mid-grey \
+                             anchor: the placement adds {}/contrast to the reference \
+                             density, and that quotient overflows to a non-finite anchor. \
+                             Use a photographic slope (the default is {:.4}), or \
+                             --sigmoid-white-at-d-max, which needs no such division",
+                            s.contrast,
+                            crate::types::MID_GREY_OUTPUT_DECADES,
+                            crate::types::REFERENCE_CONTRAST
+                        )));
+                    }
                     if f <= 0.0 || f > 1.0 {
                         return Err(usage(format!(
                             "--sigmoid-mid-fraction ({f}) must be in (0, 1] — it \
@@ -3053,6 +3153,7 @@ fn convert_frame(
     report.reconstruction_result = Some(reconstruction_result(
         &cfg.reconstruction,
         convert.dmax,
+        convert.curve_anchor,
         dmax_setting,
     ));
     // Stamp the pinned working-space interpretation (design-spec §8). NC film RGB
@@ -3349,6 +3450,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     // place it appears there. (`roll` differs: it records per-frame failures and
     // still emits its report, so the roll-level warning survives a bad frame.)
     if let Some(msg) = pipeline_version_warning(loaded.meta_pipeline_version) {
+        push_warning_buf(&mut warnings, &log, msg);
+    }
+    if let Some(msg) = sigmoid_anchor_default_warning(loaded.sigmoid_anchor_absent) {
         push_warning_buf(&mut warnings, &log, msg);
     }
     let frame = convert_frame(
@@ -3926,7 +4030,28 @@ fn resolve_frames(
                             log.warn(&msg);
                             roll_warnings.push(msg);
                         }
-                        // `output.preset` is the third roll-fixed choice, and the
+                        // `reconstruction.curve.anchor` is roll-fixed for the same
+                        // reason, one level up: `curve.dmax` is the roll's reference
+                        // density and the anchor placement decides which *tone* that
+                        // reference pins (design-spec §7.3). Overriding it per frame is
+                        // therefore a tonal-placement break even when every frame shares
+                        // one Dmax — the frame renders on a different rule, which is
+                        // subtler than a different number and would otherwise be silent.
+                        if sets_curve_anchor(&ov) {
+                            let msg = format!(
+                                "frame {}: a per-frame `params` override sets \
+                                 `reconstruction.curve.anchor`, overriding the roll-fixed \
+                                 anchor placement — this frame pins a different tone to the \
+                                 roll's reference density, breaking tonal consistency. Set \
+                                 the placement once in the shared --params recipe (and drop \
+                                 the per-frame `reconstruction.curve.anchor`) if you want a \
+                                 frozen, consistent roll.",
+                                mf.input.display()
+                            );
+                            log.warn(&msg);
+                            roll_warnings.push(msg);
+                        }
+                        // `output.preset` is the fourth roll-fixed choice, and the
                         // coarsest: it selects which branch out of the ACEScg boundary
                         // runs, so overriding it per frame emits a frame of a different
                         // *image class* — an unclamped linear ACEScg master among
@@ -4099,6 +4224,7 @@ fn run_roll(args: RollArgs) -> Result<()> {
         cfg: shared,
         curve_dmax_present: shared_dmax_present,
         meta_pipeline_version,
+        sigmoid_anchor_absent,
     } = load_recipe(args.recipe_in.as_deref())?;
     validate(&shared)?;
     reject_roll_unsupported(&shared)?;
@@ -4115,6 +4241,12 @@ fn run_roll(args: RollArgs) -> Result<()> {
     // it was captured under is a roll-level fact (one shared recipe, N frames), so
     // it rides `roll_warnings` rather than any single frame's list.
     if let Some(msg) = pipeline_version_warning(meta_pipeline_version) {
+        log.warn(&msg);
+        roll_warnings.push(msg);
+    }
+    // Same reasoning for the anchor-placement default: one shared recipe, N frames, so
+    // it is a roll-level fact rather than any single frame's.
+    if let Some(msg) = sigmoid_anchor_default_warning(sigmoid_anchor_absent) {
         log.warn(&msg);
         roll_warnings.push(msg);
     }
@@ -5492,6 +5624,96 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_a_contrast_too_small_to_place_the_anchor() {
+        // The placement adds MID_GREY_OUTPUT_DECADES / contrast, so a positive-but-tiny
+        // slope overflows that quotient. Before this check it passed `validate` (positive
+        // and under the cap), then panicked on a debug assertion — exit 101 for what is a
+        // usage error.
+        // The quotient overflows below ~2.2e-39, so those are the values under test.
+        for bad in [1e-40, 1e-44, 2.1e-39] {
+            let cfg = sigmoid_cfg(SigmoidParams {
+                contrast: bad,
+                anchor: AnchorPlacement::MidAtDmaxFraction(0.5),
+                ..SigmoidParams::default()
+            });
+            let Err(err) = validate(&cfg) else {
+                panic!("contrast {bad} must be rejected")
+            };
+            assert!(matches!(err, NcError::Usage(_)), "{bad}: {err}");
+            assert!(err.to_string().contains("--sigmoid-contrast"), "{err}");
+        }
+        // Just above the threshold the derivation stays finite and is therefore accepted —
+        // the check guards the *overflow*, not "small contrast" in general. `f32::MIN_POSITIVE`
+        // gives a finite anchor of ~6.3e37, and since `contrast * anchor` is then exactly
+        // MID_GREY_OUTPUT_DECADES the render is a flat mid-grey rather than a broken one.
+        validate(&sigmoid_cfg(SigmoidParams {
+            contrast: f32::MIN_POSITIVE,
+            anchor: AnchorPlacement::MidAtDmaxFraction(0.5),
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
+        // `WhiteAtDmax` performs no division, so an overflowing slope is none of this rule's
+        // business — it stays accepted, which is what makes the check targeted rather than
+        // a blanket lower bound on contrast.
+        validate(&sigmoid_cfg(SigmoidParams {
+            contrast: 1e-40,
+            anchor: AnchorPlacement::WhiteAtDmax,
+            ..SigmoidParams::default()
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn sigmoid_anchor_default_warning_fires_only_for_an_anchorless_sigmoid_recipe() {
+        // The witness is a raw-JSON probe, so test it that way.
+        let probe = |json: &str| {
+            selects_sigmoid_without_anchor(
+                &serde_json::from_str::<serde_json::Value>(json).unwrap(),
+            )
+        };
+        // An archived sigmoid recipe with no `anchor` — the case that silently changed
+        // meaning on 2026-08-03.
+        assert!(probe(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","contrast":1.0}}}"#
+        ));
+        // Pinned explicitly either way ⇒ nothing changed underneath it, no noise.
+        assert!(!probe(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax"}}}"#
+        ));
+        assert!(!probe(
+            r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5}}}}"#
+        ));
+        // The exponential curve has no placement rule, and a recipe with no curve section
+        // resolves to exponential — neither is affected, so neither warns.
+        assert!(!probe(
+            r#"{"reconstruction":{"curve":{"type":"exponential"}}}"#
+        ));
+        assert!(!probe(r#"{"reconstruction":{"type":"density"}}"#));
+        assert!(!probe(r#"{"film_base":{"source":"auto"}}"#));
+
+        assert_eq!(sigmoid_anchor_default_warning(false), None);
+        let msg = sigmoid_anchor_default_warning(true).expect("must warn");
+        assert!(msg.contains("white-at-dmax"), "{msg}");
+    }
+
+    #[test]
+    fn sets_curve_anchor_probes_the_roll_fixed_placement() {
+        let probe = |json: &str| {
+            sets_curve_anchor(&serde_json::from_str::<serde_json::Value>(json).unwrap())
+        };
+        assert!(probe(
+            r#"{"reconstruction":{"curve":{"anchor":"white-at-dmax"}}}"#
+        ));
+        assert!(probe(
+            r#"{"reconstruction":{"curve":{"anchor":{"mid-at-dmax-fraction":0.6}}}}"#
+        ));
+        // A restating override still counts (same rule as `sets_curve_dmax`), and a frame
+        // that touches only non-placement keys does not.
+        assert!(!probe(r#"{"reconstruction":{"curve":{"contrast":2.0}}}"#));
+        assert!(!probe(r#"{"print":{"print_exposure":0.5}}"#));
+    }
+
+    #[test]
     fn validate_rejects_bad_sigmoid_mid_fraction() {
         // (0, 1]: 0 detaches the anchor from the reference entirely (mid-grey on
         // the film base), negative places it below the base, above 1 places
@@ -5937,6 +6159,7 @@ mod tests {
         let v = serde_json::to_value(reconstruction_result(
             &Reconstruction::Simple,
             None,
+            None,
             DmaxSetting::Default,
         ))
         .unwrap();
@@ -5944,6 +6167,7 @@ mod tests {
 
         let v = serde_json::to_value(reconstruction_result(
             &Reconstruction::default(),
+            Some(2.0),
             Some(2.0),
             DmaxSetting::Default,
         ))
@@ -5954,7 +6178,11 @@ mod tests {
                 "type": "density",
                 "curve": {
                     "type": "exponential",
-                    "dmax": {"policy": "fixed", "value": 2.0, "provenance": "default"}
+                    "dmax": {"policy": "fixed", "value": 2.0, "provenance": "default"},
+                    // No placement rule exists for the exponential curve, so `anchor` is
+                    // omitted entirely rather than reported as a null rule; the reference
+                    // *is* the anchor, so `anchor_value` mirrors it.
+                    "anchor_value": 2.0
                 }
             })
         );
@@ -5966,6 +6194,7 @@ mod tests {
         });
         let v = serde_json::to_value(reconstruction_result(
             &cfg.reconstruction,
+            None,
             None,
             DmaxSetting::Recipe,
         ))
@@ -5986,10 +6215,23 @@ mod tests {
             let v = serde_json::to_value(reconstruction_result(
                 &cfg.reconstruction,
                 Some(1.37),
+                // Default mid-grey placement: A = 0.5*1.37 + 0.745/2.0687 ≈ 1.045, so the
+                // derived anchor is deliberately NOT the reference here.
+                Some(1.045),
                 setting,
             ))
             .unwrap();
             assert_eq!(v["curve"]["type"], "sigmoid");
+            // The placement rule and the derived anchor make this block self-contained:
+            // `dmax.value` is the reference, `anchor_value` is what rendered to 1.0.
+            assert_eq!(
+                v["curve"]["anchor"],
+                serde_json::json!({"mid-at-dmax-fraction": 0.5})
+            );
+            // Approximate: an f32 widens to f64 in JSON (1.045f32 is 1.0449999570846558),
+            // so an exact literal comparison would be asserting f32 representation.
+            let got = v["curve"]["anchor_value"].as_f64().expect("anchor_value");
+            assert!((got - 1.045).abs() < 1e-6, "{got}");
             assert_eq!(v["curve"]["dmax"]["policy"], "auto");
             assert_eq!(
                 v["curve"]["dmax"]["provenance"], "auto-frame",
@@ -6005,6 +6247,7 @@ mod tests {
         let v = serde_json::to_value(reconstruction_result(
             &cfg.reconstruction,
             Some(1.64),
+            Some(1.64),
             DmaxSetting::Recipe,
         ))
         .unwrap();
@@ -6013,6 +6256,7 @@ mod tests {
         // ...and a CLI-passed one reports `cli`.
         let v = serde_json::to_value(reconstruction_result(
             &cfg.reconstruction,
+            Some(1.64),
             Some(1.64),
             DmaxSetting::Cli,
         ))

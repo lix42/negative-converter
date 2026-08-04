@@ -1674,3 +1674,46 @@ What other epics need to know about `algo`:
   **grey card in frame** (a real 18% reference under the same illumination as a diffuse white —
   only 2 of 10 existing frames could even approximate the datasheet Δ), and ideally the
   calibrated transmission step wedge.
+
+### 2026-08-03 (later) — PR #70 review: four findings, and why one remedy was refused
+
+- **The report named a number the render did not use.** `ReconstructionReport.dmax` was
+  documented as "the display-white anchor the curve used" and, after the placement split,
+  carried the *reference* instead. Now both travel: `dmax` (reference, what a recipe freezes
+  back) and `curve_anchor` (derived, what rendered to 1.0 and therefore sets the floor at
+  `10^(−contrast·anchor)`). The JSON `reconstruction_result.curve` gained the placement
+  *rule* plus `anchor_value`, so that block is self-contained — a consumer no longer has to
+  re-derive the anchor from the echoed recipe, which is the opposite of what diagnostics are
+  for. Exponential reports both fields equal rather than a null, so consumers need no special
+  case.
+- **A tiny contrast panicked instead of erroring.** `MID_GREY_OUTPUT_DECADES / contrast`
+  overflows below ~2.2e-39, and the `debug_assert` I had left there turned that into exit
+  101 in debug and `inf` fed into `s_curve` in release. Now a `validate` usage error naming
+  the flag, plus `apply_curve` returning a real error for the programmatic path (the
+  defense-in-depth pattern `algo/simple.rs` already uses). Two things worth recording: the
+  bound applies **only** to the mid-grey placement, since `WhiteAtDmax` performs no
+  division; and `f32::MIN_POSITIVE` is *accepted* on purpose — the quotient is finite there,
+  and because `contrast · anchor` is then exactly `MID_GREY_OUTPUT_DECADES` the render is a
+  flat mid-grey rather than a broken one. My first test asserted it should fail, which was
+  wrong about the arithmetic.
+- **The roll consistency check had a fourth hole.** `resolve_frames` probed `film_base`,
+  `curve.dmax` and `output.preset`, so a per-frame `curve.anchor` override silently gave one
+  frame a different placement *rule* — subtler than a different Dmax number and, by our own
+  documentation, a roll-level property. Added as warning (5) of six.
+- **Refused: bumping `reconstruction.schema_version`.** The reviewer was right that an
+  archived sigmoid recipe now renders differently — real, and it would have been silent. But
+  the proposed remedy is wrong for this codebase and the reasoning is worth keeping: that
+  constant versions the schema **shape** and the reader checks it for *exact* equality, so
+  bumping to 2 would reject every archived recipe outright, including the large majority that
+  select `exponential` and are wholly unaffected. The alternative — preserving v1 semantics
+  via a per-version default table — is a real design, but it would have to cover `contrast`
+  and `shoulder` too (both moved in the same commit with the identical property), and that is
+  `core/conversion-versioning` policy, not something to improvise inside an algo task.
+  **What is not acceptable is silence**, so it is now a loud, `--strict`-promotable warning
+  when a loaded recipe selects sigmoid with no `anchor` — modelled directly on the existing
+  `pipeline_version_warning`, which handles the same "parameters still apply, default moved
+  underneath them" situation one level up.
+- **A gap that is genuinely unowned, flagged rather than filed:** `core/conversion-versioning`
+  is scoped to *default* behaviour ("bumps only when default conversion behaviour changes"),
+  so nothing currently owns "a non-default path changed and archived recipes for it are
+  reinterpreted". The warning covers this instance; the policy question is open.
