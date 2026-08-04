@@ -509,7 +509,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [SilverFast HDR/HDRi decode](tasks/io/silverfast-decode.md)
 - [x] [TIFF encode and output](tasks/io/tiff-encode.md)
 - [x] [Input data semantics and validation](tasks/io/input-data-semantics.md) — resolve transfer encoding independently from scanner-device versus colorimetric meaning; report evidence and reject ambiguity instead of automatically applying an ICC transform before density conversion
-- [ ] [Transactional output writes](tasks/io/transactional-output-writes.md) — from
+- [x] [Transactional output writes](tasks/io/transactional-output-writes.md) — from
   the output-atomicity review: write every artifact (primary TIFF, IR, sidecar,
   report-file) to a same-directory temp, fsync, then rename, so a failed/interrupted
   run never leaves a truncated final file. Honest guarantee: no partial files +

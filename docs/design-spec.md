@@ -1724,6 +1724,36 @@ false-positive on legitimate high-contrast conversions).
   changed preset/default pixels activate.
 
 ### Output / encode (current terminal stage; target stages 5–6)
+
+**How artifacts reach disk (`io/transactional-output-writes`).** Every file `nc`
+writes — the primary output, the IR export, the sidecar, `--dump-params`,
+`--report-file` — is written to a **same-directory temp**, flushed, **fsynced**, and
+only then renamed onto its final path. Two guarantees follow, and one deliberately
+does not:
+
+- **No truncated file ever appears at a final path.** A failure mid-write leaves only
+  a temp, which is removed; the final path holds either the previous content or
+  nothing. Overwrite remains **atomic replace** — `nc` keeps overwriting its own
+  output rather than refusing.
+- **One conversion's artifacts commit together.** The IR export, primary and sidecar
+  are all staged before any is renamed, so a failure in a later one leaves *no*
+  primary output — the "complete TIFF with no sidecar" case is gone. The renames are
+  pre-checked (a target occupied by a directory fails before anything is promoted) and
+  the **primary is renamed last**, because its presence is what reads as success.
+- **Not a multi-file transaction.** POSIX `rename` is atomic per *file*; a set cannot
+  be flipped as one unit. A crash between two renames, or a rename failure no cheap
+  check predicts, can still leave one final path updated and another not. This is
+  inherent and stated rather than papered over.
+
+`--dump-params` and `--report-file` are staged individually but *not* held back to
+join that set: the former is written before anything is decoded, and the latter must
+land even when `--strict` then fails the run (and under `roll` it is a roll-level
+artifact no single frame's set could hold). Telemetry is unchanged — after the
+finalized output, best-effort, never part of the set. Directory fsync (power-loss
+durability for the rename itself) is out of scope: the temp+rename pattern already
+covers a full disk, a permissions error, a crash and `SIGINT`, and the remaining gain
+would cost a Unix-only code path for output that is reproducible by re-running.
+
 - `-o, --output <path>` (required)
 - `--output-preset <legacy|film-master|ultra-hdr-v1>` — the atomic output
   **policy** choice;
@@ -2026,6 +2056,12 @@ recipe key, and the deprecated `--assume-linear` flag are **usage** errors, exit
 2; `--input-profile` (reserved, not applied) is unsupported, exit 4. `nc inspect`
 never fails on ambiguity — it reports the per-axis evidence so the file stays
 diagnosable.
+
+**Output write failures** map to exit **5**, and since
+`io/transactional-output-writes` that exit carries a stronger promise: no truncated
+artifact is left at a final path, and a failure while writing any of one conversion's
+artifacts leaves *no* primary output rather than an orphaned one (§9 Output/encode).
+A failed run also leaves no `*.nctmp` staging files behind.
 
 **Memory preflight** (§9 Global, `--max-memory`) maps to exit **6**: before any
 input is decoded, every command that reads a scan estimates the run's peak

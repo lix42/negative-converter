@@ -5,21 +5,20 @@
 //! library is pinned in `vendor/ultrahdr-sys`; ISO writing is deliberately off.
 
 use std::ffi::{CStr, c_void};
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::ptr::NonNull;
 
 use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use ultrahdr_sys as uhdr;
 
+use crate::io::staged::{self, Staged};
 use crate::pipeline::{color, gain_map};
 use crate::types::{EncodeOutcome, EncodeReport, NcError, OutputStats, Result};
 
 const JPEG_QUALITY: u8 = 95;
 
 /// Encode and package one explicit legacy Ultra HDR v1 output.
-pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<EncodeOutcome> {
+pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<(Staged, EncodeOutcome)> {
     let gain = gain_map::encode_legacy_gain_map(&render)?;
     let (base, icc, _) = color::encode_rendered_sdr(render.into_sdr())?;
     let (base_rgb, loss, stats) = quantize_base(&base.rgb);
@@ -42,14 +41,10 @@ pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<EncodeOutc
     )?;
     let packaged = package(&base_jpeg, &gain_jpeg, &gain.metadata)?;
 
-    let file = File::create(path)
-        .map_err(|e| NcError::Write(format!("creating {}: {e}", path.display())))?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(&packaged)
-        .and_then(|()| writer.flush())
-        .map_err(|e| NcError::Write(format!("writing {}: {e}", path.display())))?;
-    Ok(EncodeOutcome { loss, stats })
+    // Staged like the TIFF path: the whole package is built in memory first, so the
+    // final path only ever sees a complete Ultra HDR file.
+    let staged = staged::stage_bytes(path, &packaged)?;
+    Ok((staged, EncodeOutcome { loss, stats }))
 }
 
 fn encode_jpeg(

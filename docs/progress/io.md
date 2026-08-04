@@ -39,9 +39,16 @@ What other epics need to know about `io`:
 - **f32 output is written verbatim** (values > 1.0 preserved); u16 clamps and
   rounds. Non-finite samples are counted at **both** depths, so a numerical fault
   upstream stays visible — don't launder `NaN` into a finite value in a stage.
-- **Known gap:** artifacts are still written straight to their final paths
-  (`io/transactional-output-writes`). *(The "peak memory is unbounded" half of this
-  gap is resolved — see the next bullet.)*
+- **Every artifact is written to a same-directory temp, fsynced, then renamed**
+  (`io/transactional-output-writes`, done 2026-08-04 — supersedes the "written
+  straight to their final paths" gap). `io::staged` owns the pattern; every writer in
+  `io` goes through it. What other epics can rely on: **no truncated file ever appears
+  at a final path**, overwrite is **atomic replace**, and one conversion's IR + primary
+  + sidecar are all staged before any is renamed, so a later failure leaves *no*
+  primary output. What they must **not** assume: multi-file atomicity — `rename` is
+  atomic per file, so a crash between renames can still split the set. If you add an
+  artifact to `convert`, stage it and push it onto `pending` *before* the primary,
+  which is deliberately committed last.
 - **Peak memory is now bounded and reported** (`io/memory-preflight`, done
   2026-07-27 — supersedes the "unbounded" gap above). Every command that decodes
   runs a **preflight before decode**, from a metadata-only `io::decode::probe`, and
@@ -686,10 +693,64 @@ What other epics need to know about `io`:
 
 ## transactional-output-writes
 
-**Status:** not started
-**Updated:** —
+**Status:** done
+**Updated:** 2026-08-04
 
 - Goal: Ensure a failed or interrupted `nc convert` never leaves a **partial or inconsistent artifact set** on disk.
+- **Done.** New `src/io/staged.rs` (`stage` / `stage_bytes` / `Staged::commit` /
+  `commit_all`); `io::encode::{encode, export_ir, write_sidecar}`, `io::ultra_hdr::encode`
+  and `cli::write_json` all return or use a `Staged` instead of writing to the final path.
+  Full gate green (fmt, clippy `-D warnings`, 522 binary + 130 integration tests).
+
+### The decisions the task asked to pin down
+
+- **fsync depth: each temp, yes; parent directory, no.** `File::sync_all` on every temp
+  before any rename — required, since a rename is only as good as the data it points at.
+  Directory fsync is **out of scope**: it buys only *power-loss* durability for the
+  rename itself, while the failures worth defending against here (full disk, permissions,
+  crash, `SIGINT`) are already covered because a rename either happened or did not. It
+  would also cost a Unix-only code path (`File::open(dir)?.sync_all()` has no portable
+  equivalent) for output that is reproducible by re-running the command.
+- **Overwrite: atomic replace**, matching the previous `File::create` truncate-in-place
+  behaviour — `nc` keeps overwriting its own output. Verified from the std source rather
+  than memory: `fs::rename` documents "replacing the original file if `to` already
+  exists" on both Unix (`rename`) and Windows (`MoveFileExW` /
+  `SetFileInformationByHandle`). One caveat std cannot paper over: on Windows a rename
+  can fail if the destination is held open by another process. CI is Linux + macOS only,
+  so the Windows path is **untested, not guaranteed** — recorded rather than claimed.
+- **Report inclusion: no.** `--report-file` is staged individually (so it can't be
+  truncated) but does not join the conversion's set. Two independent reasons: it must
+  land even when `--strict` subsequently fails the run, and under `roll` it is a
+  roll-level artifact that no single frame's set could hold. `--dump-params` likewise —
+  it is written before anything is decoded. Telemetry unchanged: after the finalized
+  output, best-effort, never part of the set.
+- **The set is IR + primary + sidecar**, all staged before any rename. Under `roll` that
+  set is per frame, which falls out of `convert_frame` being shared verbatim.
+
+### Two findings worth keeping
+
+- **Staging alone did not fix the orphaned-primary case, and the failure-injection test
+  is what caught it.** The obvious way to make a sidecar write fail — occupy its path
+  with a directory — does not fail the *write*: the temp is a sibling of that directory,
+  so `create` succeeds and the **rename** is what fails. With commits running in order,
+  the primary was already promoted by then, reproducing the very bug this task exists to
+  kill. Two changes fixed it: `commit_all` pre-checks every target for a directory
+  blocker before promoting anything, and the **primary is committed last** because its
+  presence at the final path is what reads as "this conversion succeeded". Neither would
+  have been written from reasoning alone — the test found it.
+- **`Staged` must be `#[must_use]` and unlink on `Drop`.** Dropping one discards the
+  write, which is right on an error path and a silent data-loss bug anywhere else. The
+  attribute is what makes the difference visible at the call site. `commit` takes `self`
+  by value and puts the temp path back on failure, so a rename that fails still cleans up.
+- **`flush_buf` moved and kept its test.** `BufWriter`'s implicit flush on drop discards
+  its error, so a full disk on the final block would silently truncate — the trap the old
+  `io::encode::flush_buf` existed to close. It now lives in `io::staged` as
+  `flush_surfacing_errors`, still generic over the writer purely so the failure stays
+  testable with a mock; a real `File` cannot be made to fail portably.
+- **Determinism verified against the pre-change binary**, not assumed: same input +
+  recipe produced a **byte-identical** primary TIFF, and the only sidecar difference was
+  `meta.git_dirty` (an artifact of building from a dirty tree). This change is purely
+  *how and where* bytes are written.
 
 
 ## scanner-density-calibration

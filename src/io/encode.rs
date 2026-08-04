@@ -8,14 +8,14 @@
 //! (the neutral contract lives in [`crate::types`]).
 
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 
 use tiff::encoder::colortype::{ColorType, Gray16, Gray32Float, RGB16, RGB32Float};
 use tiff::encoder::{TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, TiffValue};
 use tiff::tags::Tag;
 
+use crate::io::staged::{self, Staged};
 use crate::types::{
     BigTiff, EncodeOutcome, EncodeReport, LinearImage, NcError, OutDepth, OutputParams,
     OutputStats, Result,
@@ -47,13 +47,12 @@ pub fn encode(
     params: &OutputParams,
     icc: Option<&[u8]>,
     path: &Path,
-) -> Result<EncodeOutcome> {
-    // Borrow the BufWriter into the encoder rather than moving it, so we still
-    // own it afterward and can flush explicitly — see `flush_buf`.
-    let mut writer = BufWriter::new(create(path)?);
-    let outcome = encode_to_writer(&mut writer, image, params, icc)?;
-    flush_buf(&mut writer, path)?;
-    Ok(outcome)
+) -> Result<(Staged, EncodeOutcome)> {
+    // Staged: the bytes land on a same-directory temp and are fsynced, and `path`
+    // does not exist (or still holds the previous output) until the caller commits.
+    // Flushing is `stage`'s job now — a `BufWriter` dropped unflushed silently
+    // truncates, which is why neither layer may leave it implicit.
+    staged::stage(path, |writer| encode_to_writer(writer, image, params, icc))
 }
 
 /// Whether encoding `image` under `params` (with an `icc_len`-byte embedded
@@ -75,15 +74,15 @@ pub fn plans_bigtiff(params: &OutputParams, image: &LinearImage, icc_len: usize)
 /// Write the IR plane as a single-channel TIFF at `depth`. Errors loudly when the
 /// image carries no IR plane rather than writing an empty/placeholder file — the
 /// caller asked for IR export, so a missing plane is a real failure.
-pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<()> {
-    // Check for the IR plane *before* creating the file: a no-IR error must not
-    // truncate/clobber an existing target the user pointed `--export-ir` at.
+pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<Staged> {
+    // Check for the IR plane before staging anything. Staging alone would no longer
+    // clobber the target — that is the point of the temp — but there is no reason to
+    // create and immediately discard a file for a request that cannot succeed.
     if image.ir.is_none() {
         return Err(no_ir_error());
     }
-    let mut writer = BufWriter::new(create(path)?);
-    export_ir_to_writer(&mut writer, image, depth)?;
-    flush_buf(&mut writer, path)
+    let (staged, ()) = staged::stage(path, |writer| export_ir_to_writer(writer, image, depth))?;
+    Ok(staged)
 }
 
 /// Write the sidecar JSON next to the output. The sidecar path is `<output>.json`
@@ -95,10 +94,9 @@ pub fn export_ir(image: &LinearImage, depth: OutDepth, path: &Path) -> Result<()
 /// (`core/conversion-versioning`), keeping run identity out of the recipe body so
 /// the sidecar stays reloadable through `--params`. This function only owns the
 /// path and the write error.
-pub fn write_sidecar(output_path: &Path, sidecar_json: &str) -> Result<()> {
+pub fn write_sidecar(output_path: &Path, sidecar_json: &str) -> Result<Staged> {
     let sidecar = sidecar_path(output_path);
-    std::fs::write(&sidecar, sidecar_json)
-        .map_err(|e| NcError::Write(format!("writing sidecar {}: {e}", sidecar.display())))
+    staged::stage_bytes(&sidecar, sidecar_json.as_bytes())
 }
 
 /// The sidecar path for an output: `<output>.json` (extension appended, not
@@ -280,24 +278,8 @@ where
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn create(path: &Path) -> Result<File> {
-    File::create(path).map_err(|e| NcError::Write(format!("creating {}: {e}", path.display())))
-}
-
 fn no_ir_error() -> NcError {
     NcError::Unsupported("cannot export IR: image has no IR plane (HDRi input only)".into())
-}
-
-/// Flush buffered output explicitly, surfacing the error. `BufWriter`'s implicit
-/// flush on drop discards any error (e.g. a full disk on the final block), so a
-/// dropped-without-flush writer would silently truncate the TIFF — exactly the
-/// "fail loudly" violation this stage must avoid. The `tiff` encoder never flushes
-/// and gives no way to reclaim the moved writer, so callers own the BufWriter and
-/// flush it here once encoding returns.
-fn flush_buf<W: Write>(writer: &mut W, path: &Path) -> Result<()> {
-    writer
-        .flush()
-        .map_err(|e| NcError::Write(format!("flushing {}: {e}", path.display())))
 }
 
 fn depth_bytes(depth: OutDepth) -> u64 {
@@ -710,31 +692,17 @@ mod tests {
     }
 
     #[test]
-    fn flush_error_is_surfaced_not_swallowed() {
-        // A writer whose flush fails must produce an NcError::Write, not be
-        // silently dropped (the BufWriter-drop-swallows-errors trap).
-        struct FailFlush;
-        impl Write for FailFlush {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::Error::other("disk full"))
-            }
-        }
-        let mut w = FailFlush;
-        let err = flush_buf(&mut w, Path::new("out.tiff")).unwrap_err();
-        assert!(matches!(err, NcError::Write(msg) if msg.contains("disk full")));
-    }
-
-    #[test]
     fn sidecar_path_appends_json() {
         let dir = std::env::temp_dir();
         let output = dir.join(format!("nc_sidecar_test_{}.tiff", std::process::id()));
         let json = r#"{"algorithm":"density"}"#;
-        write_sidecar(&output, json).unwrap();
-
+        let staged = write_sidecar(&output, json).unwrap();
         let sidecar = PathBuf::from(format!("{}.json", output.display()));
+        // Staged, so nothing is at the sidecar path yet — the commit is what puts it
+        // there. This test now covers the path derivation *and* that ordering.
+        assert!(!sidecar.exists(), "the sidecar appears only on commit");
+        staged.commit().unwrap();
+
         let read = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(read, json);
         // Valid JSON.

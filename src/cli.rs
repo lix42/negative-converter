@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::algo::density;
 use crate::io::decode::{DecodeInfo, decode_within, probe};
-use crate::io::{encode, ultra_hdr};
+use crate::io::{encode, staged, ultra_hdr};
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
@@ -2333,11 +2333,17 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Serialize a value as pretty JSON to a file; an I/O failure is a write error.
+///
+/// Staged and committed immediately, so a failure mid-write cannot leave a truncated
+/// document at `path` — but *not* held back to join a conversion's artifact set
+/// (`io/transactional-output-writes`). Both callers are deliberately outside it:
+/// `--dump-params` is written before anything is decoded, and `--report-file` must
+/// land even when `--strict` subsequently fails the run — and in `roll` it is a
+/// roll-level artifact that no single frame's set could hold.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| NcError::Other(format!("serializing JSON: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(|e| NcError::Write(format!("cannot write {}: {e}", path.display())))
+    staged::stage_bytes(path, json.as_bytes())?.commit()
 }
 
 /// Emit a report as JSON to stdout (kept clean) or `--report-file`. `none`
@@ -3181,6 +3187,13 @@ fn convert_frame(
 
     // Optional IR export — before the main encode, so a failing IR write fails
     // the run without first writing the primary output/sidecar.
+    // Staged artifacts, committed together after every fallible step succeeds. The
+    // set is IR + primary + sidecar: all three belong to one conversion, and it is
+    // the orphaned-primary case (`encode` ok → sidecar fails) that motivated this.
+    // `--report-file` / `--dump-params` are staged individually elsewhere: the report
+    // must land even when `--strict` then fails the run, and in `roll` it is a
+    // roll-level artifact that no single frame's set could hold.
+    let mut pending: Vec<staged::Staged> = Vec::new();
     let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
         let stage_started = Instant::now();
@@ -3189,16 +3202,15 @@ fn convert_frame(
         // legacy `--output-hdr` and `film-master` (which resolves f32 without touching `output.hdr`). The IR
         // *samples* are unchanged either way — the plane is carried, never converted —
         // so the only difference is quantization headroom. Documented in design-spec §9.
-        encode::export_ir(&image, cfg.output.depth(), path)?;
+        pending.push(encode::export_ir(&image, cfg.output.depth(), path)?);
         ir_export_ms = Some(elapsed_ms(stage_started));
-        log.info(format_args!("wrote IR plane {}", path.display()));
         report.ir_exported = Some(path.clone());
     }
 
     // Stage 5 — encode + effective-recipe sidecar.
     let stage_started = Instant::now();
     let render_timings = rendered.timings();
-    let outcome = match rendered {
+    let (primary, outcome) = match rendered {
         FrameRender::Tiff(rendered) => {
             encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?
         }
@@ -3249,7 +3261,27 @@ fn convert_frame(
         params: cfg,
     })
     .map_err(|e| NcError::Other(format!("serializing sidecar: {e}")))?;
-    encode::write_sidecar(output, &sidecar_json)?;
+    pending.push(encode::write_sidecar(output, &sidecar_json)?);
+    // The primary goes LAST, deliberately. Its presence at the final path is what
+    // reads as "this conversion succeeded", so it must be the last thing to appear:
+    // if some other rename fails, the run leaves no output rather than an output with
+    // a missing companion. The reverse order would reintroduce the orphaned-primary
+    // case for any commit-phase failure.
+    pending.push(primary);
+
+    // Everything is written and fsynced; only the renames are left, and `commit_all`
+    // pre-checks every target first so a predictable blocker fails before anything is
+    // promoted. This is the narrow window the scope note describes — a crash between
+    // two renames, or a rename failure no check predicts, can still leave one final
+    // path updated and another not. POSIX cannot fix that (rename is atomic per file,
+    // not across a set). What can no longer happen: a truncated artifact at a final
+    // path, or a complete primary output orphaned because a later step failed.
+    staged::commit_all(std::mem::take(&mut pending))?;
+    // Logged only after the renames, so the message describes what is actually on
+    // disk under that name rather than what was staged.
+    if let Some(path) = &export_ir {
+        log.info(format_args!("wrote IR plane {}", path.display()));
+    }
     log.info(format_args!("wrote {}", output.display()));
 
     // Success: hand the accumulated warnings to the report (the buffer is the
