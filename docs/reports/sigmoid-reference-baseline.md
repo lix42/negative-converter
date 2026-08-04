@@ -192,3 +192,52 @@ compresses between-frame differences too (candidate 1's small sd is that artifac
   and P3 (window at +0, people at +1.5) exceed the SDR range. That is the HDR-output question,
   deliberately deferred until every candidate is renderable so it can be judged across all of
   them at once.
+
+## What shipped (2026-08-03)
+
+The task file mandates trying remedies in order — recalibrate defaults, then
+reparameterize semantics, then change the equation. **The first two sufficed; the
+equation is untouched.** §7.3's five lines are character-for-character what they were,
+which is why no `pipeline_version` bump is owed here and why the two default curve
+shapes remain comparable as the same family.
+
+**Remedy 1 — recalibrated defaults.** `contrast 1.0 → 0.745/0.36 ≈ 2.0687` and
+`shoulder 0.2 → 0.6`. Neither is a preference: the contrast is the manufacturers' own
+mid-to-white aim delta expressed on the output axis (corroborated by film gamma 0.52
+and system gamma 1.07), and the shoulder is the width whose bend begins at `D′ ≈ 0.70`,
+essentially at mid-grey, where a print shoulder belongs. `toe` stayed at 0.2 — nothing
+in the measurement asked it to move.
+
+**Remedy 2 — reparameterized the anchor.** Recalibration alone could not fix the
+defect, and this is the substantive change. `curve.dmax` used to be two things at once:
+the roll's *reference* density and the density that renders to `1.0`. Splitting them
+into `curve.dmax` (reference) + `curve.anchor` (which tone it places) is exactly the
+"make the placement a declared control instead of an emergent value" option the task
+listed, and it is what makes a photographic contrast usable — raising contrast pivots
+the line about the pinned point, so pinning white necessarily darkens everything below
+it. The default `{"mid-at-dmax-fraction": 0.5}` is candidate 3's form.
+
+**Candidate 3 shipped as the default; candidate 8 did not, and could not.** 8 is the
+better form — Dmin-anchored, so it does not inherit the leader's unreliability — but its
+anchor needs per-stock datasheet offsets, i.e. the registry that
+[`algo/film-stock-profiles`](../tasks/algo/film-stock-profiles.md) exists to build, and
+those offsets currently rest on chart reads that are not true Status M densities. The
+routing the user specified (declared stock → 8, no stock → 3, no roll Dmax → the fixed
+fallback, per-frame always opt-in) therefore lands in two pieces: this task ships the
+no-stock arm and the opt-in escape hatch, and the stock arm arrives with the registry.
+`AnchorPlacement` is the seam it plugs into — a third variant, not a rewrite.
+
+**What is deliberately still provisional.** `f = 0.5` is a measurement (α ≈ 0.48–0.57
+across three stocks) whose numerator is one of those chart reads, and the fixed fallback
+`NOMINAL_DMAX = 2.0` is not recalibrated: the measured rolls cluster near 1.36 once
+Phoenix is excluded, but the user is adding samples and asked for that calculation to
+wait. Mid-placement halves the cost of getting it wrong (`dA/dR = f`), which is why
+leaving it is defensible rather than negligent. Both are parameter values, not forms —
+a later change is a default change plus a conversion-version bump, which is the seam
+`output/presets` and `conversion-versioning` already own.
+
+**Retained as diagnostics, not deprecated.** `--sigmoid-white-at-d-max` is the old rule
+kept reachable so the defect can be reproduced on demand, and candidate 7 (zero free
+parameters, white at the *measured* diffuse white) remains the check on the datasheet
+derivation. Both are content-driven or known-wrong for a default; neither is worth
+deleting.

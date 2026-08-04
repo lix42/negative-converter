@@ -74,10 +74,18 @@ pub struct GainMapSource {
 /// the recipe structs).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ConvertReport {
-    /// The resolved display-white anchor density (`Dmax`) the density curve
-    /// used, when one was applied. `None` for `simple` (no curve stage) and for
+    /// The resolved **reference** density (`curve.dmax`) — the roll calibration, and the
+    /// value to freeze back into a recipe. `None` for `simple` (no curve stage) and for
     /// the exponential curve with `dmax = none`.
+    ///
+    /// Not necessarily the density that rendered to `1.0`: the sigmoid derives its anchor
+    /// from this reference via `AnchorPlacement`. See [`Self::curve_anchor`].
     pub dmax: Option<f32>,
+    /// The **derived** anchor the curve used — the corrected density that rendered to
+    /// `1.0`, hence the black floor at `10^(−contrast·curve_anchor)`. Equal to
+    /// [`Self::dmax`] for the exponential curve and the sigmoid's `white-at-dmax`
+    /// placement; larger under the default mid-grey placement.
+    pub curve_anchor: Option<f32>,
     /// The resolved stage-4 white-balance gains `[r, g, b]` the legacy print
     /// render applied — the explicit gains, or the auto-estimated ones
     /// (`print.white_balance = gray-world | percentile`). Reported so a roll can
@@ -111,6 +119,7 @@ pub(crate) fn reconstruct_and_print(
         positive,
         ConvertReport {
             dmax: recon.dmax,
+            curve_anchor: recon.curve_anchor,
             white_balance,
             balance_range: recon.balance_range,
         },
@@ -173,6 +182,7 @@ pub fn render_gain_map_source(
     Ok(GainMapSource {
         convert: ConvertReport {
             dmax: recon.dmax,
+            curve_anchor: recon.curve_anchor,
             white_balance: Some(shared.controls.white_balance()),
             balance_range: recon.balance_range,
         },
@@ -254,6 +264,7 @@ fn render_film_master(
         icc,
         convert: ConvertReport {
             dmax: recon.dmax,
+            curve_anchor: recon.curve_anchor,
             white_balance: None,
             balance_range: recon.balance_range,
         },
@@ -673,8 +684,8 @@ mod tests {
 pub(crate) mod golden {
     use super::*;
     use crate::types::{
-        BalanceRange, DensityCurve, DensityParams, DmaxSource, ExponentialParams, SigmoidParams,
-        WbSource,
+        AnchorPlacement, BalanceRange, DensityCurve, DensityParams, DmaxSource, ExponentialParams,
+        SigmoidParams, WbSource,
     };
 
     /// Five pixels spanning the tonal range plus out-of-range finite values,
@@ -871,16 +882,29 @@ pub(crate) mod golden {
 
     #[test]
     fn golden_sigmoid_default_is_numerically_exact() {
-        // The shipped sigmoid equation, default knobs (contrast 1, toe/shoulder
-        // 0.2, fixed anchor) — the refactor changes ownership and schema, not
-        // one bit of the numeric behavior.
+        // RECAPTURED 2026-08-03 (`algo/reference-anchored-sigmoid`, Phase 4). The sigmoid
+        // defaults changed deliberately: contrast 1.0 → REFERENCE_CONTRAST (≈2.07), shoulder
+        // 0.2 → 0.6, and the anchor is now mid-grey at half the reference rather than white
+        // at the reference. On this synthetic vector the base pixel moves 0.0115 → 0.00177
+        // (≈28/255 → ≈6/255, i.e. an actual black — the defect this task was opened for) and
+        // the dense highlight 0.448 → 0.946.
+        //
+        // NOTE these values still use the `Fixed` fallback reference of NOMINAL_DMAX = 2.0,
+        // which places mid-grey at D′ 1.0. On a *measured* roll (reference ≈1.35) it lands at
+        // ≈0.67, matching real mid-tones. The fallback constant is `film-base`'s to fix
+        // (`film-base/dmax-anchor-reliability`); this vector is not evidence about it.
+        //
+        // The drift-gate fingerprints are deliberately NOT touched: the default recipe still
+        // selects the exponential curve, so `version::PIPELINE_FINGERPRINTS` does not move and
+        // no `pipeline_version` bump is owed here. `output/presets` owns that bump when it
+        // flips the default curve to sigmoid.
         assert_golden(
             sigmoid_default_config(),
             PrintParams::default(),
             &[
-                0x3c420db4, 0x3c468086, 0x3c471719, 0x3cf5f640, 0x3cfa7fad, 0x3d0f6a21, 0x3ee58f1a,
-                0x3ee9ba90, 0x3eede3b3, 0x3c264ff3, 0x3f800000, 0x3f800000, 0x3c3c33e8, 0x3c3c33e8,
-                0x3c3c33e8,
+                0x3af793c5, 0x3b02af7d, 0x3b03a290, 0x3c7438ec, 0x3c7da965, 0x3ca7e975, 0x3f72198a,
+                0x3f72e4fa, 0x3f73a232, 0x3ac99e34, 0x3f800000, 0x3f800000, 0x3ae75cf6, 0x3ae75cf6,
+                0x3ae75cf6,
             ],
             Some(0x40000000),
             Some(UNIT_WB),
@@ -899,6 +923,8 @@ pub(crate) mod golden {
                     toe: 0.1,
                     shoulder: 0.4,
                     dmax: DmaxSource::Explicit(1.5),
+                    // The golden vectors were captured with the anchor == dmax.
+                    anchor: AnchorPlacement::WhiteAtDmax,
                 }),
             },
             custom_print(),
@@ -1005,12 +1031,17 @@ pub(crate) mod golden {
                 ..PrintParams::default()
             },
             &[
-                0x3cd867ac, 0x3c468086, 0x3c471719, 0x3d892568, 0x3cfa7fad, 0x3d0f6a21, 0x3f800000,
-                0x3ee9ba90, 0x3eede3b3, 0x3cb977ed, 0x3f800000, 0x3f800000, 0x3cd1e15b, 0x3c3c33e8,
-                0x3c3c33e8,
+                0x3b02e55f, 0x3b02af7d, 0x3b03a290, 0x3c811f4b, 0x3c7da965, 0x3ca7e975, 0x3f800000,
+                0x3f72e4fa, 0x3f73a232, 0x3ad531a7, 0x3f800000, 0x3f800000, 0x3af4a59d, 0x3ae75cf6,
+                0x3ae75cf6,
             ],
             Some(0x40000000),
-            Some([1074708039, 1065353216, 1065353216]),
+            // RECAPTURED 2026-08-03: the auto-WB gain drops 2.2304 → 1.0574 because the
+            // estimator samples the *rendered* positive, and the new sigmoid defaults produce
+            // a far better-balanced one — so it has much less to correct. A large WB gain was
+            // partly compensating for the old curve, which is worth knowing: WB and the curve
+            // were entangled, and they are less so now.
+            Some([0x3f875963, 0x3f800000, 0x3f800000]),
             None,
         );
     }

@@ -36,6 +36,17 @@ What other epics need to know about `algo`:
   scalar `Dmax` from `film-base`; sigmoid *requires* a positive anchor and rejects
   `none`. `DmaxSource::None` is the bit-exact scene-referred escape hatch and is
   a density-only feature.
+- **For sigmoid, `Dmax` is the *reference*, not the anchor** (since
+  `reference-anchored-sigmoid`, 2026-08-03). `curve.anchor`
+  (`AnchorPlacement`) says which tone the reference places: the default
+  `MidAtDmaxFraction(0.5)` pins **mid-grey** at half the reference and lets white
+  land above it, `WhiteAtDmax` is the old rule kept as a diagnostic. Consequences
+  for other epics: the two coincide only under `WhiteAtDmax`, so the paper-black
+  floor is `10^(−contrast·A)` and the reduce-to-exponential identity holds only
+  there; a per-stock rule is a **third variant**, not a new field; and the default
+  sigmoid contrast/shoulder are now `≈2.0687`/`0.6`, derived from manufacturer aim
+  densities rather than chosen. Drift fingerprints did **not** move — the default
+  recipe still selects `exponential`, so `output/presets` still owns that bump.
 - **Mutually exclusive knobs are one enum, never parallel fields** — `WbSource`,
   `BalanceRange`, `DmaxSource`, the tagged `Reconstruction`/`DensityCurve`. This
   is what makes the flags-win merge sound and provenance representable.
@@ -1582,6 +1593,54 @@ What other epics need to know about `algo`:
   work under the parameter-tuning task — but it is the honest way to get what the clamp was
   reaching for.
 
+### 2026-08-03 — Phase 4: the remedy, and why it stopped at step 2
+
+- **Remedies 1 and 2 sufficed; §7.3's equation is character-for-character unchanged.**
+  Recorded because the task mandated that order and the outcome is the answer to "why did
+  the less invasive options suffice": the defect was never in the curve, it was in *which
+  tone the curve pins*. Recalibrating alone could not fix it — at contrast 1.0 the floor is
+  72/255, and raising contrast with white pinned drags midtones down, because steepening a
+  line pivots it about the pinned point. Two coupled changes were needed, not one.
+- **Defaults recalibrated:** `contrast 1.0 → 0.745/0.36 ≈ 2.0687`, `shoulder 0.2 → 0.6`,
+  `toe` unchanged. Both derived, with the derivation in the doc comments so a future reader
+  can re-check rather than trust: the contrast from the manufacturers' own mid-to-white aim
+  delta (film gamma 0.52 / system gamma 1.07 as independent corroboration), the shoulder
+  from where its bend begins (`D′ ≈ 0.70`, essentially mid-grey).
+- **Anchor reparameterized** — the substantive change. `curve.dmax` was overloaded: the
+  roll's *reference* density **and** the density rendering to `1.0`. Now `curve.dmax` is the
+  reference and `curve.anchor` (`AnchorPlacement`) says which tone it places, defaulting to
+  `{"mid-at-dmax-fraction": 0.5}` — candidate 3's form, `A = f·R + 0.745/contrast`.
+- **`AnchorPlacement` is an enum, not a bool + f32**, for the same reason `DmaxSource` and
+  `FilmBaseSource` are: independent fields can encode illegal combinations that a flags-win
+  merge then silently mis-resolves. The two CLI flags conflict at the clap layer and each
+  replaces the whole variant.
+- **Golden impact, verified rather than predicted.** The two sigmoid goldens moved and were
+  recaptured with the reasoning at the site — the default vector's base pixel 0.0115 →
+  0.00177 (≈28/255 → ≈6/255, an actual black), its dense highlight 0.448 → 0.946. The
+  **auto-WB golden gain dropped 2.2304 → 1.0574**, which is worth keeping: the estimator
+  samples the rendered positive, so WB had been partly compensating for the broken curve.
+  Both drift fingerprints are **unmoved**, as predicted — the default recipe still selects
+  `exponential`, so `output/presets` still owns the bump when it flips the default curve.
+- **Candidate 8 could not ship here, and that is a dependency fact rather than a
+  reversal.** Its per-stock offsets *are* `algo/film-stock-profiles`, and they currently
+  rest on chart reads PR #68 established are not true Status M densities. So the user's
+  routing lands in two pieces: this task ships the no-stock arm (3) plus the opt-in escape
+  hatch, and the stock arm is a **third `AnchorPlacement` variant** when the registry
+  exists. Recording the seam explicitly so the next task does not re-litigate the design.
+- **`NOMINAL_DMAX` deliberately left at 2.0.** The measured rolls cluster near 1.36 with
+  Phoenix excluded, but the user is adding samples and asked for that calculation to wait.
+  Safe to defer *because* of the mid placement: `dA/dR = f`, so the fallback's error is now
+  halved (fixed default gives `A = 1.36` against a measured ≈1.01, where the old rule gave
+  2.0 against 1.3).
+- **Two doc claims were conditional on the old rule and are now qualified, not left
+  quietly false:** the paper-black floor is `10^(−contrast·A)`, and "zero knees reduce to
+  the exponential curve bit-for-bit" holds only under `white-at-dmax` — under the default
+  placement it is the same line *offset*. The existing reduction test already pinned that
+  variant explicitly, which is why it stayed green and the staleness was invisible to CI.
+- **Gate:** `fmt` clean, `clippy --all-targets -D warnings` clean, 507 binary + 126
+  integration tests green, drift gate 4/4. End-to-end on `tests/fixtures/hdr-48bit.tif`:
+  both flags reach the resolved report, each changes the image, and the emitted recipe fed
+  back through `--params` reproduces the render bit-identically.
 
 ## auto-anchor-interior-measurement
 
@@ -1615,3 +1674,46 @@ What other epics need to know about `algo`:
   **grey card in frame** (a real 18% reference under the same illumination as a diffuse white —
   only 2 of 10 existing frames could even approximate the datasheet Δ), and ideally the
   calibrated transmission step wedge.
+
+### 2026-08-03 (later) — PR #70 review: four findings, and why one remedy was refused
+
+- **The report named a number the render did not use.** `ReconstructionReport.dmax` was
+  documented as "the display-white anchor the curve used" and, after the placement split,
+  carried the *reference* instead. Now both travel: `dmax` (reference, what a recipe freezes
+  back) and `curve_anchor` (derived, what rendered to 1.0 and therefore sets the floor at
+  `10^(−contrast·anchor)`). The JSON `reconstruction_result.curve` gained the placement
+  *rule* plus `anchor_value`, so that block is self-contained — a consumer no longer has to
+  re-derive the anchor from the echoed recipe, which is the opposite of what diagnostics are
+  for. Exponential reports both fields equal rather than a null, so consumers need no special
+  case.
+- **A tiny contrast panicked instead of erroring.** `MID_GREY_OUTPUT_DECADES / contrast`
+  overflows below ~2.2e-39, and the `debug_assert` I had left there turned that into exit
+  101 in debug and `inf` fed into `s_curve` in release. Now a `validate` usage error naming
+  the flag, plus `apply_curve` returning a real error for the programmatic path (the
+  defense-in-depth pattern `algo/simple.rs` already uses). Two things worth recording: the
+  bound applies **only** to the mid-grey placement, since `WhiteAtDmax` performs no
+  division; and `f32::MIN_POSITIVE` is *accepted* on purpose — the quotient is finite there,
+  and because `contrast · anchor` is then exactly `MID_GREY_OUTPUT_DECADES` the render is a
+  flat mid-grey rather than a broken one. My first test asserted it should fail, which was
+  wrong about the arithmetic.
+- **The roll consistency check had a fourth hole.** `resolve_frames` probed `film_base`,
+  `curve.dmax` and `output.preset`, so a per-frame `curve.anchor` override silently gave one
+  frame a different placement *rule* — subtler than a different Dmax number and, by our own
+  documentation, a roll-level property. Added as warning (5) of six.
+- **Refused: bumping `reconstruction.schema_version`.** The reviewer was right that an
+  archived sigmoid recipe now renders differently — real, and it would have been silent. But
+  the proposed remedy is wrong for this codebase and the reasoning is worth keeping: that
+  constant versions the schema **shape** and the reader checks it for *exact* equality, so
+  bumping to 2 would reject every archived recipe outright, including the large majority that
+  select `exponential` and are wholly unaffected. The alternative — preserving v1 semantics
+  via a per-version default table — is a real design, but it would have to cover `contrast`
+  and `shoulder` too (both moved in the same commit with the identical property), and that is
+  `core/conversion-versioning` policy, not something to improvise inside an algo task.
+  **What is not acceptable is silence**, so it is now a loud, `--strict`-promotable warning
+  when a loaded recipe selects sigmoid with no `anchor` — modelled directly on the existing
+  `pipeline_version_warning`, which handles the same "parameters still apply, default moved
+  underneath them" situation one level up.
+- **A gap that is genuinely unowned, flagged rather than filed:** `core/conversion-versioning`
+  is scoped to *default* behaviour ("bumps only when default conversion behaviour changes"),
+  so nothing currently owns "a non-default path changed and archived recipes for it are
+  reinterpreted". The warning covers this instance; the policy question is open.

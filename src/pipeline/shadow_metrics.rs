@@ -880,6 +880,10 @@ fn measure_candidates() {
                         AnchorRule::Explicit(a) => DmaxSource::Explicit(a),
                         AnchorRule::Auto => DmaxSource::Auto,
                     },
+                    // The harness computes each candidate's anchor itself, so the value it
+                    // passes must be taken literally rather than re-derived by a placement
+                    // rule — otherwise every measurement in the report would shift.
+                    anchor: crate::types::AnchorPlacement::WhiteAtDmax,
                 }),
             };
             let print = PrintParams::default();

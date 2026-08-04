@@ -14,8 +14,9 @@
 //! ## Curve (per channel, in log₁₀-output space)
 //!
 //! ```text
-//! t = contrast·(D' − Dmax)                       the straight line (log₁₀ of it)
-//! F = −contrast·Dmax                             paper-black floor (the line's value at D' = 0)
+//! A = anchor.anchor(reference, contrast)         the D' that renders to 1.0 (see below)
+//! t = contrast·(D' − A)                          the straight line (log₁₀ of it)
+//! F = −contrast·A                                paper-black floor (the line's value at D' = 0)
 //! p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skip if toe = 0)
 //! v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skip if shoulder = 0)
 //! lin = 10^v
@@ -49,17 +50,19 @@
 //!   `shoulder = 0` there is no roll-off and highlights follow the (toe-shaped)
 //!   line, which *can* exceed `1.0` (like the exponential curve).
 //! - **Black (shadows):** with `toe > 0`, `lin` approaches the paper-black floor
-//!   `10^(−contrast·Dmax)` as `D' → −∞` (the shoulder's effect on the floor is
-//!   negligible for realistic params; the floor is exactly `10^(−contrast·Dmax)`
+//!   `10^(−contrast·A)` as `D' → −∞` (the shoulder's effect on the floor is
+//!   negligible for realistic params; the floor is exactly `10^(−contrast·A)`
 //!   when `shoulder = 0`).
-//! - **Reduction:** `toe = shoulder = 0` skips both knees and reproduces the
-//!   exponential curve **bit-for-bit** (`10^(contrast·(D'−Dmax))`), so the
-//!   exponential stays the debuggable straight-line reference.
+//! - **Reduction:** `toe = shoulder = 0` *and* `anchor = WhiteAtDmax` skips both
+//!   knees and reproduces the exponential curve **bit-for-bit**
+//!   (`10^(contrast·(D'−Dmax))`), so the exponential stays the debuggable
+//!   straight-line reference. Under the default mid-grey placement the reduced
+//!   curve is the same line *offset*, since `A ≠ Dmax`.
 //! - **Monotonic:** a composition of two monotone-increasing soft knees.
 //!
-//! **A positive anchor is required.** The S-curve is anchored on `[0, Dmax]` —
-//! both the white knee and the black floor (`F = −contrast·Dmax`) derive from a
-//! *positive* `Dmax` — so `curve.dmax = none` (unity placement, no anchor) and a
+//! **A positive anchor is required.** Both the white knee and the black floor
+//! (`F = −contrast·A`) derive from a *positive* anchor — so `curve.dmax = none`
+//! (unity placement, no reference) and a
 //! degenerate non-positive `Auto` anchor (an all-non-finite buffer, or a wrong
 //! film base that pushes most corrected densities negative) are both unusable:
 //! with `anchor ≤ 0` the floor sits at or above display white and every sample
@@ -70,6 +73,21 @@
 //! gotcha pattern). The anchor is resolved by the same
 //! [`resolve_dmax`](super::density::resolve_dmax) (`Auto` percentile /
 //! `Explicit`) as the exponential curve — one measurement, not a second one.
+//!
+//! **`dmax` supplies the *reference* density;
+//! [`AnchorPlacement`](crate::types::AnchorPlacement) decides which
+//! tone that reference places.** For the exponential curve the two coincide —
+//! `Dmax` *is* the density rendering to `1.0`. Here they are separate, because
+//! pinning display white at a leader-measured reference put midtones 2.5–3.6
+//! stops too dark once the contrast became photographic: steepening the slope
+//! pivots the line about the pinned point, dragging everything below it down.
+//! The default `MidAtDmaxFraction(0.5)` instead pins mid-grey at half the
+//! reference (`A = f·R + 0.745/contrast`) and lets white land above it, where the
+//! shoulder compresses the excess; `WhiteAtDmax` (`A = R`) is the previous rule,
+//! kept as an explicit diagnostic. Mid-placement is also half as sensitive to a
+//! reference error (`dA/dR = f`), which matters because a leader's density
+//! records how the roll was loaded rather than the film. Either way the anchor is
+//! a **roll-level** placement — nothing here reads frame content.
 //!
 //! **Interaction with `--highlight-compress`:** the print render's soft-clip
 //! also compresses highlights, but in linear space *after* exposure/WB; the
@@ -253,7 +271,7 @@ fn anchor_error(resolved: Option<f32>, source: DmaxSource, densities: &[f32]) ->
 pub(super) fn apply_curve(
     density: DensityImage,
     params: &SigmoidParams,
-) -> Result<(FilmRgbImage, Option<f32>)> {
+) -> Result<(FilmRgbImage, Option<f32>, Option<f32>)> {
     // One anchor measurement, shared semantics with the exponential curve. The
     // S-curve is anchored on `[0, Dmax]` — its white knee and its black floor
     // (`F = −contrast·anchor`) both derive from a *positive* anchor — so an
@@ -264,7 +282,7 @@ pub(super) fn apply_curve(
     // `simple.rs`). `Explicit` is CLI-validated positive, so this only fires
     // on `none` (config/programmatic) or a degenerate `Auto` measurement.
     let resolved = resolve_dmax(&density.density, params.dmax);
-    let Some(anchor) = resolved.filter(|a| a.is_finite() && *a > 0.0) else {
+    let Some(reference) = resolved.filter(|a| a.is_finite() && *a > 0.0) else {
         return Err(NcError::Other(anchor_error(
             resolved,
             params.dmax,
@@ -276,11 +294,37 @@ pub(super) fn apply_curve(
         toe,
         shoulder,
         dmax: _,
+        anchor: placement,
     } = *params;
+    // The reference is not necessarily the anchor: `AnchorPlacement` decides which tone is
+    // pinned and where. `WhiteAtDmax` is the identity (anchor == reference); the mid-grey
+    // form places the anchor *above* the reference, so white lands beyond it and the shoulder
+    // compresses what exceeds it — which is what a print shoulder is for.
+    let anchor = placement.anchor(reference, contrast);
+    // Defense in depth, and a real error rather than an assertion: the derivation divides
+    // by `contrast`, so a positive-but-tiny slope overflows the quotient and yields a
+    // non-finite anchor. `validate` rejects that at the CLI boundary (naming the flag), but
+    // a programmatic caller or a future placement rule reaches here first — and a
+    // `debug_assert` made it a panic (exit 101) in debug and fed `inf` into `s_curve` in
+    // release, which is the quietly-wrong image this guard exists to prevent.
+    if !anchor.is_finite() || anchor <= 0.0 {
+        return Err(NcError::Other(format!(
+            "the sigmoid anchor placement derived a non-usable anchor ({anchor}) from a \
+             valid reference density ({reference}) at contrast {contrast}: the mid-grey \
+             placement adds {}/contrast to the reference, which overflows for a very small \
+             contrast. Use a photographic contrast, or the white-at-dmax placement",
+            crate::types::MID_GREY_OUTPUT_DECADES
+        )));
+    }
     let film = super::density::apply_curve(density, move |d| {
         s_curve(d, contrast, toe, shoulder, anchor)
     });
-    Ok((film, resolved))
+    // Both numbers, because they are no longer the same one: `resolved` is the roll's
+    // reference density (what a recipe freezes back as `curve.dmax`), `anchor` is the
+    // density this render actually mapped to 1.0 and therefore what sets the black floor
+    // at `10^(-contrast*anchor)`. Reporting only the reference would document a value the
+    // curve did not use.
+    Ok((film, resolved, Some(anchor)))
 }
 
 #[cfg(test)]
@@ -288,8 +332,8 @@ mod tests {
     use super::*;
     use crate::algo::{finish_print, reconstruct};
     use crate::types::{
-        BalanceRange, DensityCurve, DensityParams, ExponentialParams, FilmBase, LinearImage,
-        PrintParams, Reconstruction, WbSource,
+        AnchorPlacement, BalanceRange, DensityCurve, DensityParams, ExponentialParams, FilmBase,
+        LinearImage, PrintParams, Reconstruction, WbSource,
     };
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
@@ -555,6 +599,9 @@ mod tests {
                 toe: 0.0,
                 shoulder: 0.0,
                 dmax,
+                // WhiteAtDmax preserves this test's meaning: the given `dmax` IS the
+                // anchor, which is what its pinned curve values were captured against.
+                anchor: AnchorPlacement::WhiteAtDmax,
             }),
             PrintParams::default(),
         )
@@ -649,6 +696,7 @@ mod tests {
                 toe: 0.0,
                 shoulder: 0.0,
                 dmax,
+                anchor: AnchorPlacement::WhiteAtDmax,
             }),
             PrintParams::default(),
         )

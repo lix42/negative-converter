@@ -664,6 +664,102 @@ impl Default for ExponentialParams {
     }
 }
 
+/// Output decades between mid-grey and display white: `−log10(0.18)`.
+///
+/// A mid-grey card reflects ~18% of the light falling on it, so on a correctly exposed
+/// display-referred image it belongs at 0.18 of white — about 2.5 stops down. This is a
+/// property of what "18% reflectance" means, not a tunable.
+pub const MID_GREY_OUTPUT_DECADES: f32 = 0.744_727_5;
+
+/// Density between a mid-grey card and a diffuse white on a correctly exposed colour
+/// negative, from the manufacturers' own aim tables.
+///
+/// Every Kodak colour-negative datasheet carries the same *Judging Negative Exposures*
+/// table (Status M, red channel, for "a normally exposed and processed color negative").
+/// The absolute values differ per stock, but their **difference is essentially constant**:
+/// Ektar 100, Portra 160 and Portra 400 all give 0.36 (Gold 200, a consumer stock, 0.40).
+/// Sources: Kodak E-4046, E-4051, E-4050, E-7022.
+///
+/// A per-stock value belongs to `algo/film-stock-profiles`; until that registry exists this
+/// single professional-film figure is the reference.
+pub const REFERENCE_MID_TO_WHITE_DELTA: f32 = 0.36;
+
+/// The default [`SigmoidParams::contrast`], **derived rather than chosen**.
+///
+/// Placing a mid-grey [`REFERENCE_MID_TO_WHITE_DELTA`] below white, and requiring it to
+/// land at 0.18 of white, fixes the slope: `contrast = 0.745 / 0.36 ≈ 2.07`. Two
+/// independent checks agree — it implies a film gamma of `0.36 / log10(0.90/0.18) = 0.52`,
+/// textbook for colour negative, and an overall system gamma of `0.745/0.699 = 1.07`, i.e.
+/// near-faithful reproduction of scene luminance ratios. It also sits inside the
+/// conventional 1.7–2.2 negative→print range.
+///
+/// The previous default of `1.0` is the value at which the S-curve reduces bit-exactly to
+/// the straight line, which suggests it was a testability default rather than a rendering
+/// intent. It confined the whole image to `contrast · Dmax ≈ 1.3` decades and left the black
+/// floor at 57–72/255 — the measured defect `algo/reference-anchored-sigmoid` was opened for.
+pub const REFERENCE_CONTRAST: f32 = MID_GREY_OUTPUT_DECADES / REFERENCE_MID_TO_WHITE_DELTA;
+
+/// The default [`SigmoidParams::shoulder`].
+///
+/// Chosen because it begins bending at `D′ ≈ 0.70`, essentially at mid-grey (≈0.67), which
+/// is where a print shoulder belongs. The previous `0.2` only starts at 0.95 and so
+/// collapses highlight differentiation to *zero* above the anchor once the anchor moves down
+/// to diffuse white; `1.0` starts at 0.45 and is no longer a highlight shoulder at all but a
+/// flattening of the entire upper range. Measured on real frames: the output gap across a
+/// curtain's density range is 0.00003 at 0.2, 0.0164 at 0.6 and 0.0502 at 1.0, while
+/// mid-grey placement costs 0.1799 → 0.1740 → 0.1525.
+pub const REFERENCE_SHOULDER: f32 = 0.6;
+
+/// Which tone the sigmoid pins, and at what density (design-spec §7.3/§9,
+/// `reconstruction.curve.anchor`).
+///
+/// The curve is an affine map in log space: a slope ([`SigmoidParams::contrast`]) plus **one**
+/// pinned `(density, output)` pair, from which everything else follows. This enum is that
+/// choice — a single mutually-exclusive rule, like [`DmaxSource`], not independent fields.
+///
+/// Why it exists: pinning white at the reference density placed midtones 2.5–3.6 stops too
+/// dark once the contrast became photographic, because steepening the line pivots it *around
+/// white* and drags everything below down. Pinning a mid-tone instead removes that conflict.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AnchorPlacement {
+    /// Pin **display white** at the resolved reference density. The pre-2026-08 behaviour,
+    /// kept as an explicit diagnostic: it is what makes the reference's own unreliability
+    /// fully visible in the render (`film-base/dmax-anchor-reliability`).
+    WhiteAtDmax,
+    /// Pin **mid-grey** (output 0.18) at `fraction × reference`, letting white fall where it
+    /// must — above the reference, where the shoulder compresses it, which is what a print
+    /// shoulder is for.
+    ///
+    /// `0.5` is the default. Mid-grey sits roughly half-way up the measured reference range
+    /// (measured 0.48–0.57 across the fixture stocks), and this form is **half as sensitive**
+    /// to a reference error as pinning white: `dAnchor/dReference` is `fraction`, so the
+    /// 0.046 density disagreement seen between two rolls of one stock costs 0.15 stop rather
+    /// than 0.31.
+    MidAtDmaxFraction(f32),
+}
+
+impl Default for AnchorPlacement {
+    fn default() -> Self {
+        AnchorPlacement::MidAtDmaxFraction(0.5)
+    }
+}
+
+impl AnchorPlacement {
+    /// Derive the curve's anchor `A` from the resolved reference density and the contrast.
+    ///
+    /// `A` is the density that maps to display white, so pinning mid-grey at `M` means
+    /// solving `10^(contrast·(M − A)) = 0.18`, i.e. `A = M + 0.745/contrast`.
+    pub fn anchor(self, reference: f32, contrast: f32) -> f32 {
+        match self {
+            AnchorPlacement::WhiteAtDmax => reference,
+            AnchorPlacement::MidAtDmaxFraction(f) => {
+                f * reference + MID_GREY_OUTPUT_DECADES / contrast
+            }
+        }
+    }
+}
+
 /// Sigmoid-curve knobs (design-spec §7.3/§9,
 /// `reconstruction.curve.type = "sigmoid"`): the S-curve mapping corrected
 /// density to positive linear. It shares the density-reconstruction stage
@@ -675,6 +771,8 @@ impl Default for ExponentialParams {
 pub struct SigmoidParams {
     /// Mid-density slope of the curve in log-output space (the exponential
     /// `gamma` analogue). Must be finite and > 0.
+    ///
+    /// The default is **derived, not chosen**: see [`REFERENCE_CONTRAST`].
     pub contrast: f32,
     /// Toe (shadow) knee width in log10 density units: how softly the curve
     /// approaches paper black. `0` disables the toe (hard straight-line black).
@@ -682,18 +780,24 @@ pub struct SigmoidParams {
     /// Shoulder (highlight) knee width in log10 density units: how softly the
     /// curve approaches display white. `0` disables the shoulder.
     pub shoulder: f32,
-    /// Display-white anchor source (default `fixed`). `"none"` is rejected for
-    /// this curve (`cli::validate`) — the S-curve is anchored on `[0, Dmax]`.
+    /// Reference density source (default `fixed`). `"none"` is rejected for this curve
+    /// (`cli::validate`) — the S-curve needs a positive reference to place anything against.
+    ///
+    /// Note this is the *reference*, not necessarily the anchor: [`AnchorPlacement`] derives
+    /// the anchor from it.
     pub dmax: DmaxSource,
+    /// Which tone is pinned, and at what density (default: mid-grey at half the reference).
+    pub anchor: AnchorPlacement,
 }
 
 impl Default for SigmoidParams {
     fn default() -> Self {
         Self {
-            contrast: 1.0,
+            contrast: REFERENCE_CONTRAST,
             toe: 0.2,
-            shoulder: 0.2,
+            shoulder: REFERENCE_SHOULDER,
             dmax: DmaxSource::Fixed,
+            anchor: AnchorPlacement::default(),
         }
     }
 }
@@ -788,7 +892,9 @@ impl<'de> Deserialize<'de> for DensityCurve {
             .as_object()
             .ok_or_else(|| D::Error::custom("reconstruction.curve must be a JSON object"))?;
 
-        const KNOWN: [&str; 6] = ["type", "gamma", "contrast", "toe", "shoulder", "dmax"];
+        const KNOWN: [&str; 7] = [
+            "type", "gamma", "contrast", "toe", "shoulder", "dmax", "anchor",
+        ];
         if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
             return Err(D::Error::custom(format!(
                 "unknown field `{k}` in reconstruction.curve"
@@ -806,7 +912,7 @@ impl<'de> Deserialize<'de> for DensityCurve {
 
         match curve_type {
             DensityCurveType::Exponential => {
-                if let Some(key) = ["contrast", "toe", "shoulder"]
+                if let Some(key) = ["contrast", "toe", "shoulder", "anchor"]
                     .into_iter()
                     .find(|k| obj.contains_key(*k))
                 {
@@ -842,6 +948,9 @@ impl<'de> Deserialize<'de> for DensityCurve {
                         .map_err(D::Error::custom)?
                         .unwrap_or(d.shoulder),
                     dmax: dmax.unwrap_or(d.dmax),
+                    anchor: take_recipe_field(obj, "anchor")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.anchor),
                 }))
             }
         }
@@ -1452,6 +1561,7 @@ mod tests {
             toe: 0.1,
             shoulder: 0.4,
             dmax: DmaxSource::Auto,
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         for curve in [exponential, sigmoid] {
             let json = serde_json::to_string(&curve).unwrap();

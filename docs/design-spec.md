@@ -703,8 +703,9 @@ algorithm's straight `10^(gamma·(D'−Dmax))` line. It shares density correctio
 replaced:
 
 ```
-t = contrast·(D' − Dmax)                       the straight line, in log10-output space
-F = −contrast·Dmax                             paper-black floor (the line's value at D' = 0)
+A = anchor(R, contrast)                        anchor density: the D' rendering to 1.0 (below)
+t = contrast·(D' − A)                          the straight line, in log10-output space
+F = −contrast·A                                paper-black floor (the line's value at D' = 0)
 p = F + toe·log10(1 + 10^((t−F)/toe))          toe  FIRST: soft-max with F   (skipped if toe = 0)
 v = p − shoulder·log10(1 + 10^(p/shoulder))    shoulder LAST: soft-min with 0 (skipped if shoulder = 0)
 lin = 10^v
@@ -720,22 +721,57 @@ anchor), so under neutral print params the default u16 encode **cannot clip
 highlights** (the later print/display render — exposure/gains — can still lift samples
 above `1.0`). With `shoulder = 0` there is no roll-off and
 highlights follow the (toe-shaped) line, which can exceed `1.0` like `density`.
-The toe holds shadows to the paper-black floor `≈ 10^(−contrast·Dmax)` (exact
+The toe holds shadows to the paper-black floor `≈ 10^(−contrast·A)` (exact
 when `shoulder = 0`; the shoulder nudges it imperceptibly lower otherwise).
 `toe`/`shoulder` are knee widths in log10 density units; `contrast` is the
 mid-density slope in log-output space. The curve is strictly monotonic; with
-`toe = shoulder = 0` both knees are skipped and it reproduces `density`'s step 3
-**bit-for-bit** (`contrast` standing in for `density_gamma`), so `density`
-remains the debuggable straight-line reference. `contrast` is capped (§9) — an
+`toe = shoulder = 0` **and `anchor = "white-at-dmax"`** both knees are skipped
+and it reproduces `density`'s step 3 **bit-for-bit** (`contrast` standing in for
+`density_gamma`), so `density` remains the debuggable straight-line reference.
+Under the default mid-grey placement the line is the same shape but offset,
+since `A ≠ Dmax` — the equivalence is a property of that anchoring rule, not of
+zero knees alone. `contrast` is capped (§9) — an
 extreme slope would collapse the curve into a hard threshold that silently
 destroys tonal detail.
 
 Because both the white knee and the black floor derive from the anchor, the
-S-curve is anchored on `[0, Dmax]` and **requires** one: `curve.dmax = "none"`
-with `curve.type = "sigmoid"` is a usage error (exit 2); unity placement is
-supported only by the exponential curve. The anchor uses the same fixed,
-explicit/reference-derived, or opt-in auto resolution policy as the
-exponential curve. Gamma exists only in the exponential variant. Supplying
+S-curve **requires** one: `curve.dmax = "none"` with `curve.type = "sigmoid"` is
+a usage error (exit 2); unity placement is supported only by the exponential
+curve. `curve.dmax` resolves by the same fixed, explicit/reference-derived, or
+opt-in auto policy as the exponential curve.
+
+**`curve.dmax` supplies the roll's *reference* density `R`; `curve.anchor` decides
+which tone that reference places.** For the exponential curve the two are the
+same thing — `Dmax` *is* the density rendering to `1.0`. The sigmoid separates
+them, because pinning display white at a reference measured from a fully-exposed
+leader put midtones 2.5–3.6 stops too dark once the contrast became photographic:
+steepening the slope pivots the line about whatever point is pinned, so pinning
+the top end drags everything below it down. The two rules are:
+
+| `curve.anchor` | anchor `A` | meaning |
+|---|---|---|
+| `{"mid-at-dmax-fraction": f}` (default, `f = 0.5`) | `f·R + 0.745/contrast` | mid-grey (18%) renders at fraction `f` of the reference; display white lands `0.745/contrast` above it, and densities beyond it are compressed by the shoulder rather than clipped |
+| `"white-at-dmax"` | `R` | display white renders *at* the reference — the pre-2026-08 rule, retained as an explicit diagnostic |
+
+`0.745 = −log10(0.18)` is mid-grey's fixed distance below white on the *output*
+axis, so `f` is the only free number and it is a **roll-level** placement, never
+derived from frame content.
+
+**Archived recipes are warned about, not silently reinterpreted.** `curve.anchor` did not
+exist before 2026-08-03, so a recipe frozen earlier omits it and picks up this build's
+default placement — a different render even with `contrast`, `toe`, `shoulder` and `dmax`
+all pinned. Loading a recipe that selects `sigmoid` without an `anchor` therefore emits a
+loud, `--strict`-promotable warning naming `"white-at-dmax"` as the way to reproduce the
+old placement. This is deliberately *not* a `reconstruction.schema_version` bump: that
+constant versions the schema **shape** and is checked for exact equality, so bumping it
+would reject every archived recipe outright, including the majority that select the
+exponential curve and are unaffected. Preserving per-version semantics instead (a
+historical default table, which would also have to cover `contrast` and `shoulder`) is
+policy owned by `core/conversion-versioning`. Mid-placement is also half as sensitive to a
+reference error (`dA/dR = f`), which matters because a leader's density records
+how the roll was loaded, not the film. `f` must be in `(0, 1]` (§9). Both rules
+keep `curve.dmax` as the normalisation reference, so the roll-fixed invariant
+holds. Gamma exists only in the exponential variant. Supplying
 `--density-gamma` while the resolved curve is sigmoid is an invalid combination
 after merge (exit 2), never a warning or ignored value (the pre-reconstruction
 implementation's ignored-gamma warning is gone).
@@ -877,10 +913,11 @@ shapes (other stage objects are omitted here):
     },
     "curve": {
       "type": "sigmoid",
-      "contrast": 1.0,
+      "contrast": 2.0686874,
       "toe": 0.2,
-      "shoulder": 0.2,
-      "dmax": {"explicit": 2.0}
+      "shoulder": 0.6,
+      "dmax": {"explicit": 2.0},
+      "anchor": {"mid-at-dmax-fraction": 0.5}
     }
   }
 }
@@ -889,7 +926,9 @@ shapes (other stage objects are omitted here):
 `reconstruction.schema_version` is exactly `1`. Partial input may omit it and
 defaults to 1; resolved recipes always emit it. `curve.dmax` accepts
 `"fixed"`, `"auto"`, `"none"`, or
-`{"explicit": <density>}`; `"none"` is valid only for exponential. Omitted
+`{"explicit": <density>}`; `"none"` is valid only for exponential. `curve.anchor`
+(sigmoid only) accepts `"white-at-dmax"` or `{"mid-at-dmax-fraction": <f>}` with
+`f` in `(0, 1]`, defaulting to `{"mid-at-dmax-fraction": 0.5}` (§7.3). Omitted
 density fields take the displayed defaults. Partial input may omit
 `reconstruction.curve`, which selects exponential with its defaults; every
 resolved recipe/report emits exactly one tagged curve. Partial objects are
@@ -1069,7 +1108,14 @@ behavioral `pipeline_version` is a **separate** field owned by
 `conversion-versioning`; this build stamps none, so it is absent rather than
 guessed.
 
-For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object;
+For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object plus two
+placement fields: `anchor` (the resolved placement *rule*, omitted entirely for the
+exponential curve, which has none) and `anchor_value` (the **derived** anchor — the
+corrected density this render mapped to `1.0`, hence the black floor at
+`10^(−contrast·anchor_value)`). `dmax.value` is the *reference*; under the default
+mid-grey placement the two differ, so reporting only the reference would document a
+number the render did not use. For the exponential curve, and for the sigmoid's
+`white-at-dmax` placement, `anchor_value` equals `dmax.value`;
 for exponential `"none"`, `dmax` is
 `{"policy":"none","value":null,"provenance":"recipe"}`; for simple,
 `reconstruction_result` is exactly `{"type":"simple"}`. `policy` is one of
@@ -1498,6 +1544,12 @@ crossover.
 - `--sigmoid-contrast <f>`, `--sigmoid-toe <f>`, and
   `--sigmoid-shoulder <f>` ⇒ `reconstruction.curve.contrast`, `.toe`, and
   `.shoulder`, valid only when the resolved curve type is `sigmoid`.
+- `--sigmoid-mid-fraction <f>` ⇒
+  `reconstruction.curve.anchor = {"mid-at-dmax-fraction": f}` and
+  `--sigmoid-white-at-d-max` ⇒ `reconstruction.curve.anchor = "white-at-dmax"`,
+  likewise sigmoid-only. The two flags conflict (the placement is one rule, not
+  two independent fields); whichever is given replaces a recipe's `anchor`
+  entirely.
 - `Dmax` is owned by the tagged curve. Its target recipe key is
   `reconstruction.curve.dmax` (default `"fixed"`; see §7.2). It is a
   **roll-fixed
@@ -1555,9 +1607,16 @@ crossover.
 ### Sigmoid density curve (`reconstruction = density`, `density-curve = sigmoid`)
 The stage-3 S-curve knobs (§7.3); density correction and the later print/display
 render use `reconstruction.density` and `print`. The exact recipe keys are
-`reconstruction.curve.contrast`, `.toe`, and `.shoulder`:
+`reconstruction.curve.contrast`, `.toe`, `.shoulder`, and `.anchor`:
 - `--sigmoid-contrast <f>` — mid-density slope of the curve in log-output space
-  (the `--density-gamma` analogue). Finite and in `(0, 50]`; default `1.0`. The
+  (the `--density-gamma` analogue). Finite and in `(0, 50]`; default
+  `0.745/0.36 ≈ 2.0687`, derived rather than chosen: `0.36` is the mid-grey →
+  diffuse-white density difference the manufacturers' own *Judging Negative
+  Exposures* aim tables state (constant across stocks, though the absolute
+  densities are not), and `0.745 = −log10(0.18)` is the same interval on the
+  output axis. Cross-checks: it implies a film gamma of `0.52`, textbook for
+  colour negative, and an overall system gamma of `1.07`, i.e. near-faithful
+  reproduction. The
   upper cap guards against an extreme slope collapsing the S-curve into a hard
   black/white threshold that silently destroys tonal detail (use the
   `exponential` density curve for genuinely extreme contrast).
@@ -1567,8 +1626,21 @@ render use `reconstruction.density` and `print`. The exact recipe keys are
   flatten the image into near-uniform tone without tripping the clip/non-finite
   counters.
 - `--sigmoid-shoulder <f>` — shoulder (highlight) knee width in log10 density
-  units; `0` disables the shoulder. In `[0, 10]`; default `0.2` (same cap
-  rationale as `--sigmoid-toe`).
+  units; `0` disables the shoulder. In `[0, 10]`; default `0.6` (same cap
+  rationale as `--sigmoid-toe`). At the default contrast that width begins bending
+  at `D' ≈ 0.70`, essentially at mid-grey — where a print shoulder belongs, and
+  what makes the anchor's headroom above white a roll-off rather than a clip.
+  Narrower widths (`0.2`) give visibly crisper midtones at a measurable cost in
+  highlight separation.
+- `--sigmoid-mid-fraction <f>` / `--sigmoid-white-at-d-max` — which tone the
+  reference density places (§7.3). `f` is finite and in `(0, 1]`; default
+  `0.5`. Under the mid-grey placement `contrast` additionally has a **lower** bound: the
+  anchor adds `0.745/contrast` to the reference, so a slope below ~`2.2e-39` overflows that
+  quotient to a non-finite anchor and is a usage error naming the flag (the bound applies
+  only to this placement — `--sigmoid-white-at-d-max` performs no division). Outside that range the anchor either detaches from the reference
+  entirely (`f ≤ 0` pins mid-grey at or below the film base, rendering the whole
+  frame above mid-grey) or places mid-grey past display white (`f > 1`), so both
+  are usage errors rather than clamped values.
 
 These caps reject only *nonsense / degenerate-asymptote* values (a knee of `10000`
 that flattens the frame); within them, aggressive-but-valid contrast/knees produce
@@ -1801,10 +1873,14 @@ hard errors, so a deliberate best-effort batch remains usable: (1) a shared
 `film_base.source` other than `explicit` re-estimates Dmin per frame; (2) the
 active Dmax key set to `auto` measures Dmax per frame; (3) a per-frame override
 that sets `film_base` changes that frame's Dmin; (4) a per-frame override
-that changes the active Dmax key changes that frame's placement; and (5) a per-frame
-override that sets `output.preset` gives that frame a different output **policy** —
+that changes the active Dmax key changes that frame's placement; (5) a per-frame override
+that sets `reconstruction.curve.anchor` changes which *tone* that frame pins to the roll's
+reference density — a placement break that survives even when every frame shares one Dmax,
+and subtler than a different number because the frame renders on a different *rule*; and
+(6) a per-frame override that sets `output.preset` gives that frame a different output
+**policy** —
 a different branch out of the ACEScg boundary, so a different *image class* (unclamped
-linear master vs rendered TIFF), not merely a different rendering. (5) warns even when
+linear master vs rendered TIFF), not merely a different rendering. (5) and (6) warn even when
 the override restates the shared preset, because `frames[].status` carries no
 `output_render` block (that is a `convert`-only report field), leaving the
 `frames[].overrides` echo as the only other trace. Shared `fixed`, explicit, or

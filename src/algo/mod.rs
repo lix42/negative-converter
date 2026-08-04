@@ -121,10 +121,23 @@ impl std::fmt::Debug for FilmRgbImage {
 /// resolved values, not new knobs (controls live in [`Reconstruction`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ReconstructionReport {
-    /// The resolved display-white anchor density (`Dmax`) the curve used.
-    /// `None` for `simple` (no curve stage) and for the exponential curve with
-    /// `dmax = none` (unity placement).
+    /// The resolved **reference** density (`curve.dmax`) — the roll calibration, and
+    /// the value to freeze back into a recipe. `None` for `simple` (no curve stage) and
+    /// for the exponential curve with `dmax = none` (unity placement).
+    ///
+    /// This is *not* necessarily the density that rendered to `1.0`: since
+    /// `algo/reference-anchored-sigmoid`, the sigmoid curve derives its anchor from this
+    /// reference through [`AnchorPlacement`](crate::types::AnchorPlacement). See
+    /// [`Self::curve_anchor`] for what the curve actually used.
     pub dmax: Option<f32>,
+    /// The **derived** anchor the curve used — the corrected density that rendered to
+    /// `1.0`, and therefore what sets the black floor at `10^(−contrast·anchor)`.
+    ///
+    /// Equal to [`Self::dmax`] for the exponential curve (no placement rule sits between
+    /// them) and for the sigmoid under `AnchorPlacement::WhiteAtDmax`; larger than it under
+    /// the default mid-grey placement, which is why reporting only the reference would
+    /// document a number the render did not use. `None` for `simple`.
+    pub curve_anchor: Option<f32>,
     /// The resolved regional-balance tone-ramp range `[lo, hi]` (corrected
     /// density), when a shadow/highlight balance was applied. `None` for
     /// `simple` or when both balances are the neutral `[0, 0, 0]`.
