@@ -752,6 +752,42 @@ What other epics need to know about `io`:
   `meta.git_dirty` (an artifact of building from a dirty tree). This change is purely
   *how and where* bytes are written.
 
+### PR #72 review — four behaviours a bare rename silently changed
+
+All five findings verified against the code before acting; four were real regressions
+introduced by the switch to rename, one was a false claim in my own docs. Recorded because
+each is a way "just write to a temp and rename" differs from `File::create`, and none is
+obvious until something breaks:
+
+- **`File::create` preserves an existing file's mode; a rename does not.** Measured: create
+  keeps `0600`, rename yields `0644`. So a deliberately restricted scan would silently
+  become world-readable on the next run. `commit` now copies the target's permissions onto
+  the temp before promoting, as a **hard error** rather than best-effort — quietly widening
+  access is worse than failing. Mode only; ACLs and xattrs are not carried, which is a real
+  limitation of doing this with `std`.
+- **`File::create` follows a symlink; a rename replaces the link itself.** A
+  `latest.tiff → real.tiff` workflow would have reported success while destroying the link
+  and leaving the referent stale. `resolve_target` now follows the link (and hand-resolves
+  one hop for a *dangling* link, which `canonicalize` cannot). Staging beside the referent
+  is also what keeps the rename same-filesystem. Note it canonicalizes the directory part
+  too, so on macOS the temp path reads `/private/var/…` — same directory, different
+  spelling, which cost one test failure to notice.
+- **Two processes can derive the same temp name.** The pid+counter suffix is unique within
+  a process, not globally: separate PID namespaces sharing an output mount can both be pid
+  1 at sequence 0, and `File::create` would have **truncated the other process's live
+  staging file**, promoting mixed bytes as a complete output. Now `create_new` (which
+  refuses rather than truncates) with a bounded retry on a fresh sequence.
+- **The suffix could push a legal path over `NAME_MAX`.** A 245-byte basename plus the
+  14-byte suffix is 259 bytes ⇒ `ENAMETOOLONG`, so a target writable *directly* could not
+  be staged. The temp now uses a truncated **prefix** of the basename — a prefix rather
+  than an unrelated bounded name, so a stray temp is still traceable to its artifact.
+- **The `SIGINT` cleanup claim was false and is now narrowed.** Destructors do not run when
+  a signal kills the process, so `Drop` cannot remove the temp there. Final-path integrity
+  still holds unconditionally (the final path is never opened for writing); *temp cleanup*
+  holds only on ordinary error paths. A signal handler or startup scavenging would close
+  the gap — neither is installed, so the docs now say "ordinary error paths" instead of
+  implying always.
+
 
 ## scanner-density-calibration
 

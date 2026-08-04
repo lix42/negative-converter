@@ -6,9 +6,17 @@
 //! that are actually achievable:
 //!
 //! 1. **No truncated file ever appears at a final path.** Every byte is written to
-//!    `<final>.<pid>.<n>.nctmp`, flushed and fsynced, and only then renamed. A failure
-//!    mid-write leaves a temp that [`Staged`]'s `Drop` removes; the final path is
-//!    either the previous content or absent.
+//!    `<final-prefix>.<pid>.<n>.nctmp`, flushed and fsynced, and only then renamed. The
+//!    final path holds either the previous content or nothing. This one holds
+//!    unconditionally — including on `SIGINT`, `SIGKILL` and power loss, because the
+//!    final path is simply never opened for writing.
+//!
+//!    **Temp cleanup is narrower.** [`Staged`]'s `Drop` removes the temp, so ordinary
+//!    error paths (and abandoned writes) leave nothing behind — but a signal that kills
+//!    the process does **not** run destructors, so `SIGINT`/`SIGKILL` can leave an inert
+//!    `*.nctmp` beside the output. Installing a signal handler or scavenging temps at
+//!    startup would close that; neither is done here, so the guarantee is stated as
+//!    "ordinary error paths" rather than "always".
 //! 2. **A minimal inconsistency window.** The orchestrator stages *every* artifact
 //!    first — all the fallible work — and calls [`Staged::commit`] on each only at
 //!    the end. A crash between two commits can still leave one final path updated
@@ -27,6 +35,15 @@
 //!   process-unique counter, so two artifacts (or two `roll` frames) can never stage
 //!   onto each other, and a temp can never equal a checked final path.
 //!
+//! **A symlinked target is followed, and an existing file's mode is carried over.**
+//! Both restore `File::create` behaviour that a bare rename would have changed:
+//! `create` followed a symlink and updated its referent, and it preserved the existing
+//! file's permissions because it truncates in place. A rename would instead replace the
+//! link itself and install the temp's umask-derived mode — destroying a
+//! `latest.tiff`-style link, and turning a deliberate `0600` output into `0644`. See
+//! [`resolve_target`] and [`Staged::commit`]. Mode only: ACLs and extended attributes
+//! are not carried across.
+//!
 //! **Overwrite is atomic replace**, matching the previous `File::create`
 //! truncate-in-place behaviour: `nc` keeps overwriting its own output rather than
 //! refusing. `std::fs::rename` documents replacing an existing target on both Unix
@@ -39,8 +56,9 @@
 //! **Directory fsync is deliberately out of scope.** Surviving *power loss* across
 //! the rename itself requires fsyncing the parent directory too. For a conversion
 //! CLI the failures worth defending against are a full disk, a permissions error, a
-//! mid-run crash, and `SIGINT` — all of which the temp+rename pattern already
-//! handles, because the rename either happened or it didn't. Adding a directory
+//! mid-run crash, and `SIGINT` — for all of which the *final path* is already safe,
+//! because the rename either happened or it didn't (temp cleanup after a signal is
+//! the separate, narrower guarantee above). Adding a directory
 //! fsync would buy only power-loss durability, at the cost of a Unix-only code path
 //! (`File::open(dir)?.sync_all()` has no portable equivalent) for a tool whose
 //! output is reproducible by re-running it.
@@ -52,9 +70,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{NcError, Result};
 
-/// Process-unique suffix counter. Combined with the pid so concurrent `nc`
-/// processes writing the same target directory cannot pick the same temp name.
+/// Process-unique suffix counter, combined with the pid so two artifacts (or two
+/// `roll` frames) in one process never stage onto each other.
+///
+/// It does **not** make the name globally unique: two processes in separate PID
+/// namespaces — separate containers sharing an output mount — can both be pid 1 and
+/// both start at sequence 0. That is why the temp is created with `create_new`, which
+/// fails instead of truncating a live staging file, and why [`stage`] retries with a
+/// fresh sequence rather than trusting the name.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Longest single path component the common filesystems accept (`NAME_MAX` is 255
+/// bytes on ext4, APFS and NTFS). The staging suffix has to fit *inside* this budget:
+/// a legal 245-byte output basename plus a 14-byte suffix is 259 and fails with
+/// `ENAMETOOLONG`, so a target that could be written directly would fail to stage.
+const MAX_BASENAME_BYTES: usize = 255;
+
+/// How many times [`stage`] retries a colliding temp name before giving up. Each
+/// attempt draws a fresh sequence number, so a handful is plenty — this exists to
+/// bound a pathological loop, not to survive sustained contention.
+const TEMP_NAME_ATTEMPTS: u32 = 8;
 
 /// A file fully written and fsynced at a temp path, waiting to be renamed onto its
 /// final path by [`commit`](Self::commit).
@@ -83,6 +118,25 @@ impl Staged {
             .temp
             .take()
             .expect("Staged::commit is by-value, so temp is always present");
+        // A rename replaces the target's *inode*, so the promoted file carries the
+        // temp's umask-derived mode — turning a deliberately `0600` output into `0644`
+        // on the next run. `File::create` preserved the existing mode (it truncates in
+        // place), so this restores that behaviour rather than silently widening access.
+        // Verified empirically: create keeps 0600, rename alone yields 0644.
+        //
+        // A hard error, not best-effort: quietly widening access to someone's scan is
+        // worse than failing the run. Mode only — ACLs and extended attributes are not
+        // carried across, which is a real limitation of doing this with `std`.
+        if let Ok(existing) = fs::metadata(&self.target) {
+            fs::set_permissions(&temp, existing.permissions()).map_err(|e| {
+                self.temp = Some(temp.clone());
+                NcError::Write(format!(
+                    "finalizing {}: cannot carry the existing file's permissions onto \
+                     the staged copy: {e}",
+                    self.target.display()
+                ))
+            })?;
+        }
         fs::rename(&temp, &self.target).map_err(|e| {
             // Put it back so `Drop` removes the temp we could not promote — the
             // alternative leaves a stray `.tmp` beside a failed run.
@@ -114,13 +168,71 @@ impl Drop for Staged {
     }
 }
 
-/// The temp path for `target`: same directory, suffixed with the pid and a
-/// process-unique counter. See the module docs for why both properties matter.
-fn temp_path_for(target: &Path) -> PathBuf {
-    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = target.as_os_str().to_os_string();
-    name.push(format!(".{}.{seq}.nctmp", std::process::id()));
-    PathBuf::from(name)
+/// The temp path for `target`: same directory, named from a **prefix** of the
+/// target's basename plus the pid and `seq`.
+///
+/// A prefix, not the whole basename: appending to a basename already near
+/// [`MAX_BASENAME_BYTES`] pushes the temp past the filesystem's component limit, so a
+/// perfectly legal output path would fail to stage. Keeping a prefix (rather than a
+/// name with no relation to the target, which would also be correct) means a stray
+/// temp is still traceable to the artifact it belonged to.
+///
+/// Pure and `seq`-parameterized so the bounding logic is testable without reaching
+/// into the counter.
+fn temp_path_for(target: &Path, seq: u64) -> PathBuf {
+    let suffix = format!(".{}.{seq}.nctmp", std::process::id());
+    // Lossy is fine: the suffix carries the uniqueness, so a non-UTF-8 basename that
+    // round-trips imperfectly costs only traceability, never correctness.
+    let base = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let budget = MAX_BASENAME_BYTES.saturating_sub(suffix.len());
+    let mut kept = String::with_capacity(budget);
+    for ch in base.chars() {
+        if kept.len() + ch.len_utf8() > budget {
+            break;
+        }
+        kept.push(ch);
+    }
+    let parent = target.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{kept}{suffix}"))
+}
+
+/// Resolve a symlinked target to the file it points at, so a rename replaces the
+/// **referent** instead of the link.
+///
+/// `File::create(path)` followed a symlink and updated its referent; `rename(temp,
+/// path)` would replace the link's own directory entry — destroying a
+/// `latest.tiff`-style link and leaving the intended file stale, while the run
+/// reported success. Resolving here preserves the previous behaviour, and staging in
+/// the *referent's* directory is also what keeps the rename same-filesystem.
+///
+/// A dangling symlink is resolved one hop by hand (`canonicalize` requires the
+/// referent to exist), which covers `latest.tiff -> not-yet-written.tiff`. A dangling
+/// *chain* resolves only its first hop — an edge case of an edge case, noted rather
+/// than handled.
+fn resolve_target(target: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if let Ok(real) = fs::canonicalize(target) {
+                return Ok(real);
+            }
+            let link = fs::read_link(target).map_err(|e| {
+                NcError::Write(format!(
+                    "cannot resolve the symlink at {}: {e}",
+                    target.display()
+                ))
+            })?;
+            Ok(if link.is_absolute() {
+                link
+            } else {
+                target.parent().unwrap_or(Path::new(".")).join(link)
+            })
+        }
+        // Not a symlink, or does not exist yet: write it where the caller asked.
+        _ => Ok(target.to_path_buf()),
+    }
 }
 
 /// Stage a write: create the temp, hand a buffered writer to `write`, then flush
@@ -137,18 +249,46 @@ pub fn stage<T>(
     target: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> Result<T>,
 ) -> Result<(Staged, T)> {
-    let temp = temp_path_for(target);
-    let file = File::create(&temp).map_err(|e| {
+    // Follow a symlinked target so the rename replaces the referent, not the link.
+    let target = &resolve_target(target)?;
+    // `create_new`, never `create`: two processes in separate PID namespaces can
+    // derive the same candidate name, and `create` would silently *truncate* the
+    // other one's live staging file — promoting mixed bytes as a complete output.
+    // Exclusive creation turns that into a detectable collision we simply retry.
+    let mut last_err = None;
+    let mut opened = None;
+    for _ in 0..TEMP_NAME_ATTEMPTS {
+        let candidate = temp_path_for(target, TEMP_SEQ.fetch_add(1, Ordering::Relaxed));
+        match File::options()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                opened = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => {
+                return Err(NcError::Write(format!(
+                    "creating a staging file for {}: {e}",
+                    target.display()
+                )));
+            }
+        }
+    }
+    let (temp, file) = opened.ok_or_else(|| {
         NcError::Write(format!(
-            "creating temporary file for {}: {} : {e}",
+            "creating a staging file for {}: {} name collisions in a row{}",
             target.display(),
-            temp.display()
+            TEMP_NAME_ATTEMPTS,
+            last_err.map(|e| format!(" ({e})")).unwrap_or_default()
         ))
     })?;
     // Own the guard from here on, so every `?` below unlinks the temp via `Drop`.
     let staged = Staged {
         temp: Some(temp.clone()),
-        target: target.to_path_buf(),
+        target: target.clone(),
     };
     let mut writer = BufWriter::new(file);
     let value = write(&mut writer)?;
@@ -405,6 +545,144 @@ mod tests {
         assert_eq!(fs::read(&a).unwrap(), b"aa");
         assert_eq!(fs::read(&b).unwrap(), b"bb");
         assert!(dir.temps().is_empty());
+    }
+
+    #[test]
+    fn a_long_basename_still_stages_within_the_component_limit() {
+        // Regression: a legal 245-byte basename plus the old full-basename suffix was
+        // 259 bytes and failed with ENAMETOOLONG — a path that could be written
+        // directly could not be staged.
+        let dir = TempDir::new("longname");
+        let target = dir.join(&"a".repeat(245));
+        let staged = stage_bytes(&target, b"x").unwrap();
+        let temp = staged.temp_path().unwrap().to_path_buf();
+        let temp_base = temp.file_name().unwrap().to_string_lossy().len();
+        assert!(
+            temp_base <= MAX_BASENAME_BYTES,
+            "temp basename is {temp_base} bytes, over the {MAX_BASENAME_BYTES} limit"
+        );
+        assert_eq!(temp.parent(), target.parent(), "still a sibling");
+        staged.commit().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"x");
+    }
+
+    #[test]
+    fn the_temp_name_keeps_a_prefix_of_the_target_for_traceability() {
+        // Bounding must not degenerate into an opaque name: a stray temp should still
+        // point back at the artifact it belonged to.
+        let temp = temp_path_for(Path::new("/tmp/out.tiff"), 7);
+        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("out.tiff."), "{name}");
+        assert!(name.ends_with(".7.nctmp"), "{name}");
+        // And a pathological basename is truncated, not rejected.
+        let long = format!("/tmp/{}", "b".repeat(300));
+        let temp = temp_path_for(Path::new(&long), 0);
+        assert!(temp.file_name().unwrap().to_string_lossy().len() <= MAX_BASENAME_BYTES);
+    }
+
+    #[test]
+    fn staging_creates_exclusively_rather_than_truncating() {
+        // The primitive the collision retry rests on: `create_new` must refuse an
+        // existing file, where `create` would truncate it. Two processes in separate
+        // PID namespaces can derive the same candidate name, and truncating the other
+        // one's live staging file would promote mixed bytes as a complete output.
+        let dir = TempDir::new("exclusive");
+        let occupied = dir.join("occupied");
+        fs::write(&occupied, b"live staging data").unwrap();
+        let err = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&occupied)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(&occupied).unwrap(),
+            b"live staging data",
+            "create_new must not have touched the existing bytes"
+        );
+    }
+
+    #[test]
+    fn committing_preserves_a_restrictive_mode_on_the_replaced_file() {
+        // Regression: a rename installs the temp's umask-derived mode, so a deliberately
+        // 0600 output became 0644 on the next run — silently widening access to a scan.
+        // `File::create` preserved it because it truncates in place.
+        let dir = TempDir::new("perms");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+            stage_bytes(&target, b"new").unwrap().commit().unwrap();
+            let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the replaced file must keep its mode");
+            assert_eq!(fs::read(&target).unwrap(), b"new");
+        }
+        // On a non-Unix target the mode has no meaning; the replace itself must still work.
+        #[cfg(not(unix))]
+        {
+            stage_bytes(&target, b"new").unwrap().commit().unwrap();
+            assert_eq!(fs::read(&target).unwrap(), b"new");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_target_updates_the_referent_and_survives() {
+        // Regression: `File::create` followed the link and wrote the referent, but a
+        // bare rename replaces the link's own entry — destroying a `latest.tiff`-style
+        // link and leaving the intended file stale while the run reports success.
+        let dir = TempDir::new("symlink");
+        let real = dir.join("real.bin");
+        let link = dir.join("latest.bin");
+        fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let staged = stage_bytes(&link, b"new").unwrap();
+        // The temp is a sibling of the *referent*, which is also what keeps the rename
+        // on one filesystem. Compared canonically because resolving through
+        // `canonicalize` also canonicalizes the directory part (on macOS `/var` becomes
+        // `/private/var`), so the two spellings differ while naming the same directory.
+        let canon = |p: &Path| fs::canonicalize(p).expect("directory exists");
+        assert_eq!(
+            canon(staged.temp_path().unwrap().parent().unwrap()),
+            canon(real.parent().unwrap())
+        );
+        staged.commit().unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink must survive the write"
+        );
+        assert_eq!(
+            fs::read(&real).unwrap(),
+            b"new",
+            "and its referent must carry the new bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_target_writes_the_file_it_points_at() {
+        // `canonicalize` can't resolve a link whose referent does not exist yet, so this
+        // is the hand-resolved hop. `latest.bin -> not-yet.bin` must create `not-yet.bin`
+        // rather than replacing the link.
+        let dir = TempDir::new("dangling");
+        let link = dir.join("latest.bin");
+        std::os::unix::fs::symlink("not-yet.bin", &link).unwrap();
+        stage_bytes(&link, b"fresh").unwrap().commit().unwrap();
+        assert_eq!(fs::read(dir.join("not-yet.bin")).unwrap(), b"fresh");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself is untouched"
+        );
     }
 
     #[test]

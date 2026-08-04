@@ -1731,10 +1731,17 @@ writes — the primary output, the IR export, the sidecar, `--dump-params`,
 only then renamed onto its final path. Two guarantees follow, and one deliberately
 does not:
 
-- **No truncated file ever appears at a final path.** A failure mid-write leaves only
-  a temp, which is removed; the final path holds either the previous content or
-  nothing. Overwrite remains **atomic replace** — `nc` keeps overwriting its own
-  output rather than refusing.
+- **No truncated file ever appears at a final path.** The final path holds either the
+  previous content or nothing — unconditionally, including on `SIGINT`/`SIGKILL` and
+  power loss, because the final path is never opened for writing. Overwrite remains
+  **atomic replace**: `nc` keeps overwriting its own output rather than refusing, a
+  **symlinked** target is followed so the *referent* is replaced and the link survives,
+  and an existing file's **permissions are carried onto** the replacement so a `0600`
+  output does not silently widen to `0644` (mode only — not ACLs or xattrs).
+- **Temp cleanup is narrower than that.** Ordinary error paths remove the staging file;
+  a signal that kills the process does **not** run destructors, so `SIGINT`/`SIGKILL`
+  can leave an inert `*.nctmp` beside the output. No signal handler or startup
+  scavenging is installed, so the guarantee is stated for ordinary error paths only.
 - **One conversion's artifacts commit together.** The IR export, primary and sidecar
   are all staged before any is renamed, so a failure in a later one leaves *no*
   primary output — the "complete TIFF with no sidecar" case is gone. The renames are
@@ -2061,7 +2068,8 @@ diagnosable.
 `io/transactional-output-writes` that exit carries a stronger promise: no truncated
 artifact is left at a final path, and a failure while writing any of one conversion's
 artifacts leaves *no* primary output rather than an orphaned one (§9 Output/encode).
-A failed run also leaves no `*.nctmp` staging files behind.
+A run that fails through an ordinary error path also leaves no `*.nctmp` staging files;
+a run killed by a signal may leave one, since destructors do not run then.
 
 **Memory preflight** (§9 Global, `--max-memory`) maps to exit **6**: before any
 input is decoded, every command that reads a scan estimates the run's peak
