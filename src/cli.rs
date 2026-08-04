@@ -2340,27 +2340,46 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
 /// `--dump-params` is written before anything is decoded, and `--report-file` must
 /// land even when `--strict` subsequently fails the run — and in `roll` it is a
 /// roll-level artifact that no single frame's set could hold.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+fn write_json<T: Serialize>(path: &Path, value: &T, log: &Log) -> Result<()> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|e| NcError::Other(format!("serializing JSON: {e}")))?;
-    staged::stage_bytes(path, json.as_bytes())?.commit()
+    // Promotion notes (currently: a hard-linked target whose aliases keep the old bytes)
+    // go to stderr here rather than into `report.warnings`. These are *operational*
+    // artifacts — `--dump-params`, `--report-file` — and folding them into the conversion's
+    // warning set would let a hard-linked report file fail a `--strict` render, which is not
+    // what `--strict` is about. Silent was the defect; this is loud without conflating the
+    // two channels.
+    for note in staged::stage_bytes(path, json.as_bytes())?.commit()? {
+        log.warn(&note);
+    }
+    Ok(())
 }
 
 /// Emit a report as JSON to stdout (kept clean) or `--report-file`. `none`
 /// suppresses it entirely.
-pub fn emit_report(report: &Report, format: ReportFormat, file: Option<&Path>) -> Result<()> {
-    emit_json(report, format, file)
+fn emit_report(
+    report: &Report,
+    format: ReportFormat,
+    file: Option<&Path>,
+    log: &Log,
+) -> Result<()> {
+    emit_json(report, format, file, log)
 }
 
 /// Emit any serializable report as JSON to stdout (kept clean) or a file. `none`
 /// suppresses it entirely. Shared by the per-command [`Report`] and the roll-level
 /// [`RollReport`].
-fn emit_json<T: Serialize>(value: &T, format: ReportFormat, file: Option<&Path>) -> Result<()> {
+fn emit_json<T: Serialize>(
+    value: &T,
+    format: ReportFormat,
+    file: Option<&Path>,
+    log: &Log,
+) -> Result<()> {
     if format == ReportFormat::None {
         return Ok(());
     }
     match file {
-        Some(p) => write_json(p, value),
+        Some(p) => write_json(p, value, log),
         None => {
             let json = serde_json::to_string_pretty(value)
                 .map_err(|e| NcError::Other(format!("serializing report: {e}")))?;
@@ -3466,7 +3485,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     ensure_write_targets_distinct(&args.input, &targets)?;
 
     if let Some(path) = &args.dump_params {
-        write_json(path, &cfg)?;
+        write_json(path, &cfg, &log)?;
     }
     // `--seed` is reserved (no stochastic step in Step 1) but accepted so the
     // documented flag isn't rejected; nothing consumes it yet.
@@ -3549,6 +3568,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         &report,
         args.report.report,
         args.report.report_file.as_deref(),
+        &log,
     )?;
 
     // `--strict` promotes any present warning to a non-zero exit. Decide it here,
@@ -4453,6 +4473,7 @@ fn run_roll(args: RollArgs) -> Result<()> {
         &roll,
         args.report.report,
         args.report.report_file.as_deref(),
+        &log,
     )?;
 
     if failed > 0 {
@@ -4626,6 +4647,7 @@ fn run_inspect(args: IoArgs) -> Result<()> {
         &report,
         args.report.report,
         args.report.report_file.as_deref(),
+        &log,
     )
 }
 
@@ -4898,6 +4920,7 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         &report,
         args.report.report,
         args.report.report_file.as_deref(),
+        &log,
     )?;
     // A degenerate grid combined base (non-finite or <= 0 on any channel — e.g.
     // `--grid --base-region` on the dark holder) cannot anchor the density

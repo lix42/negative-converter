@@ -126,12 +126,14 @@ impl Staged {
     /// This is the only operation that touches the final path, and it is the only
     /// step left after every artifact has been staged — which is what keeps the
     /// inconsistency window down to the renames.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(mut self) -> Result<Vec<String>> {
         // Take first: on failure the temp must still be cleaned up by `Drop`, and
         // on success it must not be, because it *is* the target now.
         // Callable directly (`write_json` does), so the gate lives here too rather than
         // only in `commit_all`'s pre-pass.
         check_promotable(&self.target)?;
+        // Collected before the rename, since promoting is what breaks the links.
+        let notes: Vec<String> = hard_link_warning(&self.target).into_iter().collect();
         let temp = self
             .temp
             .take()
@@ -155,7 +157,7 @@ impl Staged {
                 ))
             })?;
         }
-        fs::rename(&temp, &self.target).map_err(|e| {
+        let rename = fs::rename(&temp, &self.target).map_err(|e| {
             // Put it back so `Drop` removes the temp we could not promote — the
             // alternative leaves a stray `.tmp` beside a failed run.
             self.temp = Some(temp.clone());
@@ -164,7 +166,8 @@ impl Staged {
                 self.target.display(),
                 temp.display()
             ))
-        })
+        });
+        rename.map(|()| notes)
     }
 
     /// The temp path bytes are currently at. Test-only introspection — production
@@ -256,13 +259,34 @@ fn create_exclusive(path: &Path, _mode: Option<u32>) -> std::io::Result<File> {
     File::options().write(true).create_new(true).open(path)
 }
 
-/// Collapse `.` and `..` without touching the filesystem.
+/// A key for deciding whether two staged artifacts name the **same file**.
 ///
-/// Purely lexical on purpose: it is used for a path whose referent does not exist, so
-/// `canonicalize` is unavailable. That makes it wrong in the presence of symlinked
-/// *directories* (`a/b/..` is not `a` if `b` is a link) — acceptable here because the only
-/// caller is comparing a synthesized sibling path for aliasing, not resolving it for
-/// access. A leading `..` that cannot be collapsed is kept, so a relative link still works.
+/// Never used to open or rename anything — only to compare. Two different spellings of one
+/// path (`<dir>/sub/../ir.bin` vs `<dir>/ir.bin`) must collide, or one artifact silently
+/// overwrites another; `PathBuf` equality is lexical and would miss it.
+///
+/// It canonicalizes the **parent directory** and re-joins the file name, rather than
+/// canonicalizing the whole path: the file itself may not exist yet (that is exactly the
+/// dangling-symlink case), while its directory almost always does. Resolving the directory
+/// for real is what makes this correct where a lexical collapse is not — `sub/..` does not
+/// cancel when `sub` is a symlink to another directory. Lexical normalization is the
+/// fallback for when even the parent cannot be resolved.
+fn alias_key(target: &Path) -> PathBuf {
+    match (target.parent(), target.file_name()) {
+        (Some(parent), Some(name)) => match fs::canonicalize(parent) {
+            Ok(dir) => dir.join(name),
+            Err(_) => lexically_normalize(target),
+        },
+        _ => lexically_normalize(target),
+    }
+}
+
+/// Collapse `.` and `..` purely lexically — the [`alias_key`] fallback for a path whose
+/// parent directory cannot be resolved.
+///
+/// Wrong in the presence of symlinked *directories* (`a/b/..` is not `a` when `b` is a
+/// link), which is why it is only a fallback and is never used to reach a file. A leading
+/// `..` that cannot be collapsed is kept, so a relative path still points somewhere.
 fn lexically_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -390,17 +414,18 @@ fn resolve_target(target: &Path) -> Result<PathBuf> {
                     target.display()
                 ))
             })?;
-            // Normalized, because this is the one target path `nc` *synthesizes* rather
-            // than receives, and `commit_all` compares targets lexically. An unnormalized
-            // `latest.tiff -> sub/../ir.tiff` joins to `<dir>/sub/../ir.tiff`, which is the
-            // same file as `<dir>/ir.tiff` but not the same `PathBuf` — so the duplicate
-            // check would miss the alias and one artifact would overwrite the other.
-            // `canonicalize` cannot help here: the referent does not exist yet.
-            Ok(lexically_normalize(&if link.is_absolute() {
+            // Deliberately NOT normalized. `File::create` followed the path as written,
+            // and `..` after a symlinked *directory* does not collapse textually: with
+            // `latest -> sub/../ir.bin` where `sub` links elsewhere, the kernel resolves
+            // `sub` first and lands in the referent's parent, while a lexical collapse
+            // would name the link directory's own `ir.bin` — a **different file**. So the
+            // path used for *access* stays verbatim; aliasing comparisons use
+            // [`alias_key`], which resolves the directory properly instead of guessing.
+            Ok(if link.is_absolute() {
                 link
             } else {
                 target.parent().unwrap_or(Path::new(".")).join(link)
-            }))
+            })
         }
         // Not a symlink, or does not exist yet: write it where the caller asked.
         _ => Ok(target.to_path_buf()),
@@ -497,8 +522,14 @@ pub fn commit_all(artifacts: Vec<Staged>) -> Result<Vec<String>> {
     // resolution happens later, here. So `-o latest.tiff` (a dangling link to `ir.tiff`)
     // plus `--export-ir ir.tiff` look distinct up front and then collide — the last commit
     // silently overwrites the first while the run reports success. Reject the whole set.
+    let keys: Vec<PathBuf> = artifacts.iter().map(|a| alias_key(&a.target)).collect();
     for (i, a) in artifacts.iter().enumerate() {
-        if let Some(other) = artifacts[..i].iter().find(|b| b.target == a.target) {
+        if let Some(other) = artifacts[..i]
+            .iter()
+            .zip(&keys)
+            .find(|(_, k)| **k == keys[i])
+            .map(|(b, _)| b)
+        {
             return Err(NcError::Write(format!(
                 "two output artifacts resolve to the same file {} (staged as {} and {}) — \
                  one would silently overwrite the other. This can happen when a symlinked \
@@ -509,13 +540,12 @@ pub fn commit_all(artifacts: Vec<Staged>) -> Result<Vec<String>> {
             )));
         }
     }
-    let mut warnings = Vec::new();
     for a in &artifacts {
         check_promotable(&a.target)?;
-        warnings.extend(hard_link_warning(&a.target));
     }
+    let mut warnings = Vec::new();
     for a in artifacts {
-        a.commit()?;
+        warnings.extend(a.commit()?);
     }
     Ok(warnings)
 }
@@ -997,6 +1027,75 @@ mod tests {
         let staged = stage_bytes(&target, b"fresh").unwrap();
         staged.commit().unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"fresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dotdot_after_a_symlinked_directory_is_not_collapsed_for_access() {
+        // The P1 my first normalization introduced: with `latest -> sub/../ir.bin` where
+        // `sub` links to ANOTHER directory, the kernel resolves `sub` first and lands in the
+        // referent's parent, so `File::create` wrote `<root>/ir.bin`. A lexical collapse
+        // names `<link_dir>/ir.bin` instead — a different file. Verified against the real
+        // filesystem, which is the only authority here.
+        let dir = TempDir::new("symdir");
+        let link_dir = dir.join("link_dir");
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir(&link_dir).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", link_dir.join("sub")).unwrap();
+        let link = link_dir.join("latest");
+        std::os::unix::fs::symlink("sub/../ir.bin", &link).unwrap();
+
+        stage_bytes(&link, b"x").unwrap().commit().unwrap();
+        assert!(
+            dir.join("ir.bin").exists(),
+            "must write the file the path really resolves to (root/ir.bin)"
+        );
+        assert!(
+            !link_dir.join("ir.bin").exists(),
+            "and NOT the lexically collapsed sibling"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_alias_key_resolves_a_symlinked_directory_rather_than_collapsing_it() {
+        // The comparison half: two spellings of one file must collide, and a `..` after a
+        // symlinked directory must NOT be treated as cancelling.
+        let dir = TempDir::new("aliaskey");
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        // Same file, two spellings ⇒ equal keys.
+        assert_eq!(
+            alias_key(&dir.join("sub/../ir.bin")),
+            alias_key(&dir.join("ir.bin"))
+        );
+        // Different files via a symlinked dir ⇒ different keys, where a lexical collapse
+        // would have said "equal".
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink("../elsewhere", sub.join("link")).unwrap();
+        assert_ne!(
+            alias_key(&dir.join("sub/link/../ir.bin")),
+            alias_key(&dir.join("sub/ir.bin")),
+            "`link/..` lands in `elsewhere`'s parent, not in `sub`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_direct_commit_reports_hard_links_too() {
+        // `write_json` (--dump-params, --report-file, inspect/estimate reports) calls
+        // `commit` directly, so the warning has to come from `commit` rather than only from
+        // `commit_all` — otherwise "hard links are reported" was true for some artifacts and
+        // silently false for others.
+        let dir = TempDir::new("directcommit");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"old").unwrap();
+        fs::hard_link(&target, dir.join("alias.bin")).unwrap();
+        let notes = stage_bytes(&target, b"new").unwrap().commit().unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("hard links"), "{}", notes[0]);
     }
 
     #[test]

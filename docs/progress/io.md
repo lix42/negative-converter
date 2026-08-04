@@ -813,13 +813,34 @@ obvious until something breaks:
     `commit_all` returns warnings, `run_convert` pushes them through the normal channel, and
     `--strict` promotes them (verified exit 1). Refusing would reject a reasonable output
     path to protect an alias the user may not care about.
-  - **A `..` in a dangling symlink defeated the duplicate check.** `PathBuf` equality is
-    lexical, so `latest.bin -> sub/../ir.bin` joins to a path that *is* `<dir>/ir.bin` but
-    does not compare equal to it. The synthesized path is now lexically normalized (purely
-    lexical on purpose — the referent does not exist, so `canonicalize` is unavailable;
-    wrong for symlinked *directories*, which is documented and fine for an aliasing
-    comparison). Fixing this also corrected `/..`, which POSIX collapses to `/` and my first
-    implementation kept.
+
+    The warning now comes from `commit` itself, not `commit_all`: `write_json`
+    (`--dump-params`, `--report-file`, the `inspect`/`estimate` reports) commits directly, so
+    the first version made "hard links are reported" true for the conversion artifacts and
+    silently false for everything else. Those notes go to **stderr** rather than
+    `report.warnings`, deliberately — a hard-linked report file should not fail a `--strict`
+    render, which is about the conversion. `write_json`/`emit_json`/`emit_report` therefore
+    take a `&Log`; `emit_report` stopped being `pub` in the process, since only `cli` calls
+    it and `Log` is private.
+  - **A `..` in a dangling symlink defeated the duplicate check**, because `PathBuf`
+    equality is lexical: `latest.bin -> sub/../ir.bin` joins to a path that *is*
+    `<dir>/ir.bin` yet does not compare equal to it. Fixing this also corrected `/..`, which
+    POSIX collapses to `/` and my first implementation kept.
+
+    **My first fix was a P1 bug, and the caveat I wrote to excuse it was false.** I
+    normalized the path lexically and noted it was "wrong for symlinked directories —
+    acceptable, since the only caller compares rather than resolves". `resolve_target`
+    *returns* that path to `stage`, which writes there, so it was absolutely used for access.
+    Measured: with `latest -> sub/../ir.bin` where `sub` links elsewhere, `File::create`
+    writes `<root>/ir.bin` (the kernel resolves `sub` first, then `..`), while the lexical
+    collapse names `<link_dir>/ir.bin` — **a different file**. The two uses are now split:
+    the *access* path stays verbatim, and comparison goes through `alias_key`, which
+    canonicalizes the parent **directory** (resolving symlinked dirs for real) and re-joins
+    the file name, falling back to lexical only when even the parent is unresolvable. That is
+    both correct and strictly better than the lexical version at catching aliases.
+
+    Worth generalizing: a comment that explains why a known-wrong shortcut is safe deserves
+    the same scrutiny as the code. This one was wrong about its own call graph.
   - **My stale-temps test failed when run alone**, and for the exact reason it was meant to
     disprove: it seeded litter with `temp_path_for`, occupying *this* process's next
     candidates. It passed only because earlier tests had advanced the counter. Now it seeds
