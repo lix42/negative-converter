@@ -1,20 +1,4 @@
 {
-  "extraKnownMarketplaces": {
-    "lix42": {
-      "source": {
-        "source": "github",
-        "repo": "lix42/claude-plugins"
-      },
-      "autoUpdate": true
-    }
-  },
-  "enabledPlugins": {
-    "tasks@lix42": true,
-    "ship@lix42": true,
-    "pr-review-toolkit@claude-plugins-official": true,
-    "commit-commands@claude-plugins-official": true,
-    "claude-md-management@claude-plugins-official": true
-  },
   "permissions": {
     "allow": [
       "Bash(cargo build*)",
@@ -30,7 +14,6 @@
       "Bash(cargo bench*)",
       "Bash(cargo tree*)",
       "Bash(rustup *)",
-
       "Bash(git status*)",
       "Bash(git diff*)",
       "Bash(git log*)",
@@ -51,7 +34,6 @@
       "Bash(git tag*)",
       "Bash(git worktree*)",
       "Bash(git remote *)",
-
       "Bash(gh pr create*)",
       "Bash(gh pr view*)",
       "Bash(gh pr checks*)",
@@ -65,5 +47,21 @@
       "Bash(gh api *)",
       "Bash(gh repo view*)"
     ]
+  },
+  "enabledPlugins": {
+    "tasks@lix42": true,
+    "ship@lix42": true,
+    "pr-review-toolkit@claude-plugins-official": false,
+    "commit-commands@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "lix42": {
+      "source": {
+        "source": "github",
+        "repo": "lix42/claude-plugins"
+      },
+      "autoUpdate": true
+    }
   }
 }

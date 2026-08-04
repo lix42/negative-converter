@@ -68,10 +68,27 @@ about the two leading forms was unaffected; only 4, 5 and 7 moved.
 **structurally had to**: `sdr::render` *errors* on any sample outside `[0, 1]`, so a
 returned image cannot contain one, and the old column was measuring nothing. The
 replacement counts samples at or above 0.999, i.e. highlight separation the shoulder has
-compressed against white. It immediately earns its place by **quantifying the one loss the
-visual review found**: mid-anchoring (3, 8) saturates ~8.4–9.0% against the shipped 6.4%,
-which is the "P3 curtain detail is gone" observation in numbers. It also shows 4/7
-saturating exactly 0.00% — not a virtue but a symptom, since their contaminated anchor
+compressed against white.
+
+**It validates against the blind visual review, in exact rank order.** P3 is the frame the
+user singled out unprompted — "3 and 8 lost all the details on the curtain, 5b lost some
+details, 1, 2, 5a keep the details" — recorded before this metric existed. Its P3 saturation
+shares:
+
+| candidate | 8 | 3 | 5b | 5a | 2 | 1 |
+|---|---|---|---|---|---|---|
+| sat% on P3 | 26.88 | 25.29 | 21.97 | 11.15 | 9.91 | 7.64 |
+| visual verdict | lost all | lost all | lost some | kept | kept | kept |
+
+The ordering matches across all six candidates, and the *three-way grouping* falls out too:
+~25–27% for "lost all", ~22% for "lost some", ~8–11% for "kept". An independent numeric
+statistic reproducing a visual judgement that precisely is the strongest single piece of
+validation in this report — and it is exactly what the old column, pinned at 0.00%, could
+never have supplied. Across all ten frames the medians are 8.35% (3) and 8.98% (8) against
+the shipped default'"'"'s 6.39%, so mid-anchoring'"'"'s highlight cost is real but concentrated in
+the high-dynamic-range frames rather than spread evenly.
+
+4/7 saturate exactly 0.00% — not a virtue but a symptom, since their contaminated anchor
 renders the whole frame near black.
 
 **The defect, stated precisely: the shipped default gets midtones nearly right and blacks
