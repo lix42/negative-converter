@@ -1,0 +1,20 @@
+{
+  "roll": "2026-07-24-Gold200",
+  "dmin": {
+    "frame": "20260724-leica-1130.tif",
+    "region": "1555,1080,2074,1440",
+    "base": {
+      "r": 0.6001831,
+      "g": 0.27512017,
+      "b": 0.14776836
+    },
+    "warnings": ""
+  },
+  "dmax": {
+    "frame": "20260724-leica-1129.tif",
+    "region": "1555,1080,2074,1440",
+    "scalar": 1.2758015,
+    "warnings": ""
+  },
+  "note": "center 40% region excludes film holder; scalars frozen for deterministic apply"
+}

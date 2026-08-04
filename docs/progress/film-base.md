@@ -944,3 +944,29 @@ Four real findings on PR #56, plus one document-only deferral.
 **Updated:** —
 
 - Goal: Replace `GridEstimate.agreement: bool` (plus the overloaded `spread` sentinel) with a self-describing verdict enum, so `nc estimate --grid` reports *which* of the mutually-exclusive grid outcomes occurred and the CLI stops re-deriving it from the combined base.
+
+
+## dmax-anchor-reliability
+
+**Status:** not started
+**Updated:** 2026-08-03
+
+- Goal: establish whether the roll-fixed `Dmax` anchor measures the quantity it is meant to.
+  A follow-up on a **completed** contract (`film-base/dmax-reference` built what was specified),
+  which is why it is a new task rather than an edit.
+- Evidence from `algo/reference-anchored-sigmoid` (2026-08-02/03), all from committed data:
+  1. **Same-stock rolls disagree by a full stop while their bases agree.** `Portra400` 1.7383 vs
+     `Portra400-leica-flaw` 1.4435 (0.295 apart) while their **red base agrees to 0.0005** — the
+     base proves ±0.03 reproducibility is achievable, so both cannot be film properties. The
+     Portra 160 pair differs by only 0.046, so the leader is not reliably *wrong*; it is
+     **uncontrolled**, which is worse, because one measurement cannot tell you which case it is.
+  2. **Real content exceeds the anchor** — G3 `D′` 1.3265 vs Dmax 1.2758; P3 1.5062 vs 1.3816.
+  3. **Leaders are uniform**, so it is not a fogging gradient: interior `D′` range 0.024/0.039/
+     0.067, gradients ≤0.024. A uniform field at an *uncontrolled level*. Grain sensitivity also
+     makes "fully exposed" arguably ill-posed.
+- Separately, `NOMINAL_DMAX = 2.0` is a poor no-reference fallback: measured rolls span 0.90–1.74
+  (median ≈1.34; ≈1.36 excluding the poor-quality Harman Phoenix), so worst-case error is 1.10
+  density and switching between `Fixed` and `Explicit` is a multi-stop jump. ~1.35 is provisional;
+  n=7 is too small to fix a shipped constant, and Portra400's own 1.7383 is one of the suspects.
+- `algo` candidates 2 and 3 are contingent on this: candidate 3 halves a Dmax error
+  (`dA/dDmax = 0.5`, so 0.046 → 0.15 stop but 0.295 → 0.98 stop); candidate 2 passes it in full.

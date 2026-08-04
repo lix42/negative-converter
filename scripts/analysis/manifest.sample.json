@@ -75,11 +75,11 @@
     },
     "Portra160-2026-07-22": {
       "stock": "Kodak Portra 160",
-      "note": "NLP comparison source; no in-roll unexposed/leader reference frame",
+      "note": "NLP comparison source",
       "frames": [
         {
           "file": "rolls/Portra160-2026-07-22/20260722-nikon-1096.tif",
-          "role": "real",
+          "role": "leader",
           "width": 5184,
           "height": 3600,
           "channels": 3,
@@ -92,7 +92,7 @@
         },
         {
           "file": "rolls/Portra160-2026-07-22/20260722-nikon-1097.tif",
-          "role": "real",
+          "role": "unexposed",
           "width": 5184,
           "height": 3600,
           "channels": 3,

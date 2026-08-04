@@ -54,6 +54,12 @@ the required reference task to accumulate content-analysis code.
 
 ## Dependencies
 
+- [Auto anchor: measure the interior, not the holder](auto-anchor-interior-measurement.md) —
+  **hard prerequisite.** Content-driven anchoring is currently unusable: `DmaxSource::Auto`
+  takes the 99.5th percentile over the whole scan, so the nearly-opaque film holder owns it
+  (measured 2.23–2.37 against roll Dmax 1.28–1.38) and every frame renders black. Any
+  content-derived toe placement inherits that defect until the measurement is confined to the
+  picture area.
 - [Reference-anchored sigmoid reconstruction](reference-anchored-sigmoid.md)
 - [Roll conversion](../core/roll-conversion.md)
 - [Output presets and guidance](../output/presets.md)

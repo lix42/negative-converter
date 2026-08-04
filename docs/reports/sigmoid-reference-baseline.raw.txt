@@ -1,0 +1,129 @@
+
+running 1 test
+
+=== E1  Ektar  Dmax 1.2933   valid patches: shadow true mid false white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.2933       1.000          -    79/255     6.82
+    2  white@Dmax, c=2.0                          1.2933       2.000          -    18/255     7.11
+    3  mid@0.5*Dmax, c=2.0                        1.0190       2.000          -    40/255    12.50
+    4  auto (content-driven), c=2.0               2.3745       2.000          -     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000          -    14/255     6.98
+    5b black@0.005, c=2.0                         1.1505       2.000          -    28/255     9.09
+    7  auto (content-driven), c=0.745/D           2.3745       2.069          -     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              0.9800       2.069          -    41/255    14.35
+
+=== E2  Ektar  Dmax 1.2933   valid patches: shadow true mid true white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.2933       1.000     0.1250    76/255     6.05
+    2  white@Dmax, c=2.0                          1.2933       2.000     0.0156    15/255     6.82
+    3  mid@0.5*Dmax, c=2.0                        1.0190       2.000     0.0552    35/255     8.76
+    4  auto (content-driven), c=2.0               2.2266       2.000     0.0002     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0120    12/255     6.44
+    5b black@0.005, c=2.0                         1.1505       2.000     0.0301    24/255     7.77
+    7  auto (content-driven), c=0.745/D           2.2266       2.069     0.0002     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              0.9800       2.069     0.0602    36/255     9.12
+
+=== E3  Ektar  Dmax 1.2933   valid patches: shadow true mid true white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.2933       1.000     0.1634    72/255     6.28
+    2  white@Dmax, c=2.0                          1.2933       2.000     0.0267    12/255     6.68
+    3  mid@0.5*Dmax, c=2.0                        1.0190       2.000     0.0944    31/255     8.35
+    4  auto (content-driven), c=2.0               2.2626       2.000     0.0003     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0206    10/255     6.53
+    5b black@0.005, c=2.0                         1.1505       2.000     0.0515    21/255     7.17
+    7  auto (content-driven), c=0.745/D           2.2626       2.069     0.0002     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              0.9800       2.069     0.1049    31/255     8.97
+
+=== G1  2026-07-24-Gold200  Dmax 1.2758   valid patches: shadow true mid false white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.2758       1.000          -    72/255     6.18
+    2  white@Dmax, c=2.0                          1.2758       2.000          -    12/255     6.61
+    3  mid@0.5*Dmax, c=2.0                        1.0103       2.000          -    29/255     7.22
+    4  auto (content-driven), c=2.0               2.3047       2.000          -     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000          -     8/255     6.33
+    5b black@0.005, c=2.0                         1.1505       2.000          -    19/255     6.97
+    7  auto (content-driven), c=0.745/D           2.3047       1.862          -     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.1300       1.862          -    26/255     7.00
+
+=== G2  2026-07-24-Gold200  Dmax 1.2758   valid patches: shadow true mid true white true
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.2758       1.000     0.2149    73/255     6.39
+    2  white@Dmax, c=2.0                          1.2758       2.000     0.0462    13/255     6.62
+    3  mid@0.5*Dmax, c=2.0                        1.0103       2.000     0.1570    30/255     7.14
+    4  auto (content-driven), c=2.0               2.3229       2.000     0.0004     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0329     9/255     6.50
+    5b black@0.005, c=2.0                         1.1505       2.000     0.0823    20/255     6.94
+    7  auto (content-driven), c=0.745/D           2.3229       1.862     0.0006     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.1300       1.862     0.1068    27/255     6.96
+
+=== G3  2026-07-24-Gold200  Dmax 1.2758   valid patches: shadow true mid true white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.2758       1.000     0.1352    85/255     7.25
+    2  white@Dmax, c=2.0                          1.2758       2.000     0.0184    22/255     7.75
+    3  mid@0.5*Dmax, c=2.0                        1.0103       2.000     0.0625    46/255    18.56
+    4  auto (content-driven), c=2.0               2.3643       2.000     0.0001     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0131    17/255     6.93
+    5b black@0.005, c=2.0                         1.1505       2.000     0.0327    32/255    11.95
+    7  auto (content-driven), c=0.745/D           2.3643       1.862     0.0002     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.1300       1.862     0.0452    39/255    12.71
+
+=== P1  Portra160-2026-07-22  Dmax 1.3816   valid patches: shadow true mid false white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.3816       1.000          -    63/255     5.82
+    2  white@Dmax, c=2.0                          1.3816       2.000          -     7/255     6.35
+    3  mid@0.5*Dmax, c=2.0                        1.0632       2.000          -    25/255     8.06
+    4  auto (content-driven), c=2.0               2.2979       2.000          -     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000          -     9/255     6.48
+    5b black@0.005, c=2.0                         1.1505       2.000          -    19/255     7.05
+    7  auto (content-driven), c=0.745/D           2.2979       2.069          -     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.0300       2.069          -    25/255     8.98
+
+=== P2  Portra160-2026-07-22  Dmax 1.3816   valid patches: shadow false mid true white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.3816       1.000     0.1882         -     6.93
+    2  white@Dmax, c=2.0                          1.3816       2.000     0.0357         -     7.35
+    3  mid@0.5*Dmax, c=2.0                        1.0632       2.000     0.1545         -     7.67
+    4  auto (content-driven), c=2.0               2.3005       2.000     0.0005         -     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0413         -     7.42
+    5b black@0.005, c=2.0                         1.1505       2.000     0.1034         -     7.62
+    7  auto (content-driven), c=0.745/D           2.3005       2.069     0.0004         -     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.0300       2.069     0.1698         -     7.68
+
+=== P3  Portra160-2026-07-22  Dmax 1.3816   valid patches: shadow true mid true white false
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.3816       1.000     0.2613    64/255     7.64
+    2  white@Dmax, c=2.0                          1.3816       2.000     0.0692     7/255     9.91
+    3  mid@0.5*Dmax, c=2.0                        1.0632       2.000     0.2997    25/255    25.29
+    4  auto (content-driven), c=2.0               2.3723       2.000     0.0007     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0803     9/255    11.15
+    5b black@0.005, c=2.0                         1.1505       2.000     0.2006    19/255    21.97
+    7  auto (content-driven), c=0.745/D           2.3723       2.069     0.0006     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.0300       2.069     0.3368    25/255    26.88
+
+=== P4  Portra160-2026-07-22  Dmax 1.3816   valid patches: shadow true mid true white true
+    candidate                                     anchor    contrast  mid->0.18    shadow     sat%
+    1  white@Dmax, c=1.0 (shipped)                1.3816       1.000     0.1370    63/255     5.52
+    2  white@Dmax, c=2.0                          1.3816       2.000     0.0189     7/255     6.20
+    3  mid@0.5*Dmax, c=2.0                        1.0632       2.000     0.0821    25/255     7.24
+    4  auto (content-driven), c=2.0               2.2649       2.000     0.0003     0/255     0.00
+    5a black@0.002, c=2.0                         1.3495       2.000     0.0220     8/255     6.48
+    5b black@0.005, c=2.0                         1.1505       2.000     0.0549    19/255     7.03
+    7  auto (content-driven), c=0.745/D           2.2649       2.069     0.0002     0/255     0.00
+    8  mid@Dmin+datasheet, c=0.745/D              1.0300       2.069     0.0883    24/255     7.32
+
+
+=== GATES ACROSS FRAMES (mid target 0.18; shadow wants a low code value) ===
+candidate                                   mid med   mid sd|EV| to .18  shadow med shadow max  sat med
+1  white@Dmax, c=1.0 (shipped)               0.1634   0.0461       0.14          72         85    6.39%
+2  white@Dmax, c=2.0                         0.0267   0.0179       2.75          12         22    6.82%
+3  mid@0.5*Dmax, c=2.0                       0.0944   0.0791       0.93          30         46    8.35%
+4  auto (content-driven), c=2.0  [explicit-mode only]   0.0003   0.0002       9.12           0          0    0.00%
+5a black@0.002, c=2.0                        0.0220   0.0220       3.04           9         17    6.53%
+5b black@0.005, c=2.0                        0.0549   0.0551       1.71          20         32    7.62%
+7  auto (content-driven), c=0.745/D  [explicit-mode only]   0.0002   0.0002       9.51           0          0    0.00%
+8  mid@Dmin+datasheet, c=0.745/D             0.1049   0.0921       0.78          27         41    8.98%
+
+Read: 'mid sd' is the between-frame spread a FIXED anchor leaves — lower is more
+reference-driven. '|EV| to .18' is the residual fixed offset the default would need.
+'sat med' is the median share of rendered samples at or above 0.999 — highlight
+separation the shoulder has compressed against display white. It is NOT a clip count; see the doc comment.

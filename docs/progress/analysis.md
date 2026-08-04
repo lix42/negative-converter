@@ -350,3 +350,25 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
   midtone re-grade. Numeric bounds must be established from the frozen real-scan
   baseline before default activation rather than replaced by a visual-only
   judgment.
+
+
+## comparison-review-tooling
+
+**Status:** not started
+**Updated:** 2026-08-03
+
+- Goal: promote the ad-hoc review pages built during `algo/reference-anchored-sigmoid` into a
+  maintained tool for comparing rendering configurations by eye. Requested explicitly by the
+  user rather than continuing to patch the scripts inline.
+- Lessons already paid for and worth preserving: **render through the path being measured** (the
+  previews originally used the *legacy* path while the metrics measured `pipeline::sdr::render` —
+  reviewing one renderer while measuring another); **click, not hover** (a hover popover covers
+  the thumbnail you are trying to leave, and inter-thumbnail gaps make it flicker); **one shared
+  lightbox**, which is what makes prev/next possible; **single-quote CSS `url()`** inside a
+  double-quoted `style` attribute or the attribute terminates and the tile renders black;
+  **never publish these pages** (rendered personal photographs — throwaway dir only, never
+  `../nc-assets` or the repo); and **`sips` destroys a gain map when downscaling**, so HDR review
+  needs full-size files.
+- Wanted: one entry point instead of two overlapping script pairs, the configuration matrix as
+  data rather than code, HDR review for frames whose range exceeds SDR, and build-vs-build
+  comparison so a future default change can be reviewed the same way.

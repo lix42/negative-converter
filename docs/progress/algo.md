@@ -1147,3 +1147,471 @@ What other epics need to know about `algo`:
   is likely this effect. The manufacturer-*tabulated* aims (and their difference Δ) are
   the authoritative half; chart reads must not become ground truth for the registry or
   for `io/scanner-density-calibration` until properly integrated or tabulated.
+## reference-anchored-sigmoid (Phase 0)
+
+**Status:** in progress
+**Updated:** 2026-08-02
+
+- 2026-08-02: **Phase 0 complete — fixture Dmin/Dmax frozen for all three fixture rolls**
+  via `harness.sh freeze`, which now reads its roll triples from the asset manifest:
+
+  | Roll | Dmin (r,g,b) | Dmax | note |
+  |---|---|---|---|
+  | `2026-07-24-Gold200` | 0.6001831, 0.27512017, 0.14776836 | 1.2758015 | new; no estimator warning |
+  | `Ektar` | 0.51679254, 0.2768597, 0.18973067 | 1.2933096 | reproduced bit-identically |
+  | `Portra160-2026-07-22` | 0.49988556, 0.24776074, 0.14920272 | **1.3816013** | re-frozen; see below |
+
+- **The Portra160 re-freeze was necessary and material.** The committed `Portra160.json`
+  named Dmin/Dmax frames `20260720-nikon-1059` / `1058`, neither of which is in the
+  current `Portra160-2026-07-22` roll (manifest: unexposed 1097 / leader 1096) — the
+  recipes predate an asset reorganisation. Re-freezing from the manifest's frames gives
+  Dmax **1.3816** against the stale **1.3352**, a 0.046 shift. Reusing the old value
+  would have anchored the entire baseline comparison on a different piece of film.
+- `Ektar`, `Portra400-leica-flaw` and `phoenix` reproduced bit-identically, which both
+  validates harness determinism and confirms the defect was specific to Portra160.
+- Gold200 raised **no** plausibility warning (Dmax 1.2758 is above the C-41 `≳1.0`
+  floor), so the `film-base/dense-base-dmax-plausibility` risk did not materialise here.
+- **Stale artifacts left in place, flagged not fixed:** `Portra160.json` and
+  `Portra400.json` name rolls that no longer exist under those names. `Portra160.json`
+  now sits beside `Portra160-2026-07-22.json` with a *different* Dmax, which is a trap
+  for the next reader — recommend deleting both stale files, but that removes another
+  task's committed artifacts so it is the user's call, not a side effect of this task.
+- Three `*.hdr.json` files show as modified with **no value change** — the harness now
+  emits the `output` block after `reconstruction` instead of before. Committed so a
+  future re-freeze shows a clean diff.
+- α recomputed against the frozen anchors: Ektar 0.479, Portra160 0.485, Gold200 0.572
+  (mean ≈ 0.51). Config 3's sweep covers 0.5/0.6/0.65, so it still spans the range —
+  and per the PR #68 review the numerator is a provisional chart read, so this must not
+  be used to narrow the sweep.
+- 2026-08-02 (**Evidence D upgraded from suggestive to measured**): the user restored the
+  `Portra160` and `Portra400` roll folders, so both same-stock pairs now exist. **Correction
+  to the Phase 0 entry above: those recipes were never "stale" — they were *orphaned* by the
+  folders' removal.** Re-freezing reproduced their recorded Dmax exactly (1.3352162 and
+  1.7382799), so they were correct for their rolls all along. The `Portra160-2026-07-22`
+  freeze was still necessary: that is a *different* roll of the same stock, with no recipe
+  of its own.
+- The controlled comparison — same stock, same scanner, contrasting the **base** (a genuine
+  film + development property) against the leader-derived Dmax:
+
+  | Stock | pair | base Δ (r / g / b) | leader Dmax Δ |
+  |---|---|---|---|
+  | Portra 160 | `Portra160` vs `-2026-07-22` | +0.029 / +0.027 / +0.021 | +0.046 (0.15 stops) |
+  | Portra 400 | `Portra400` vs `-leica-flaw` | **−0.0005** / +0.023 / +0.021 | **−0.295** (0.98 stops) |
+
+  The Portra 400 row is decisive: its **red base agrees to 0.0005 density** — same stock,
+  same instrument — while the leader-derived Dmax differs by a **full stop**. Both
+  quantities cannot be film properties.
+- **Framing sharpened:** "accidental" was too strong. Portra 160's leaders agree to 0.046,
+  within base-level variation. The leader is not reliably wrong, it is **uncontrolled** —
+  sometimes it lands, sometimes it is a stop out, and a single measurement cannot tell you
+  which. That is worse for an anchor than a consistent bias.
+- By-products: **±0.03 density is the cross-roll reproducibility floor** for a
+  Dmin-referenced quantity (good for config 8 — ~0.07 decades at contrast 2.2); and in
+  *both* pairs the later-dated roll carries ~+0.02 more green/blue base while red does not
+  move consistently — n = 2, so a hypothesis, but a systematic per-session per-channel shift
+  would bound how far any one-time scanner profile can be trusted
+  (`io/scanner-density-calibration`).
+- Gold200's stock confirmed by the user as **Kodak Gold 200** (E-7022), retroactively
+  validating the use of that datasheet's aims (0.95 / 1.35, Δ 0.40) — previously inferred
+  from the folder name.
+- 2026-08-02 (**Phase 2 harness landed; Phase 1 proposal run**): added
+  `src/pipeline/shadow_metrics.rs`, declared `#[cfg(test)] pub mod` in
+  `pipeline/mod.rs`. Two `#[ignore]`d entry points — `propose_patches` and
+  `characterise_reference_frames` — plus 4 always-on unit tests for the geometry and
+  statistics. Skips with a message when `../nc-assets` is absent, so the full suite
+  (126 tests) stays green with no assets and CI needs none.
+- **Harness bug caught by its own first run:** it globbed the roll directory and so
+  proposed "shadow" and "diffuse white" patches on the *leader* and *unexposed* frames,
+  where both are meaningless. Now reads `role` from the manifest and proposes only over
+  `real` frames; leader/unexposed get their own characterisation pass. Also note the two
+  `#[ignore]`d tests interleave stdout when run together — use `--test-threads=1` or the
+  roll headers are misattributed.
+- **Leaders are uniform — no fogging gradient.** Interior tile `D′` range across the
+  leader: Gold200 0.024, Ektar 0.039, Portra160 0.067; L−R / T−B gradients ≤ 0.024.
+  Their median `D′` is 99.9 / 100.1 / 100.3 % of the frozen Dmax, confirming the anchor
+  is that frame's own level. **This refutes a speculation in the plan** — non-uniformity
+  is *not* additional evidence for the leader problem, because there is none. The case
+  rests entirely on the cross-roll comparison: a uniform field at an *uncontrolled level*.
+- Unexposed frames sit at `D′` 0.016–0.026 over the interior (the base was frozen from a
+  centre 40% region, so the wider interior reads marginally denser) with in-tile spread
+  0.024–0.040. That spread is the **measurement noise floor** — any patch spread below
+  ~0.04 is grain, not texture. Real-frame candidates ran 0.15–0.98, comfortably above it.
+- **The decisive measurement: diffuse white lands at 41–93 % of the leader Dmax (median
+  ~66 %), never near 100 %.** Density headroom above the brightest textured diffuse
+  candidate is 0.09–0.81 (median ≈ 0.43). At contrast 1.0 that is ~0.43 decades of range
+  reserved for densities no photograph in the set contains — the saturation-as-white
+  hypothesis, measured on real frames rather than inferred from a datasheet.
+- Mid-tone sits at 11–58 % of Dmax across frames: the genuine exposure spread the task
+  must preserve, and a usable signal for the exposure-spacing metric.
+- **Check A is not evaluable from auto-proposed patches, as expected.** The implied
+  mid→white Δ scatters 0.085–0.850 against the datasheet's 0.36, because the proposal's
+  "mid-tone" is the frame's *median tile* (not a mid-grey surface) and its "diffuse
+  white" is the brightest textured tile (not necessarily a diffuse reflector). Suggestive
+  detail: the three frames whose Δ lands nearest 0.36 (0.303, 0.347, 0.435) are the ones
+  whose mid-tone sits at 37–46 % of Dmax, i.e. the normally-exposed-looking ones. Δ is
+  printed labelled "orientation only, NOT Check A".
+- 2026-08-02 (Phase 1 review aid): added `scripts/sigmoid-baseline/patch-review.sh` +
+  `build_patch_review.py`, which turn the `propose_patches` output into a reviewable HTML
+  page — each `real` frame rendered as a positive with the candidate rectangles drawn on
+  it, a magnified crop per box, and per-frame questions keyed to a stable mark (G1–G3,
+  E1–E3, P1–P4) so a later discussion can name one box. Crops are pure CSS
+  `background-position` off the single per-frame JPEG, so no crop files are generated.
+- Deliberate choices there: previews render through **`--density-curve sigmoid`**, both
+  because it is the curve under investigation and because the frozen *exponential* recipe
+  clips ~10.3% of samples — blown highlights would defeat the "is this a diffuse white?"
+  judgement the page asks for. Output goes to `../temp/patch-review` (throwaway), never
+  into `../nc-assets` or the repo, and it is **not** published as an Artifact: these are
+  the user's personal photographs and publishing would upload them to an external host.
+- 2026-08-02 (review-page bug, fixed): the magnified crops rendered as solid black. Cause
+  was HTML, not CSS geometry — the crop's inline style used `url("X.jpg")` with **double
+  quotes inside a double-quoted `style` attribute**, so the attribute terminated at
+  `url(` and the remainder was parsed as junk attributes. Fixed to single quotes, with a
+  comment at the site since the failure mode (black box) does not point at quoting.
+  Verified in Chrome by inverting the CSS background math to recover the displayed source
+  region: all 30 crops resolve to their declared rectangle within ~1 px, aspect 0.959
+  (= 328/342), `background-size` 1580.49 % (= 5184/328), no crop left without a
+  background. Verification used JS introspection only — no screenshots — so no sample
+  pixels entered an agent context.
+- 2026-08-02 (exposure question reworked, at the user's request): "correct / under / over"
+  proved genuinely hard to answer, and the reason is diagnostic — **at the shipped contrast
+  the raised black floor leaves no black reference, so a frame reads as neither under nor
+  over.** The question is now "which EV variant reads as correctly exposed?", answered from
+  a row of five real renders per frame.
+- Implemented as **real `--print-exposure` renders, not a CSS `filter: brightness()`**. CSS
+  filters act on *encoded* sRGB, so `brightness(2)` is not one stop; it is a non-photometric
+  curve and a variant chosen that way would not map back to any pipeline value. The real
+  knob is a true `2^EV` linear gain, so the chosen variant converts directly into an EV
+  offset — and it is the *relative* answers across frames that classify exposure.
+- The row renders at `--sigmoid-contrast 2.0` (the datasheet-derived ≈2.07) while the
+  full frame above stays at the shipped 1.0, so the page also shows the contrast comparison
+  directly. Sweep runs downward (−2 … 0) because at contrast 2.0, EV 0 clips **nothing** on
+  these frames while EV +1 clips ~14 %. A brightness/contrast slider is included for
+  free-form looking, labelled non-photometric so it is not mistaken for a candidate setting.
+- WB deliberately left neutral despite the visible blue cast: auto-WB is frame-local, and
+  injecting a per-frame correction into a comparison whose purpose is reading per-frame
+  differences would confound it.
+- 2026-08-03 (Phase 1 round 1 reviewed; tool improved per user feedback):
+  - **Patches were too coarse.** The 12 × 8 grid gave 328 × 342 patches (6.3 % × 9.5 % of
+    frame) and the user's answers showed they straddled objects — "dark branch *and*
+    distant forest", "2/3 shadow *and* background forest", and for P1 all three boxes were
+    "a mix of dark forest and bright sky". A patch whose semantics cannot be stated is
+    useless for the Δ calibration. Grid is now 32 × 22 → ~123 × 124 (a quarter the area),
+    overridable via `NC_TILES=<x>x<y>`, plus **non-maximum suppression**
+    (`MIN_SEPARATION_TILES = 3`) so the reported top-3 are spatially distinct rather than
+    three adjacent cells of one surface.
+  - **Consequence, flagged to the user:** the boxes moved, so round-1 answers no longer
+    describe them (E1's white went from the lake at 2262,1115 to 2713,555). Round 1 is not
+    wasted — its *general* observations stand (P1 is all forest/sky mixture; P2 has no
+    large shadow area; P4's white is a specular tractor highlight) — but the per-box
+    yes/no answers must be re-collected against the new geometry.
+  - **My sweep was one-sided, and that was a measurement error.** All ten frames picked
+    EV 0, the boundary of a −2…0 range, which means the optimum sat at or beyond it. Now
+    two-sided (−2 … +1.5), and `EVS` is overridable.
+  - **Upward EV clips heavily and that is itself a finding:** at contrast 2.0, EV 0 clips
+    *nothing* on E1 while +0.5 clips 11.6 % and P3 reaches 20.1 %. Raising exposure buys
+    brighter midtones only by blowing 7–26 % of highlights, because the shoulder has
+    already packed content against white. **Exposure is the wrong knob for a raised
+    floor** — an argument for changing the curve's shape (configs 3/4/8) over recalibrating
+    defaults.
+  - **Why the boundary preference happens at all:** with white pinned at Dmax, raising
+    contrast pivots the line *around white*, pushing everything below it down. So more
+    contrast darkens midtones and needs +EV to compensate — the two knobs fight. A
+    mid-anchored or diffuse-white-anchored form would not have that interaction.
+  - **The same-illumination constraint on Δ** (missed until the user's descriptions
+    exposed it): the datasheet says the grey card and the paper grey scale each *"receiv[e]
+    same illumination as subject"*, so Δ = 0.36 is defined for white and mid under the
+    **same light**. The proposal ranks on density alone and has no notion of illumination,
+    so it will pair a sunlit white with a shadowed mid and put the lighting difference
+    straight into Δ — very likely much of the 0.085–0.850 scatter. P3 is the clearest
+    casualty: its white (window ledge in sunshine) is the best in the set, but its mid
+    (sofa in shadow) makes the pair invalid.
+  - Patch-quality triage from round 1: genuine diffuse whites on only **G1** (painted
+    garage door), **G2** (white flower) and **P3** (window ledge); bad mids on G1 (blue
+    sky) and P4 (parking lot in shade); **P1 unusable for patch metrics entirely.** So
+    Check A may rest on one or two frames — far too thin, which independently confirms the
+    user's own point that a grey card in frame (not merely more frames) is what is needed.
+  - User asks the tool be kept and reused for config comparison beyond this task; `EVS`
+    and `NC_TILES` are the first steps toward that.
+- 2026-08-03 (review-page tweaks, user request): removed the CSS brightness/contrast
+  sliders (unused — and they were non-photometric anyway, so nothing is lost), and added a
+  **hover zoom** on the EV variants: hovering a thumbnail shows the same file full-size in
+  a fixed overlay labelled with its mark and EV. Same `src`, so it is served from cache
+  rather than downloaded twice. Variant renders bumped 1000 → 1600 px so the zoom actually
+  resolves detail (~45 MB total in `../temp`, throwaway).
+- 2026-08-03 (variant comparison reworked; hover replaced by a click lightbox): hover was
+  unusable for two reasons the user hit immediately — a centred thumbnail is covered by its
+  own popover, so you cannot move to the next one, and the gaps between thumbnails make the
+  overlay flicker as the pointer crosses them. Replaced with **one shared lightbox**: click a
+  variant to open, ‹ / › buttons or arrow keys to step through that frame's row (wrapping at
+  both ends), Esc or a click anywhere in the overlay except the buttons to dismiss. One
+  modal rather than 80 overlays is what makes prev/next possible at all.
+- **Verification limit, stated rather than glossed:** the interactive behaviour could *not*
+  be confirmed in the Chrome-automation sandbox. Inline scripts appear to be blocked there —
+  a capture listener saw zero clicks from a synthetic dispatch, and the page's own keydown
+  handler did not respond to a bubbling Escape, while the script text is demonstrably present
+  in the document. Structure, CSS and the handler's logic were verified (row length 8, index
+  lookup, opening resolves to `display: grid`); the event wiring is unverified here and needs
+  a human check in a normal browser. This is an artifact of the automation environment, not
+  of a local `file://` page, where inline scripts run normally.
+- User asks for a **separate task** to improve this tool properly rather than continuing to
+  patch it inline. Not filed yet: `docs/TASKS.md` is currently modified on the open PR #68
+  branch, so adding another task now would conflict. File it once #68 merges.
+- 2026-08-03 (Phase 1 round 2 answers; sweep extended a **second** time):
+  - **My sweep was bounded too low twice.** A −2…0 range had all ten frames pick 0; a
+    −2…+1.5 range had six of ten pick +1.5. A near-unanimous boundary choice means the
+    optimum lies *outside* the range. Now −1…+3.5, and the generator reads the same `EVS`
+    list the render script uses so the two cannot drift into referencing unrendered images.
+  - **The deficit is quantified and it is large.** At contrast 2.0 with white pinned at
+    Dmax, a measured mid-tone lands at `10^(2·(D′−Dmax))`: E1's 0.5418 → 0.031 linear
+    (50/255), needing **+2.52 EV** to reach 0.18; E2 needs **+3.57 EV**. So the shipped
+    anchor places midtones 2.5–3.6 stops too dark once contrast is photographic — which is
+    exactly why every frame wanted more exposure than I offered.
+  - **The datasheet chain closes on itself.** With white pinned at *diffuse* white and
+    `contrast = 0.745/Δ = 2.07`, a mid-grey sitting Δ below white lands at
+    `10^(2.07·−0.36) = 0.18` — mid-grey, exactly, by construction. So the entire observed
+    EV deficit is attributable to anchoring on Dmax rather than diffuse white, and configs
+    4/7/8 predict **zero** exposure compensation. Sharp and falsifiable.
+  - **Content exceeds the leader Dmax.** G3's auto white measures `D′` 1.3265 against
+    Dmax 1.2758, and P3's 1.5062 against 1.3816 — real photographic content sits *above*
+    the anchor. The leader-derived Dmax does not even bound the frame, which is an
+    independent blow to it beyond the same-stock inconsistency already recorded.
+  - Testing "chosen EV == the diffuse-white pin" gave mean |diff| 1.50 EV — **not** a clean
+    confirmation, but the residual is structured, not random: it is ≤0.5 EV on the frames
+    whose white is genuinely diffuse and below Dmax (E1 +0.27, E3 +0.50, G2 +0.41) and
+    breaks down precisely where the patch is invalid — G3 −1.84 and P3 −2.33, the two
+    super-Dmax speculars. The test is also censored, since six answers sat at my +1.5 cap.
+    Re-run once the extended sweep is answered.
+  - **Confirmed patch semantics (round 2).** Genuine diffuse whites on only **G2** (white
+    lily) and **P4** (white painted sign); P3's window ledge is white but sunlit and
+    super-Dmax. Speculars: E2 and E3 ("sunshine reflected on leaves"), P4's earlier tractor
+    highlight. Sky: G3, P1. Fog: E1, P2. **E1's white is contaminated by a scanning dust
+    speck** — dust blocks light, so it is dense in the negative and renders as a false
+    highlight; IR-based dust removal is a roadmap item, and that patch must move.
+  - **User pushback on G1's mid being blue sky, partially accepted:** sky luminance can sit
+    near mid-grey, so it is defensible as an *exposure* reference. It is still poor for Δ,
+    which needs a spectrally *neutral* surface — strongly blue sky has very unequal
+    per-channel densities, and sky luminance varies with angle to the sun and haze.
+  - P1's blue cast: agreed out of scope. The frozen recipe uses neutral WB deliberately.
+- 2026-08-03 (**review path corrected — previews now come from the measured renderer**):
+  the user asked whether the review JPEGs carry HDR. They do not (8-bit, sRGB, no gain map)
+  — but the question exposed a worse problem: previews came from the **legacy** path
+  (`reconstruct → finish_print → color::to_output`) while the acceptance bounds are measured
+  on `pipeline::sdr::render`, which is different code (Hermite shoulder + radial gamut
+  mapping vs legacy's linear-space soft clip). Reviewing one renderer while measuring
+  another is not a fair test. Previews now render with `--output-preset ultra-hdr-v1`,
+  whose JPEG **base is** the `pipeline::sdr` rendition, so the page shows what gets
+  measured. Display P3 survives the `sips` downscale (verified: red matrix column 0.51512 /
+  0.2412 / −0.00105); the gain map is dropped, which is correct for SDR thumbnails.
+  - **Correction to a previously reported finding.** "Exposure is the wrong knob because it
+    costs 7–26 % blown highlights" was measured on the **legacy** path only. On the display
+    path, contrast 2.0 at EV +1.5 reports `clipped_high: 0`. The clipping argument does not
+    transfer. What survives is the *exposure deficit* itself (midtones 2.5–3.6 stops too
+    dark), which is density arithmetic and path-independent.
+  - HDR review deferred by user decision: "we are just at the first one at our all
+    comparison, and this white-pinned one is even not the one with highest expectation."
+    Full-size gain-map files for the mixed-range frames (G3, P3) come once every candidate
+    config is renderable, so the HDR question can be judged across all of them at once.
+    Constraint to remember: `sips` cannot downscale a gain-map JPEG without destroying the
+    gain map, so HDR review needs full-size (~6.5 MB) files.
+- 2026-08-03 (**first uncensored exposure comparison — reference-driven anchor beats
+  content-driven**). Round-3 EV preferences on the corrected display path, extended range
+  −1…+3.5 with no answer at the boundary: E1 +1.5, E2 +1, E3 +1.5, G1 +2.5, G2 +1.5,
+  G3 mixed (sky +0 / tree +2), P1 +2.5, P2 +2.5, P3 +1.5 (people) / +0 (window), P4 +2.5.
+- Two candidate anchors were scored against those preferences, expressing each as the
+  equivalent `--print-exposure` at contrast 2.0 (`EV = c·(Dmax − W)/log10 2`):
+
+  | | mean \|diff\| | median |
+  |---|---|---|
+  | **A** content-driven — pin the *measured* brightest diffuse patch | 0.96 EV | 0.59 |
+  | **B** reference-driven — pin the *datasheet* diffuse-white-above-base | **0.63 EV** | 0.58 |
+
+- **B wins, and its residuals are per-stock systematic rather than random:** Ektar ≈ +0.6
+  throughout, Portra 160 ≈ 0 (P1/P2/P4 all within **0.16 EV** — one constant predicting
+  three different scenes to a sixth of a stop), Gold 200 ≈ −1.0. A constant per-stock
+  offset is exactly the signature expected if each stock's derived white is off by a fixed
+  amount — which is anticipated, since they rest on the **provisional chart-read `D-min`**
+  values PR #68 flagged as not true Status M densities. The *form* is supported; the
+  constants are the uncertain part. (Correcting each stock by its mean residual would fit
+  within ~0.3 EV everywhere, but that is fitting, not prediction, so it is not validation.)
+- **This favours the shippable candidate over the diagnostic one.** A is config 4/7 —
+  frame-local content adaptation, forbidden for the default — while B is config 8, which is
+  content-free and default-eligible. A's failures are also explained by that: it stretches
+  whatever the brightest diffuse patch happens to be up to 1.0, so a frame containing no
+  true white (P2 fog, P4 sign, E2 specular leaves) is forced too bright. Frame-local
+  fitting misbehaving exactly as the plan predicted.
+- **G3 and P3 are unresolvable by any single global curve** (sky +0 vs trees +2; window +0
+  vs people +1.5) — their scene range exceeds SDR. That is the HDR question, deferred.
+- 2026-08-03 (**scope reduced by the user: filter methods, do not tune parameters**).
+  - **Bias identified in my measurement design:** asking for a preferred EV frame by frame
+    *is* per-frame optimisation, which contradicts being honest to the film. Quantified —
+    the user's preferences have stdev 0.57 EV with a **within-stock spread of 0.5–1.0 EV**,
+    and that within-stock part is what a fixed anchor cannot follow and must not chase:
+    some is real exposure variation in the negatives (which the task requires *preserving*)
+    and the rest is judgement noise. For comparison, candidate A's own frame-to-frame swing
+    is 1.43 EV across 8 distinct values — it adapts *more* than the human — while B's is
+    0.54 EV across 3 values, one per stock.
+  - **Correct use of the data is the central tendency, not the per-frame values.** Median
+    preference is +1.5 EV at contrast 2.0 = white pinned **0.452 density below Dmax**, close
+    to the median *measured* diffuse-white gap of 0.417 — two independent routes to
+    ~0.42–0.45. Candidates will no longer be scored frame-by-frame against preference. Note
+    an offset stated relative to Dmax inherits Dmax's unreliability; config 8's Dmin
+    reference does not.
+  - **Revised goal:** (1) do not seek the optimal parameter — contrast ≈2 ≫ 1.0 suffices,
+    2.21 vs 2.22 is out of scope; (2) filter which anchoring forms deserve support, with
+    **no requirement to pick a single winner** — closer to the task file's "choose the least
+    invasive remedy" than a parameter hunt; (3) parameter tuning moves to a follow-up task
+    once higher-quality, deliberately correctly-exposed samples exist (the current ten were
+    picked at random).
+  - **Consequences:** acceptance bounds become **qualitative gates** (reaches a plausible
+    black; needs no per-frame correction; preserves exposure spacing; finite/continuous/
+    monotone; no clipping) rather than numeric thresholds — defensible at n = 10, which
+    thresholds never were. And the deliverable becomes a filtered candidate set plus a
+    *provisional* parameter; since `output/presets` activates whatever default this task
+    lands, it would ship a provisional value. Acceptable pre-release, and the seam is clean
+    (a later parameter change is a default change + conversion-version bump, not a change of
+    form) — recorded so it is a conscious decision rather than a surprise at activation.
+- 2026-08-03 (**Phase 3 measured — candidate set filtered**). Froze
+  `scripts/sigmoid-baseline/fixtures.json` (schema 1) with each patch's rectangle *and*
+  user-confirmed semantics plus validity flags, so invalid patches are skipped rather than
+  averaged in: 2/10 valid diffuse whites (G2 white lily, P4 painted sign), 7/10 valid mids,
+  9/10 valid shadows, **2 frames usable for the datasheet Δ**. Added
+  `shadow_metrics::measure_candidates`, which exploits the fact that **every anchoring form
+  reduces to one number** — the sigmoid anchor `A` (`curve.dmax`) plus a contrast — so no new
+  curve code was needed. Report: `docs/reports/sigmoid-reference-baseline.md` (+ raw output).
+- **The defect, precisely: the shipped default gets midtones nearly right and blacks badly
+  wrong.** Candidate 1 needs only 0.14 EV to place a mid-grey yet its darkest *confirmed*
+  shadow patch sits at 72/255. That is why the complaint is "pale" and not "dark", and it is
+  now reproduced on confirmed patches rather than inferred.
+- Filtering outcome: **reject 1** (black gate, 72/255); **reject 5** (black-pinned needs
+  +4.75 EV — pinning black alone leaves white and mid unplaced, and fixing that requires a
+  second pin ⇒ adaptive contrast, already rejected); **4 and 7 diagnostic-only** on the
+  frame-local argument, explicitly *not* on this data since both resolve on **2 frames only**;
+  **2 and 3 contingent** on a `film-base` Dmax fix; **support 8** — smallest residual (0.78 EV)
+  of any black-passing shippable form, Dmax-free and content-free.
+- **A gate I had backwards, now corrected in the harness output.** "Lower mid spread = more
+  reference-driven" is wrong. A reference-driven anchor applied to frames that genuinely differ
+  in exposure *should* leave spread; **low** spread means the anchor is *correcting* exposure —
+  the frame-local behaviour the default must not have. Also only comparable at equal contrast,
+  since low contrast compresses between-frame differences (candidate 1's small sd is that
+  artifact, not a merit).
+- 2026-08-03 (**two of my rejections were wrong; user caught both**):
+  - **Candidate 5 (black-pinned) was rejected on my parameter, not its form.** Pinning black
+    at NLP's 0.00061 with c=2.0 implies an anchor of `−log10(0.00061)/2 = 1.607` — *above*
+    every roll's Dmax (1.28–1.38) — so nothing reached white and the frame rendered dark. My
+    stated reason ("pinning black alone leaves everything unplaced at any fixed contrast") was
+    simply false: fixed contrast is exactly what candidate 2 does. Retested at targets
+    consistent with the contrast — 0.002 → anchor 1.349, 0.005 → anchor 1.151. Black-pinning
+    is as legitimate as white- or mid-pinning: another rule for the same single anchor, and
+    **Dmax-free**. Results: 5a needs +3.04 EV (shadow 9/255), 5b +1.71 EV (shadow 20/255).
+  - **Gating the content-driven candidates on a *semantically valid* white was incoherent.**
+    A content-driven mode has no knowledge of what a real white is — it measures the brightest
+    content and adapts. Requiring validity also meant they resolved on 2 frames only, making
+    their statistics worthless. They now use the shipped `DmaxSource::Auto` (99.5th percentile
+    of corrected densities), so they resolve on all ten and test *shipped* behaviour. Verdict
+    changes from "diagnostic only" to **"explicit-mode only"** — a legitimate opt-in mode
+    (`algo/content-aware-sigmoid-toe`), just never the default.
+  - **And that immediately found a real defect: `Auto` is dominated by the film holder.** It
+    resolves to **2.23–2.37** on every frame against a roll Dmax of 1.28–1.38, because the
+    opaque holder has near-zero transmission and therefore enormous corrected density, so it
+    owns the 99.5th percentile of a full-frame scan. Candidates 4 and 7 render everything to
+    0/255 — that is holder contamination, not content adaptation, so it is **not** a verdict on
+    the form. A content-driven mode must measure the *interior*, which is what `film-base`'s
+    rebate detection exists for. This also explains why `--auto-d-max` was demoted to opt-in.
+- Added `scripts/sigmoid-baseline/candidate-review.sh` + `build_candidate_review.py`: renders
+  all 8 candidate forms × 10 frames (80 images) through the display path with **no exposure
+  applied**, and builds a comparison page with the same click lightbox. The anchor rules live
+  in one place so renders and page cannot disagree.
+- 2026-08-03 (**user verdicts on the candidate forms, and a gap in my sweep**):
+  - Ranking, best to worst: **3 and 8** (both GO), then **5b** (most likely GO), **5a**
+    (unsure), **1** (maybe not go), **2** (not go). Plus two per-frame notes: on **G3, 8 > 3**;
+    on **E2, 2 > 1**.
+  - The user notes the ranking is partly exposure-driven, since exposure is the most salient
+    cue to the eye. Recorded as an honest property of the data, not a contamination — the
+    verdicts are per *form* and aggregated, which is what the reduced scope asks for.
+  - **P3 exposes a clean physical trade, and the arithmetic reproduces the user's eye
+    exactly.** Output gap between `D′` 1.40 and 1.50 (where the curtain detail lives):
+    c1 0.067, c2 0.083, c5a 0.047 (detail kept) · c5b **0.00057** ("lost some") · c3 0.00008,
+    c8 0.00003 ("lost all"). Mechanism: lowering the anchor to lift midtones and blacks puts
+    more content *above* white, where the shoulder must compress it — and at width 0.2 that
+    compression saturates and differentiation collapses.
+  - **Answer to the user's question — yes, recoverable, via the shoulder, which I never
+    varied.** All eight configs used the shipped `shoulder = 0.2`; that is a real gap. Swept on
+    c8 (A=1.03, c=2.069): shoulder 0.2 → gap 0.00003, mid 0.1799; 0.6 → 0.0164 / 0.1740;
+    **1.0 → 0.0502 / 0.1525**; 1.5 → 0.0699 / 0.1188; 2.0 → 0.0684 / 0.0887. So **0.6–1.0
+    recovers most highlight differentiation** (1.0 is comparable to c1's 0.067) for ~0.24 EV of
+    midtone cost; beyond 1.5 midtones darken for little gain.
+  - **Why the shipped default is too narrow:** 0.2 was calibrated for a regime where content
+    essentially never exceeded white (anchor at Dmax, nothing reaches it). Moving the anchor to
+    diffuse white makes the shoulder **load-bearing for the first time**, so a width chosen for
+    a decorative roll-off is inadequate. Testing 0.2 vs ~1.0 is therefore a *form-viability*
+    question, not the 2.21-vs-2.22 tuning that was deferred.
+  - Mechanism summary that now ties the three datapoints together: **anchor height governs
+    highlights** (G3: 8's 1.13 anchor beats 3's 1.01 on a sky-heavy frame; P3 likewise),
+    **contrast governs shadows** (E2: 2 > 1 on a dark forest frame where the pale floor is most
+    objectionable), and **the shoulder is what relaxes the conflict between them**.
+- 2026-08-03 (**shoulder verdict: ≈0.6, with a mechanism, not a preference**). User read:
+  0.2 sharper in the regular range but obvious highlight loss; 0.6 and 1.0 both avoid most of
+  the loss; 1.0 only beats 0.6 on P3; 0.6 sharper than 1.0. Verdict **0.6 > 1.0 > 0.2**.
+  Quantified — local contrast per 0.05 density on c8 (A=1.03, c=2.069):
+
+  | `D′` | region | sh 0.2 | sh 0.6 | sh 1.0 |
+  |---|---|---|---|---|
+  | 0.67 | mid-grey | 0.0430 | 0.0393 | 0.0308 |
+  | 0.85 | upper mid | **0.0995** | 0.0716 | 0.0498 |
+  | 1.20 | highlight | 0.0043 | 0.0428 | **0.0507** |
+  | 1.40 | curtain | **0.0000** | 0.0117 | **0.0298** |
+
+- **The decisive figure is where each shoulder begins eating local contrast:** `D′` 0.95
+  (sh 0.2), **0.70** (sh 0.6), **0.45** (sh 1.0). Mid-grey is at 0.67 — so **0.6 begins bending
+  right at mid-grey**, where a print shoulder belongs, while **1.0 begins well below it** and is
+  therefore no longer a highlight shoulder but a flattening of the entire upper half. That is
+  the mechanism behind "0.6 is sharper than 1.0", and it makes 0.6 principled rather than
+  merely preferred.
+- **On the user's "clamp to 1.0 when part of the image is too light":** their own instinct that
+  it belongs to a different story is correct, and the reason is precise — selecting the shoulder
+  from how much content is too light is **content-adaptive**, so two frames of one roll would
+  get different curves and their highlight relationships would stop being comparable. Same
+  category as content-driven anchoring; belongs in the explicit mode, not the default.
+- **Better resolution:** the *only* frame where 1.0 beats 0.6 is **P3** — already identified as
+  one of the two frames whose scene range exceeds SDR. So the frames that would trigger the
+  clamp are exactly the frames that should get **HDR output** instead. Do not adapt the shoulder
+  to force a high-DR scene into SDR; give it the range it needs.
+- **A legitimate reference-driven version does exist**, and should be recorded rather than lost:
+  a **per-stock** shoulder taken from datasheet curve shape (not per-frame content) would be as
+  defensible as the per-stock anchor. No datasheet shoulder data exists yet, so it is follow-up
+  work under the parameter-tuning task — but it is the honest way to get what the clamp was
+  reaching for.
+
+
+## auto-anchor-interior-measurement
+
+**Status:** not started
+**Updated:** 2026-08-03
+
+- Goal: make `DmaxSource::Auto` measure the picture area, not the whole scan.
+- 2026-08-03 (found by `algo/reference-anchored-sigmoid`): `Auto` takes the 99.5th percentile
+  of corrected densities over the **whole frame**, and the nearly-opaque film holder sits at the
+  `SCAN_EPSILON` floor, so its corrected density is enormous and it owns the top percentile. On
+  the three fixture rolls `Auto` resolved to **2.23–2.37** against roll Dmax 1.28–1.38, and every
+  frame rendered to 0/255. The fix is a sampling *region*, not a new statistic — `film_base`
+  already locates the rebate by marching inward, so plumb a resolved interior in via the
+  orchestrator (as the film base is). An implausible `Auto` result must fail loudly.
+
+
+## sigmoid-parameter-calibration
+
+**Status:** not started
+**Updated:** 2026-08-03
+
+- Goal: turn `reference-anchored-sigmoid`'s **provisional** parameters into calibrated ones.
+- Provisional values and their firmness: contrast ≈2.07 (firmest — derived `0.745/Δ` from
+  *tabulated* datasheet Δ); shoulder ≈0.6 (bends at `D′` 0.70 ≈ mid-grey 0.67, judged on ten
+  frames); per-stock anchor offsets (**weakest** — from chart-read `D-min` values that are not
+  true Status M densities, with systematic per-stock residuals of Ektar ≈+0.6 EV, Portra 160 ≈0,
+  Gold 200 ≈−1.0); and the `NOMINAL_DMAX = 2.0` fallback (measured rolls 0.90–1.74, ≈1.35 better).
+- **More frames will not fix this.** Per-frame exposure preference *is* frame optimisation, so
+  only central tendency is usable. It needs a **bracketed roll** (exposure labels true by
+  construction, which makes exposure-preservation verifiable rather than "consistent with"), a
+  **grey card in frame** (a real 18% reference under the same illumination as a diffuse white —
+  only 2 of 10 existing frames could even approximate the datasheet Δ), and ideally the
+  calibrated transmission step wedge.

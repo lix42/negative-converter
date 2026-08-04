@@ -8,9 +8,6 @@
       ]
     }
   },
-  "output": {
-    "hdr": true
-  },
   "reconstruction": {
     "type": "density",
     "curve": {
@@ -19,5 +16,8 @@
         "explicit": 1.4434652
       }
     }
+  },
+  "output": {
+    "hdr": true
   }
 }

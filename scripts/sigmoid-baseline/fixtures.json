@@ -1,0 +1,483 @@
+{
+  "schema_version": 1,
+  "purpose": "Frozen fixture declaration for algo/reference-anchored-sigmoid. Patch rectangles were proposed deterministically and their SEMANTICS confirmed by the user; the validity flags are what keep the metrics from averaging invalid patches together.",
+  "identity": {
+    "git_commit": "bcf0b21424dd",
+    "pipeline_version": 1,
+    "proposal_grid": "32x22 tiles over the interior 76% (NC_TILES default)",
+    "note": "frame paths are relative to the asset root; sha256 from ../nc-assets/manifest.json"
+  },
+  "delta_reference": {
+    "aim": {
+      "Ektar": 0.36,
+      "Portra160": 0.36,
+      "Gold200": 0.4
+    },
+    "caveat": "Datasheet delta (mid-grey -> diffuse white). Only usable where BOTH patches are valid and in the SAME illumination \u2014 the datasheet specifies 'receiving same illumination as subject'. Two frames qualify: G2 and P4."
+  },
+  "exposure_preference": {
+    "use": "central tendency only \u2014 per-frame values are frame-optimisation and must not select an anchor",
+    "median_ev_at_contrast_2": 1.5,
+    "within_stock_spread_ev": {
+      "Ektar": 0.5,
+      "Gold200": 1.0,
+      "Portra160": 1.0
+    }
+  },
+  "rolls": {
+    "2026-07-24-Gold200": {
+      "recipe": "scripts/real-scan-verify/recipes/2026-07-24-Gold200.json",
+      "stock": "Kodak Gold 200",
+      "dmin": [
+        0.6001831,
+        0.27512017,
+        0.14776836
+      ],
+      "dmax": 1.2758015,
+      "dmin_frame": "20260724-leica-1130.tif",
+      "dmax_frame": "20260724-leica-1129.tif"
+    },
+    "Ektar": {
+      "recipe": "scripts/real-scan-verify/recipes/Ektar.json",
+      "stock": "Kodak Ektar 100",
+      "dmin": [
+        0.51679254,
+        0.2768597,
+        0.18973067
+      ],
+      "dmax": 1.2933096,
+      "dmin_frame": "20260713-nikon-963.tif",
+      "dmax_frame": "20260715-nikon-1009.tif"
+    },
+    "Portra160-2026-07-22": {
+      "recipe": "scripts/real-scan-verify/recipes/Portra160-2026-07-22.json",
+      "stock": "Kodak Portra 160",
+      "dmin": [
+        0.49988556,
+        0.24776074,
+        0.14920272
+      ],
+      "dmax": 1.3816013,
+      "dmin_frame": "20260722-nikon-1097.tif",
+      "dmax_frame": "20260722-nikon-1096.tif"
+    }
+  },
+  "frames": {
+    "G1": {
+      "mark": "G1",
+      "roll": "2026-07-24-Gold200",
+      "file": "20260724-leica-1137.tif",
+      "sha256": "ac638f9e09d98d9d31c0bba82248e3d91b0ca89ac8c28002e0136288b62316df",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.275802,
+      "patches": {
+        "shadow": {
+          "x": 3943,
+          "y": 2044,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.0342,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 4312,
+          "y": 680,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.4879,
+          "description": "blue sky",
+          "valid": false,
+          "invalid_because": "near mid-grey in luminance but strongly non-neutral; poor for a spectral delta"
+        },
+        "white": {
+          "x": 1114,
+          "y": 1796,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.8105,
+          "description": "window with blinds off",
+          "valid": false,
+          "invalid_because": "bright window opening, not a diffuse reflector"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": 2.5
+    },
+    "G2": {
+      "mark": "G2",
+      "roll": "2026-07-24-Gold200",
+      "file": "20260724-leica-1144.tif",
+      "sha256": "3ff3768b349c4a8499cb18bdad03cc4c58f93ea464dc48f50222fd79706383d8",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.275802,
+      "patches": {
+        "shadow": {
+          "x": 3820,
+          "y": 432,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.0544,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 3574,
+          "y": 1424,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.5944,
+          "description": "grassland",
+          "valid": true
+        },
+        "white": {
+          "x": 1975,
+          "y": 2416,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.9888,
+          "description": "white lily",
+          "valid": true
+        }
+      },
+      "usable_for_delta": true,
+      "exposure_preference_ev": 1.5
+    },
+    "G3": {
+      "mark": "G3",
+      "roll": "2026-07-24-Gold200",
+      "file": "20260724-leica-1151.tif",
+      "sha256": "09454a82a698f18f5f8ec2969aff6918eef1b21e1ee47cce3d2bc094dad26dc9",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.275802,
+      "patches": {
+        "shadow": {
+          "x": 3574,
+          "y": 2416,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.1899,
+          "description": "shadow side of leaves",
+          "valid": true
+        },
+        "mid": {
+          "x": 2836,
+          "y": 804,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.3559,
+          "description": "tree leaves",
+          "valid": true
+        },
+        "white": {
+          "x": 1606,
+          "y": 432,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 1.3265,
+          "description": "cloudy sky",
+          "valid": false,
+          "invalid_because": "sky, and measures ABOVE the roll Dmax"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": null,
+      "ev_note": "mixed: sky best at +0, trees at +2 \u2014 scene range exceeds SDR"
+    },
+    "E1": {
+      "mark": "E1",
+      "roll": "Ektar",
+      "file": "20260713-nikon-971.tif",
+      "sha256": "5d7ab00ad02251ace6ddbac81f754ff72dc0422792dd19e639d583dcaaa0a5fd",
+      "width": 5184,
+      "height": 3599,
+      "roll_dmax": 1.29331,
+      "patches": {
+        "shadow": {
+          "x": 1975,
+          "y": 3035,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.2091,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 3820,
+          "y": 1423,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.5418,
+          "description": "lake surface",
+          "valid": false,
+          "invalid_because": "water, not a neutral reflector"
+        },
+        "white": {
+          "x": 2713,
+          "y": 555,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 1.064,
+          "description": "fog, with a scanning dust speck rendering as a false highlight",
+          "valid": false,
+          "invalid_because": "dust blocks light -> dense in the negative -> false highlight; IR dust removal is a roadmap item"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": 1.5
+    },
+    "E2": {
+      "mark": "E2",
+      "roll": "Ektar",
+      "file": "20260714-nikon-989.tif",
+      "sha256": "8419394d7d7b1b5caea5c6a8e7b0bfbb9744c069afa12d029137e90cf367f74b",
+      "width": 5184,
+      "height": 3599,
+      "roll_dmax": 1.29331,
+      "patches": {
+        "shadow": {
+          "x": 622,
+          "y": 431,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.1542,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 1360,
+          "y": 2911,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.3829,
+          "description": "leaves",
+          "valid": true
+        },
+        "white": {
+          "x": 622,
+          "y": 1547,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.8766,
+          "description": "sunshine reflected on leaves",
+          "valid": false,
+          "invalid_because": "specular"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": 1.0
+    },
+    "E3": {
+      "mark": "E3",
+      "roll": "Ektar",
+      "file": "20260714-nikon-991.tif",
+      "sha256": "9b114b803a89d058ce821c7f88fe2b0743402687796b6c25f5315e277250e95c",
+      "width": 5184,
+      "height": 3599,
+      "roll_dmax": 1.29331,
+      "patches": {
+        "shadow": {
+          "x": 3820,
+          "y": 1795,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.09,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 4066,
+          "y": 2043,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.5083,
+          "description": "moss",
+          "valid": true
+        },
+        "white": {
+          "x": 1975,
+          "y": 1795,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 1.0678,
+          "description": "sunshine reflected on leaves",
+          "valid": false,
+          "invalid_because": "specular"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": 1.5
+    },
+    "P1": {
+      "mark": "P1",
+      "roll": "Portra160-2026-07-22",
+      "file": "20260722-nikon-1102.tif",
+      "sha256": "29e291464604ffd2bc0b38fa1e6c01fd520781db991ad935e36e06f4ad0dabf2",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.381601,
+      "patches": {
+        "shadow": {
+          "x": 1360,
+          "y": 3036,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.0474,
+          "description": "trees, deliberately underexposed",
+          "valid": true
+        },
+        "mid": {
+          "x": 745,
+          "y": 2044,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.1861,
+          "description": "cloudy sky and trees, roughly half and half",
+          "valid": false,
+          "invalid_because": "mixed content"
+        },
+        "white": {
+          "x": 2959,
+          "y": 1672,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 1.0576,
+          "description": "cloudy sky with a tree tip",
+          "valid": false,
+          "invalid_because": "sky, mixed content"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": 2.5,
+      "note": "frame unusable for patch metrics: all three boxes are forest/sky mixtures"
+    },
+    "P2": {
+      "mark": "P2",
+      "roll": "Portra160-2026-07-22",
+      "file": "20260723-nikon-1111.tif",
+      "sha256": "a70e7e2406da69772043a636ad945257064bbf5e05506d385e95e0f55162ce99",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.381601,
+      "patches": {
+        "shadow": {
+          "x": 2713,
+          "y": 2044,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.1923,
+          "description": "a tree with slight shadow",
+          "valid": false,
+          "invalid_because": "no large shadow area in this frame"
+        },
+        "mid": {
+          "x": 2836,
+          "y": 2292,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.6329,
+          "description": "grassland",
+          "valid": true
+        },
+        "white": {
+          "x": 1975,
+          "y": 1424,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.7688,
+          "description": "fog",
+          "valid": false,
+          "invalid_because": "unknown effective reflectance"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": 2.5
+    },
+    "P3": {
+      "mark": "P3",
+      "roll": "Portra160-2026-07-22",
+      "file": "20260723-nikon-1121.tif",
+      "sha256": "f640a04de3096c2e718a8d6610bf77a77890a2f85429421668e9afa2c5fbe0dc",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.381601,
+      "patches": {
+        "shadow": {
+          "x": 991,
+          "y": 2912,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.0537,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 4189,
+          "y": 1300,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.805,
+          "description": "wall in shadow",
+          "valid": true,
+          "invalid_because": "valid surface, but shaded -> not same illumination as the white"
+        },
+        "white": {
+          "x": 3943,
+          "y": 1052,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 1.5062,
+          "description": "window ledge under sunlight",
+          "valid": false,
+          "invalid_because": "genuinely white but SUNLIT and measures above Dmax; different illumination from the mid patch"
+        }
+      },
+      "usable_for_delta": false,
+      "exposure_preference_ev": null,
+      "ev_note": "mixed: people best at +1.5, window at +0 \u2014 scene range exceeds SDR"
+    },
+    "P4": {
+      "mark": "P4",
+      "roll": "Portra160-2026-07-22",
+      "file": "20260723-nikon-1127.tif",
+      "sha256": "66562a276399df87d787336b16f6167860f985f3b4049b91f30b3973f9684fa8",
+      "width": 5184,
+      "height": 3600,
+      "roll_dmax": 1.381601,
+      "patches": {
+        "shadow": {
+          "x": 1729,
+          "y": 680,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.0393,
+          "description": "shadow",
+          "valid": true
+        },
+        "mid": {
+          "x": 3205,
+          "y": 804,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.4826,
+          "description": "leaves",
+          "valid": true
+        },
+        "white": {
+          "x": 868,
+          "y": 1672,
+          "w": 123,
+          "h": 124,
+          "measured_dprime_p50": 0.7692,
+          "description": "white painted sign",
+          "valid": true
+        }
+      },
+      "usable_for_delta": true,
+      "exposure_preference_ev": 2.5
+    }
+  }
+}
