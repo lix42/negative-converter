@@ -1534,3 +1534,34 @@ update the current row's `recipe` field without bumping `PIPELINE_VERSION`.
 **Updated:** —
 
 - Goal: Make nc's value-domain terminology — especially `Dmin`/`Dmax` — easy to understand, use, and maintain for **both people and agents**.
+
+### 2026-08-04 — cross-reference: `conversion-versioning`'s contract has a known hole
+
+Appended rather than edited into the `conversion-versioning` section above, which records
+the task as shipped and stays verbatim.
+
+- **`pipeline_version` covers the *default* path only, and that is now a demonstrated gap
+  rather than a theoretical one.** `algo/reference-anchored-sigmoid` (2026-08-03) moved three
+  sigmoid defaults — `contrast` 1.0 → ≈2.0687, `shoulder` 0.2 → 0.6, and a new
+  `curve.anchor` defaulting to mid-grey placement where the previous behavior pinned display
+  white. The default curve is `exponential`, so `PIPELINE_VERSION` correctly did not move and
+  `PIPELINE_FINGERPRINTS` correctly did not fail — yet every recipe selecting `sigmoid`
+  renders differently, even with `contrast`/`toe`/`shoulder`/`dmax` all pinned, because
+  omitted keys take the new defaults.
+- **Filed as a sibling, not by reopening this task**, following the precedent
+  `film-base/dmax-anchor-reliability` set for `film-base/dmax-reference`: the new work changes
+  what a **completed** task's contract *promises*. Reopening would also have made
+  `output/presets` non-executable, since it depends on this task — a real cost for a
+  bookkeeping choice. New task: `core/recipe-replay-fidelity`, dependent on this task and on
+  the algo task that exposed the gap.
+- **The stopgap that exists today:** `cli::sigmoid_anchor_default_warning` — a hand-written,
+  `--strict`-promotable warning when a loaded recipe selects sigmoid with no `anchor`,
+  modelled on this task's own `pipeline_version_warning`. It closes one instance and does not
+  generalize (it names one knob and one date in prose, and says nothing about the `contrast`
+  and `shoulder` moves with the identical property). The new task owns retiring it.
+- **Two remedies already considered and rejected, recorded so they are not re-derived:**
+  bumping `reconstruction.schema_version` (it versions schema *shape* and is checked for
+  exact equality, so a bump rejects every archived recipe — including the majority selecting
+  `exponential`, which the change does not touch), and per-schema-version historical default
+  tables (defensible, but it cannot stop at one knob, and committing to maintaining
+  historical defaults is a policy decision that belongs in the new task, not an algo one).

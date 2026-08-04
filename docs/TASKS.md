@@ -132,6 +132,7 @@ graph TD
     core/cli-framework
     core/pipeline-orchestration
     core/conversion-versioning
+    core/recipe-replay-fidelity
     core/stdout-broken-pipe-safety
     core/value-domain-terminology
     core/dependency-hygiene
@@ -276,6 +277,8 @@ graph TD
   core/pipeline-orchestration --> core/roll-conversion
   algo/dmax-white-anchor --> core/roll-conversion
   core/pipeline-orchestration --> core/conversion-versioning
+  core/conversion-versioning --> core/recipe-replay-fidelity
+  algo/reference-anchored-sigmoid --> core/recipe-replay-fidelity
   core/pipeline-orchestration --> io/input-data-semantics
   io/input-data-semantics --> color/scanner-profile-before-density-experiment
   color/management --> color/scanner-profile-before-density-experiment
@@ -350,6 +353,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `core/cli-framework`: `core/project-foundation`
 - `core/pipeline-orchestration`: `io/silverfast-decode`, `io/tiff-encode`, `color/management`, `film-base/estimation`, `algo/simple`, `algo/density`, `core/cli-framework`
 - `core/conversion-versioning` (post-MVP): `core/pipeline-orchestration`
+- `core/recipe-replay-fidelity` (post-MVP): `core/conversion-versioning`, `algo/reference-anchored-sigmoid`
 - `core/stdout-broken-pipe-safety` (post-MVP, hardening): `core/cli-framework`
 - `core/value-domain-terminology` (post-MVP, cleanup, **preserves data flow**): `core/pipeline-orchestration`
 - `core/dependency-hygiene` (post-MVP, cleanup): `core/pipeline-orchestration` (dep removal is standalone)
@@ -479,6 +483,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Roll conversion (batch + frozen recipe)](tasks/core/roll-conversion.md)
 - [ ] [Base-acquisition planner (the cascade)](tasks/core/base-acquisition-planner.md) — the roll-level `Dmin`/`Dmax` acquisition cascade: frozen recipe with provenance + confidence, and the roll→single fallback decision
 - [x] [Conversion versioning & baseline comparison](tasks/core/conversion-versioning.md) — report `identity`, `pipeline_version` **1** (not 0 — `film-base/dmax-reference` already moved the default render) + the golden drift gate, `{meta,params}` sidecar envelope with bare legacy recipes still loading, and `nctool compare run|diff`; `v0` history in [reports/v0-baseline.md](reports/v0-baseline.md). **Known gap: the Python half runs under no CI gate.**
+- [ ] [Recipe replay fidelity for non-default behavior changes](tasks/core/recipe-replay-fidelity.md) — `pipeline_version` covers the **default** path only, so a recipe opting into a non-default curve replays under a new build with the same label and different pixels (first instance: the 2026-08-03 sigmoid defaults). Decide the policy — widen the label, add a second one, generalize the drift warning, or keep historical defaults — then retrofit that instance and retire its bespoke warning.
 - [ ] [Stdout broken-pipe safety](tasks/core/stdout-broken-pipe-safety.md) — make every
   stdout JSON write (the report via `emit_report`, `nc params`) tolerate a closed
   pipe (e.g. `nc … | head`) without a panic/backtrace. Pre-existing on `main`, not
