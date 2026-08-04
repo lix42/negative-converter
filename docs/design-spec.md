@@ -1737,7 +1737,17 @@ does not:
   **atomic replace**: `nc` keeps overwriting its own output rather than refusing, a
   **symlinked** target is followed so the *referent* is replaced and the link survives,
   and an existing file's **permissions are carried onto** the replacement so a `0600`
-  output does not silently widen to `0644` (mode only — not ACLs or xattrs).
+  output does not silently widen to `0644` (mode only — not ACLs or xattrs). The staging
+  temp is created at the target's mode too, so a killed run cannot leave a wider-than-final
+  copy of the pixels behind.
+- **Three targets are refused rather than replaced**, because `rename` is more permissive
+  than the `File::create` it replaced: an existing **read-only** file (rename needs write
+  permission on the *directory*, so a deliberate `0400` output would otherwise be silently
+  overwritten), a **non-regular** file (FIFO, socket, device node — `create` opened those;
+  a rename destroys them), and **two artifacts that resolve to the same file** (possible
+  when a symlinked output points at another artifact's path, which the up-front collision
+  check cannot see because it compares the paths as given). Each is exit 5 with a message
+  naming the path and the reason.
 - **Temp cleanup is narrower than that.** Ordinary error paths remove the staging file;
   a signal that kills the process does **not** run destructors, so `SIGINT`/`SIGKILL`
   can leave an inert `*.nctmp` beside the output. No signal handler or startup

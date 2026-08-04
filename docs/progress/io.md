@@ -781,6 +781,30 @@ obvious until something breaks:
   14-byte suffix is 259 bytes ⇒ `ENAMETOOLONG`, so a target writable *directly* could not
   be staged. The temp now uses a truncated **prefix** of the basename — a prefix rather
   than an unrelated bounded name, so a stray temp is still traceable to its artifact.
+- **Round two: the fixes above created five more.** Each is another way `rename` is more
+  permissive than `File::create`, and every one was surfaced by re-review of the *fix*, not
+  of the original code — worth recording as a pattern, since "replace an open-and-write with
+  a rename" quietly changes at least eight behaviours:
+  - **A read-only target was silently overwritten.** `rename` needs write permission on the
+    *directory*, not the file. Measured: `create` refuses `0400` with EACCES, a bare rename
+    succeeds. Now probed by opening the target for write **without** truncating — which
+    reproduces the old gate rather than approximating it from mode bits — and refused.
+  - **A FIFO/socket/device target was destroyed.** `create` opened such a node; a rename
+    replaces it. Now refused. The type check must run **before** the writability probe, or
+    opening a FIFO for writing blocks forever — the test would hang rather than fail.
+  - **Two artifacts could resolve to one file.** `cli`'s collision guard compares the paths
+    as given; symlink resolution happens later, so `-o latest.tiff` (a dangling link to
+    `ir.tiff`) plus `--export-ir ir.tiff` looked distinct and then collided, the last commit
+    silently overwriting the first. `commit_all` now rejects duplicate resolved targets.
+  - **The temp was born at 0644 while replacing a 0600 file.** Narrowing the mode at commit
+    time left a world-readable staged copy of the pixels for the length of the write — and
+    the signal caveat above means it can be left behind. The temp is now created at the
+    target's mode.
+  - **Deterministic temp names could exhaust the retries.** Each signal-killed run leaves
+    the next run's first candidate behind, and a new process restarts the counter at 0, so
+    after 8 such runs every name it would try is taken. Temp tokens now mix in a
+    per-process OS-seeded random value (`std::hash::RandomState`, no new dependency), so
+    candidates are unpredictable and stale temps cannot accumulate into a wall.
 - **The `SIGINT` cleanup claim was false and is now narrowed.** Destructors do not run when
   a signal kills the process, so `Drop` cannot remove the temp there. Final-path integrity
   still holds unconditionally (the final path is never opened for writing); *temp cleanup*

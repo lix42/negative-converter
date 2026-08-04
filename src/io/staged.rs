@@ -66,19 +66,34 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::{NcError, Result};
 
-/// Process-unique suffix counter, combined with the pid so two artifacts (or two
-/// `roll` frames) in one process never stage onto each other.
+/// Per-artifact counter, mixed with a per-process random seed to name staging temps.
 ///
-/// It does **not** make the name globally unique: two processes in separate PID
-/// namespaces — separate containers sharing an output mount — can both be pid 1 and
-/// both start at sequence 0. That is why the temp is created with `create_new`, which
-/// fails instead of truncating a live staging file, and why [`stage`] retries with a
-/// fresh sequence rather than trusting the name.
+/// A counter alone is not enough, and neither is counter+pid. Two processes in separate
+/// PID namespaces — separate containers sharing an output mount — can both be pid 1 and
+/// both start at sequence 0, so the *sequence* of candidate names would be identical.
+/// Combined with the documented fact that a signal can leave a `*.nctmp` behind, a
+/// deterministic sequence means each killed run poisons the next run's first candidate:
+/// after eight such runs every name [`stage`] would try is already taken and staging
+/// fails even though countless names are free. Mixing in OS-seeded randomness makes the
+/// candidates unpredictable per process, so stale temps cannot accumulate into a wall.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Per-process random seed for temp names, from the OS via `RandomState` (`std`'s
+/// `hashmap_random_keys`) — no extra dependency, and this needs unpredictability, not
+/// cryptographic strength.
+static TEMP_SEED: OnceLock<u64> = OnceLock::new();
+
+fn temp_seed() -> u64 {
+    *TEMP_SEED.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        std::hash::RandomState::new().build_hasher().finish()
+    })
+}
 
 /// Longest single path component the common filesystems accept (`NAME_MAX` is 255
 /// bytes on ext4, APFS and NTFS). The staging suffix has to fit *inside* this budget:
@@ -114,6 +129,9 @@ impl Staged {
     pub fn commit(mut self) -> Result<()> {
         // Take first: on failure the temp must still be cleaned up by `Drop`, and
         // on success it must not be, because it *is* the target now.
+        // Callable directly (`write_json` does), so the gate lives here too rather than
+        // only in `commit_all`'s pre-pass.
+        check_promotable(&self.target)?;
         let temp = self
             .temp
             .take()
@@ -180,7 +198,10 @@ impl Drop for Staged {
 /// Pure and `seq`-parameterized so the bounding logic is testable without reaching
 /// into the counter.
 fn temp_path_for(target: &Path, seq: u64) -> PathBuf {
-    let suffix = format!(".{}.{seq}.nctmp", std::process::id());
+    // A scrambled token rather than the bare sequence, so consecutive artifacts do not
+    // produce adjacent (and therefore predictable) names — see `TEMP_SEQ`.
+    let token = temp_seed() ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let suffix = format!(".{}.{token:016x}.nctmp", std::process::id());
     // Lossy is fine: the suffix carries the uniqueness, so a non-UTF-8 basename that
     // round-trips imperfectly costs only traceability, never correctness.
     let base = target
@@ -197,6 +218,89 @@ fn temp_path_for(target: &Path, seq: u64) -> PathBuf {
     }
     let parent = target.parent().unwrap_or(Path::new("."));
     parent.join(format!("{kept}{suffix}"))
+}
+
+/// The mode of an existing target, so a staging temp can be created no wider than the
+/// file it will replace.
+///
+/// Without this the temp is created at the process default (typically `0644`), the whole
+/// artifact is written into it, and only [`Staged::commit`] narrows the mode — leaving a
+/// **world-readable staged copy** of a `0600` scan for the length of the write. Harmless
+/// if the run completes; not harmless given that a signal can leave the temp behind.
+#[cfg(unix)]
+fn existing_mode(target: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(target).ok().map(|m| m.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn existing_mode(_target: &Path) -> Option<u32> {
+    None
+}
+
+/// Create `path` exclusively — failing if it exists rather than truncating — at `mode`
+/// when the platform has one.
+#[cfg(unix)]
+fn create_exclusive(path: &Path, mode: Option<u32>) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    if let Some(mode) = mode {
+        options.mode(mode);
+    }
+    options.open(path)
+}
+
+#[cfg(not(unix))]
+fn create_exclusive(path: &Path, _mode: Option<u32>) -> std::io::Result<File> {
+    File::options().write(true).create_new(true).open(path)
+}
+
+/// Whether `target` can be promoted onto — checked *before* any rename.
+///
+/// `rename` is far more permissive than the `File::create` it replaced, so three cases
+/// that used to fail loudly would now succeed destructively. All three are rejected:
+///
+/// - **A directory.** The rename would fail anyway; catching it first means no *other*
+///   artifact in the set gets promoted before we find out.
+/// - **A non-regular file** (FIFO, socket, device node). `File::create` opened such a
+///   node; `rename` *replaces* it, so an `-o` pointing at a named pipe destroyed it on a
+///   successful commit. Checked before the writability probe below, which would otherwise
+///   block forever opening a FIFO for writing.
+/// - **A file we cannot open for writing.** `rename` needs write permission on the
+///   *directory*, not the file, so a deliberately `0400` output was silently overwritten
+///   where `File::create` refused with `EACCES`. Probed by opening for write **without**
+///   truncating, which reproduces the old gate exactly rather than approximating it from
+///   the mode bits.
+fn check_promotable(target: &Path) -> Result<()> {
+    let Ok(meta) = fs::metadata(target) else {
+        // Absent (or unreadable metadata): nothing to protect, and a real problem here
+        // surfaces from the rename itself with the OS's own message.
+        return Ok(());
+    };
+    if meta.is_dir() {
+        return Err(NcError::Write(format!(
+            "cannot write {}: a directory exists at that path",
+            target.display()
+        )));
+    }
+    if !meta.is_file() {
+        return Err(NcError::Write(format!(
+            "cannot write {}: it exists and is not a regular file (a FIFO, socket or \
+             device node). Promoting the output would replace and destroy it",
+            target.display()
+        )));
+    }
+    if let Err(e) = File::options().write(true).open(target)
+        && e.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        return Err(NcError::Write(format!(
+            "cannot write {}: the existing file is not writable ({e}). Remove it or make \
+             it writable — replacing it through a rename would ignore its permissions",
+            target.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a symlinked target to the file it points at, so a rename replaces the
@@ -255,15 +359,14 @@ pub fn stage<T>(
     // derive the same candidate name, and `create` would silently *truncate* the
     // other one's live staging file — promoting mixed bytes as a complete output.
     // Exclusive creation turns that into a detectable collision we simply retry.
+    // Read the target's mode before creating anything, so the temp is born no wider than
+    // the file it will replace rather than being narrowed later at commit time.
+    let mode = existing_mode(target);
     let mut last_err = None;
     let mut opened = None;
     for _ in 0..TEMP_NAME_ATTEMPTS {
         let candidate = temp_path_for(target, TEMP_SEQ.fetch_add(1, Ordering::Relaxed));
-        match File::options()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match create_exclusive(&candidate, mode) {
             Ok(file) => {
                 opened = Some((candidate, file));
                 break;
@@ -321,13 +424,25 @@ pub fn stage<T>(
 /// So callers should order the set with the artifact whose *presence implies success*
 /// last; `cli` commits the primary output after the sidecar for that reason.
 pub fn commit_all(artifacts: Vec<Staged>) -> Result<()> {
-    for a in &artifacts {
-        if a.target.is_dir() {
+    // Two artifacts resolving to the SAME file is not caught upstream: `cli`'s
+    // `ensure_write_targets_distinct` compares the paths the user gave, and symlink
+    // resolution happens later, here. So `-o latest.tiff` (a dangling link to `ir.tiff`)
+    // plus `--export-ir ir.tiff` look distinct up front and then collide — the last commit
+    // silently overwrites the first while the run reports success. Reject the whole set.
+    for (i, a) in artifacts.iter().enumerate() {
+        if let Some(other) = artifacts[..i].iter().find(|b| b.target == a.target) {
             return Err(NcError::Write(format!(
-                "cannot write {}: a directory exists at that path",
-                a.target.display()
+                "two output artifacts resolve to the same file {} (staged as {} and {}) — \
+                 one would silently overwrite the other. This can happen when a symlinked \
+                 output points at another artifact's path",
+                a.target.display(),
+                other.temp.as_deref().unwrap_or(&other.target).display(),
+                a.temp.as_deref().unwrap_or(&a.target).display()
             )));
         }
+    }
+    for a in &artifacts {
+        check_promotable(&a.target)?;
     }
     for a in artifacts {
         a.commit()?;
@@ -573,7 +688,17 @@ mod tests {
         let temp = temp_path_for(Path::new("/tmp/out.tiff"), 7);
         let name = temp.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("out.tiff."), "{name}");
-        assert!(name.ends_with(".7.nctmp"), "{name}");
+        assert!(name.ends_with(".nctmp"), "{name}");
+        // The token is a scrambled random value now, not the bare sequence — so assert its
+        // shape rather than its value (16 hex digits between the pid and the extension).
+        let token = name.trim_end_matches(".nctmp").rsplit('.').next().unwrap();
+        assert_eq!(token.len(), 16, "{name}");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{name}");
+        // Distinct sequences give distinct names, which is what the retry relies on.
+        assert_ne!(
+            temp_path_for(Path::new("/tmp/out.tiff"), 7),
+            temp_path_for(Path::new("/tmp/out.tiff"), 8)
+        );
         // And a pathological basename is truncated, not rejected.
         let long = format!("/tmp/{}", "b".repeat(300));
         let temp = temp_path_for(Path::new(&long), 0);
@@ -683,6 +808,116 @@ mod tests {
                 .is_symlink(),
             "the link itself is untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_staging_temp_is_never_wider_than_the_file_it_replaces() {
+        // The staged copy holds the full artifact for the length of the write, and a signal
+        // can leave it behind — so creating it at the default 0644 while replacing a 0600
+        // scan would expose the pixels even though the final file stays protected.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("tempmode");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let staged = stage_bytes(&target, b"new").unwrap();
+        let temp_mode = fs::metadata(staged.temp_path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            temp_mode, 0o600,
+            "the temp must be born as narrow as the target"
+        );
+        staged.commit().unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_target_is_refused_instead_of_replaced() {
+        // `rename` needs write permission on the *directory*, not the file, so a
+        // deliberately 0400 output would be silently overwritten where `File::create`
+        // refused with EACCES. Measured: create refuses, a bare rename succeeds.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("readonly");
+        let target = dir.join("out.bin");
+        fs::write(&target, b"protected").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let err = stage_bytes(&target, b"new").unwrap().commit().unwrap_err();
+        assert!(err.to_string().contains("not writable"), "{err}");
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"protected",
+            "the protected file must be untouched"
+        );
+        assert!(dir.temps().is_empty(), "and the refused temp is cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_target_is_refused_instead_of_destroyed() {
+        // `File::create` opened a FIFO; `rename` replaces the node, destroying it. The
+        // type check also has to run BEFORE the writability probe, or opening the FIFO for
+        // writing would block forever — this test would hang, not fail.
+        let dir = TempDir::new("fifo");
+        let target = dir.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let err = stage_bytes(&target, b"new").unwrap().commit().unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            fs::symlink_metadata(&target).unwrap().file_type().is_fifo(),
+            "the FIFO must survive"
+        );
+    }
+
+    #[test]
+    fn two_artifacts_resolving_to_one_file_are_refused_as_a_set() {
+        // `cli`'s collision guard compares the paths the *user* gave; symlink resolution
+        // happens later, here — so `-o latest.tiff` (dangling link to ir.tiff) plus
+        // `--export-ir ir.tiff` look distinct up front and then collide, with the last
+        // commit silently overwriting the first.
+        let dir = TempDir::new("dupe");
+        let real = dir.join("shared.bin");
+        let a = stage_bytes(&real, b"first").unwrap();
+        let b = stage_bytes(&real, b"second").unwrap();
+        let err = commit_all(vec![a, b]).unwrap_err();
+        assert!(err.to_string().contains("same file"), "{err}");
+        assert!(!real.exists(), "neither artifact may be promoted");
+        assert!(dir.temps().is_empty());
+    }
+
+    #[test]
+    fn stale_temps_do_not_exhaust_the_retry_budget() {
+        // The failure this guards: with deterministic names, each signal-killed run leaves
+        // the next run's first candidate behind, and after TEMP_NAME_ATTEMPTS such runs
+        // every name a new process would try is taken. Randomised tokens make the
+        // candidates unpredictable, so pre-existing temps are simply not hit.
+        let dir = TempDir::new("stale");
+        let target = dir.join("out.bin");
+        // Litter the directory with plausible stale temps, including this process's own
+        // next few candidate names.
+        for seq in 0..TEMP_NAME_ATTEMPTS as u64 * 2 {
+            fs::write(temp_path_for(&target, seq), b"stale").unwrap();
+        }
+        // Staging must still succeed — the live candidates come from the shared counter,
+        // which has moved past those sequences, and `create_new` would catch any overlap.
+        let staged = stage_bytes(&target, b"fresh").unwrap();
+        staged.commit().unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"fresh");
     }
 
     #[test]
