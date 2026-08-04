@@ -2347,10 +2347,15 @@ fn write_json<T: Serialize>(path: &Path, value: &T, log: &Log) -> Result<()> {
     // go to stderr here rather than into `report.warnings`. These are *operational*
     // artifacts — `--dump-params`, `--report-file` — and folding them into the conversion's
     // warning set would let a hard-linked report file fail a `--strict` render, which is not
-    // what `--strict` is about. Silent was the defect; this is loud without conflating the
-    // two channels.
+    // what `--strict` is about.
+    //
+    // `warn_always`, not `warn`: kept out of the JSON report *and* quiet-gated would mean
+    // no channel carries it under `--quiet`, leaving the stranded alias entirely silent —
+    // exactly the defect this reporting exists to close. That combination is what
+    // `warn_always` is for (see its doc comment; fail-soft telemetry uses it for the same
+    // reason).
     for note in staged::stage_bytes(path, json.as_bytes())?.commit()? {
-        log.warn(&note);
+        log.warn_always(&note);
     }
     Ok(())
 }
