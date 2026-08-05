@@ -279,17 +279,25 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   fork point. Don't lean on the *default* base compare when the worktree's base
   lags `origin/main`: it shows confusing reverse-diffs of already-merged work —
   pass the intended base explicitly. **Neither scope covers both halves, and the
-  default silently picks one** (verified in the companion's `scripts/lib/git.mjs`):
-  `working-tree` sends staged + unstaged diffs plus untracked file contents —
-  but **inlines an untracked file only if it is text under 24 KiB**
-  (`MAX_UNTRACKED_BYTES`), else it sends just a `(skipped: …)` marker, so a big
-  new module is silently reviewed as a filename; `git add -N <path>` first
-  routes it through the size-unlimited unstaged diff. It sends
-  no commits; `branch` sends a two-dot `merge-base..HEAD` range, so it sees
-  commits but neither the working tree nor untracked files; and `--scope auto`
-  (the default) takes working-tree whenever the tree is dirty **at all**,
-  otherwise branch. With committed *and* uncommitted work, one `auto` run
-  reviews the dirty tree and never looks at the commits — run both scopes. The
+  default silently picks one.** `review` (`reviewName === "Review"`) takes
+  `executeReviewRun`'s *native* branch: it assembles **no diff locally** and hands
+  Codex's built-in reviewer only a target — `{type: "uncommittedChanges"}` for
+  `working-tree`, `{type: "baseBranch", branch: <ref>}` for `branch` (the ref
+  string only; no merge-base is computed). Scope selection is
+  `resolveReviewTarget` in `scripts/lib/git.mjs`, where `--base` short-circuits
+  `--scope`, and `auto` takes working-tree whenever the tree is dirty **at all**
+  (staged, unstaged, *or* untracked), otherwise branch. So with committed *and*
+  uncommitted work, one `auto` run reviews the working tree and never looks at the
+  commits — run both scopes. Two traps: **don't pre-stage anything to "help" it**
+  (`git add -N` turns an untracked file into a tracked-unstaged one and *changes*
+  what `uncommittedChanges` means), and prefer a **ref** over a resolved SHA for
+  `--base`, since the field is named `branch` and SHA acceptance is unverified
+  (the type lives in a generated module absent from the plugin cache). Only
+  `adversarial-review` reaches `collectReviewContext`, and it alone carries the
+  local-assembly limits — a 24 KiB `MAX_UNTRACKED_BYTES` cap that degrades a large
+  untracked file to a `(skipped: …)` marker, and `buildBranchComparison`'s two-dot
+  `merge-base..HEAD` range. Both commands are `disable-model-invocation`, so an
+  agent must call `node "<script>" review|adversarial-review` directly. The
   command wraps
   `node "<codex-plugin>/scripts/codex-companion.mjs" review --wait --scope
   working-tree` (`--wait` = foreground/verbatim, `--background` = detach; the

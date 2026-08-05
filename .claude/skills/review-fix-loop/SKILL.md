@@ -75,31 +75,44 @@ Two facts that decide the whole scope, both verified:
   so one command covers local commits, staged, and unstaged changes together.
   `git diff "$base"..HEAD` would silently drop everything uncommitted; don't use
   the two-dot form here.
-- **No diff form includes untracked files.** A brand-new module or test file —
-  usually the whole point of the change — appears only as `??` in `git status`.
-  Enumerate every untracked path explicitly so a new file can't slip through
-  unreviewed, and **save that list** — Step 2 may stage some of them for Codex,
-  which removes them from the `??` list.
+- **No diff form includes untracked files, and `--untracked-files=all` is not
+  optional.** A brand-new module appears only as `??` in `git status` — and bare
+  `git status --short` collapses a whole new directory to a single `newmod/`
+  entry, hiding every file inside it. That is precisely the new-module case this
+  check exists to catch, so always pass `--untracked-files=all` (or use
+  `git ls-files --others --exclude-standard`, which lists files individually).
+- **Gitignored new files are invisible to both**, by design. If the change
+  deliberately adds an ignored file, `git status --ignored=matching` is the only
+  way to see it; otherwise say ignored paths were out of scope.
 
-**If you use `git add -N`, use it safely.** Intent-to-add pulls a new file into
-`git diff` without committing, which Step 2 needs for large untracked files. Two
-rules, both verified:
+**Don't reach for `git add -N` here.** Earlier versions of this skill staged
+untracked files to force them into a diff. Step 2 explains why that is wrong for
+the Codex path and can actively change what gets reviewed. If you ever do use
+intent-to-add for some other reason, undo it **path-scoped** —
+`git reset -- <path>`, never a bare `git reset`, which also unstages files *the
+user* had staged, and in this repo staging is the user's review queue (see
+`~/.claude/CLAUDE.md`).
 
-- **Undo it path-scoped: `git reset -- <path>`, never a bare `git reset`.** A
-  bare reset also unstages files *the user* had staged, and in this repo staging
-  is the user's review queue (see `~/.claude/CLAUDE.md`) — destroying it is a
-  real cost, not a cosmetic one.
-- **Do it before launching either engine**, never between them, so both review
-  the same tree. It moves a file from `??` to ` A` in `git status`, and *into*
-  `git diff "$base"` — coverage shifts channels rather than disappearing, but
-  only if both engines start after the change.
+**Resolve the base defensively — an empty `$base` fails loudly one command
+later.** `git merge-base` exits non-zero when `origin/main` is absent or history
+is shallow, leaving `$base` empty and turning the next command into
+`fatal: ambiguous argument ''`. Walk the fallbacks in the shell, not in your head:
 
-**Base-ref fallbacks.** If `origin/main` doesn't exist, try `origin/HEAD`, then
-local `main`/`master`, then — if the repo has no shared base at all — fall back
-to `HEAD` and review only the uncommitted changes, saying so in the report. If
-`git fetch` fails (offline, no remote), use the stale `origin/main` and note it:
-a stale base can widen the diff with already-merged work, which reads as
-confusing reverse-diffs.
+```
+git fetch origin 2>/dev/null || true    # bare `origin`: `origin main` errors outright if main is absent
+base=""
+for ref in origin/main origin/HEAD main master; do
+  base=$(git merge-base HEAD "$ref" 2>/dev/null) && [ -n "$base" ] && break
+  base=""
+done
+[ -z "$base" ] && echo "NO SHARED BASE — review uncommitted work only, and say so"
+```
+
+A stale base (fetch failed, offline) still works but widens the diff with
+already-merged work, which reads as confusing reverse-diffs — note it if so. Note
+too that `merge-base` without `--all` returns one ancestor; with criss-cross
+history that can pull in unrelated changes, though squash-merged PRs make it
+unlikely here.
 
 Then read the checkout's `CLAUDE.md` (conventions differ per branch after
 rebases) and write a 2–3 sentence framing of *what the change does* — you will
@@ -113,11 +126,12 @@ Start Codex as a background job and spawn `nc-reviewer` in the same breath —
 both run in the background, so the two overlap instead of serializing.
 
 **Codex** (independent engine) — run from *inside* the target checkout so it
-reviews the right git state. The portable way is the plugin **command**
-`/codex:review`, which resolves its own plugin path. To run it as a captured
-background job, invoke the companion script the command wraps — but **discover**
-the path, never hard-code the version (the cache dir is
-`~/.claude/plugins/cache/openai-codex/codex/<ver>/` and the plugin auto-updates):
+reviews the right git state. **`/codex:review` and `/codex:adversarial-review`
+are both `disable-model-invocation: true`** — the same human-only restriction
+documented for `/code-review` below — so calling the companion script directly is
+your *only* route, not a fallback. **Discover** the path; never hard-code the
+version (the cache dir is `~/.claude/plugins/cache/openai-codex/codex/<ver>/` and
+the plugin auto-updates):
 
 ```
 # Resolve the newest installed companion script, then review this checkout.
@@ -130,44 +144,55 @@ codex_mjs=$(command ls -1t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/
 node "$codex_mjs" review --wait --scope working-tree
 ```
 
-**Codex's scopes each cover only half of Step 1's span — pick deliberately, and
-never rely on the default.** Verified against the companion's
-`scripts/lib/git.mjs`:
+**`review` sends Codex a *target*, not a diff — so the scope you pass decides
+which half of Step 1's span it looks at, and the default silently picks one.**
+`executeReviewRun` takes the native branch for `reviewName === "Review"`
+(`codex-companion.mjs`), handing `runAppServerReview` only the object below;
+Codex's built-in reviewer then resolves the change set on its own. Scope
+selection itself is `resolveReviewTarget` in `scripts/lib/git.mjs`:
 
-| Codex invocation | What it actually sends | Covers |
+| Codex invocation | Target object sent | Looks at |
 |---|---|---|
-| `--scope working-tree` | staged diff + unstaged diff + untracked file contents, **each untracked file inlined only if under 24 KiB and text** | uncommitted only — **not** local commits |
-| `--scope branch --base "$base"` | `merge-base..HEAD` commit range (log + diff) | commits only — **not** the working tree, **not** untracked files |
-| `--scope auto` (the default) | working-tree **if the tree is dirty at all**, else branch | whichever one it picked; silently drops the other |
+| `--scope working-tree` | `{type: "uncommittedChanges"}` | uncommitted work — **not** local commits |
+| `--scope branch --base origin/main` | `{type: "baseBranch", branch: "origin/main"}` | the branch vs that base — commit history |
+| `--scope auto` (the default) | whichever of the two `resolveReviewTarget` picks | working-tree **whenever the tree is dirty at all** (staged, unstaged, *or* untracked), else branch |
 
-**The untracked-file limit is a real coverage hole, and it fails quietly.**
-`formatUntrackedFile` replaces the body with a `(skipped: …)` marker for any
-untracked path that is a directory, binary, unreadable, or larger than
-`MAX_UNTRACKED_BYTES` (24 KiB) — so Codex receives the *filename* of a big new
-module and reviews nothing, while the report still looks complete. A ~600-line
-Rust file clears 24 KiB easily. Before launching **either** engine, check the size
-of every untracked path from Step 1; for any that would be skipped,
-`git add -N <path>` so the content reaches Codex through the unstaged diff (which
-has no size limit), then `git reset -- <path>` when the loop is done — follow the
-intent-to-add rules in Step 1, and tell `nc-reviewer` which paths you staged so it
-doesn't read an emptied `??` list as "no new files". If you skip the workaround,
-say in Step 6 that only `nc-reviewer` read that file — a one-engine file is not
-the two-engine guarantee this loop advertises.
+Two consequences, both load-bearing:
+
+- **No local diff assembly happens on this path.** The companion does not read
+  your files, so there is nothing to pre-stage and no size cap to work around —
+  and `git add -N` would be *actively harmful*, because turning an untracked file
+  into a tracked-unstaged one changes what `uncommittedChanges` resolves to.
+  (Local assembly, with a 24 KiB `MAX_UNTRACKED_BYTES` cap that degrades a large
+  untracked file to a `(skipped: …)` marker, happens only on the
+  `adversarial-review` path — see below.)
+- **The "Looks at" column is what the target *means*, not a diff span this repo
+  verified.** How Codex's internal reviewer expands `baseBranch` — whether it
+  folds in uncommitted work — is decided inside Codex, not here. Don't assert it.
 
 So match the invocation to what Step 1 found:
 
 - **Uncommitted only** (the common case) → one run, `--scope working-tree`.
-- **Local commits only, clean tree** → one run, `--scope branch --base "$base"`
-  (pass the base explicitly; `--base` overrides `--scope` and skips Codex's own
-  default-branch detection).
-- **Both** → **two runs**, one of each. A single `auto` run would review the
-  dirty working tree and never look at the commits. Aggregate both reports in
-  Step 3.
+- **Local commits only, clean tree** → one run,
+  `--scope branch --base origin/main`. Pass the base as a **ref name**, not the
+  resolved `"$base"` SHA: `--base` short-circuits `resolveReviewTarget` (so it
+  does override `--scope` and skip Codex's own default-branch detection) but the
+  value lands in a protocol field named `branch`, and whether a 40-hex SHA is
+  accepted there is **not verified** — the type lives in a generated module absent
+  from the plugin cache. Letting Codex resolve the fork point from a ref is the
+  safe form; if you do test the SHA form, record the result here.
+- **Both** → **two runs**, one of each. A single `auto` run would take the
+  working tree and never look at the commits. Aggregate both reports in Step 3.
 
 Launch each with `run_in_background: true` (the `--wait` keeps it foreground
 *inside* that background shell so the output is captured verbatim). If you need
-custom framing/focus, use the **`/codex:adversarial-review`** command instead
-(the plain `/codex:review` takes no focus text and errors if given any). Gotcha:
+custom framing/focus, `review` rejects focus text outright, so use the
+adversarial subcommand — again by script, not by slash command:
+`node "$codex_mjs" adversarial-review --wait --scope working-tree "<focus>"`.
+That path is the one that assembles the diff locally (`collectReviewContext`), so
+it *is* subject to the 24 KiB `MAX_UNTRACKED_BYTES` untracked-file cap and to
+`buildBranchComparison`'s two-dot `merge-base..HEAD` range under `--scope branch`
+— neither of which applies to plain `review`. Gotcha:
 if the review 400s on the reviewer model, the Codex CLI is too old / its default
 model needs a switch (see CLAUDE.md "Codex review on a worktree").
 
@@ -210,7 +235,8 @@ the diff clearly warrants it, and still review-only:
 **Standing rule for every reviewer**, whichever engine: scope is **this branch's
 whole divergence, no GitHub PR** — `git diff "$base"` (merge-base vs working
 tree, which covers local commits + staged + unstaged) *plus* every untracked file
-from `git status --short`; findings reported **by severity with file:line**; and
+from `git status --short --untracked-files=all` (bare `--short` hides files inside
+a new directory); findings reported **by severity with file:line**; and
 **do NOT modify any files — review only.** Only the fix agent edits.
 
 ## Step 3 — Aggregate and VERIFY

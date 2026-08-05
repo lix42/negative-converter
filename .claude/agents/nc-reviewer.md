@@ -42,15 +42,18 @@ Two traps, both load-bearing:
   two-dot `"$base"..HEAD` form silently drops everything uncommitted, and plain
   `git diff HEAD` silently drops everything committed on the branch. Use the
   no-dot form.
-- **No diff form includes untracked files.** A new module or test file — often
-  the entire point of the change — appears only as `??` in `git status`. Walk
-  every untracked path and read it in full; a review that drifts to the modified
-  files misses the actual feature. **A new file can also reach you pre-staged**:
-  an intent-to-add entry (` A` in `git status --short`, staged by the orchestrator
-  so a large file reaches the other engine) is *not* in the `??` list but *is* in
-  `git diff "$base"`. So an empty `??` list never proves there are no new files —
-  cross-check the diff's added-file list, and treat any path the orchestrator
-  names as staged-for-review as a new file.
+- **No diff form includes untracked files, and you must pass
+  `--untracked-files=all`.** A new module appears only as `??` — and bare
+  `git status --short` collapses a whole new directory into one `newmod/` entry,
+  hiding every file in it, which is exactly the case that matters most. Walk every
+  untracked path and read it in full; a review that drifts to the modified files
+  misses the actual feature. Gitignored additions show up in neither the diff nor
+  `--untracked-files=all`; treat them as out of scope unless told otherwise.
+- **A new file can also reach you pre-staged.** An intent-to-add entry (` A` in
+  `git status --short`) is *not* in the `??` list but *is* in `git diff "$base"`,
+  so an empty `??` list never proves there are no new files — cross-check the
+  diff's added-file list, and treat any path the orchestrator names as
+  staged-for-review as a new file.
 
 If `origin/main` is missing, fall back to `origin/HEAD`, then local
 `main`/`master`, then `HEAD` alone (uncommitted-only) — and say which base you
@@ -69,7 +72,12 @@ The load-bearing rules you review against:
 - **Every conversion knob spans four coupled spots**: a CLI `*Overrides` field
   (`cli.rs`), a recipe `*Params` field (`types.rs`), a `merge` arm, and usually a
   `validate` check — plus a merge test. A missing `merge` arm makes the flag a
-  silent no-op; check all four for any new or changed knob.
+  silent no-op; check all four for any new or changed knob. Note `validate` is
+  **not** the whole `convert` gate: `validate_convert` composes it with the
+  flag-presence checks, so a rule that must see flag *presence* (not just the
+  resolved value) belongs there. Output-preset atomicity is deliberately
+  asymmetric — value rules for `output.hdr`/`output_profile`/`bigtiff`, but
+  flag-presence for `--output-sdr`; a change that "unifies" them is a finding.
 - **Recipe shape mirrors design-spec §9** and structs use `deny_unknown_fields`,
   so a key in the wrong section silently rejects docs-shaped recipes. `params`
   is a reserved top-level key. Mutually-exclusive knobs are one enum field, not
