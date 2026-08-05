@@ -321,6 +321,7 @@ graph TD
   output/sdr-display-rendering --> output/gain-map-hdr-output
   output/hdr-display-rendering --> output/gain-map-hdr-output
   output/gain-map-hdr-output --> output/ultrahdr-dependency-externalization
+  output/iso-gain-map-metadata --> output/ultrahdr-dependency-externalization
   output/gain-map-hdr-output --> output/iso-gain-map-metadata
   output/gain-map-hdr-output --> color/colorimetry-source-of-truth
   output/hdr-display-rendering --> output/hdr-avif-output
@@ -432,7 +433,17 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `output/sdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/display-p3-output`, `output/hdr-output-spike`
 - `output/hdr-display-rendering` (post-MVP): `color/film-master-render-pipeline`, `output/hdr-output-spike`
 - `output/gain-map-hdr-output` (post-MVP): `output/sdr-display-rendering`, `output/hdr-display-rendering`
-- `output/ultrahdr-dependency-externalization` (post-MVP, **deferred maintenance**; no downstream blockers): `output/gain-map-hdr-output`
+- `output/ultrahdr-dependency-externalization` (post-MVP, **deferred maintenance**; no downstream blockers): `output/gain-map-hdr-output`, `output/iso-gain-map-metadata`
+  — **re-scoped 2026-08-05** from "externalize to a published crate" to "remove the
+  native dependency entirely"; the id is deliberately unchanged so its links,
+  progress sections, and the `check-vendored-native.py` reference keep resolving.
+  The published `ultrahdr-sys` crate cannot qualify: it obtains libjpeg-turbo
+  either by build-time clone at a mutable tag or from a machine-installed library,
+  and that `GIT_TAG` lives inside the crate's own bundled CMake with no
+  `ExternalProject_Add` override — so no version bump fixes it. `iso-gain-map-metadata`
+  is a real prerequisite, not sequencing: re-implementing container assembly must
+  reproduce **both** dialects, so its C.4.3/C.4.6 placement rules have to be settled
+  or the ISO container work gets written twice
 - `output/iso-gain-map-metadata` (post-MVP): `output/gain-map-hdr-output`
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
 - `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`, `io/transactional-output-writes`
@@ -628,7 +639,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [SDR display rendering](tasks/output/sdr-display-rendering.md) — render intentional linear ACEScg film values into a valid Display P3 or sRGB SDR rendition with explicit reference-white, tone, and gamut policy
 - [x] [Display-HDR rendering](tasks/output/hdr-display-rendering.md) — render intentional linear ACEScg film values into BT.2020 PQ/HLG with explicit headroom, tone, and gamut mapping
 - [x] [Ultra HDR v1 gain-map JPEG output](tasks/output/gain-map-hdr-output.md) — write an explicit backward-compatible Display P3 JPEG plus public Ultra HDR v1 gain-map metadata
-- [ ] [Externalize the Ultra HDR native dependency](tasks/output/ultrahdr-dependency-externalization.md) — **deferred maintenance**: replace the checked-in native snapshot with an exact published Cargo dependency once it contains the required marker-order fix and supports a network-free, static build; blocks no output work
+- [ ] [Remove the Ultra HDR native dependency](tasks/output/ultrahdr-dependency-externalization.md) — **deferred maintenance**, **re-scoped 2026-08-05** (id kept): delete `vendor/ultrahdr-sys` and end the C/C++ dependency by writing the Ultra HDR v1 XMP and MPF container in Rust, so neither `cargo build` nor `cargo test` needs CMake/clang/nasm/libjpeg or a network fetch. Only 6 native calls are on the shipping path and they merely assemble XMP+MPF around two JPEGs nc already encodes itself. The decode oracle is **replaced by captured goldens**, not kept as a dev-dependency (that would leave the native toolchain in CI). The published-crate route is recorded but not pursued — it fetches libjpeg-turbo at a mutable tag or links a system library, and no version bump changes that. Blocks no output work
 - [~] [Final ISO gain-map metadata](tasks/output/iso-gain-map-metadata.md) — add verified ISO 21496-1:2025 metadata to the same JPEG and prove dual-dialect agreement. **Metadata and container halves implemented against the licensed text** (2026-08-04: `pipeline/gain_map/iso.rs` C.2.2 payload + normative validation; `io/ultra_hdr.rs` `Dialects::LegacyPlusIso` writing C.4.3/C.4.6 segments into both images, MPF-safe). **Code complete**; verified with exiftool (MPF index resolves, second image extracts, 2350+1186=3536 bytes) and `sips`. Remaining is non-code: C.4.3's CIPA DC-007 baseline requirement is **blocked** on that free-but-gated document (no Exif synthesised against an unread standard), the external ISO-aware decoder oracle, and CLI activation (owned by `output/presets`). **Note the `ts:` URN is the published first edition's, not a draft** — and libultrahdr's compact-denominator ISO layout is *non-conformant*, so nc owns its serializer.
 - [ ] [HDR AVIF output](tasks/output/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
 - [ ] [Lossless HDR TIFF outputs](tasks/output/lossless-hdr-tiff.md) — preserve display-linear BT.2020 as 32-bit float TIFF and Rec.2100 PQ/HLG as losslessly stored 16-bit TIFF code values with truthful signaling

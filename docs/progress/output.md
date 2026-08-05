@@ -26,10 +26,19 @@ What other epics need to know about `output`:
   path uses only the public Android/Adobe XMP + MPF/GContainer dialect and must
   not be labeled ISO-conformant.
 - **Native dependency packaging:** the shipped Ultra HDR implementation keeps
-  the audited libultrahdr/libjpeg-turbo snapshot in-tree for now. A deferred,
-  non-blocking maintenance task may replace it only with an exact published
-  Cargo release that preserves the required marker ordering, static linkage,
-  and network-free native build.
+  the audited libultrahdr/libjpeg-turbo snapshot in-tree. **The plan changed on
+  2026-08-05** (`output/ultrahdr-dependency-externalization`, id kept, scope now
+  *removal*): the exit is nc writing the Ultra HDR v1 XMP and MPF container in
+  Rust so the C/C++ dependency leaves the tree, **not** swapping in a published
+  crate. The published `ultrahdr-sys` cannot qualify at any version — it obtains
+  libjpeg-turbo by build-time clone at a mutable tag, or from a machine-installed
+  library. Two facts for anyone touching this: our snapshot's
+  `libultrahdr/CMakeLists.txt` is the **one file modified** from upstream
+  `11ac0c3` (both libjpeg-turbo fetch blocks replaced by `DOWNLOAD_COMMAND ""`),
+  and only **6** native calls are on the shipping path — the rest of the `uhdr::`
+  surface is the test-only decode oracle, to be replaced by captured goldens
+  rather than kept as a dev-dependency, since `cargo test` would still drag the
+  native toolchain into CI.
 - **The spike waived the licensed-normative-text review at spike level and
   re-homed it** as a pre-merge conformance gate on the encoder tasks. Don't treat
   it as already satisfied.
@@ -886,3 +895,102 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   dialect a dual-aware decoder selects). `iso_sample_for_external_decoder`
   produces the file that gate needs. Final gates green: 568 unit (1 new ignored)
   + 130 integration.
+## ultrahdr-dependency-externalization (continued)
+
+**Status:** not started
+**Updated:** 2026-08-04
+
+- 2026-08-04: Checked this task's trigger while working the ISO gate; it is
+  **not yet met**, though half of it now is. Upstream libultrahdr released
+  `v1.5.0` and `v1.5.1` on 2026-07-30, and `v1.5.0` **does contain** our pinned
+  marker fix (`git compare` against `11ac0c32…`: 0 behind, 4 ahead). But this
+  task's trigger is an exact published **Cargo** release, and crates.io
+  `ultrahdr-sys` is still at **0.1.5 (2026-04-29)** — predating both the fix and
+  those releases. So the snapshot, its force-tracked files, and
+  `scripts/check-vendored-native.py` all stay until `ultrahdr-sys` publishes a
+  version wrapping ≥ `v1.5.0` with a network-free static build. Re-check
+  crates.io rather than upstream tags when revisiting.
+
+
+## ultrahdr-dependency-externalization (re-scoped)
+
+**Status:** not started
+**Updated:** 2026-08-05
+
+- 2026-08-05: **Superseding the preceding entry's trigger.** "Wait for a published
+  crate wrapping ≥ v1.5.0" is not a sufficient condition and never was; inspecting
+  the published archive (which the task's own How-to-Verify asked for) found a
+  second, structural blocker no version bump can fix. Task **re-scoped** from
+  "externalize the snapshot to a published crate" to **"remove the native
+  dependency from the tree entirely."** The task **id is deliberately unchanged**
+  — eight references depend on it, including `scripts/check-vendored-native.py:39`
+  and this log's own append-only headings — so only the human-readable title moved.
+- 2026-08-05: Evidence against the published crate. It is a third-party wrapper
+  (`Enter-tainer/libultrahdr-rs`), **not Google's** — correcting an impression an
+  earlier entry left. Still 0.1.5 (2026-04-29). Its bundled `jpegr.cpp` has no
+  APP0 extraction (`grep -c "Extract APP0"` → 0), so adopting it would reintroduce
+  the exact ordering that made ImageIO reject our files. The structural problem:
+  libultrahdr's CMake takes libjpeg-turbo from
+  `ExternalProject_Add(GIT_REPOSITORY … GIT_TAG 3.1.0)`. With the crate's
+  `vendored` feature that is a build-time clone at a **mutable tag**; without it,
+  `cargo:rustc-link-lib=jpeg` links a **machine-installed** library. First breaks
+  pinning, second breaks the self-contained binary and makes output vary per user
+  machine. The `GIT_TAG` sits inside the crate's own bundled CMake and
+  `ExternalProject_Add` has no cache-variable override for it (unlike
+  `FetchContent`'s `FETCHCONTENT_SOURCE_DIR_*`), so it cannot be pinned without
+  forking — i.e. a local copy again.
+- 2026-08-05: **What our snapshot actually is**, verified rather than assumed —
+  worth recording because the obvious guess is wrong in both directions.
+  `libultrahdr/lib/src/jpegr.cpp` is **verbatim upstream `11ac0c3`** (empty diff);
+  I suspected local patches from its comment style and was wrong. But
+  `libultrahdr/CMakeLists.txt` **is** modified: both libjpeg-turbo
+  `GIT_REPOSITORY`/`GIT_TAG 3.1.0` blocks became `DOWNLOAD_COMMAND ""` so the build
+  consumes the in-tree `third_party/turbojpeg` (pinned `20ade4de`). That two-line
+  edit *is* the offline build, and it is exactly what no published crate provides.
+  `patches/libultrahdr-no-threads.patch` is applied at build time on top.
+- 2026-08-05: **The size motive does not survive measurement.** Whole-repo pack is
+  **14.36 MiB**; vendor is 782 tracked files / 18 MB working tree. "Reduce
+  repository size" was chasing a non-problem, which caps what the task should be
+  willing to pay. The genuine cost is the maintenance apparatus: the
+  force-tracking guard (needed because the copied upstream `.gitignore` hides
+  legitimate files) and `check-vendored-native.py`.
+- 2026-08-05: **Which readiness conditions are load-bearing**, after challenging
+  both. *Static linkage: keep.* Linking a system libjpeg would lose the
+  self-contained binary (a design-spec choice, and the same reason the HDR spike
+  rejected HEIC/x265) and would make output vary by **user machine** — a bigger
+  determinism hole than a build-time fetch, and one no test can see. Checking in
+  prebuilt `.a`/binaries is worse on every axis: one artifact per target, larger
+  than the source it replaces, unauditable, and only `aarch64-apple-darwin` is
+  installed here so the Linux artifacts could be neither built nor verified
+  locally. *No-network: too strict as written.* The property worth protecting is
+  **pinning to an immutable revision**, not bundling; a SHA-pinned fetch would be
+  fine. Relaxing it still does not unblock this crate, for the reason above.
+- 2026-08-05: **The chosen route, and why the oracle is not kept as a
+  dev-dependency.** Only **6** native calls are on the shipping path
+  (`uhdr_create_encoder`, `uhdr_enc_set_compressed_image`,
+  `uhdr_enc_set_gainmap_image`, `uhdr_encode`, `uhdr_get_encoded_stream`,
+  `uhdr_release_encoder`) and they only write XMP + MPF around two JPEGs nc
+  already encodes in pure Rust. **29 of the module's 46 `uhdr::` references are
+  tests** — the decode-and-verify oracle. Keeping that as a dev-dependency was
+  the first proposal and it was wrong: `cargo test` builds dev-dependencies, so
+  CI would still need cmake/clang/nasm and the libjpeg fetch, and the dependency
+  would have *moved rather than gone*. Its value is also narrower than it appears
+  — libultrahdr reads only the **legacy** dialect, so it was never an ISO oracle,
+  and the manual Apple/Android gate answers the same question with real consumer
+  decoders. Replaced by captured goldens recorded **while the dependency is still
+  present**, plus exiftool structural validation and the documented external gate.
+- 2026-08-05: Two consequences to plan for. Assembling the container ourselves
+  **retires `insert_baseline_iso_segment`** — with placement under our control both
+  ISO segments go in directly instead of being spliced in after packaging — and it
+  removes the marker-order bug class, since ordering becomes ours to state rather
+  than inherited from libultrahdr's APP0-extraction fix. It also **changes the
+  shipped `ultra-hdr-v1` bytes**, because our XMP will not serialize
+  byte-identically. That preset is non-default and the gain map is not in
+  `version::PIPELINE_FINGERPRINTS`, so no `pipeline_version` boundary is involved,
+  but its determinism/golden assertions must be **re-captured deliberately, never
+  adjusted until they pass**.
+- 2026-08-05: The published-crate route stays recorded but unpursued, with real
+  trigger conditions (contains `11ac0c3` **and** obtains libjpeg-turbo without a
+  mutable-tag fetch or system library). Watching crates.io for a version bump is
+  explicitly **not** the trigger. Our delta is small enough to upstream if anyone
+  wants to try, but merge and release cadence would not be ours.
