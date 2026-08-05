@@ -98,3 +98,16 @@
   [0]    derived=0.2627                   shipped=0.2627           ulps=0
   [1]    derived=0.678                    shipped=0.678            ulps=0
   [2]    derived=0.0593                   shipped=0.0593           ulps=0
+
+[BT2020_NCL_RGB_TO_YCBCR]
+  nonlinear R'G'B' -> Y'CbCr from TABULATED bt2020 luma (AVIF matrix_coefficients=9)
+  compared as f32
+  [0][0] derived=0.2627                   shipped=0.2627           ulps=0
+  [0][1] derived=0.678                    shipped=0.678            ulps=0
+  [0][2] derived=0.0593                   shipped=0.0593           ulps=0
+  [1][0] derived=-0.13963006271925163     shipped=-0.13963006      ulps=0
+  [1][1] derived=-0.3603699372807484      shipped=-0.36036995      ulps=0
+  [1][2] derived=0.5                      shipped=0.5              ulps=0
+  [2][0] derived=0.5                      shipped=0.5              ulps=0
+  [2][1] derived=-0.45978570459785706     shipped=-0.4597857       ulps=0
+  [2][2] derived=-0.04021429540214295     shipped=-0.040214296     ulps=0

@@ -27,6 +27,23 @@
 //! encode     decoded + rendered + u16 quantize + retained     38 + 12·s B/px
 //! ```
 //!
+//! `hdr-pq` / `hdr-hlg` ([`RunProfile::HdrAvif`]) replace the last two rows — one
+//! display rendition instead of a positive, and a native encoder instead of a u16
+//! quantize buffer:
+//!
+//! ```text
+//! render     decoded + shared ACEScg + BT.2020 rendition      2·decoded + 12 + 12·s B/px
+//! encode     decoded + rendition + AVIF staging               28 + 48 + 12·s B/px
+//! ```
+//!
+//! The shared ACEScg source is `decoded`-shaped rather than RGB-only — it carries
+//! the IR plane through, so it is 16 B/px on an HDRi input and 12 on an IR-free
+//! one — which is why the render row counts `decoded` twice instead of adding a
+//! flat 12.
+//!
+//! The transfer (PQ or HLG) is applied *in place* to the rendition, so it adds
+//! nothing. [`AVIF_STAGING_BYTES_PER_PX`] is the calibrated 48.
+//!
 //! `s` is the sampled rectangle as a fraction of the frame ([`SamplePlan`]): `0`
 //! for an explicit `--film-base` (nothing is sampled), ~0.69 for the `auto` path's
 //! frame interior on a 3:2 frame, up to 1.0 for a full-frame `--base-region` /
@@ -118,6 +135,9 @@
 //! | `convert --base-region` (full frame) 74.65 MP | 4.427 GB | 3.743 GB | +18.3% |
 //! | `convert` u16 18.66 MP | 0.950 GB | 0.681 GB | +39.4% |
 //! | `ultra-hdr-v1` 18.66 MP (explicit base, no IR export) | 1.851 GB | 1.681 GB | +10.1% |
+//! | `hdr-pq` 18.66 MP (explicit base, no IR export) | 1.765 GB | 1.472 GB | +19.9% |
+//! | `hdr-pq` 74.65 MP (explicit base, no IR export) | 6.659 GB | 5.866 GB | +13.5% |
+//! | `hdr-hlg` 18.66 MP (explicit base, no IR export) | 1.765 GB | 1.503 GB | +17.5% |
 //!
 //! Two sources of slack are visible and deliberate. Small frames run looser
 //! (+39.4% for the u16 18.66 MP run) because [`ALLOWANCE_FIXED_BYTES`] stops being negligible —
@@ -132,7 +152,21 @@
 //! No Ultra HDR run with `--export-ir` has been measured. Its optional export
 //! therefore retains the TIFF model's conservative 2 B/px u16 staging term;
 //! tests pin that structural increment without claiming it as a calibrated RSS
-//! observation.
+//! observation. The same holds for `hdr-pq`/`hdr-hlg` with `--export-ir`.
+//!
+//! The two `hdr-pq` rows are the *pair* that solved
+//! [`AVIF_STAGING_BYTES_PER_PX`] — they are a fit, not two independent
+//! confirmations, and their 78.47 B/px slope is what a future re-calibration
+//! should re-measure. The `hdr-hlg` row is an independent check of the shared
+//! profile: HLG differs from PQ only in a transfer applied in place to an
+//! already-allocated buffer, and it measured 1.503 GB against the same 1.765 GB
+//! estimate, so one profile covers both. (It does emit a substantially larger
+//! codestream — 621 KB against PQ's 72 KB on that frame — which costs allocation
+//! only inside the lumped staging term.)
+//!
+//! Peak RSS varies by a few tens of KB between identical runs; the frozen literals
+//! in the tests are single observations, which is why the assertions are
+//! `estimate >= measured` rather than equality.
 //!
 //! Measured overhead over the *accounted* buffers peaked at **12.9%** on the
 //! no-sampling rows, which is why [`ALLOWANCE_PERCENT`] sits above it rather than
@@ -172,6 +206,38 @@ const F32_BYTES: u64 = 4;
 /// (enforced by its constructor) and `io::encode` writes RGB unconditionally. Only
 /// the source-depth read buffer is sized from the file's own channel count.
 const WORKING_CHANNELS: u64 = 3;
+
+/// Bytes per pixel charged to the AVIF encode phase beyond the retained f32
+/// rendition (`RunProfile::HdrAvif`).
+///
+/// Covers, in one figure: nc's three 10-bit Y'/Cb/Cr `u16` planes (6 B/px),
+/// libaom's own `aom_img_alloc` frame in `AOM_IMG_FMT_I44416` including its
+/// alignment border (~6 B/px), libaom's internal all-intra working set for 10-bit
+/// 4:4:4, the emitted codestream, and the assembled container held in memory
+/// before it is staged.
+///
+/// **Calibrated, not derived** — it is one lumped constant because libaom's
+/// internal allocation is not something nc can enumerate per buffer, and splitting
+/// it into named terms would imply a precision the model does not have.
+///
+/// Measured on two real HDRi scans (macOS/aarch64, release, `--film-base`
+/// explicit so nothing is sampled), solving `measured = px·(28 + X) + fixed`
+/// across the pair:
+///
+/// | Scan | Pixels | Measured peak RSS |
+/// |---|---|---|
+/// | Phoenix frame | 18.66 MP | 1,472,397,312 B |
+/// | `samples/largest` | 74.65 MP | 5,865,947,136 B |
+///
+/// The two points give **78.47 B/px** total with only ~7.9 MB fixed — clean linear
+/// scaling — so the actual staging above the 28 B/px retained term is 50.47 B/px.
+/// Pinning 48 leaves `accounted` 3.4–3.8% *under* measured, which
+/// [`ALLOWANCE_PERCENT`] then covers with room to spare (its own justification is a
+/// 12.9% worst case). That is the same convention the `Convert` profile uses:
+/// `accounted` enumerates buffers, the allowance covers allocator overhead. Do not
+/// "fix" the 3.8% gap by raising this — double-counting it pushed the 18.66 MP
+/// estimate to 1.43x measured, which rejects runs the machine could serve.
+const AVIF_STAGING_BYTES_PER_PX: u64 = 48;
 
 /// Default memory budget when `--max-memory` is not given: 6 GiB.
 ///
@@ -231,6 +297,16 @@ pub enum RunProfile {
     /// buffers coexist before the two JPEGs are packaged.
     UltraHdrV1 {
         /// Whether a u16 IR TIFF is staged before the primary JPEG.
+        export_ir: bool,
+    },
+    /// `hdr-pq` / `hdr-hlg`: one display rendition, then the AVIF encoder's own
+    /// planes and libaom's internal working set.
+    ///
+    /// Cheaper than [`UltraHdrV1`](Self::UltraHdrV1) in f32 buffers — there is a
+    /// single rendition, not two plus a gain map — but it pays for a native
+    /// encoder that the JPEG path does not.
+    HdrAvif {
+        /// Whether a u16 IR TIFF is staged before the primary AVIF.
         export_ir: bool,
     },
     /// `inspect` / `estimate`: decode, then sample — no render, no encode.
@@ -667,6 +743,35 @@ pub fn estimate_peak(
                 sum(sum(sum(retained, byte_staging)?, ir_export)?, sampled)?,
             )
         }
+        RunProfile::HdrAvif { export_ir } => {
+            // Render: decoded (held for `--export-ir` / the report) plus the shared
+            // adjusted ACEScg source, plus the BT.2020 rendition allocated beside
+            // it. `encode_transfer` mutates that rendition in place, so the PQ/HLG
+            // transfer costs nothing further here.
+            //
+            // The shared source is `image`-shaped, not RGB-only: reconstruction
+            // carries the IR plane through `AcesCgImage` into
+            // `AdjustedAcesCgImage`, so on an HDRi input it is 16 B/px like the
+            // decoded image rather than 12. Counting it as one more `image` is what
+            // `UltraHdrV1` above does for the same reason; modelling it as a bare
+            // RGB buffer under-reported this phase by 4 B/px on every IR input.
+            let rendition = mul(pixels, WORKING_CHANNELS * F32_BYTES)?;
+            let render = sum(mul(image, 2)?, rendition)?;
+
+            // Encode: decoded + the retained f32 rendition, plus the AVIF encoder's
+            // own buffers. `AVIF_STAGING_BYTES_PER_PX` covers everything native.
+            let retained = sum(image, mul(pixels, WORKING_CHANNELS * F32_BYTES)?)?;
+            let avif_staging = mul(pixels, AVIF_STAGING_BYTES_PER_PX)?;
+            let ir_export = if export_ir && shape.ir_present {
+                mul(pixels, 2)?
+            } else {
+                0
+            };
+            (
+                sum(render, sampled)?,
+                sum(sum(sum(retained, avif_staging)?, ir_export)?, sampled)?,
+            )
+        }
     };
 
     let accounted_bytes = decode_bytes
@@ -975,6 +1080,57 @@ mod tests {
         // silently growing into an invented calibration claim.
     }
 
+    #[test]
+    fn hdr_avif_profile_counts_one_rendition_plus_the_codec_staging() {
+        // 10x10, no IR: the post-decode `image` term is 12 B/px (f32 RGB), so
+        // render = 12 + 24 (shared ACEScg + the BT.2020 rendition beside it) = 36
+        // B/px; encode = 12 + 12 (retained rendition) + 48 (AVIF staging) = 72.
+        let no_ir = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::HdrAvif { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(no_ir.render_bytes, 3_600);
+        assert_eq!(no_ir.encode_bytes, 7_200);
+        // Encode is the peak phase, as it is for every convert-shaped profile.
+        assert_eq!(no_ir.accounted_bytes, no_ir.encode_bytes);
+
+        // A carried IR plane widens the post-decode `image` term to 16 B/px (the
+        // f32 IR plane rides along), and only an actual export adds the 2 B/px u16
+        // staging plane on top. Render pays for that plane *twice* — once in the
+        // decoded image, once in the shared ACEScg source that carries it through —
+        // so it is 2*16 + 12 = 44 B/px, not 40.
+        let with_ir_no_export = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrAvif { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let with_ir = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrAvif { export_ir: true },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(with_ir.encode_bytes - with_ir_no_export.encode_bytes, 200);
+        assert_eq!(with_ir_no_export.render_bytes, 4_400);
+        // The IR plane is counted in *both* live copies at render, so an HDRi
+        // input costs 8 B/px more there than an IR-free one, not 4.
+        assert_eq!(with_ir_no_export.render_bytes - no_ir.render_bytes, 800);
+
+        // Cheaper than the gain-map path in f32 buffers (one rendition, no gain
+        // map) but more expensive overall, because it pays for a native encoder.
+        let gain_map = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::UltraHdrV1 { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert!(no_ir.render_bytes < gain_map.render_bytes);
+        assert!(no_ir.encode_bytes > gain_map.encode_bytes);
+    }
+
     /// The largest scan on hand (`largest.tif`), the calibration reference.
     fn big() -> ImageShape {
         shape(10368, 7200, true)
@@ -1236,7 +1392,7 @@ mod tests {
             depth: OutDepth::F32,
             export_ir: false,
         };
-        let cases: [(ImageShape, RunProfile, SamplePlan, u64); 7] = [
+        let cases: [(ImageShape, RunProfile, SamplePlan, u64); 9] = [
             (
                 big(),
                 RunProfile::DecodeOnly,
@@ -1258,6 +1414,20 @@ mod tests {
                 RunProfile::UltraHdrV1 { export_ir: false },
                 SamplePlan::none(),
                 1_681_408_000,
+            ),
+            // The two `hdr-pq` calibration runs behind
+            // `AVIF_STAGING_BYTES_PER_PX`. Both used an explicit `--film-base`.
+            (
+                ultra_hdr,
+                RunProfile::HdrAvif { export_ir: false },
+                SamplePlan::none(),
+                1_472_397_312,
+            ),
+            (
+                shape(10368, 7200, true),
+                RunProfile::HdrAvif { export_ir: false },
+                SamplePlan::none(),
+                5_865_947_136,
             ),
         ];
         for (shape, profile, sampling, measured) in cases {

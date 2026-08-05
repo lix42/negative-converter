@@ -54,9 +54,11 @@ See the design spec for the complete command and parameter reference.
 ## Building
 
 The Rust build also compiles the pinned libultrahdr and libjpeg-turbo sources
-statically. A fresh build machine needs CMake, C and C++ compilers, and
-libclang for bindgen (plus NASM for libjpeg-turbo SIMD on supported targets).
-For example:
+statically, plus libaom (the AV1 encoder behind the `hdr-pq` / `hdr-hlg` AVIF
+outputs) from the `libaom-sys` crate's vendored source. A fresh build machine needs
+CMake, C and C++ compilers, and libclang for bindgen (plus NASM for libjpeg-turbo
+and libaom SIMD on supported targets). No network access is needed for any of the
+native builds. For example:
 
 ```sh
 # Debian/Ubuntu
@@ -67,11 +69,13 @@ brew install cmake llvm nasm
 export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
 ```
 
-Runtime deployment does not require a separate libultrahdr or libjpeg
-installation. The complete IJG attribution, Modified BSD terms, and Adobe Gain
-Map notice are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
-Binary release packaging must also include the exact libultrahdr, image_io,
-modp_b64, libjpeg-turbo, and Adobe license files listed in that notice.
+Runtime deployment does not require a separate libultrahdr, libjpeg, libaom or
+libavif installation — nc writes the AVIF container itself and statically links
+every codec. The complete IJG attribution, Modified BSD terms, Adobe Gain Map
+notice, and the libaom / Alliance for Open Media patent-license summary are in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Binary release packaging must
+also include the exact libultrahdr, image_io, modp_b64, libjpeg-turbo, Adobe, and
+libaom license files listed in that notice.
 
 ## License
 

@@ -99,6 +99,18 @@ profile-specific accounting and calibrate it against measured peak RSS before
 any display preset becomes CLI-reachable. Do not silently apply the legacy
 estimate to these new paths.
 
+**Boundary note (recorded 2026-08-05 by `output/hdr-avif-output`).** The gate
+above is *not* this task's job for presets an encoder task already activated. The
+`ultra-hdr-v1` precedent is now the rule: whichever task ships an explicit
+`convert`-only preset also adds and calibrates that preset's `RunProfile`. So
+`RunProfile::UltraHdrV1` came with `output/gain-map-hdr-output`, and the AVIF
+profile for `hdr-pq`/`hdr-hlg` comes with `output/hdr-avif-output`, which also
+owns accepting those two names, their `.avif` suffix rule, and their atomicity.
+What remains here is *selection*: proving a resolved preset picks its calibrated
+profile, and adding profiles for the presets this task activates first
+(`gain-map-hdr` as default, `display-p3`, `compatibility`, `custom`). Do not
+re-derive an already-calibrated model.
+
 To preserve exposure across frames, `film-master` rejects frame-local automatic
 Dmax. The exponential density curve accepts supported `none` or fixed/
 roll-calibrated scalar placement; the sigmoid curve uses fixed Dmax as a

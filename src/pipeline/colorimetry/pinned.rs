@@ -150,6 +150,25 @@ pub const BT2020_TO_DISPLAY_P3: [[f32; 3]; 3] = [
 /// standard rounds and encoders are expected to use the rounded form.
 pub const BT2020_LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
 
+/// BT.2020 non-constant-luminance R'G'B' → Y'CbCr matrix, used by `io::avif`.
+///
+/// **Applied to nonlinear PQ/HLG code values, not to linear light** — see
+/// [`derive::ycbcr_from_luma`](super::derive::ycbcr_from_luma). It is the matrix
+/// AVIF signals as `matrix_coefficients = 9`, so it is a *container* coefficient:
+/// a decoder inverts exactly this to recover R'G'B', which is why it must be the
+/// standard's matrix and not a convenient approximation.
+///
+/// Derived from the **tabulated** [`BT2020_LUMA`] rather than from the BT.2020
+/// primaries, and that choice is load-bearing: encoders and decoders both use the
+/// rounded tabulated weights, so deriving from primaries here would put nc's
+/// forward transform ~2e-6 away from every decoder's inverse. Row 0 is
+/// [`BT2020_LUMA`] verbatim; the `0.5` entries and the zero row sums are exact.
+pub const BT2020_NCL_RGB_TO_YCBCR: [[f32; 3]; 3] = [
+    [0.2627, 0.678, 0.0593],
+    [-0.139_630_06, -0.360_369_95, 0.5],
+    [0.5, -0.459_785_7, -0.040_214_296],
+];
+
 /// Display P3 luma weights, used by `pipeline::gain_map` and `pipeline::sdr`.
 ///
 /// Unlike [`BT2020_LUMA`] this has no tabulated form: it **is** derived, as the

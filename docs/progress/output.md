@@ -39,6 +39,26 @@ What other epics need to know about `output`:
   surface is the test-only decode oracle, to be replaced by captured goldens
   rather than kept as a dev-dependency, since `cargo test` would still drag the
   native toolchain into CI.
+- **The AVIF path does *not* use libavif** (decided 2026-08-05 in
+  `hdr-avif-output`, amending the spike note's encoder paragraph): no published
+  crate ships libavif ≥ 1.4.2 and `avif-serialize` cannot emit the required
+  `MA1A` brand, so it is published `libaom-sys` for the codestream plus an
+  nc-owned Rust MIAF/AVIF container writer. Consequence for anyone touching it:
+  `av1C` is filled by **parsing the encoded sequence-header OBU**, never from the
+  encoder config. Windows static builds are deferred (no Windows CI runner) →
+  `output/hdr-avif-windows-packaging`.
+- **`hdr-pq` and `hdr-hlg` are live**, as explicit `convert`-only presets
+  requiring an `.avif` path — so five preset names are now accepted. Two things
+  downstream tasks inherit: the suffix and convert-only rules are driven by one
+  `cli::required_extensions` table (extend *that*, don't add a parallel check), and
+  `stages::render_gain_map_source` is now **`render_display_source`** returning
+  `DisplaySource`, because every display preset shares it.
+- **The preset/`RunProfile` ownership rule, from the `ultra-hdr-v1` and now AVIF
+  precedents:** whichever task ships an explicit `convert`-only preset also adds
+  and calibrates that preset's `memory::RunProfile`. `output/presets` verifies
+  profile *selection* and owns the default, the rest of the suffix table, `custom`,
+  and roll integration — it does not re-derive an already-calibrated model. Recorded
+  in both task files.
 - **The spike waived the licensed-normative-text review at spike level and
   re-homed it** as a pre-merge conformance gate on the encoder tasks. Don't treat
   it as already satisfied.
@@ -292,8 +312,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 
 ## hdr-avif-output
-**Status:** not started
-**Updated:** 2026-07-23
+**Status:** done
+**Updated:** 2026-08-05
 
 - 2026-07-23: Added the missing owner for libavif/libaom FFI, static packaging,
   AVIF container and metadata conformance, determinism, licensing inputs, and
@@ -301,6 +321,266 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   full-range 4:4:4 AVIF v1.2 Advanced Profile, AV1 High Profile level ≤ 6.0,
   with `avif`/`mif1`/`miaf`/`MA1A` brands inside profile limits and explicit
   grid or general-brand-only behavior for oversized images.
+- 2026-08-05: Started with a STEP 0 packaging/feasibility spike, because the
+  task's written design ("wrap `libavif` 1.4.2 or newer") has no supply chain:
+  **no published crate ships libavif ≥ 1.4.2.** `libavif-sys` 0.17 is libavif
+  **1.0.4** + libaom 3.11.0 — below the task's floor and predating Advanced
+  Profile / `MA1A` brand writing. Vendoring upstream was measured at ~1,445
+  files / 45 MB for libaom alone (libavif itself is only 31 files / 1.3 MB), and
+  would double down on exactly the in-repo-snapshot pattern that
+  `output/ultrahdr-dependency-externalization` exists to undo.
+- 2026-08-05: **Decision (with user approval): published `libaom-sys` for the AV1
+  codestream + an nc-owned Rust MIAF/AVIF container writer.** This supersedes the
+  spike note's "narrow Rust FFI around libavif" for this task only; the spike's
+  binding *numbers* (203-nit reference white, 1000-nit peak, gain-map domain, RGB
+  map) are untouched. Rationale: `libaom-sys` 0.17.2 vendors libaom 3.11.0 inside
+  the crate and builds it statically via cmake with **no network and no in-repo
+  snapshot** (measured: 29 s clean build on macOS/aarch64), which is precisely the
+  dependency shape `ultrahdr-dependency-externalization` names as the target. The
+  container is ours because **`avif-serialize` 0.8.9 hardcodes
+  `compatible_brands: [mif1, miaf]` with no setter** — it cannot emit the required
+  `avif`/`MA1A` brands, and has no grid support for the oversized path. Writing the
+  container also turns the task's "independently inspect ... rather than assuming
+  encoder defaults establish conformance" clause from an audit into an authored
+  guarantee.
+- 2026-08-05: Confirmed the target bytes are achievable before committing. Local
+  libavif 1.4.2 / aom 3.14.1 `avifenc -d 10 -y 444 -r full --cicp 9/16/9` writes
+  major brand `avif` + compatible `avif mif1 miaf MA1A`, supports `--clli`, and
+  three repeated `-j 1` encodes were byte-identical. That reference file's full box
+  layout was decoded and used as the writer's target: `hdlr` 33, `pitm` 14, `iloc`
+  30 (v0, 4/4 offset/length sizes, absolute offset), `iinf` 40 / `infe` 26
+  (v2, `av01`, item name `"Color"`), `ipco` 87 (`ispe`,`pixi`,`av1C`,`colr`,`clli`),
+  `ipma` 24 — with **only `av1C` carrying the essential bit** (`0x83`), and `av1C`
+  `configOBUs` deliberately empty.
+- 2026-08-05: STEP 0 probe result (scratchpad, not committed): libaom encodes
+  10-bit 4:4:4 full-range via `AOM_USAGE_ALL_INTRA` + `AOM_IMG_FMT_I44416`,
+  `g_profile = 1`, `g_threads = 1`, `g_limit = 1` and
+  `full_still_picture_hdr = 0`. The hand-written container's `meta` box came out
+  **byte-identical to libavif 1.4.2's except one byte** — the `iloc` extent length,
+  which differs only because our codestream is 49 B vs its 70 B. `avifdec` (dav1d,
+  independent of libaom) decodes it as 64x64, 10-bit, YUV444, Full range, CICP
+  9/16/9, CLLI 1000,203; ExifTool agrees on brands and CICP; the y4m round trip
+  reports `C444p10` / `XCOLORRANGE=FULL` with chroma preserved exactly and luma
+  max error 6/1023 (RMS 1.62) at `cq_level` 20 — the first datapoint for the
+  codec-bounds chunk.
+- 2026-08-05: **Two gotchas worth keeping.** (1) libaom's packet list is *per
+  `aom_codec_encode` call*: draining `aom_codec_get_cx_data` only after the flush
+  silently yields a **0-byte codestream**, because the frame is emitted during the
+  first call (`lag_in_frames` is 0 for all-intra). Drain after every call. (2)
+  `AV1E_GET_SEQ_LEVEL_IDX` reports the *target* level and returned **31**
+  (unset) — writing it into `av1C` would have signalled a bogus level where
+  libavif writes 0. So **every `av1C` field must be parsed back out of the
+  codestream's own sequence-header OBU**, not read from the encoder config. The
+  probe's reduced-still-picture-header parser confirms `seq_profile` 1,
+  `still_picture` 1, `reduced_still_picture_header` 1, `seq_level_idx_0` 0,
+  CICP 9/16/9, full range, 4:4:4, 10-bit — and is the seed of the conformance
+  inspector the task's verification section requires.
+- 2026-08-05: Windows static builds **deferred** with the gap recorded (user
+  decision): CI is `[ubuntu-latest, macos-15]` with no Windows runner, so the
+  task's three-platform clause has no coverage. Delivery gates macOS + Linux;
+  a Windows follow-up is filed when this task closes. Linux/macOS already install
+  `cmake clang libclang-dev nasm` from the gain-map work, which is what libaom's
+  build needs — so no new CI prerequisite is expected, but the x86_64 Linux build
+  is unproven locally and CI is the first place it compiles.
+- 2026-08-05: **Confirmed the Advanced Profile limits against the published AVIF
+  v1.2 text** rather than from memory, which also discharges the brand/limit half
+  of the spike's re-homed normative-text gate — unlike ISO 21496-1, the AVIF and
+  AV1 specifications are public. Verbatim: Advanced Profile requires "the High
+  Profile and the level shall be 6.0 or lower", and its coded image items "may not
+  have a number of pixels greater than 35651584, a width greater than 16384 or a
+  height greater than 8704", with brands `avif, mif1, miaf, MA1A`. Those four
+  numbers are now named constants in `io::avif` with the quote attached. Note the
+  level bound is `seq_level_idx <= 16`, *not* "an index that looks like a 6":
+  the index is `(major - 2) * 4 + minor`, so 17/18/19 are levels 6.1/6.2/6.3 and
+  are over the ceiling.
+- 2026-08-05: Added `pinned::BT2020_NCL_RGB_TO_YCBCR` through the colorimetry
+  maintenance workflow before writing any encoder code, because AVIF's
+  `matrix_coefficients = 9` means the file stores Y'CbCr while the renderer
+  produces R'G'B' — and a standards matrix may not be inlined in a stage. Details
+  and its three verification anchors are in `docs/progress/color.md`; the
+  headline for this epic is that it audits at `ulps = 0`, moves no existing
+  artifact, and is therefore **not** a pixel change to any shipped path.
+- 2026-08-05: Implemented `src/io/avif.rs`: quantization, the libaom FFI, the
+  container writer, the sequence-header inspector, and error translation.
+  `encode(RenderedHdr, &Path) -> (Staged, EncodeOutcome, AvifSummary)` mirrors
+  `io::ultra_hdr::encode`, so the whole file is built in memory and committed
+  through `io::staged` — a failure anywhere leaves nothing at the destination
+  (a test proves the uncommitted path). Native handles are RAII guards
+  (`Encoder` boxes the context because libaom stores interior pointers to it;
+  `Image` owns the `aom_img_alloc` frame), every `unsafe` block carries a SAFETY
+  comment, and libaom status codes become `NcError::Write` /
+  `NcError::Other` / `NcError::Resource` with `aom_codec_error_detail` text.
+- 2026-08-05: The encoder does not trust itself. After encoding,
+  `parse_sequence_header` reads the codestream back and `verify_codestream`
+  refuses to package a file whose coded seq_profile, still_picture, subsampling,
+  bit depth, CICP, colour range or frame size disagrees with the renderer's
+  declared contract; `resolve_profile` then classifies the *parsed* level and the
+  real dimensions, so an encoder that picked a higher level than expected
+  downgrades the brand instead of being mis-advertised. `MA1A` is written only
+  when every published limit holds, and `AvifProfile::GeneralOnly` carries the
+  reason back for the report.
+- 2026-08-05: Two deliberate policy calls to revisit at calibration. `CQ_LEVEL`
+  is **provisional** — it round-trips a neutral ramp within 6/1023 but is not yet
+  a reviewed quality decision. And `clli` is written for **PQ only**: PQ carries
+  absolute luminance so `MaxCLL`/`MaxPALL` report the pinned 1000-nit peak and
+  203-nit reference white, whereas HLG is display-referred, so inventing absolute
+  values there would be a false claim. `MaxPALL` is policy, not a per-image
+  measurement; measuring it per image is deferred with the codec bounds.
+- 2026-08-05: Clipping in quantization is **reachable, not defensive**. BT.2100-2
+  Table 9's full-range chroma row puts a fully saturated primary at
+  `±0.5 · 1023 + 512`, i.e. half a code outside the range at each end, so those
+  samples are counted into `EncodeReport` rather than silently clamped. A
+  non-finite sample falls back to *its own* neutral level — 0 for luma but 512 for
+  chroma — so a numerical fault cannot turn into a saturated colour. `OutputStats`
+  means are taken on the R'G'B' signal, not the written Y'CbCr codes, because the
+  type is defined per R/G/B channel and reporting chroma under `mean[1]` would
+  mislead.
+- 2026-08-05: Verified nc's *own* output with independent tools, not just unit
+  tests. `avifdec` (dav1d) reports both files as 64x1, 10-bit, YUV444, Full range,
+  CICP 9/16/9 (PQ, CLLI 1000,203) and 9/18/9 (HLG, no CLLI), with no ICC/EXIF/XMP;
+  ExifTool agrees on brands `avif, mif1, miaf, MA1A`; macOS `sips` opens both at
+  10 bits. In-repo, a libaom round trip decodes the container's own `iloc` extent
+  and checks neutral pixels stay achromatic and the ramp stays monotonic, and
+  three repeat encodes are byte-identical.
+- 2026-08-05: Packaging shape confirmed: `libaom-sys` is an ordinary
+  `[dependencies]` entry with `default-features = false, features =
+  ["av1_encoder"]`, and the decoder is a `[dev-dependencies]` feature so tests can
+  round-trip. Verified rather than assumed — `aom_codec_av1_dx` is **absent from
+  the release binary**, so resolver v3 does keep the dev-dependency feature out of
+  `cargo build`. No in-repo native snapshot exists;
+  `scripts/check-vendored-native.py` still reports only the libultrahdr /
+  libjpeg-turbo files. Caveat: the libaom round-trip test shares an implementation
+  with the encoder, so it proves self-consistency, not conformance — the
+  independent-decoder bounds the task requires remain the codec-bounds step's job.
+- 2026-08-05: All four CI-equivalent gates green in order — `cargo fmt --all
+  --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`, and
+  `cargo test` (555 unit + 130 integration, up from 539 + 130), plus
+  `scripts/check-vendored-native.py`. **Still open in this task:** CLI/preset
+  activation of `hdr-pq`/`hdr-hlg` (which removes `io::avif`'s module-level
+  `dead_code` allow), the `RunProfile` memory model and its calibration, the
+  oversized-image grid path, codec error bounds via an independent decoder,
+  report wiring for `AvifSummary`, and the licence/patent-review record.
+- 2026-08-05: **Recorded the `output/presets` boundary** in both task files, because
+  each claimed the memory-calibration gate and a literal reading meant either
+  duplicated work or a mutual gap. The rule, from the `ultra-hdr-v1` precedent:
+  whichever task ships an explicit `convert`-only preset also adds and calibrates
+  that preset's `RunProfile`; `output/presets` verifies profile *selection* and owns
+  the default, the rest of the suffix table, `custom`, and roll integration. That
+  ordering is also forced — `output/presets` additionally depends on
+  `output/iso-gain-map-metadata`, which is hard-blocked on the paywalled
+  ISO 21496-1:2025 text, so deferring activation would have left a complete, tested
+  AVIF encoder unreachable behind an unrelated standard.
+- 2026-08-05: Activated `hdr-pq` and `hdr-hlg` as explicit `convert`-only presets.
+  `OutputPreset` gained the two names (moved out of the "not accepted yet" list — the
+  `hdr-*-tiff` presets are *different* presets and stay planned) plus
+  `hdr_transfer()` as the single place a preset becomes an `HdrTransfer`. Both
+  resolve `OutDepth::U16` for the optional IR TIFF only; the primary is fixed 10-bit
+  AVIF. The suffix and roll gates were **generalized rather than special-cased**: one
+  `required_extensions` table now drives both the `.avif`/`.jpg` requirement and the
+  "convert-only" refusal, so a future container cannot acquire one rule and miss the
+  other.
+- 2026-08-05: Renamed `stages::render_gain_map_source` → `render_display_source` and
+  `GainMapSource` → `DisplaySource` (one call site). The function was never
+  gain-map-specific — it is the shared reconstruction + print-controls source, and
+  both display presets now consume it, so a gain-map-shaped name would have been
+  actively misleading about what `hdr-pq` shares with `ultra-hdr-v1`.
+- 2026-08-05: Added `RunProfile::HdrAvif` and **calibrated it on two real scans**,
+  which is the part worth repeating. Solving `measured = px·(28 + X) + fixed` across
+  an 18.66 MP and a 74.65 MP frame gave 78.47 B/px with only ~7.9 MB fixed — clean
+  linear scaling — so the true AVIF staging is 50.47 B/px. Pinned
+  `AVIF_STAGING_BYTES_PER_PX = 48`, leaving `accounted` 3.4–3.8% *under* measured for
+  the 15% allowance to cover. **A first pass at 64 B/px was wrong in the expensive
+  direction**: padding the enumerated buffers double-counts the allowance and put the
+  18.66 MP estimate at 1.43x measured, which rejects runs the machine could serve.
+  HLG measured 1.503 GB against the same estimate, so one profile covers both.
+- 2026-08-05: Pinned `CQ_LEVEL = 8` after measuring the quality/size curve on a real
+  scan plus a four-class test field (`cq` 0 / 8 / 12 / 20 → 20.38 / 0.99 / 0.35 /
+  0.07 MiB at max code error 0 / 10 / 14 / 20 of 1023). It is a fixed part of the
+  preset like `ultra_hdr::JPEG_QUALITY`, not a new knob. Two findings recorded in the
+  constant's doc: **`cq_level = 0` is mathematically lossless**, so AV1 could carry a
+  bit-exact HDR still at ~20x the size if a preset ever wants one; and AVIF is nc's
+  *delivery* container, so the archival paths remain `film-master` and the planned
+  lossless HDR TIFFs.
+- 2026-08-05: Codec bounds are pinned by **equality, not tolerance**, because AV1
+  reconstruction is normatively specified and bit-exact. Measured with
+  `avifdec`/dav1d at `cq_level` 8 on the four-class field (max, RMS per plane):
+  PQ `(9, 0.702) (10, 0.849) (9, 0.591)`, HLG `(8, 0.645) (8, 0.782) (7, 0.615)`.
+  The committed test decodes with libaom and **reproduces those dav1d numbers
+  exactly**, which is what makes a CI-runnable in-repo decode a legitimate stand-in
+  for the independent one; a neutral ramp comes back with chroma at exactly the
+  achromatic level.
+- 2026-08-05: **Oversized-image policy: general-brand-only, no grid.** The AVIF v1.2
+  text permits either, and implementing a conforming grid would mean pinning tile
+  ordering and edge-tile behaviour for a case nc can already serve correctly. Proven
+  on a real 74.65 MP scan: the file is a valid AVIF, `MA1A` is omitted, and the
+  report plus a `--strict`-promotable warning name the limit. That run also surfaced
+  a reporting bug — libaom emits `seq_level_idx = 31`, AV1's **"maximum parameters"
+  sentinel**, which my first version formatted as "level 9.3", a level the
+  specification does not define. `level_name` now renders 31 and the 24..=30 reserved
+  range as names. The brand *decision* was right throughout; only the label was wrong.
+- 2026-08-05: Wired the report: a new `avif` block carries the profile (and, when
+  general-brand-only, the reason), bit depth, the AV1 profile/level **parsed from the
+  codestream**, the CICP triple, range and coded size — evidence about the artifact
+  rather than an echo of the request. Recorded libaom's licence and the Alliance for
+  Open Media Patent License 1.0 in `THIRD_PARTY_NOTICES.md`, stating plainly that the
+  summary is not a completed legal review: the *standards* half of the spike's
+  re-homed gate is discharged (AVIF/AV1 are public and were checked against their
+  normative text), while counsel review of the patent grant stays with release.
+- 2026-08-05: End-to-end on the 18.66 MP Phoenix scan, both presets: 5184x3600,
+  10-bit, YUV444, Full range, CICP 9/16/9 (PQ, CLLI 1000,203) and 9/18/9 (HLG, no
+  CLLI), brands `avif mif1 miaf MA1A`, level 6.0 — the ceiling, legitimately, since
+  18.66 MP exceeds level 5.x's 8,912,896-pixel limit. PQ 1.03 MB, HLG 3.29 MB. Under
+  `--strict` both exit 1 on the documented IR-plane warning, as any HDRi scan does.
+  All four gates green: 559 unit + 133 integration.
+- 2026-08-05: **Review round: `clli` is now measured, and the per-axis limit was
+  wrong.** (1) The earlier "MaxPALL is policy, measurement deferred" call was not
+  defensible: CTA-861.3 defines both fields as properties of *this content* and
+  displays tone-map from them, so writing the 1000/203 constants made a nearly
+  black frame claim a 1000-nit peak. `pipeline::hdr::render_linear` now measures
+  per-pixel luminance (`dot(rgb, BT2020_LUMA) · 203`, where its values are still
+  display-linear and reference-white-relative), MaxCLL = peak and MaxFALL = mean,
+  and carries them as `HdrRenderMetadata::content_light` for `io::avif` to write.
+  On the `hdr-48bit` fixture the box now reads 114/41 instead of 1000/203, and the
+  same frame four stops darker reads 7/3 — confirmed on the written files by
+  `avifdec --info` (libavif/dav1d, independent of nc's parser), and pinned in-repo
+  as the dark-versus-bright regression at both the unit and CLI levels. Render
+  metadata is not a recipe key, so
+  `PIPELINE_FINGERPRINTS` and `params_hash` are unmoved (verified, not assumed),
+  and the pinned codec bounds still match exactly — no pixel moved. HLG still
+  omits the box. (2) The dimension gate used `aom_img_alloc`'s documented `2^27`,
+  which bounds the *allocator*; the **encoder** refuses anything over 65,536 per
+  axis (`av1_cx_iface.c:646-647`, `RANGE_CHECK(cfg, g_w, 1, 65536); // 16 bits
+  available` — a format limit, since `frame_width_bits` is `f(4)`). An axis in
+  `65_537..=2^27` therefore paid for a full quantization pass and three plane
+  allocations before failing as a generic exit-1; it is now exit 4 before any
+  allocation. (3) Three smaller review fixes: the module-wide
+  `#![allow(dead_code)]` in `io::avif` is gone now that the presets are wired (no
+  item needed a replacement allow); `OutputPreset::hdr_transfer` became
+  `pipeline::hdr::transfer_for`, since `types` is the shared-types leaf and must
+  not depend on a pipeline module; and `write_container`'s 32-bit guard now counts
+  the 8-byte `mdat` header, because a codestream in `u32::MAX - 7 ..= u32::MAX`
+  would have wrapped the box size to 1..8 and written a malformed file with no
+  error — `bx` now converts the size with a checked cast instead of `as u32`.
+- 2026-08-05 (ship review): Codex caught the `RunProfile::HdrAvif` **render** phase
+  under-counting by 4 B/px on every IR input. The shared display source is
+  `image`-shaped, not RGB-only — reconstruction carries the IR plane through
+  `AcesCgImage` into `AdjustedAcesCgImage` — so render holds decoded RGB+IR *and*
+  shared RGB+IR *and* the rendition. `UltraHdrV1` already modelled this correctly
+  with `mul(image, 2)`; the new profile did not. Now
+  `sum(mul(image, 2)?, rendition)`. The gate decision is unaffected (encode is
+  still the peak, and the estimate stays byte-identical to the calibrated
+  1,765,311,488 on the 18.66 MP scan) — what was wrong was the reported per-phase
+  breakdown, which CLAUDE.md requires to track the code. Lesson for the next
+  profile: check whether a stage's buffer is `image`-shaped (carries IR) before
+  modelling it as a flat RGB buffer.
+
+- 2026-08-05: **Two residual risks, neither resolvable here.** (1) Only
+  `aarch64-apple-darwin` is installed on this machine, so the **x86_64 Linux build of
+  libaom is unproven until CI runs** — CI already installs `cmake clang libclang-dev
+  nasm` from the gain-map work, which is what libaom needs, and `io::avif` contains
+  no platform-gated code, but CI is genuinely the first place it compiles. (2)
+  Windows is deferred by decision with no CI runner; filed as
+  `output/hdr-avif-windows-packaging`.
 
 
 ## sdr-display-rendering
@@ -994,3 +1274,19 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   mutable-tag fetch or system library). Watching crates.io for a version bump is
   explicitly **not** the trigger. Our delta is small enough to upstream if anyone
   wants to try, but merge and release cadence would not be ours.
+## hdr-avif-windows-packaging
+
+**Status:** not started
+**Updated:** 2026-08-05
+
+- 2026-08-05: Filed by `output/hdr-avif-output`, which shipped the AVIF encoder
+  gated on macOS and Linux only. CI's matrix is `[ubuntu-latest, macos-15]` with no
+  Windows runner, so the task's three-platform clause had no coverage and claiming
+  it would have been false. This task adds a `windows-latest` job and proves the
+  static libaom build under MSVC; no encoding behaviour changes. Note the contract
+  it must *not* over-claim: byte identity is scoped per build/architecture
+  (design-spec §8), so the Windows binary is not expected to reproduce the
+  macOS/Linux bytes — only the semantic metadata and the pinned decoded-pixel
+  bounds. If MSVC cannot build the vendored libaom source unpatched, prefer
+  documenting Windows as unsupported over carrying a local patch; the repo already
+  has one regretted native snapshot.

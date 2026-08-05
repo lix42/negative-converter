@@ -348,6 +348,257 @@ fn ultra_hdr_v1_writes_a_deterministic_legacy_gain_map_jpeg() {
     assert_eq!(bytes, std::fs::read(&second).unwrap());
 }
 
+/// Walk an AVIF's top-level and `meta` boxes into `(type, body offset)` pairs.
+fn avif_boxes(buf: &[u8]) -> Vec<(String, usize)> {
+    fn walk(buf: &[u8], start: usize, end: usize, out: &mut Vec<(String, usize)>) {
+        const CONTAINERS: [&[u8; 4]; 4] = [b"meta", b"iprp", b"ipco", b"iinf"];
+        let mut at = start;
+        while at + 8 <= end {
+            let size = u32::from_be_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+            if size < 8 {
+                return;
+            }
+            let kind: [u8; 4] = buf[at + 4..at + 8].try_into().unwrap();
+            out.push((String::from_utf8_lossy(&kind).into_owned(), at + 8));
+            if CONTAINERS.contains(&&kind) {
+                let skip = match &kind {
+                    b"meta" => 4,
+                    b"iinf" => 6,
+                    _ => 0,
+                };
+                walk(buf, at + 8 + skip, (at + size).min(end), out);
+            }
+            at += size;
+        }
+    }
+    let mut out = Vec::new();
+    walk(buf, 0, buf.len(), &mut out);
+    out
+}
+
+#[test]
+fn hdr_pq_writes_a_deterministic_advanced_profile_avif() {
+    let tmp = TempDir::new("hdr-pq");
+    let first = tmp.path("first.avif");
+    let second = tmp.path("second.AVIF");
+    for (index, output) in [&first, &second].into_iter().enumerate() {
+        let telemetry = tmp.path(&format!("telemetry-{index}.json"));
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            "hdr-pq",
+            "--film-base",
+            "1,1,1",
+            "--telemetry-file",
+            telemetry.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let report = json(&stdout);
+        assert_eq!(report["recipe"]["output"]["preset"], "hdr-pq");
+        assert_eq!(
+            report["output_render"]["encoding"],
+            "rec2100-pq-10bit-444-avif"
+        );
+        // The `avif` report block is evidence read back out of the file.
+        assert_eq!(report["avif"]["profile"], "advanced");
+        assert_eq!(report["avif"]["bit_depth"], 10);
+        assert_eq!(report["avif"]["seq_profile"], 1);
+        assert_eq!(report["avif"]["full_range"], true);
+        assert_eq!(report["avif"]["cicp"][0], 9);
+        assert_eq!(report["avif"]["cicp"][1], 16);
+        assert_eq!(report["avif"]["cicp"][2], 9);
+        assert!(report["avif"]["profile_reason"].is_null());
+        // The conformance property is the ceiling, not a particular level: a
+        // small fixture lands well under it, and pinning the exact value would
+        // make a legitimate encoder change look like a conformance failure.
+        let level_idx = report["avif"]["seq_level_idx"].as_u64().unwrap();
+        assert!(level_idx <= 16, "level index {level_idx} exceeds 6.0");
+        assert_eq!(
+            report["avif"]["level"],
+            format!("{}.{}", 2 + (level_idx >> 2), level_idx & 3)
+        );
+        let timing: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(telemetry).unwrap()).unwrap();
+        assert!(
+            timing["timing_ms"]["color"]
+                .as_f64()
+                .is_some_and(|value| value > 0.0),
+            "HDR display rendering must be included in timing_ms.color: {timing}"
+        );
+    }
+
+    let bytes = std::fs::read(&first).unwrap();
+    // Brands, and the absence of any metadata nc did not ask for.
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert_eq!(&bytes[8..12], b"avif", "major brand");
+    for brand in [b"avif", b"mif1", b"miaf", b"MA1A"] {
+        assert!(
+            bytes[..32].windows(4).any(|w| w == brand),
+            "missing compatible brand {}",
+            String::from_utf8_lossy(brand)
+        );
+    }
+    let tree = avif_boxes(&bytes);
+    let at = |kind: &str| {
+        tree.iter()
+            .find(|(name, _)| name == kind)
+            .unwrap_or_else(|| panic!("no `{kind}` box in {tree:?}"))
+            .1
+    };
+    // nclx CICP 9/16/9 with the full-range flag, plus PQ's content-light box.
+    let colr = at("colr");
+    assert_eq!(&bytes[colr..colr + 4], b"nclx");
+    assert_eq!(&bytes[colr + 4..colr + 10], &[0, 9, 0, 16, 0, 9]);
+    assert_eq!(bytes[colr + 10], 0x80);
+    // `clli` states this frame's measured content light: MaxCLL is its brightest
+    // pixel in cd/m² and MaxFALL its frame average, both bounded by the 1000-nit
+    // mastering peak. Deliberately not frozen literals — the point of the box is
+    // that it follows the pixels, which the darker run below proves.
+    let clli = at("clli");
+    let content_light = |bytes: &[u8], at: usize| {
+        (
+            u16::from_be_bytes(bytes[at..at + 2].try_into().unwrap()),
+            u16::from_be_bytes(bytes[at + 2..at + 4].try_into().unwrap()),
+        )
+    };
+    let (max_cll, max_fall) = content_light(&bytes, clli);
+    assert!(
+        0 < max_cll && max_cll <= 1000,
+        "MaxCLL {max_cll} is outside the rendered 0..=1000 cd/m² range"
+    );
+    assert!(
+        max_fall <= max_cll,
+        "MaxFALL {max_fall} exceeds MaxCLL {max_cll}"
+    );
+    // 10-bit on three channels, and High Profile in `av1C`.
+    let pixi = at("pixi");
+    assert_eq!(&bytes[pixi + 4..pixi + 8], &[3, 10, 10, 10]);
+    let av1c = at("av1C");
+    assert_eq!(bytes[av1c], 0x81);
+    assert_eq!(bytes[av1c + 1] >> 5, 1, "seq_profile must be High");
+    // No EXIF/XMP/ICC is invented. An embedded ICC would appear as a `colr` box
+    // of type `prof`; nc signals colour with nclx only.
+    assert!(
+        tree.iter()
+            .filter(|(name, _)| name == "colr")
+            .all(|(_, body)| &bytes[*body..*body + 4] == b"nclx"),
+        "every colr box must be nclx, never an embedded ICC (`prof`)"
+    );
+    assert!(
+        !bytes.windows(4).any(|w| w == b"Exif"),
+        "no EXIF should be written"
+    );
+    assert!(
+        !bytes.windows(3).any(|w| w == b"xml"),
+        "no XMP should be written"
+    );
+    // Byte-identical on repeat, on the same build.
+    assert_eq!(bytes, std::fs::read(&second).unwrap());
+
+    // The same frame four stops darker must report lower content light. This is the
+    // regression that matters: a `clli` derived from renderer policy instead of
+    // pixels would hand both files the identical 1000/203 claim.
+    let dark = tmp.path("dark.avif");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        dark.to_str().unwrap(),
+        "--output-preset",
+        "hdr-pq",
+        "--film-base",
+        "1,1,1",
+        // `=` because clap would otherwise read the leading `-` as a flag.
+        "--print-exposure=-4",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let dark_bytes = std::fs::read(&dark).unwrap();
+    let dark_tree = avif_boxes(&dark_bytes);
+    let dark_clli = dark_tree.iter().find(|(name, _)| name == "clli").unwrap().1;
+    let (dark_cll, dark_fall) = content_light(&dark_bytes, dark_clli);
+    assert!(
+        dark_cll < max_cll && dark_fall <= dark_cll,
+        "a four-stop-darker render reported MaxCLL/MaxFALL {dark_cll}/{dark_fall} against \
+         the reference render's {max_cll}/{max_fall}"
+    );
+}
+
+#[test]
+fn hdr_hlg_signals_its_own_transfer_and_omits_content_light_level() {
+    let tmp = TempDir::new("hdr-hlg");
+    let output = tmp.path("out.avif");
+    let (code, stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--output-preset",
+        "hdr-hlg",
+        "--film-base",
+        "1,1,1",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert_eq!(
+        report["output_render"]["encoding"],
+        "rec2100-hlg-10bit-444-avif"
+    );
+    assert_eq!(report["avif"]["cicp"][1], 18);
+    let bytes = std::fs::read(&output).unwrap();
+    let tree = avif_boxes(&bytes);
+    let colr = tree.iter().find(|(n, _)| n == "colr").unwrap().1;
+    assert_eq!(&bytes[colr + 4..colr + 10], &[0, 9, 0, 18, 0, 9]);
+    assert!(
+        !tree.iter().any(|(n, _)| n == "clli"),
+        "HLG is display-referred; absolute content-light metadata must be omitted"
+    );
+}
+
+#[test]
+fn hdr_avif_presets_reject_a_non_avif_suffix_and_roll_mode() {
+    let tmp = TempDir::new("hdr-avif-gates");
+    for preset in ["hdr-pq", "hdr-hlg"] {
+        let output = tmp.path(&format!("{preset}.tiff"));
+        let (code, _stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+        ]);
+        assert_eq!(code, 2, "{err}");
+        assert!(err.contains(".avif"), "{err}");
+        assert!(!output.exists(), "nothing may be written on a usage error");
+    }
+    // Still `convert`-only: roll naming for non-TIFF containers is `output/presets`.
+    // `roll` has no output-selection flags, so the preset arrives via the recipe.
+    let out_dir = tmp.path("roll-out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let recipe = tmp.path("roll.json");
+    std::fs::write(
+        &recipe,
+        r#"{"output":{"preset":"hdr-pq"},"film_base":{"source":{"explicit":[1,1,1]}}}"#,
+    )
+    .unwrap();
+    let (code, _stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("convert"), "{err}");
+    assert!(err.contains("hdr-pq"), "{err}");
+}
+
 #[test]
 fn ultra_hdr_v1_rejects_a_non_jpeg_suffix_before_writing() {
     let tmp = TempDir::new("ultra-hdr-v1-suffix");

@@ -534,6 +534,129 @@ fn pinned_luma_agrees_with_the_pinned_matrix_it_is_applied_after() {
     }
 }
 
+// -- BT.2020 NCL Y'CbCr (AVIF matrix_coefficients = 9) ------------------------
+
+/// The chroma coefficients as *published* in rounded form, independent of NC's
+/// derivation.
+///
+/// BT.2020-2 § 3.4 and BT.2100-2 Table 6 give the Y'CbCr conversion as formulas
+/// in `Kr`/`Kb` rather than as a coefficient table, so the external anchor is the
+/// widely republished four-decimal evaluation of those formulas (the same values
+/// carried by ffmpeg, libavif and dav1d's colour tables). Four decimals is all
+/// the published form commits to, which sets the tolerance below.
+const BT2020_YCBCR_PUBLISHED_ROUNDED: [[f64; 3]; 3] = [
+    [0.2627, 0.6780, 0.0593],
+    [-0.1396, -0.3604, 0.5000],
+    [0.5000, -0.4598, -0.0402],
+];
+
+#[test]
+fn bt2020_ycbcr_matches_the_published_rounded_coefficients() {
+    for (i, (row, published)) in pinned::BT2020_NCL_RGB_TO_YCBCR
+        .iter()
+        .zip(BT2020_YCBCR_PUBLISHED_ROUNDED)
+        .enumerate()
+    {
+        for (j, (&shipped, want)) in row.iter().zip(published).enumerate() {
+            // Half a unit in the published last decimal place.
+            assert!(
+                (f64::from(shipped) - want).abs() <= 5e-5,
+                "BT2020_NCL_RGB_TO_YCBCR[{i}][{j}] = {shipped} disagrees with the \
+                 published {want}",
+            );
+        }
+    }
+}
+
+#[test]
+fn bt2020_ycbcr_luma_row_is_the_tabulated_vector_verbatim() {
+    // Not merely equal to within a tolerance: the row must *be* the same pinned
+    // literal, so a future edit to one cannot silently desynchronize the encoder's
+    // Y' row from the luma vector `pipeline::hdr` uses.
+    assert_eq!(pinned::BT2020_NCL_RGB_TO_YCBCR[0], pinned::BT2020_LUMA);
+    for (i, (&shipped, tabulated)) in pinned::BT2020_NCL_RGB_TO_YCBCR[0]
+        .iter()
+        .zip(BT2020_LUMA_TABULATED)
+        .enumerate()
+    {
+        assert_eq!(
+            shipped, tabulated as f32,
+            "Y' row entry [{i}] is not the tabulated BT.2020 luma weight",
+        );
+    }
+}
+
+#[test]
+fn bt2020_ycbcr_normalization_puts_the_primary_extremes_at_exactly_half() {
+    // The `0.5` entries are the *reason* the chroma rows are scaled by
+    // `2(1-Kb)` / `2(1-Kr)`: full blue must land at Cb = +0.5 and full red at
+    // Cr = +0.5 exactly, which is what keeps a full-range signal inside its
+    // code-value budget. Exact equality is required, not a tolerance.
+    let blue = apply_f32(pinned::BT2020_NCL_RGB_TO_YCBCR, [0.0, 0.0, 1.0]);
+    let red = apply_f32(pinned::BT2020_NCL_RGB_TO_YCBCR, [1.0, 0.0, 0.0]);
+    assert_eq!(blue[1], 0.5, "full blue must give Cb = +0.5 exactly");
+    assert_eq!(red[2], 0.5, "full red must give Cr = +0.5 exactly");
+}
+
+#[test]
+fn bt2020_ycbcr_maps_achromatic_input_to_zero_chroma() {
+    // The invariant that matters for a neutral ramp: equal R'G'B' must produce
+    // zero chroma, or the encoder tints greys.
+    //
+    // Both bounds are *measured maxima* over the exact 10-bit code ladder this
+    // encoder quantizes onto — not round numbers. The worst chroma residual is
+    // 2^-25 at code 546 and the worst luma residual is 2^-23; the chroma figure is
+    // ~32,800x smaller than one 10-bit code value, so it cannot move a sample.
+    // Sweeping the real ladder rather than a coarse fraction matters: a 33-step
+    // sweep understates the peak by 8x, because the residual is a rounding
+    // artifact that peaks near 0.5 rather than growing monotonically.
+    const MAX_CHROMA_RESIDUAL: f32 = 2.980_233e-8; // 2^-25, measured
+    const MAX_LUMA_RESIDUAL: f32 = 1.192_093e-7; // 2^-23, measured
+    for code in 0..=1023_u32 {
+        let v = code as f32 / 1023.0;
+        let [y, cb, cr] = apply_f32(pinned::BT2020_NCL_RGB_TO_YCBCR, [v, v, v]);
+        assert!(
+            cb.abs() <= MAX_CHROMA_RESIDUAL && cr.abs() <= MAX_CHROMA_RESIDUAL,
+            "achromatic code {code} ({v}) produced chroma ({cb:e}, {cr:e})",
+        );
+        assert!(
+            (y - v).abs() <= MAX_LUMA_RESIDUAL,
+            "achromatic code {code} produced Y' {y}, which is not the input back",
+        );
+    }
+}
+
+#[test]
+fn bt2020_ycbcr_round_trips_through_its_own_inverse() {
+    // A decoder inverts this matrix, so an ill-conditioned pin would show up as a
+    // round-trip error even while every entry looked plausible.
+    let forward = pinned::BT2020_NCL_RGB_TO_YCBCR.map(|row| row.map(f64::from));
+    let back = inverse(forward);
+    for rgb in [
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.25, 0.5, 0.75],
+        [0.9, 0.1, 0.4],
+    ] {
+        let recovered = transform(back, transform(forward, rgb));
+        for (i, (got, want)) in recovered.iter().zip(rgb).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "channel {i} of {rgb:?} round-tripped to {got}",
+            );
+        }
+    }
+}
+
+/// Apply a pinned `f32` matrix the way the encoder does, so the tests observe the
+/// same accumulation order the shipped code uses.
+fn apply_f32(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    m.map(|row| row[0] * v[0] + row[1] * v[1] + row[2] * v[2])
+}
+
 // -- definitions sanity -------------------------------------------------------
 
 #[test]

@@ -22,12 +22,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::algo::density;
 use crate::io::decode::{DecodeInfo, decode_within, probe};
-use crate::io::{encode, staged, ultra_hdr};
+use crate::io::{avif, encode, staged, ultra_hdr};
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
 use crate::pipeline::memory::{self, MemoryReport, RunProfile, SamplePlan};
-use crate::pipeline::{film_base, gain_map, stages, working_space};
+use crate::pipeline::{film_base, gain_map, hdr, stages, working_space};
 use crate::telemetry;
 use crate::types::{
     AnchorPlacement, BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams,
@@ -829,6 +829,38 @@ fn reconstruction_result(
     }
 }
 
+/// What the AVIF encoder coded, for the resolved report. Serialize-only.
+///
+/// Every field is read back out of the produced file rather than restated from the
+/// request, so the report is evidence about the artifact and not an echo of the
+/// configuration. In particular `profile` records whether the file may claim the
+/// AVIF v1.2 Advanced Profile, and `profile_reason` says why not when it may not —
+/// a general-brand-only file is a legitimate output, but never a silent one.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AvifResult {
+    /// `"advanced"` when the `MA1A` brand was written, else `"general-brand-only"`.
+    pub profile: &'static str,
+    /// Which published limit put the file outside the Advanced Profile. Absent when
+    /// `profile` is `"advanced"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_reason: Option<String>,
+    /// Coded bit depth (always 10 in this build).
+    pub bit_depth: u8,
+    /// AV1 `seq_profile` parsed from the codestream (1 = High, required for 4:4:4).
+    pub seq_profile: u8,
+    /// AV1 `seq_level_idx` parsed from the codestream. 16 is level 6.0, the
+    /// Advanced Profile ceiling.
+    pub seq_level_idx: u8,
+    /// Human-readable level, e.g. `"2.0"`, derived from `seq_level_idx`.
+    pub level: String,
+    /// CICP colour primaries / transfer / matrix coefficients as coded.
+    pub cicp: [u8; 3],
+    /// Whether full-range coding was signalled.
+    pub full_range: bool,
+    /// Size of the AV1 codestream in bytes, excluding container boxes.
+    pub codestream_bytes: usize,
+}
+
 /// Which branch out of the NC film RGB v1 ACEScg boundary this conversion took,
 /// and what that branch did (design-spec §5/§8). Serialize-only.
 ///
@@ -926,6 +958,22 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
             "independently rendered SDR Display P3 base and HDR rendition, paired \
              by a single-channel luminance legacy Ultra HDR v1 gain map; not ISO 21496-1",
         ),
+        OutputPreset::HdrPq => (
+            true,
+            true,
+            "rec2100-pq-10bit-444-avif",
+            "single-rendition display HDR: BT.2020 primaries with the ST 2084 (PQ) \
+             transfer, 203 cd/m² reference white and a 1000 cd/m² mastering peak; \
+             a rendered display image, not a film master",
+        ),
+        OutputPreset::HdrHlg => (
+            true,
+            true,
+            "rec2100-hlg-10bit-444-avif",
+            "single-rendition display HDR: BT.2020 primaries with the HLG transfer \
+             under the reference 1000-nit zero-black OOTF at system gamma 1.2; \
+             a rendered display image, not a film master",
+        ),
     };
     OutputRenderResult {
         preset: cfg.output.preset,
@@ -986,6 +1034,13 @@ pub struct Report {
     /// content claim (design-spec §5/§8). See [`OutputRenderResult`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_render: Option<OutputRenderResult>,
+    /// What the AVIF encoder actually coded (`convert` with `hdr-pq` / `hdr-hlg`):
+    /// the profile the file may claim and why, the AV1 profile/level read back out
+    /// of the codestream, the CICP triple, and the coded size. Absent for every
+    /// other preset. Provenance for the conformance claim — an agent can check the
+    /// brand decision without re-parsing the container.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avif: Option<AvifResult>,
     /// What the decoder found (`inspect`): format, dimensions, channels, bit
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1876,17 +1931,42 @@ pub fn validate_convert(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> 
     // diagnosis than whatever value rule the same config might also trip.
     reject_output_sdr_with_named_preset(cfg, args)?;
     validate(cfg)?;
-    if cfg.output.preset == OutputPreset::UltraHdrV1
-        && !args
-            .output
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg"))
+    if let Some(extensions) = required_extensions(cfg.output.preset)
+        && !extensions.iter().any(|want| {
+            args.output
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+        })
     {
-        return Err(NcError::Usage(
-            "--output-preset ultra-hdr-v1 requires an output path ending in .jpg or .jpeg".into(),
-        ));
+        // The path is never rewritten — a mismatch is a usage error that names the
+        // extensions the resolved container accepts (design-spec §5).
+        let list = extensions
+            .iter()
+            .map(|e| format!(".{e}"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        return Err(NcError::Usage(format!(
+            "--output-preset {} requires an output path ending in {list}",
+            cfg.output.preset.name()
+        )));
     }
     Ok(())
+}
+
+/// Output-path extensions a preset's resolved container accepts, or `None` when
+/// the preset imposes no rule (the legacy TIFF path).
+///
+/// One table so a new container cannot acquire a suffix rule in one place and miss
+/// it in another. `output/presets` extends this with the remaining presets and is
+/// what makes it roll-aware.
+fn required_extensions(preset: OutputPreset) -> Option<&'static [&'static str]> {
+    match preset {
+        OutputPreset::UltraHdrV1 => Some(&["jpg", "jpeg"]),
+        OutputPreset::HdrPq | OutputPreset::HdrHlg => Some(&["avif"]),
+        // `film-master` is a TIFF like the legacy path; its suffix policy arrives
+        // with the rest of the table in `output/presets`.
+        OutputPreset::Legacy | OutputPreset::FilmMaster => None,
+    }
 }
 
 /// Validate a resolved config at the CLI boundary so the pure stages can trust
@@ -2926,20 +3006,25 @@ enum FrameRender {
         convert: stages::ConvertReport,
         timings: stages::StageTimings,
     },
+    HdrAvif {
+        render: Box<hdr::RenderedHdr>,
+        convert: stages::ConvertReport,
+        timings: stages::StageTimings,
+    },
 }
 
 impl FrameRender {
     fn convert(&self) -> stages::ConvertReport {
         match self {
             Self::Tiff(rendered) => rendered.convert,
-            Self::UltraHdr { convert, .. } => *convert,
+            Self::UltraHdr { convert, .. } | Self::HdrAvif { convert, .. } => *convert,
         }
     }
 
     fn timings(&self) -> stages::StageTimings {
         match self {
             Self::Tiff(rendered) => rendered.timings,
-            Self::UltraHdr { timings, .. } => *timings,
+            Self::UltraHdr { timings, .. } | Self::HdrAvif { timings, .. } => *timings,
         }
     }
 }
@@ -2992,17 +3077,20 @@ fn convert_frame(
     // inputs it exists to catch). Over budget ⇒ loud exit 6; within budget but
     // most of the machine's RAM ⇒ a `--strict`-promotable warning. Operational
     // gate — it never touches a pixel, so the output stays deterministic.
+    let export_ir_planned = cfg.input.export_ir.is_some();
     let mem = preflight_memory(
         input,
-        if cfg.output.preset == OutputPreset::UltraHdrV1 {
-            RunProfile::UltraHdrV1 {
-                export_ir: cfg.input.export_ir.is_some(),
-            }
-        } else {
-            RunProfile::Convert {
+        match cfg.output.preset {
+            OutputPreset::UltraHdrV1 => RunProfile::UltraHdrV1 {
+                export_ir: export_ir_planned,
+            },
+            OutputPreset::HdrPq | OutputPreset::HdrHlg => RunProfile::HdrAvif {
+                export_ir: export_ir_planned,
+            },
+            OutputPreset::Legacy | OutputPreset::FilmMaster => RunProfile::Convert {
                 depth: cfg.output.depth(),
-                export_ir: cfg.input.export_ir.is_some(),
-            }
+                export_ir: export_ir_planned,
+            },
         },
         sample_plan(&cfg.film_base.source),
         budget,
@@ -3143,7 +3231,7 @@ fn convert_frame(
     // Stages 3–4 — reconstruction → legacy print → output color transform.
     let rendered = if cfg.output.preset == OutputPreset::UltraHdrV1 {
         let source =
-            stages::render_gain_map_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
+            stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
         let convert = source.convert;
         let mut timings = source.timings;
         let display_started = Instant::now();
@@ -3156,6 +3244,24 @@ fn convert_frame(
         // totals account for every pixel operation even when telemetry is off.
         timings.color_ms += elapsed_ms(display_started);
         FrameRender::UltraHdr {
+            render: Box::new(render),
+            convert,
+            timings,
+        }
+    } else if let Some(transfer) = hdr::transfer_for(cfg.output.preset) {
+        // `hdr-pq` / `hdr-hlg`: one rendition off the same shared display source
+        // the gain-map path uses, so both consume an identically resolved
+        // reconstruction and print stage.
+        let source =
+            stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
+        let convert = source.convert;
+        let mut timings = source.timings;
+        let display_started = Instant::now();
+        let render = hdr::render(&source.shared, transfer, cfg.print.highlight_compress)?;
+        // The display render and its PQ/HLG transfer are colour work, like the
+        // gain-map branch above — AVIF coding alone belongs to encode_ms.
+        timings.color_ms += elapsed_ms(display_started);
+        FrameRender::HdrAvif {
             render: Box::new(render),
             convert,
             timings,
@@ -3234,11 +3340,17 @@ fn convert_frame(
     // Stage 5 — encode + effective-recipe sidecar.
     let stage_started = Instant::now();
     let render_timings = rendered.timings();
+    let mut avif_summary = None;
     let (primary, outcome) = match rendered {
         FrameRender::Tiff(rendered) => {
             encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?
         }
         FrameRender::UltraHdr { render, .. } => ultra_hdr::encode(*render, output)?,
+        FrameRender::HdrAvif { render, .. } => {
+            let (staged, outcome, summary) = avif::encode(*render, output)?;
+            avif_summary = Some(summary);
+            (staged, outcome)
+        }
     };
     if cms_error_occurred() {
         return Err(NcError::Other(
@@ -3246,6 +3358,39 @@ fn convert_frame(
         ));
     }
     let encode_ms = elapsed_ms(stage_started);
+    if let Some(summary) = avif_summary {
+        // A general-brand-only file is valid but is never advertised as Advanced
+        // Profile, and the downgrade is surfaced (and `--strict`-promotable) rather
+        // than left for someone to discover by inspecting brands.
+        let profile_reason = match &summary.profile {
+            avif::AvifProfile::Advanced => None,
+            avif::AvifProfile::GeneralOnly { reason } => {
+                push_warning_buf(
+                    warnings,
+                    log,
+                    format!(
+                        "AVIF written without the MA1A brand (not AVIF v1.2 Advanced \
+                         Profile): {reason}"
+                    ),
+                );
+                Some(reason.clone())
+            }
+        };
+        report.avif = Some(AvifResult {
+            profile: match summary.profile {
+                avif::AvifProfile::Advanced => "advanced",
+                avif::AvifProfile::GeneralOnly { .. } => "general-brand-only",
+            },
+            profile_reason,
+            bit_depth: summary.bit_depth,
+            seq_profile: summary.seq_profile,
+            seq_level_idx: summary.seq_level_idx,
+            level: avif::level_name(summary.seq_level_idx),
+            cicp: [summary.cicp.0, summary.cicp.1, summary.cicp.2],
+            full_range: summary.full_range,
+            codestream_bytes: summary.codestream_bytes,
+        });
+    }
     let loss = outcome.loss;
     report.loss = Some(loss);
     // Report-only statistics of the samples as written — the numeric basis a
@@ -3963,13 +4108,15 @@ fn load_manifest(path: &Path) -> Result<RollManifest> {
 /// `input.export_ir` path — which every frame would overwrite — is nonsensical.
 /// Reject it loudly rather than silently clobbering one IR file N times.
 fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
-    if cfg.output.preset == OutputPreset::UltraHdrV1 {
-        return Err(NcError::Usage(
-            "output.preset = \"ultra-hdr-v1\" is currently supported only by \
-             `nc convert`; roll naming, collision handling, and preset-specific \
-             memory calibration are owned by the later output/presets task"
-                .into(),
-        ));
+    // Every named preset with its own container is `convert`-only until
+    // `output/presets` makes roll naming/manifests container-aware.
+    if required_extensions(cfg.output.preset).is_some() {
+        return Err(NcError::Usage(format!(
+            "output.preset = \"{}\" is currently supported only by `nc convert`; \
+             roll naming and collision handling for non-TIFF containers are owned by \
+             the later output/presets task",
+            cfg.output.preset.name()
+        )));
     }
     if cfg.input.export_ir.is_some() {
         return Err(NcError::Usage(
@@ -6579,6 +6726,75 @@ mod tests {
         validate_convert(&cfg, &args).unwrap();
         let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
         assert!(err.contains("convert"), "{err}");
+    }
+
+    #[test]
+    fn hdr_avif_presets_are_convert_only_and_require_an_avif_suffix() {
+        for (preset, name) in [
+            (OutputPreset::HdrPq, "hdr-pq"),
+            (OutputPreset::HdrHlg, "hdr-hlg"),
+        ] {
+            let cfg = ResolvedConfig {
+                output: OutputParams {
+                    preset,
+                    ..OutputParams::default()
+                },
+                ..ResolvedConfig::default()
+            };
+            // A `.tiff` (or the default) path is rejected; `.avif` in any case passes.
+            let mut args = parse_convert(&["--output-preset", name]);
+            let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+            assert!(err.contains(".avif"), "{name}: {err}");
+            assert!(err.contains(name), "{name}: {err}");
+            args.output = PathBuf::from("out.AVIF");
+            validate_convert(&cfg, &args).unwrap();
+
+            // Roll mode names the preset it is refusing.
+            let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
+            assert!(err.contains("convert"), "{name}: {err}");
+            assert!(err.contains(name), "{name}: {err}");
+
+            // Atomic like every named preset: a legacy depth selector cannot ride
+            // along, by flag presence *or* resolved value.
+            let mut sdr = parse_convert(&["--output-preset", name, "--output-sdr"]);
+            sdr.output = PathBuf::from("out.avif");
+            assert!(
+                validate_convert(&cfg, &sdr).is_err(),
+                "{name} must reject --output-sdr"
+            );
+            let hdr_flag = ResolvedConfig {
+                output: OutputParams {
+                    preset,
+                    hdr: true,
+                    ..OutputParams::default()
+                },
+                ..ResolvedConfig::default()
+            };
+            assert!(
+                validate(&hdr_flag).is_err(),
+                "{name} must reject a non-default output.hdr"
+            );
+
+            // The IR TIFF export resolves u16; the primary is fixed 10-bit AVIF.
+            assert_eq!(cfg.output.depth(), crate::types::OutDepth::U16);
+        }
+
+        // The transfer mapping is the single place the preset becomes a transfer.
+        assert_eq!(
+            hdr::transfer_for(OutputPreset::HdrPq),
+            Some(hdr::HdrTransfer::Pq)
+        );
+        assert_eq!(
+            hdr::transfer_for(OutputPreset::HdrHlg),
+            Some(hdr::HdrTransfer::Hlg)
+        );
+        for other in [
+            OutputPreset::Legacy,
+            OutputPreset::FilmMaster,
+            OutputPreset::UltraHdrV1,
+        ] {
+            assert_eq!(hdr::transfer_for(other), None, "{other:?}");
+        }
     }
 
     #[test]

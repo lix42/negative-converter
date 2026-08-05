@@ -96,7 +96,7 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   consumes the IR plane to mask the opaque holder before the auto rebate search.
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
-  `io/{decode,encode,ultra_hdr}.rs`,
+  `io/{decode,encode,ultra_hdr,avif}.rs`,
   `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,hdr,gain_map,memory}.rs`
   plus `pipeline/colorimetry/` — the **single source of truth for every
   standards-based matrix and luma vector**; see the colorimetry note below
@@ -105,13 +105,14 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   3–5a): it dispatches on the resolved `output.preset` into the frozen `legacy`
   path (`reconstruct → finish_print → color::to_output`) or `film-master`
   (`reconstruct → map_nc_film_rgb_v1 → render_split::film_master`, no colour
-  transform). The explicitly selected, `convert`-only `ultra-hdr-v1` arm is the
-  first CLI-reachable display (5b) consumer: `stages::render_gain_map_source`
-  resolves one shared source, `pipeline::gain_map` feeds the implemented
-  `pipeline::sdr` and `pipeline::hdr` stages, and `io::ultra_hdr` writes legacy
-  XMP/MPF metadata (`Dialects::LegacyUltraHdrV1`, the shipped preset, makes no ISO
-  claim; `LegacyPlusIso` adds ISO 21496-1 segments and has no CLI caller yet).
-  SDR returns opaque rendered-linear Display P3/sRGB
+  transform). The explicitly selected, `convert`-only display presets are the
+  CLI-reachable display (5b) consumers, all sharing one
+  `stages::render_display_source`: `ultra-hdr-v1` feeds `pipeline::gain_map` over
+  the implemented `pipeline::sdr` and `pipeline::hdr` stages, and `io::ultra_hdr`
+  writes legacy XMP/MPF metadata (`Dialects::LegacyUltraHdrV1`, the shipped preset,
+  makes no ISO claim; `LegacyPlusIso` adds ISO 21496-1 segments and has no CLI
+  caller yet); `hdr-pq` / `hdr-hlg` take a single `pipeline::hdr` rendition into
+  `io::avif` — see the AVIF note below. SDR returns opaque rendered-linear Display P3/sRGB
   pixels coupled to resolved 203-nit tone/gamut metadata;
   `color::encode_rendered_sdr` derives the matching transfer/profile without a
   second gamut transform. HDR returns either opaque display-linear BT.2020
@@ -119,17 +120,22 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   ratio math) or opaque in-place Rec.2100 PQ/HLG pixels coupled to the fixed
   203-nit reference-white / 1000-nit peak, shoulder, gamut, HLG OOTF, and CICP
   contract. `output/presets` still owns the remaining presets, roll integration,
-  and future default activation;
+  and future default activation — the boundary is recorded in
+  `docs/tasks/output/hdr-avif-output.md`: whichever task ships an explicit
+  `convert`-only preset also calibrates that preset's `memory::RunProfile`. One
+  `cli::required_extensions` table drives *both* the output-suffix rule and the
+  convert-only refusal, so extend that table rather than adding a parallel check —
+  otherwise a new container gets one rule and silently misses the other;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
   ACEScg mapper; `render_split` is the named-output split out of that boundary —
   `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
   controls `WB → exposure → black point → linear_range`, resolved once and
-  *borrowed* by both display branches. The `film-master` half and explicit
-  `ultra-hdr-v1` consumer are wired; a non-default `print.linear_range` is
-  accepted only by that display preset (legacy ignores it and film-master
-  rejects it);
+  *borrowed* by both display branches. The `film-master` half and the explicit
+  `ultra-hdr-v1` / `hdr-pq` / `hdr-hlg` consumers are wired; a non-default
+  `print.linear_range` is accepted only by those display presets (legacy ignores it
+  and film-master rejects it);
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
@@ -188,6 +194,61 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
     shipped entries sit exactly one ulp off the canonical derivation for reasons
     unrecoverable from the repo. For scale, the chromaticities are specified to
     three decimals, so their own ±5e-4 rounding moves entries ~3,500 ulps.
+  - **Not every artifact is a linear-light transform.**
+    `BT2020_NCL_RGB_TO_YCBCR` (AVIF `matrix_coefficients = 9`) multiplies
+    *transfer-encoded* PQ/HLG code values — that is what "non-constant luminance"
+    means — so the usual "this is a colour transform" intuition does not carry. It
+    is derived from the **tabulated** `BT2020_LUMA`, not from the BT.2020
+    primaries, and that is load-bearing: decoders invert the rounded tabulated
+    form, so deriving from primaries would put nc's forward transform ~2e-6 from
+    every decoder's inverse. A test pins row 0 as the *same literal* as
+    `BT2020_LUMA` so the two cannot desynchronize.
+- **nc writes the AVIF container itself; libaom only makes the codestream.**
+  `io/avif.rs` is the `hdr-pq`/`hdr-hlg` encoder. There is **no libavif
+  dependency** — no published crate ships libavif ≥ 1.4.2 (`libavif-sys` is
+  1.0.4, predating `MA1A`), and `avif-serialize` 0.8.9 hardcodes
+  `compatible_brands: [mif1, miaf]` with no setter, so it cannot emit the brands
+  the AVIF v1.2 Advanced Profile needs. AV1 comes from the published
+  `libaom-sys` crate, which vendors libaom and links it statically with **no
+  network and no in-repo snapshot** (so `scripts/check-vendored-native.py` still
+  covers only libultrahdr/libjpeg-turbo). The decoder half is a
+  **dev-dependency** — verified: `aom_codec_av1_dx` is absent from the release
+  binary. Four things that will bite:
+  - **`av1C` must be parsed back out of the codestream, never read from the
+    encoder config.** `AV1E_GET_SEQ_LEVEL_IDX` reports the *target* level and
+    returns **31** ("maximum parameters", not a level — real on a 74.6 MP scan),
+    which would have written a bogus level. `parse_sequence_header` +
+    `verify_codestream` read the truth back and refuse to package a file whose
+    signalling disagrees with the render. Format a level with `level_name`, which
+    renders 31 and the 24..=30 reserved range as names rather than "9.3".
+  - **libaom's packet list is per `aom_codec_encode` call.** Draining
+    `aom_codec_get_cx_data` only after the flush silently yields a **0-byte
+    codestream**, because all-intra emits the frame during the first call
+    (`lag_in_frames` is 0). Drain after every call.
+  - **`MA1A` is gated on the *published* limits, checked against the produced
+    file:** High Profile, `seq_level_idx <= 16` (level 6.0 — 17/18/19 are 6.1–6.3
+    and are *over*), ≤ 35,651,584 px, ≤ 16384 wide, ≤ 8704 high. Outside them the
+    file is a valid general-brand AVIF and the report/warning says which limit it
+    exceeded. **No grid path exists** — the spec permits either, and nc chose
+    general-brand-only.
+  - **`clli` is measured, and the per-axis encoder limit is 65,536.** MaxCLL /
+    MaxFALL carry CTA-861.3 *content* semantics, so `pipeline::hdr::render_linear`
+    measures them off the display-linear pixels it still holds (`dot(rgb,
+    BT2020_LUMA) · 203`) and rides them to `io::avif` in
+    `HdrRenderMetadata::content_light`; deriving them from the 1000/203 policy
+    constants made every frame — including a nearly black one — claim a 1000-nit
+    peak that displays then tone-map from. HLG still omits the box (display-referred).
+    Separately, the dimension gate is the **encoder's** `RANGE_CHECK` bound of
+    65,536 (`av1_cx_iface.c:646-647`, a format limit: `frame_width_bits` is `f(4)`),
+    **not** `aom_img_alloc`'s documented `2^27` — that one bounds the *allocator*,
+    and using it let a whole quantization pass run before libaom refused the frame.
+  - **Encoder settings are pinned parts of the preset, not knobs** (the
+    `ultra_hdr::JPEG_QUALITY` precedent): quality, speed, one thread, no tiling,
+    so repeated encodes on one build are byte-identical. `cq_level` is calibrated
+    in a documented table — note `cq_level = 0` is *mathematically* lossless.
+    Codec bounds are pinned by **equality**, not a tolerance, because AV1
+    reconstruction is normative and bit-exact: libaom and dav1d agree exactly, which
+    is what lets a CI-runnable in-repo decode stand in for `avifdec`.
 - **Peak memory is gated before decode, and `pipeline/memory.rs` owns the model.**
   Every command that decodes runs `memory::preflight` on a metadata-only
   `io::decode::probe` (never `read_image` — `decode` only returns dimensions after
@@ -221,8 +282,15 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   the gate silently under-approves until someone does. `decode` is
   `decode_within(&Path, budget_bytes)`. `RunProfile::Convert` models the TIFF
   paths; `RunProfile::UltraHdrV1` separately counts shared-source, dual-render,
-  gain-map, JPEG, native-copy, and package staging. Future presets must add and
-  calibrate their own profile before activation.
+  gain-map, JPEG, native-copy, and package staging; `RunProfile::HdrAvif` counts one
+  rendition plus a single lumped `AVIF_STAGING_BYTES_PER_PX` for everything libaom
+  allocates. Future presets must add and calibrate their own profile before
+  activation. **Calibrate by solving across two frame sizes, not one** — the AVIF
+  constant came from an 18.66 MP and a 74.65 MP scan, which separated the 78.47 B/px
+  slope from a ~7.9 MB fixed cost. And leave `accounted` slightly *under* measured:
+  the 15% allowance exists to cover allocator overhead, so padding the enumerated
+  buffers too double-counts it (a first pass at 64 B/px put the estimate 1.43x over
+  measured, rejecting runs the machine could serve).
 
 ### Stack / commands
 
