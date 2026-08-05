@@ -278,7 +278,19 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   a base/branch comparison (`--scope branch --base <ref>`) against the branch's
   fork point. Don't lean on the *default* base compare when the worktree's base
   lags `origin/main`: it shows confusing reverse-diffs of already-merged work —
-  pass the intended base explicitly. The command wraps
+  pass the intended base explicitly. **Neither scope covers both halves, and the
+  default silently picks one** (verified in the companion's `scripts/lib/git.mjs`):
+  `working-tree` sends staged + unstaged diffs plus untracked file contents —
+  but **inlines an untracked file only if it is text under 24 KiB**
+  (`MAX_UNTRACKED_BYTES`), else it sends just a `(skipped: …)` marker, so a big
+  new module is silently reviewed as a filename; `git add -N <path>` first
+  routes it through the size-unlimited unstaged diff. It sends
+  no commits; `branch` sends a two-dot `merge-base..HEAD` range, so it sees
+  commits but neither the working tree nor untracked files; and `--scope auto`
+  (the default) takes working-tree whenever the tree is dirty **at all**,
+  otherwise branch. With committed *and* uncommitted work, one `auto` run
+  reviews the dirty tree and never looks at the commits — run both scopes. The
+  command wraps
   `node "<codex-plugin>/scripts/codex-companion.mjs" review --wait --scope
   working-tree` (`--wait` = foreground/verbatim, `--background` = detach; the
   plugin path is under `~/.claude/plugins/cache/openai-codex/...`). It is
@@ -296,6 +308,15 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   symlinks into it for Claude Code. Exception: `review-fix-loop` ships as two
   intentionally divergent variants — `.claude/skills/` (Claude Code two-engine
   loop) and `.agents/skills/` (tool-agnostic) — never symlink one to the other.
+- **Agent layout is deliberately *not* mirrored.** Subagent definitions live in
+  `.claude/agents/` only — `nc-reviewer` (the review engine) and `nc-fixer` (the
+  single actor allowed to edit during a review loop), both driven by the
+  `review-fix-loop` skill. There is no `.agents/` counterpart and no symlink:
+  Codex CLI doesn't read `.claude/agents/`, and that is the point — Codex is the
+  loop's *other* engine, so it must not inherit `nc-reviewer`'s project primer.
+  Each agent carries a summary of the rules below and is told **this file wins on
+  conflict**, so update CLAUDE.md first and treat an agent's primer as a lossy
+  cache, not a second source of truth.
 - **Value terms (high/low/bright/dark).** Before using these in code or docs, read
   design-spec §4 "Terminology & value domains". A pixel lives in several
   **per-channel** spaces; as scene luminance rises, `transmission ↓ · density ↑ ·

@@ -1,89 +1,126 @@
 ---
 name: review-fix-loop
 description: >-
-  Run the two-engine review → fix → converge loop on a feature worktree's
-  uncommitted changes. Use when a worktree's implementation is done and needs
-  review before a PR: run two independent reviewers (Codex + an in-session
-  review), aggregate and verify their findings, route the real ones to a single
-  fix agent, and re-run until clean — leaving everything uncommitted for the
-  user's manual review. Invoke as `/review-fix-loop <worktree-path-or-task>`.
+  Run the two-engine review → fix → converge loop on the current checkout's
+  changes (defaults to the current directory; a worktree path or task name is
+  optional). Use when an implementation is done and needs review before a PR:
+  scope the change against the merge-base with origin/main, run two independent
+  reviewers (Codex + the dedicated nc-reviewer agent), aggregate and verify their
+  findings, route the real ones to the nc-fixer agent, and re-run until clean —
+  adding no commits, so the user does the final manual review. Invoke as
+  `/review-fix-loop` or `/review-fix-loop <worktree-path-or-task>`.
 ---
 
 # Review / fix loop
 
-Our house process for hardening a feature worktree before it ships. Two
-**independent** review engines run in parallel over the same uncommitted diff,
-their findings are consolidated and **verified against the code** (not trusted
-blind), genuine issues go to **one** fix agent, and the loop repeats until the
-review is clean or LOW-only. Nothing is committed — the user does the final
-manual review and merge.
+Our house process for hardening a change before it ships. Two **independent**
+review engines run in parallel over the same diff, their findings are
+consolidated and **verified against the code** (not trusted blind), genuine
+issues go to **one** fix agent, and the loop repeats until the review is clean
+or LOW-only. The loop adds no commits — the user does the final manual review
+and merge.
 
-This is the Claude Code variant, built on the Codex plugin plus an **in-session
-review you perform yourself**. A tool-agnostic variant lives at
-`.agents/skills/review-fix-loop/` and intentionally diverges — do not symlink
-them together.
+This is the Claude Code variant, built on the Codex plugin plus the dedicated
+**`nc-reviewer` agent** (`.claude/agents/nc-reviewer.md`), with fixes applied by
+the **`nc-fixer` agent** (`.claude/agents/nc-fixer.md`). A tool-agnostic variant
+lives at `.agents/skills/review-fix-loop/` and intentionally diverges — do not
+symlink them together.
 
 **Why two engines.** A different model reviewing the same diff catches a
-different class of bug. In practice Codex has caught issues the in-session
-review missed (a `+inf` non-finite laundering, a JSONL atomic-append race, a
-case-only path collision), and in-session builds have disproved a Codex
+different class of bug. In practice Codex has caught issues the second engine
+missed (a `+inf` non-finite laundering, a JSONL atomic-append race, a
+case-only path collision), and local builds have disproved a Codex
 false-positive P0. Running both, and verifying before acting, is the point — do
 not drop one. The engines are also asymmetric in a useful way: Codex sees the
-diff cold with no conversation history, while the in-session review has the
-session's context — so it knows *why* the code is shaped the way it is, and is
-correspondingly better at spotting a change that contradicts an intent it has
-seen and worse at noticing an assumption it has already absorbed. That is the
-blind spot Codex covers. "A reviewer that has the session context" is the
-second engine's whole job description, and you are one.
+diff cold with no repo priors, while `nc-reviewer` is primed with this
+project's conventions, gotchas, and doc map — plus the Step 1 framing you hand
+it — so it is better at catching convention violations (four-coupled-spots
+misses, determinism-breaking tests) and docs the change made stale, and worse
+at questioning an assumption the project itself has baked in. That is the
+blind spot Codex covers.
 
 ## Inputs
 
-- **Which worktree.** A checkout path (a sibling like `../<name>`, or an agent
-  worktree under `.claude/worktrees/agent-…`) or a task name to resolve to one.
-  Get the real checkout path from `git worktree list` — not `.git/worktrees/<name>`,
-  which is Git's internal metadata dir, not the working tree — then grep the
-  diff/task docs to identify it.
-- Confirm before reviewing: the worktree is **rebased onto current
-  `origin/main`**, its **CI gates are green**, and the changes are
-  **uncommitted** (`git status` = modified/untracked, no commits ahead). If the
-  base lags, rebase first (commit-WIP method — see CLAUDE.md / progress notes).
+- **Which checkout — defaults to the current directory.** With no argument,
+  review right here: the current project, worktree, or folder, whatever `cwd`
+  is in. No worktree is required.
+- **An optional argument** narrows it: a checkout path (a sibling like
+  `../<name>`, or an agent worktree under `.claude/worktrees/agent-…`) or a task
+  name to resolve to one. For a worktree name, get the real checkout path from
+  `git worktree list` — not `.git/worktrees/<name>`, which is Git's internal
+  metadata dir, not the working tree — then grep the diff/task docs to identify
+  it.
+- **Nothing else is a precondition.** Green CI and a fresh rebase are *nice*,
+  not required — the whole point of this loop is to run before things are tidy.
+  Note in the final report if the base lags `origin/main` badly or the gates were
+  red going in; the fix agent runs them at the end regardless.
 
 ## Step 1 — Scope and frame the change
 
-From inside the worktree:
+Everything runs from **inside the target checkout**. Scope is *this branch's
+work*: whatever has diverged from the shared history, committed or not.
 
 ```
-git status --short            # AUTHORITATIVE change list — includes untracked (??) files
-git diff --stat HEAD          # sizes for tracked (modified) changes
+git fetch origin main                      # optional but preferred: freshens the base ref
+base=$(git merge-base HEAD origin/main)    # the common ancestor to compare from
+git log --oneline "$base"..HEAD            # local commits (often none)
+git diff --stat "$base"                    # commits + staged + unstaged, tracked files
+git status --short --untracked-files=all   # staged/unstaged/UNTRACKED — the authoritative list
+git ls-files --others --exclude-standard   # untracked paths alone, script-friendly
 ```
 
-**`git diff HEAD` omits untracked files** — a brand-new module or test file (the
-whole point of a feature) shows only as `??` in `git status`, never in the diff.
-Scope from `git status --short`, and enumerate every untracked file so a new file
-can't slip through unreviewed. (If you prefer diff-based framing, `git add -N .`
-makes new files appear in `git diff HEAD` as intent-to-add — no commit — but then
-`git reset` afterward to leave the tree exactly as found.)
+Two facts that decide the whole scope, both verified:
 
-Read the worktree's `CLAUDE.md` (conventions differ per branch after rebases).
-Write a 2–3 sentence framing of *what the change does* — you will paste it into
-every reviewer prompt so they share context. Note new files/modules, new types,
-new CLI knobs (four-coupled-spots), new error paths, and which docs changed.
+- **`git diff "$base"` (no `..`) compares the merge-base to the *working tree*** —
+  so one command covers local commits, staged, and unstaged changes together.
+  `git diff "$base"..HEAD` would silently drop everything uncommitted; don't use
+  the two-dot form here.
+- **No diff form includes untracked files.** A brand-new module or test file —
+  usually the whole point of the change — appears only as `??` in `git status`.
+  Enumerate every untracked path explicitly so a new file can't slip through
+  unreviewed, and **save that list** — Step 2 may stage some of them for Codex,
+  which removes them from the `??` list.
+
+**If you use `git add -N`, use it safely.** Intent-to-add pulls a new file into
+`git diff` without committing, which Step 2 needs for large untracked files. Two
+rules, both verified:
+
+- **Undo it path-scoped: `git reset -- <path>`, never a bare `git reset`.** A
+  bare reset also unstages files *the user* had staged, and in this repo staging
+  is the user's review queue (see `~/.claude/CLAUDE.md`) — destroying it is a
+  real cost, not a cosmetic one.
+- **Do it before launching either engine**, never between them, so both review
+  the same tree. It moves a file from `??` to ` A` in `git status`, and *into*
+  `git diff "$base"` — coverage shifts channels rather than disappearing, but
+  only if both engines start after the change.
+
+**Base-ref fallbacks.** If `origin/main` doesn't exist, try `origin/HEAD`, then
+local `main`/`master`, then — if the repo has no shared base at all — fall back
+to `HEAD` and review only the uncommitted changes, saying so in the report. If
+`git fetch` fails (offline, no remote), use the stale `origin/main` and note it:
+a stale base can widen the diff with already-merged work, which reads as
+confusing reverse-diffs.
+
+Then read the checkout's `CLAUDE.md` (conventions differ per branch after
+rebases) and write a 2–3 sentence framing of *what the change does* — you will
+paste it into every reviewer prompt so they share context. Note the resolved
+base SHA, whether there are local commits, new files/modules, new types, new CLI
+knobs (four-coupled-spots), new error paths, and which docs changed.
 
 ## Step 2 — Run both engines (review-only)
 
-Start Codex **first** as a background job, then do the in-session review
-yourself while it works — that keeps the two overlapping instead of serialized.
+Start Codex as a background job and spawn `nc-reviewer` in the same breath —
+both run in the background, so the two overlap instead of serializing.
 
-**Codex** (independent engine) — run from *inside* the worktree so it reviews the
-right git state. The portable way is the plugin **command** `/codex:review`,
-which resolves its own plugin path; pass `--scope working-tree` to diff the
-uncommitted changes vs `HEAD`. To run it as a captured background job, invoke the
-companion script the command wraps — but **discover** the path, never hard-code
-the version (the cache dir is `~/.claude/plugins/cache/openai-codex/codex/<ver>/`
-and the plugin auto-updates):
+**Codex** (independent engine) — run from *inside* the target checkout so it
+reviews the right git state. The portable way is the plugin **command**
+`/codex:review`, which resolves its own plugin path. To run it as a captured
+background job, invoke the companion script the command wraps — but **discover**
+the path, never hard-code the version (the cache dir is
+`~/.claude/plugins/cache/openai-codex/codex/<ver>/` and the plugin auto-updates):
 
 ```
-# Resolve the newest installed companion script, then review the worktree.
+# Resolve the newest installed companion script, then review this checkout.
 # `command ls` bypasses any `ls` alias (eza/lsd/uutils read `-t` as "--time
 # <FIELD>" and error) while still invoking the real `ls`, which handles `-1t`.
 # `-t` (sort by mtime, newest first) + `head -1` picks the most-recently-installed
@@ -93,15 +130,66 @@ codex_mjs=$(command ls -1t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/
 node "$codex_mjs" review --wait --scope working-tree
 ```
 
-Launch it with `run_in_background: true` (the `--wait` keeps it foreground
+**Codex's scopes each cover only half of Step 1's span — pick deliberately, and
+never rely on the default.** Verified against the companion's
+`scripts/lib/git.mjs`:
+
+| Codex invocation | What it actually sends | Covers |
+|---|---|---|
+| `--scope working-tree` | staged diff + unstaged diff + untracked file contents, **each untracked file inlined only if under 24 KiB and text** | uncommitted only — **not** local commits |
+| `--scope branch --base "$base"` | `merge-base..HEAD` commit range (log + diff) | commits only — **not** the working tree, **not** untracked files |
+| `--scope auto` (the default) | working-tree **if the tree is dirty at all**, else branch | whichever one it picked; silently drops the other |
+
+**The untracked-file limit is a real coverage hole, and it fails quietly.**
+`formatUntrackedFile` replaces the body with a `(skipped: …)` marker for any
+untracked path that is a directory, binary, unreadable, or larger than
+`MAX_UNTRACKED_BYTES` (24 KiB) — so Codex receives the *filename* of a big new
+module and reviews nothing, while the report still looks complete. A ~600-line
+Rust file clears 24 KiB easily. Before launching **either** engine, check the size
+of every untracked path from Step 1; for any that would be skipped,
+`git add -N <path>` so the content reaches Codex through the unstaged diff (which
+has no size limit), then `git reset -- <path>` when the loop is done — follow the
+intent-to-add rules in Step 1, and tell `nc-reviewer` which paths you staged so it
+doesn't read an emptied `??` list as "no new files". If you skip the workaround,
+say in Step 6 that only `nc-reviewer` read that file — a one-engine file is not
+the two-engine guarantee this loop advertises.
+
+So match the invocation to what Step 1 found:
+
+- **Uncommitted only** (the common case) → one run, `--scope working-tree`.
+- **Local commits only, clean tree** → one run, `--scope branch --base "$base"`
+  (pass the base explicitly; `--base` overrides `--scope` and skips Codex's own
+  default-branch detection).
+- **Both** → **two runs**, one of each. A single `auto` run would review the
+  dirty working tree and never look at the commits. Aggregate both reports in
+  Step 3.
+
+Launch each with `run_in_background: true` (the `--wait` keeps it foreground
 *inside* that background shell so the output is captured verbatim). If you need
 custom framing/focus, use the **`/codex:adversarial-review`** command instead
-(the plain `/codex:review` takes no focus text). Gotcha: if the review 400s on
-the reviewer model, the Codex CLI is too old / its default model needs a switch
-(see CLAUDE.md "Codex review on a worktree").
+(the plain `/codex:review` takes no focus text and errors if given any). Gotcha:
+if the review 400s on the reviewer model, the Codex CLI is too old / its default
+model needs a switch (see CLAUDE.md "Codex review on a worktree").
 
-**In-session review** (second engine) — **you** review the working diff, with
-this session's context. Nothing to install and nothing to invoke.
+**`nc-reviewer`** (second engine) — the project's dedicated review agent
+(`.claude/agents/nc-reviewer.md`). Spawn it **named** via the Agent tool
+(`subagent_type: nc-reviewer`; background is the default) so later rounds can
+resume it with `SendMessage`. Its definition already carries the project
+primer, the doc map, and the review protocol (untracked-file coverage,
+severity + file:line, leads vs findings, the doc-staleness pass) — your prompt
+supplies only what the session knows:
+
+- the target checkout's **absolute path** (it runs `git` from inside it);
+- the **resolved base SHA** from Step 1 and whether local commits exist — so it
+  scopes to `git diff "$base"` plus untracked, not `git diff HEAD`;
+- the Step 1 framing, verbatim;
+- the task id / docs the change claims to implement, if any;
+- the standing rule below (review-only, whole change span, no PR).
+
+Its report includes a doc-staleness section — docs this diff made stale, plus
+pre-existing stale content it noticed along the way. Diff-caused staleness is
+an ordinary finding; treat the pre-existing items as report material for the
+user, not work for the fix agent (unless the user asked for a docs cleanup).
 
 **Do not try to call `/code-review`.** It is marked
 `disable-model-invocation`: an agent cannot run it through the Skill tool and
@@ -111,18 +199,6 @@ built-in specifically, they type `/code-review` themselves and paste (or leave
 in-session) its findings for Step 3 to aggregate — treat that as a bonus third
 input, not a prerequisite. The loop must run without it.
 
-Doing the review yourself, hold to the same bar a dedicated reviewer would:
-
-- **Cover the untracked files.** Like `git diff HEAD`, a working-diff review
-  drifts toward the modified files — and on a feature branch the new module *is*
-  the change. Walk every `??` path from Step 1 explicitly.
-- **Read the worktree's `CLAUDE.md` first**, and review against the Step 1
-  framing. Go slower and deeper on a dense or safety-critical diff.
-- **Report by severity with file:line**, and mark anything you could not settle
-  as a *lead*, not a finding. A lead goes to Step 3 for verification and never
-  straight to the fix agent. (User-supplied `/code-review` output uses
-  `CONFIRMED` / `PLAUSIBLE` for the same distinction — `PLAUSIBLE` is a lead.)
-
 **Optional built-in adjacents** — these *are* agent-invocable. Use one only when
 the diff clearly warrants it, and still review-only:
 
@@ -131,18 +207,20 @@ the diff clearly warrants it, and still review-only:
 | `/security-review` | the change touches input parsing, file writes, or anything attacker-reachable |
 | `/simplify` | optional final polish, *after* the loop is otherwise clean — it does quality only and explicitly does not hunt bugs, so it never substitutes for the review pass |
 
-**Standing rule for every reviewer**, whichever engine: scope is **all
-uncommitted changes, no GitHub PR** — `git diff HEAD` *plus* the untracked files
+**Standing rule for every reviewer**, whichever engine: scope is **this branch's
+whole divergence, no GitHub PR** — `git diff "$base"` (merge-base vs working
+tree, which covers local commits + staged + unstaged) *plus* every untracked file
 from `git status --short`; findings reported **by severity with file:line**; and
 **do NOT modify any files — review only.** Only the fix agent edits.
 
 ## Step 3 — Aggregate and VERIFY
 
-When both engines have reported — your in-session review written up, Codex's
-background job collected — consolidate into one severity-ranked list (Critical /
+When both engines have reported — the `nc-reviewer` agent's report and Codex's
+background job(s) collected — consolidate into one severity-ranked list (Critical /
 High / Important / Medium / Low), deduping overlaps. Note where the two engines
 agree: independent convergence on the same line is the strongest signal
-available here.
+available here. If you ran two Codex scopes, they are still *one* engine — an
+overlap between them is not cross-engine corroboration.
 
 **Verify each non-trivial finding against the actual code before acting.**
 Reviewers produce false positives (a Codex "won't compile" P0 was wrong — a
@@ -150,27 +228,26 @@ Reviewers produce false positives (a Codex "won't compile" P0 was wrong — a
 wrong, reject it and say why — do not forward it to the fix agent. Confirm real
 ones with a concrete failure scenario (inputs → wrong output).
 
-This step is not optional for your own findings either — self-verification comes
-from the same engine that raised them, and the same goes for a `CONFIRMED`
-verdict in user-supplied `/code-review` output. Cross-engine verification is
-what this step buys.
+Neither engine's own confidence substitutes for this step — an `nc-reviewer`
+finding, a Codex finding, and a `CONFIRMED` verdict in user-supplied
+`/code-review` output all get the same treatment (a `/code-review` `PLAUSIBLE`
+maps to a *lead*). Independent verification against the code is what this step
+buys. Verify doc-staleness findings the same way — read the doc and the code it
+describes; only diff-caused staleness goes to the fix agent.
 
-## Step 4 — Route real findings to ONE fix agent
+## Step 4 — Route real findings to the ONE fix agent
 
-Spawn (or `SendMessage`-resume) a single named fix agent — never have the
-reviewers fix their own findings. Hand it a precise, itemized set and these
-standing constraints:
+Spawn (or `SendMessage`-resume) a single named **`nc-fixer`** agent
+(`.claude/agents/nc-fixer.md`, `subagent_type: nc-fixer`) — never have the
+reviewers fix their own findings. Its definition already carries the standing
+constraints (add no commits, all four CI gates green in order,
+four-coupled-spots, design-spec is the sole design source, per-item report with
+verbatim gate results). Your prompt supplies:
 
-- Keep everything **uncommitted** (the user reviews before any commit/PR).
-- Finish with **all four CI gates green**, in order:
-  `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
-  `cargo build` → `cargo test`.
-- `docs/design-spec.md` is the **sole maintained design source** — edit it there.
-  The rendered HTML companion is retired and may be regenerated after the feature
-  roadmap stabilizes; do not recreate or hand-edit it.
-- Respect four-coupled-spots for any knob (CLI field + `*Params` + merge arm +
-  validate + a merge test).
-- Report back with a per-item summary and the **verbatim** final gate results.
+- the target checkout's **absolute path**;
+- the precise, itemized set of verified findings (`file:line`, the claim, the
+  failure scenario) — verified findings only, never raw leads;
+- any diff-caused doc-staleness items that belong in this round.
 
 ## Step 5 — Converge
 
@@ -183,22 +260,31 @@ standing constraints:
 
 ## Step 6 — Report
 
-Give the user: the consolidated aggregate (with any false-positives you rejected
-and why), what the fix agent changed, and the final gate results. State plainly
-that the worktree remains **uncommitted, awaiting their manual review** before PR
-/ merge. Do not open a PR or merge here — that's `/ship` and the user's call.
+Give the user: the review scope you settled on (base SHA, and whether it spanned
+local commits, staged/unstaged, untracked — plus which Codex scope(s) ran), the
+consolidated aggregate (with any false-positives you rejected and why), what the
+fix agent changed, and the final gate results. State plainly that the loop added
+**no commits** and the fixes sit in the working tree **awaiting their manual
+review** before PR / merge. Do not open a PR or merge here — that's `/ship` and
+the user's call.
 
 ## Invariants (do not break)
 
-- Reviewers **never** modify files; only the fix agent does. That includes the
-  in-session pass: review, write up, hand off — **do not fix as you read.** Fixes
-  go through the single fix agent in Step 4, so one actor owns the tree and the
-  gate run.
+- Reviewers **never** modify files; only `nc-fixer` does. That includes you,
+  the orchestrator: aggregate, verify, hand off — **do not fix as you read.**
+  Fixes go through the single fix agent in Step 4, so one actor owns the tree
+  and the gate run.
 - **Verify before forwarding** — a rejected false-positive is a good outcome.
-- Everything stays **uncommitted**; the user does the final review and merge.
-- Two engines, always — Codex *and* the in-session review — because they miss
-  different things, and because one of them has this session's context and the
-  other deliberately does not.
-- Name every agent you spawn so later rounds resume it with context
-  (`SendMessage` by name). The in-session review has no name to resume; redoing
-  it re-reviews the current tree, which is what a later round wants anyway.
+- **The loop adds no commits and pushes nothing.** Pre-existing local commits are
+  fine — they're part of the review scope — but every fix lands as a working-tree
+  change on top of them, and the user does the final review and merge.
+- **Scope from the merge-base, never from `HEAD` alone**, or work already
+  committed on the branch goes unreviewed — and never from a two-dot
+  `"$base"..HEAD` diff, or the uncommitted work does.
+- Two engines, always — Codex *and* `nc-reviewer` — because they miss different
+  things: one is primed with this project's conventions and doc map, the other
+  deliberately sees the diff cold with no repo priors.
+- Name every agent you spawn — the `nc-reviewer` and the `nc-fixer` — so later
+  rounds resume them with context (`SendMessage` by name). A resumed
+  `nc-reviewer` re-reviews the *current* tree with its earlier findings in
+  context, which is exactly what a Step 5 targeted re-review wants.
