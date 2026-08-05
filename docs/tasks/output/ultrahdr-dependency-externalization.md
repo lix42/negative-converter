@@ -8,10 +8,17 @@
 
 ## Goal
 
-Delete `vendor/ultrahdr-sys` and end nc's C/C++ dependency. nc writes the
-Ultra HDR v1 XMP and CIPA Multi-Picture Format container itself, in Rust, so
-`cargo build` and `cargo test` both need no CMake, clang, nasm, libjpeg, or
-network fetch.
+Delete `vendor/ultrahdr-sys` and end nc's **Ultra HDR** native dependency. nc
+writes the Ultra HDR v1 XMP and CIPA Multi-Picture Format container itself, in
+Rust, so `cargo build` and `cargo test` need no CMake, nasm, libjpeg, or network
+fetch.
+
+**This does not make nc toolchain-free, and must not be read that way.**
+`lcms2` / `lcms2-sys` stay in `Cargo.toml` for colour management, so a C FFI and
+a working C compiler remain part of the build after this task — that constraint is
+`core/release-readiness`'s supported-platforms problem, not this one's. Scope here
+is exactly the libultrahdr + libjpeg-turbo snapshot and the CMake/nasm/network
+prerequisites it alone drags in.
 
 This is deferred maintenance and blocks no output task. Until it lands, the
 reviewed local snapshot remains the supported implementation.
@@ -61,12 +68,20 @@ assembly:
   is present only for libultrahdr's internal use, so it leaves with it.
 - **Write the legacy XMP ourselves** — the `hdrgm` gain-map packet and the
   GContainer directory, whose exact strings existing tests already assert.
-- **Write MPF ourselves.** `io::ultra_hdr` already parses and patches the MP Index
-  IFD; emitting it is the same structure, and doing so retires
-  `insert_baseline_iso_segment` — with assembly under our control, both ISO
-  segments are placed directly instead of spliced in afterwards.
-- **Keep the ISO serializers unchanged.** `pipeline::gain_map::iso` owns
-  C.2.2/C.4.6 and is already independent of the container.
+- **Write MPF ourselves — and budget for it.** There is **no MPF parser or emitter
+  in the tree today**: `io::ultra_hdr` hands both JPEGs to libultrahdr, and the
+  repo's other MPF mentions are marker/string checks. A *reader* (parse the MP
+  Index IFD, patch the first image's size) arrives with the prerequisite task
+  `output/iso-gain-map-metadata` as `insert_baseline_iso_segment`; this task must
+  still write the **emitter**, which that reader does not provide. Do not scope
+  this as "the same structure, already parsed" — that reading underestimates the
+  work, and removing the native library before the emitter validates offsets and
+  lengths would ship a broken container. Once the emitter exists,
+  `insert_baseline_iso_segment` is retired: with assembly under our control both
+  ISO segments are placed directly instead of spliced in afterwards.
+- **Keep the ISO serializers unchanged.** `pipeline::gain_map::iso` (also from
+  `output/iso-gain-map-metadata`) owns C.2.2/C.4.6 and is independent of the
+  container.
 
 **Segment order becomes ours to state rather than inherit.** Today the shipped
 file's ordering depends on libultrahdr's APP0-extraction fix; assembling the
@@ -113,7 +128,12 @@ upstream (two `DOWNLOAD_COMMAND ""` lines plus a bundled tree) if someone wants
 to try, but merge and release cadence would not be ours.
 
 Do not adopt an unpinned branch, a tag-only Git dependency, a runtime system
-library, or a build-time source download.
+library, or an **unpinned** build-time source download. The pinning is the point,
+not the bundling: a fetch of an immutable revision (a full SHA, or a
+content-hash-verified archive) is acceptable and is exactly the "fetched at a
+pinned SHA" case above. A fetch of a mutable ref — branch or tag, including
+libultrahdr's current `GIT_TAG 3.1.0` — is not, because a retag silently changes
+the JPEG encoder and therefore output bytes.
 
 ## How to Verify
 
