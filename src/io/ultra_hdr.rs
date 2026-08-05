@@ -1,8 +1,15 @@
-//! Legacy Ultra HDR v1 JPEG packaging.
+//! Gain-map JPEG packaging.
 //!
 //! nc renders and compresses both JPEG images itself, then uses one small
 //! libultrahdr API-4 boundary to attach the legacy XMP/MPF metadata. The native
-//! library is pinned in `vendor/ultrahdr-sys`; ISO writing is deliberately off.
+//! library is pinned in `vendor/ultrahdr-sys`.
+//!
+//! **libultrahdr's own ISO writing stays off, deliberately and permanently:** it
+//! emits a common-denominator compact layout the normative structure has no flag
+//! for (see `pipeline::gain_map::iso`). ISO segments here are serialized by nc
+//! and attached by this module — the gain map's before packaging, the baseline's
+//! after, because libultrahdr rewrites the baseline's segments and appends the
+//! gain-map image verbatim.
 
 use std::ffi::{CStr, c_void};
 use std::path::Path;
@@ -12,16 +19,58 @@ use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use ultrahdr_sys as uhdr;
 
 use crate::io::staged::{self, Staged};
+use crate::pipeline::gain_map::iso;
 use crate::pipeline::{color, gain_map};
 use crate::types::{EncodeOutcome, EncodeReport, NcError, OutputStats, Result};
 
 const JPEG_QUALITY: u8 = 95;
 
+/// Which metadata dialects the packaged JPEG carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialects {
+    /// Only the public Android/Adobe XMP + MPF form. Makes no ISO claim, and
+    /// writes no ISO or draft-ISO marker.
+    LegacyUltraHdrV1,
+    /// The same legacy metadata plus ISO 21496-1 segments in both images,
+    /// describing the one shared gain map.
+    // No CLI caller yet by design: `output/presets` owns the neutral
+    // `gain-map-hdr` name and its default activation, and the shipped
+    // `ultra-hdr-v1` preset is contractually ISO-free (a test asserts its bytes
+    // contain no "21496"). Inventing a preset name here would hand that task a
+    // migration instead of a capability. Remove this allowance when presets wires
+    // it up. Scoped to the variant, which is what the lint names — an allowance on
+    // the enum would also hide a genuinely dead future variant.
+    #[allow(dead_code)]
+    LegacyPlusIso,
+}
+
 /// Encode and package one explicit legacy Ultra HDR v1 output.
 pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<(Staged, EncodeOutcome)> {
+    encode_with(render, path, Dialects::LegacyUltraHdrV1)
+}
+
+/// Encode and package a gain-map JPEG carrying the selected metadata dialects.
+///
+/// Both dialects describe **one** gain-map image. That image is the achromatic
+/// luminance map, because the legacy XMP dialect cannot signal a multichannel
+/// one — so a dual-dialect file necessarily shares the legacy form. The ISO
+/// fields are projected from that map's own encoded metadata, which is what
+/// makes the two dialects agree by construction rather than by coincidence.
+pub fn encode_with(
+    render: gain_map::GainMapRender,
+    path: &Path,
+    dialects: Dialects,
+) -> Result<(Staged, EncodeOutcome)> {
     let gain = gain_map::encode_legacy_gain_map(&render)?;
     let (base, icc, _) = color::encode_rendered_sdr(render.into_sdr())?;
     let (base_rgb, loss, stats) = quantize_base(&base.rgb);
+
+    // The ISO fields describe the very map just encoded, so both dialects
+    // report the same normalization window.
+    let iso = match dialects {
+        Dialects::LegacyUltraHdrV1 => None,
+        Dialects::LegacyPlusIso => Some(iso::project(&gain.metadata)?),
+    };
 
     let base_jpeg = encode_jpeg(
         &base_rgb,
@@ -30,7 +79,15 @@ pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<(Staged, E
         Some(&icc),
         "SDR base",
         ColorType::Rgb,
+        None,
     )?;
+    // The gain map's segment goes in before packaging: libultrahdr appends this
+    // image verbatim, so the segment survives. The baseline's cannot — see
+    // `insert_baseline_iso_segment`.
+    let gain_app2 = iso
+        .as_ref()
+        .map(|fields| iso::serialize_metadata(fields).map(|payload| iso::segment_content(&payload)))
+        .transpose()?;
     let gain_jpeg = encode_jpeg(
         &gain.samples,
         gain.width,
@@ -38,8 +95,13 @@ pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<(Staged, E
         None,
         "gain map",
         ColorType::Luma,
+        gain_app2,
     )?;
-    let packaged = package(&base_jpeg, &gain_jpeg, &gain.metadata)?;
+    let mut packaged = package(&base_jpeg, &gain_jpeg, &gain.metadata)?;
+    if let Some(fields) = &iso {
+        let version = iso::app2_segment(&iso::serialize_version(fields))?;
+        packaged = insert_baseline_iso_segment(&packaged, &version)?;
+    }
 
     // Staged like the TIFF path: the whole package is built in memory first, so the
     // final path only ever sees a complete Ultra HDR file.
@@ -54,6 +116,7 @@ fn encode_jpeg(
     icc: Option<&[u8]>,
     label: &str,
     color_type: ColorType,
+    app2: Option<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     let width = u16::try_from(width).map_err(|_| {
         NcError::Unsupported(format!(
@@ -72,6 +135,11 @@ fn encode_jpeg(
         encoder
             .add_icc_profile(profile)
             .map_err(|e| NcError::Write(format!("embedding {label} ICC profile: {e}")))?;
+    }
+    if let Some(segment) = app2 {
+        encoder
+            .add_app_segment(2, segment)
+            .map_err(|e| NcError::Write(format!("embedding {label} APP2 segment: {e}")))?;
     }
     encoder
         .encode(rgb, width, height, color_type)
@@ -198,6 +266,116 @@ fn package(
     Ok(unsafe { std::slice::from_raw_parts(stream.data.cast::<u8>(), stream.data_sz) }.to_vec())
 }
 
+/// Insert the ISO 21496-1 C.4.3 `GainMapVersion` segment into the packaged
+/// baseline image, immediately before its MPF segment.
+///
+/// libultrahdr rewrites the baseline image's marker segments during packaging
+/// and drops unknown APP2 segments, so the baseline's segment cannot be added
+/// before packaging the way the gain map's can — it has to go in afterwards.
+///
+/// Placement is load-bearing, not cosmetic. MPF individual-image offsets are
+/// measured from the byte after the `MPF\0` label, so inserting *before* that
+/// label moves the reference point and the appended gain map by the same amount
+/// and leaves every stored offset correct. Only the first image's recorded size
+/// grows, which this function patches. Inserting *after* the MPF segment would
+/// instead invalidate every offset.
+fn insert_baseline_iso_segment(packaged: &[u8], segment: &[u8]) -> Result<Vec<u8>> {
+    let malformed = |what: &str| NcError::Write(format!("ISO gain-map MPF repair: {what}"));
+
+    let label_at = packaged
+        .windows(4)
+        .position(|window| window == b"MPF\0")
+        .ok_or_else(|| malformed("the packaged baseline image has no MPF segment"))?;
+    // The APP2 segment header (marker + length) precedes the label.
+    let segment_start = label_at
+        .checked_sub(4)
+        .ok_or_else(|| malformed("the MPF label is not preceded by an APP2 header"))?;
+    if packaged[segment_start..segment_start + 2] != iso::APP2_MARKER {
+        return Err(malformed("the MPF label is not inside an APP2 segment"));
+    }
+
+    // MPF stores a TIFF structure whose offsets are relative to its own start.
+    let tiff = label_at + 4;
+    let endian = packaged
+        .get(tiff..tiff + 2)
+        .ok_or_else(|| malformed("truncated MPF byte-order mark"))?;
+    let big_endian = match endian {
+        b"MM" => true,
+        b"II" => false,
+        _ => return Err(malformed("unrecognized MPF byte-order mark")),
+    };
+    let read_u16 = |at: usize| -> Result<u16> {
+        let raw = packaged
+            .get(at..at + 2)
+            .ok_or_else(|| malformed("truncated MPF field"))?;
+        let raw = [raw[0], raw[1]];
+        Ok(if big_endian {
+            u16::from_be_bytes(raw)
+        } else {
+            u16::from_le_bytes(raw)
+        })
+    };
+    let read_u32 = |at: usize| -> Result<u32> {
+        let raw = packaged
+            .get(at..at + 4)
+            .ok_or_else(|| malformed("truncated MPF field"))?;
+        let raw = [raw[0], raw[1], raw[2], raw[3]];
+        Ok(if big_endian {
+            u32::from_be_bytes(raw)
+        } else {
+            u32::from_le_bytes(raw)
+        })
+    };
+
+    let ifd = tiff + read_u32(tiff + 4)? as usize;
+    let entries = read_u16(ifd)?;
+    // Tag 0xB002 is the MP Entry array; each entry is 16 bytes of
+    // attribute/size/offset/dependencies, and the first entry is the baseline.
+    let mut size_field = None;
+    for entry in 0..usize::from(entries) {
+        let at = ifd + 2 + entry * 12;
+        if read_u16(at)? == 0xB002 {
+            let count = read_u32(at + 4)? as usize;
+            if count < 16 {
+                return Err(malformed("the MP Entry array has no baseline entry"));
+            }
+            // Offset 4 within the first entry is its individual image size.
+            size_field = Some(tiff + read_u32(at + 8)? as usize + 4);
+            break;
+        }
+    }
+    let size_field = size_field.ok_or_else(|| malformed("no MP Entry array (tag 0xB002)"))?;
+    if size_field < segment_start {
+        return Err(malformed(
+            "the MP Entry array precedes the MPF segment, so insertion would move it",
+        ));
+    }
+    let recorded = read_u32(size_field)?;
+
+    let grown = recorded
+        .checked_add(u32::try_from(segment.len()).map_err(|_| malformed("segment too large"))?)
+        .ok_or_else(|| malformed("baseline image size overflows its MPF field"))?;
+
+    let mut output = Vec::with_capacity(packaged.len() + segment.len());
+    output.extend_from_slice(&packaged[..segment_start]);
+    output.extend_from_slice(segment);
+    output.extend_from_slice(&packaged[segment_start..]);
+
+    // The size field sits after the insertion point, so it moved with it.
+    let moved = size_field + segment.len();
+    let bytes = if big_endian {
+        grown.to_be_bytes()
+    } else {
+        grown.to_le_bytes()
+    };
+    output
+        .get_mut(moved..moved + 4)
+        .ok_or_else(|| malformed("patched size field is out of range"))?
+        .copy_from_slice(&bytes);
+
+    Ok(output)
+}
+
 fn compressed(bytes: &[u8], gamut: uhdr::uhdr_color_gamut_t) -> uhdr::uhdr_compressed_image_t {
     uhdr::uhdr_compressed_image_t {
         // The C API's descriptor predates const-correctness. Packaging treats
@@ -245,6 +423,483 @@ mod tests {
         assert_eq!(stats.mean[0], 0.5);
     }
 
+    /// List the APPn/SOI/SOS marker sequence of a JPEG stream, for probes.
+    fn marker_sequence(bytes: &[u8]) -> Vec<String> {
+        let mut markers = Vec::new();
+        let mut position = 0;
+        while position + 1 < bytes.len() {
+            if bytes[position] != 0xFF {
+                position += 1;
+                continue;
+            }
+            let marker = bytes[position + 1];
+            match marker {
+                0xD8 => {
+                    markers.push("SOI".to_string());
+                    position += 2;
+                }
+                0xD9 => {
+                    markers.push("EOI".to_string());
+                    position += 2;
+                }
+                0xDA => {
+                    markers.push("SOS".to_string());
+                    // Entropy-coded data follows; stop structural parsing here.
+                    break;
+                }
+                0xE0..=0xEF => {
+                    // A truncated APPn header stops the walk instead of panicking;
+                    // the loop guard only proves the marker's own two bytes exist.
+                    let Some(raw) = bytes.get(position + 2..position + 4) else {
+                        break;
+                    };
+                    let length = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+                    let label_end = (position + 4 + 32).min(bytes.len());
+                    let label = String::from_utf8_lossy(&bytes[position + 4..label_end])
+                        .chars()
+                        .take_while(|c| c.is_ascii_graphic())
+                        .collect::<String>();
+                    markers.push(format!("APP{} ({label})", marker - 0xE0));
+                    position += 2 + length;
+                }
+                _ => position += 2,
+            }
+        }
+        markers
+    }
+
+    /// Parse the MPF index of a packaged file into
+    /// `(mpf_tiff_start, [(size, offset)])`, mirroring what a reader does.
+    fn mpf_entries(bytes: &[u8]) -> (usize, Vec<(u32, u32)>) {
+        let label = bytes
+            .windows(4)
+            .position(|window| window == b"MPF\0")
+            .expect("packaged file has an MPF segment");
+        let tiff = label + 4;
+        let big_endian = &bytes[tiff..tiff + 2] == b"MM";
+        let read16 = |at: usize| {
+            let raw = [bytes[at], bytes[at + 1]];
+            if big_endian {
+                u16::from_be_bytes(raw)
+            } else {
+                u16::from_le_bytes(raw)
+            }
+        };
+        let read32 = |at: usize| {
+            let raw = [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
+            if big_endian {
+                u32::from_be_bytes(raw)
+            } else {
+                u32::from_le_bytes(raw)
+            }
+        };
+        let ifd = tiff + read32(tiff + 4) as usize;
+        let mut images = Vec::new();
+        for entry in 0..usize::from(read16(ifd)) {
+            let at = ifd + 2 + entry * 12;
+            if read16(at) == 0xB002 {
+                let entries = tiff + read32(at + 8) as usize;
+                for image in 0..read32(at + 4) as usize / 16 {
+                    let base = entries + image * 16;
+                    images.push((read32(base + 4), read32(base + 8)));
+                }
+            }
+        }
+        (tiff, images)
+    }
+
+    /// Build a small dual-dialect package the way `encode_with` does, without
+    /// touching the filesystem.
+    fn dual_dialect_package() -> (Vec<u8>, iso::IsoGainMapFields) {
+        let metadata = probe_metadata();
+        let fields = iso::project(&metadata).unwrap();
+        let base = encode_jpeg(
+            &[64, 64, 64, 192, 192, 192, 64, 64, 64, 192, 192, 192],
+            2,
+            2,
+            None,
+            "test base",
+            ColorType::Rgb,
+            None,
+        )
+        .unwrap();
+        let gain_payload = iso::serialize_metadata(&fields).unwrap();
+        let gain = encode_jpeg(
+            &[0, 255, 0, 255],
+            2,
+            2,
+            None,
+            "test gain",
+            ColorType::Luma,
+            Some(iso::segment_content(&gain_payload)),
+        )
+        .unwrap();
+        let packaged = package(&base, &gain, &metadata).unwrap();
+        let version = iso::app2_segment(&iso::serialize_version(&fields)).unwrap();
+        (
+            insert_baseline_iso_segment(&packaged, &version).unwrap(),
+            fields,
+        )
+    }
+
+    #[test]
+    fn dual_dialect_package_carries_iso_segments_in_both_images() {
+        let (bytes, fields) = dual_dialect_package();
+        let label = b"urn:iso:std:iso:ts:21496:-1\0";
+        let occurrences = bytes
+            .windows(label.len())
+            .filter(|window| *window == label)
+            .count();
+        // C.4.3 puts a version-only segment in the baseline; C.4.6 the full
+        // structure in the gain map. Exactly two, never one.
+        assert_eq!(occurrences, 2, "expected a segment in each image");
+
+        let base_end = bytes
+            .windows(2)
+            .position(|window| window == [0xFF, 0xD9])
+            .unwrap()
+            + 2;
+        let positions = bytes
+            .windows(label.len())
+            .enumerate()
+            .filter(|(_, window)| *window == label)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(positions[0] < base_end, "baseline segment must precede EOI");
+        assert!(
+            positions[1] >= base_end,
+            "gain-map segment follows the base"
+        );
+
+        // The baseline carries only the 4-byte GainMapVersion, the gain map the
+        // full structure — so their payload lengths must differ.
+        let version = iso::serialize_version(&fields);
+        let full = iso::serialize_metadata(&fields).unwrap();
+        assert_eq!(version.len(), 4);
+        assert_eq!(
+            &bytes[positions[0] + label.len()..positions[0] + label.len() + 4],
+            &version[..]
+        );
+        assert_eq!(
+            &bytes[positions[1] + label.len()..positions[1] + label.len() + full.len()],
+            &full[..]
+        );
+    }
+
+    #[test]
+    fn baseline_insertion_keeps_every_mpf_offset_resolvable() {
+        // The whole reason the segment goes in *before* the MPF label: offsets
+        // are relative to it, so they must survive untouched while the recorded
+        // baseline size grows.
+        let metadata = probe_metadata();
+        let fields = iso::project(&metadata).unwrap();
+        let base = encode_jpeg(
+            &[64, 64, 64, 192, 192, 192, 64, 64, 64, 192, 192, 192],
+            2,
+            2,
+            None,
+            "test base",
+            ColorType::Rgb,
+            None,
+        )
+        .unwrap();
+        let gain = encode_jpeg(
+            &[0, 255, 0, 255],
+            2,
+            2,
+            None,
+            "test gain",
+            ColorType::Luma,
+            None,
+        )
+        .unwrap();
+        let before = package(&base, &gain, &metadata).unwrap();
+        let segment = iso::app2_segment(&iso::serialize_version(&fields)).unwrap();
+        let after = insert_baseline_iso_segment(&before, &segment).unwrap();
+
+        assert_eq!(after.len(), before.len() + segment.len());
+        let (_, entries_before) = mpf_entries(&before);
+        let (tiff_after, entries_after) = mpf_entries(&after);
+
+        // The baseline's recorded size grew by exactly the inserted bytes.
+        assert_eq!(
+            entries_after[0].0,
+            entries_before[0].0 + segment.len() as u32
+        );
+        // Every stored offset is unchanged, and the gain map's still resolves to
+        // a real SOI — the check that would fail if we had inserted after MPF.
+        for (before, after) in entries_before.iter().zip(&entries_after) {
+            assert_eq!(before.1, after.1, "MPF offsets must not move");
+        }
+        let gain_start = tiff_after + entries_after[1].1 as usize;
+        assert_eq!(&after[gain_start..gain_start + 2], &[0xFF, 0xD8]);
+        // The gain map's recorded size still reaches exactly the file end.
+        assert_eq!(gain_start + entries_after[1].0 as usize, after.len());
+    }
+
+    #[test]
+    fn dual_dialect_baseline_keeps_jfif_first_and_iso_before_mpf() {
+        // Marker order is the one thing that already cost this epic a failed
+        // ImageIO decode, so pin it. JFIF APP0 must stay first, and our ISO
+        // segment must sit before the MPF segment — the placement that keeps
+        // MPF's relative offsets valid.
+        let (bytes, _) = dual_dialect_package();
+        let markers = marker_sequence(&bytes);
+        assert_eq!(markers[0], "SOI");
+        assert!(markers[1].starts_with("APP0 (JFIF"), "{markers:?}");
+
+        let position = |needle: &str| {
+            markers
+                .iter()
+                .position(|marker| marker.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from {markers:?}"))
+        };
+        assert!(
+            position("urn:iso:std:iso:ts:21496:-1") < position("MPF"),
+            "{markers:?}"
+        );
+        assert!(position("JFIF") < position("urn:iso"), "{markers:?}");
+    }
+
+    #[test]
+    fn baseline_carries_no_exif_colorspace_claim() {
+        // C.4.4 branches on Exif ColorSpace: a value of 1 *forces* the baseline
+        // to be read as sRGB, which would misidentify our Display P3 base. With
+        // no Exif present, the second branch applies and the embedded ICC
+        // identifies the space — which is what we rely on. If Exif is ever added
+        // here (C.4.3 wants a CIPA DC-007 baseline), it must use Uncalibrated,
+        // never 1. This test is the tripwire for that.
+        let (bytes, _) = dual_dialect_package();
+        let markers = marker_sequence(&bytes);
+        assert!(
+            !markers.iter().any(|marker| marker.contains("Exif")),
+            "an Exif block appeared; check its ColorSpace tag is not 1: {markers:?}"
+        );
+    }
+
+    #[test]
+    fn conflicting_dialect_fixture_really_disagrees() {
+        // The task requires a deliberately conflicting fixture to test dual-aware
+        // decoder precedence. Precedence itself can only be observed with an
+        // external ISO-aware decoder — libultrahdr reads the legacy dialect only,
+        // and the standard says nothing about coexistence. What is provable here
+        // is that the fixture is genuinely in conflict, so an external test run
+        // against it is meaningful rather than vacuous.
+        let legacy = probe_metadata();
+        let mut divergent = legacy;
+        divergent.gain_max = [8.0; 3]; // legacy says 4.0; ISO will say 8.0
+        let fields = iso::project(&divergent).unwrap();
+
+        let base = encode_jpeg(
+            &[64, 64, 64, 192, 192, 192, 64, 64, 64, 192, 192, 192],
+            2,
+            2,
+            None,
+            "test base",
+            ColorType::Rgb,
+            None,
+        )
+        .unwrap();
+        let payload = iso::serialize_metadata(&fields).unwrap();
+        let gain = encode_jpeg(
+            &[0, 255, 0, 255],
+            2,
+            2,
+            None,
+            "test gain",
+            ColorType::Luma,
+            Some(iso::segment_content(&payload)),
+        )
+        .unwrap();
+        // Package with the *legacy* metadata, so XMP and ISO disagree on purpose.
+        let bytes = package(&base, &gain, &legacy).unwrap();
+
+        // The legacy dialect reports log2(4.0) = 2.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("hdrgm:GainMapMax"), "no legacy GainMapMax");
+
+        // The ISO payload reports log2(8.0) = 3. Locate it and read channel 0's
+        // max: 4 version + 1 flags + 16 headroom, then min pair, then max pair.
+        let label = b"urn:iso:std:iso:ts:21496:-1\0";
+        let at = bytes
+            .windows(label.len())
+            .position(|window| window == label)
+            .expect("ISO segment present")
+            + label.len();
+        let max_numerator = i32::from_be_bytes([
+            bytes[at + 29],
+            bytes[at + 30],
+            bytes[at + 31],
+            bytes[at + 32],
+        ]);
+        let max_denominator = u32::from_be_bytes([
+            bytes[at + 33],
+            bytes[at + 34],
+            bytes[at + 35],
+            bytes[at + 36],
+        ]);
+        let iso_max = f64::from(max_numerator) / f64::from(max_denominator);
+        assert!((iso_max - 3.0).abs() < 1e-6, "ISO max(G) was {iso_max}");
+        // And it differs from the legacy dialect's log2(4.0) = 2.
+        assert!(
+            (iso_max - 2.0).abs() > 0.5,
+            "fixture does not actually conflict"
+        );
+    }
+
+    #[test]
+    fn dual_dialect_package_still_decodes_through_libultrahdr() {
+        // Adding our segments must not disturb the legacy reconstruction path.
+        let (bytes, _) = dual_dialect_package();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("hdrgm:Version=\"1.0\""));
+
+        let decoder = NonNull::new(unsafe { uhdr::uhdr_create_decoder() }).unwrap();
+        let mut image = compressed(&bytes, uhdr::uhdr_color_gamut_t::UHDR_CG_UNSPECIFIED);
+        check(
+            unsafe { uhdr::uhdr_dec_set_image(decoder.as_ptr(), &mut image) },
+            "setting dual-dialect decoder image",
+        )
+        .unwrap();
+        check(
+            unsafe { uhdr::uhdr_dec_probe(decoder.as_ptr()) },
+            "probing the dual-dialect package",
+        )
+        .unwrap();
+        // SAFETY: the decoder is live and the probe succeeded.
+        unsafe { uhdr::uhdr_release_decoder(decoder.as_ptr()) };
+    }
+
+    #[test]
+    fn baseline_insertion_fails_loudly_without_a_usable_mpf() {
+        let error = insert_baseline_iso_segment(&[0xFF, 0xD8, 0xFF, 0xD9], &[0; 8]).unwrap_err();
+        assert!(error.to_string().contains("no MPF segment"), "{error}");
+
+        // An `MPF\0` label that is not preceded by an APP2 header must not be
+        // mistaken for a real segment.
+        let mut fake = vec![0u8; 16];
+        fake[8..12].copy_from_slice(b"MPF\0");
+        let error = insert_baseline_iso_segment(&fake, &[0; 8]).unwrap_err();
+        assert!(error.to_string().contains("not inside an APP2"), "{error}");
+    }
+
+    /// A self-cleaning temp directory, following `io::staged`'s test pattern
+    /// (the crate deliberately has no `tempfile` dependency).
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("nc-uhdr-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build a real `GainMapRender` through the production stages, so the
+    /// container tests exercise the actual SDR base, ICC, and gain map rather
+    /// than hand-rolled JPEGs.
+    fn real_render() -> gain_map::GainMapRender {
+        use crate::algo::reconstruct;
+        use crate::pipeline::render_split::display_source;
+        use crate::pipeline::working_space::map_nc_film_rgb_v1;
+        use crate::types::{FilmBase, LinearImage, PrintParams, Reconstruction};
+
+        let film_rgb = [
+            0.05_f32, 0.4, 2.5, 2.5, 0.4, 0.05, 0.18, 0.3, 0.5, 1.0, 1.0, 1.0,
+        ];
+        let scan = film_rgb.iter().map(|value| 1.0 - value).collect();
+        let image = LinearImage::new(4, 1, scan, None).unwrap();
+        let (film, _) =
+            reconstruct(&image, &FilmBase::from([1.0; 3]), &Reconstruction::Simple).unwrap();
+        let print = PrintParams::default();
+        let shared = display_source(map_nc_film_rgb_v1(film), &print).unwrap();
+        gain_map::render(
+            &shared,
+            gain_map::GainMapConfig::ultra_hdr_v1(print.highlight_compress),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn encode_with_writes_both_dialects_end_to_end() {
+        let tmp = TempDir::new("dual");
+        let iso_path = tmp.path("dual.jpg");
+        let legacy_path = tmp.path("legacy.jpg");
+
+        let (staged, _) = encode_with(real_render(), &iso_path, Dialects::LegacyPlusIso).unwrap();
+        staged.commit().unwrap();
+        let (staged, _) =
+            encode_with(real_render(), &legacy_path, Dialects::LegacyUltraHdrV1).unwrap();
+        staged.commit().unwrap();
+
+        let dual = std::fs::read(&iso_path).unwrap();
+        let legacy = std::fs::read(&legacy_path).unwrap();
+        let label = b"urn:iso:std:iso:ts:21496:-1\0";
+        let count = |bytes: &[u8]| {
+            bytes
+                .windows(label.len())
+                .filter(|window| *window == label)
+                .count()
+        };
+        // One segment per image in the dual file; none at all in the legacy one,
+        // which is the shipped preset's contract.
+        assert_eq!(count(&dual), 2);
+        assert_eq!(count(&legacy), 0);
+        assert!(!legacy.windows(5).any(|window| window == b"21496"));
+
+        // Both still carry the legacy dialect and a Display P3 ICC.
+        for bytes in [&dual, &legacy] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(text.contains("hdrgm:Version=\"1.0\""));
+            assert!(bytes.windows(12).any(|window| window == b"ICC_PROFILE\0"));
+        }
+        // The ISO segments are the only difference in size.
+        assert!(dual.len() > legacy.len());
+    }
+
+    /// Emit a dual-dialect file for the manual decoder-oracle gate, which needs
+    /// an ISO-aware decoder nc cannot host (Apple ImageIO, Android 15+). There is
+    /// deliberately no CLI path yet, so this is the only way to produce one.
+    ///
+    /// `NC_ISO_SAMPLE_DIR=/some/dir cargo test -- --ignored iso_sample`
+    #[test]
+    #[ignore = "writes a sample file for external decoder verification"]
+    fn iso_sample_for_external_decoder() {
+        let dir = std::env::var("NC_ISO_SAMPLE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let path = dir.join("nc-dual-dialect-sample.jpg");
+        let (staged, _) = encode_with(real_render(), &path, Dialects::LegacyPlusIso).unwrap();
+        staged.commit().unwrap();
+        println!("wrote dual-dialect sample: {}", path.display());
+        println!("verify with: exiftool -a -G1 '{}'", path.display());
+        println!("and with:    sips -g all '{}'", path.display());
+    }
+
+    fn probe_metadata() -> gain_map::GainMapMetadata {
+        gain_map::GainMapMetadata {
+            offset_sdr: [1.0 / 64.0; 3],
+            offset_hdr: [1.0 / 64.0; 3],
+            gain_gamma: [1.0; 3],
+            gain_min: [1.0; 3],
+            gain_max: [4.0; 3],
+            display_headroom_linear: 1000.0 / 203.0,
+            display_headroom_log2: (1000.0_f32 / 203.0).log2(),
+            reference_white_nits: 203.0,
+            common_primaries: "display-p3-d65",
+            common_domain: "linear-relative-to-203-nit-reference-white",
+            hdr_gamut_mapping: "test",
+            gain_formula: "test",
+        }
+    }
+
     #[test]
     fn packaged_stream_round_trips_legacy_metadata_without_iso() {
         let base = encode_jpeg(
@@ -254,10 +909,19 @@ mod tests {
             None,
             "test base",
             ColorType::Rgb,
+            None,
         )
         .unwrap();
-        let gain =
-            encode_jpeg(&[0, 255, 0, 255], 2, 2, None, "test gain", ColorType::Luma).unwrap();
+        let gain = encode_jpeg(
+            &[0, 255, 0, 255],
+            2,
+            2,
+            None,
+            "test gain",
+            ColorType::Luma,
+            None,
+        )
+        .unwrap();
         let metadata = gain_map::GainMapMetadata {
             offset_sdr: [1.0 / 64.0; 3],
             offset_hdr: [1.0 / 64.0; 3],

@@ -10,6 +10,8 @@
 
 use serde::Serialize;
 
+pub(crate) mod iso;
+
 use crate::pipeline::colorimetry::pinned::{BT2020_TO_DISPLAY_P3, DISPLAY_P3_LUMA};
 use crate::pipeline::hdr::{LINEAR_HEADROOM, LinearBt2020Hdr, REFERENCE_WHITE_NITS, render_linear};
 use crate::pipeline::render_split::SharedDisplaySource;
@@ -260,6 +262,16 @@ fn normalize_log_gain(ratio: f32, log_min: f32, log_span: f32, gamma: f32) -> f3
         .powf(gamma)
 }
 
+/// Centre-aligned resampling taps, shared by both metadata dialects.
+///
+/// **Deliberate divergence from a non-normative preference.** ISO 21496-1 6.2.2
+/// NOTE 1 prefers a co-sited phase offset (H.265 ChromaLoc type 2); this is
+/// centre-aligned. The NOTE is informative, so co-siting is a quality
+/// preference rather than a conformance requirement, and switching would change
+/// the bytes of the already-shipped `ultra-hdr-v1` output for no measured gain.
+/// Revisit only with evidence that a real decoder's reconstruction suffers —
+/// and if it changes, both dialects must move together, since they share this
+/// function.
 fn resample_axis(index: u32, dst_len: u32, src_len: u32) -> (u32, u32, f32) {
     let coordinate = (((f64::from(index) + 0.5) * f64::from(src_len) / f64::from(dst_len)) - 0.5)
         .clamp(0.0, f64::from(src_len - 1));
@@ -505,7 +517,12 @@ mod tests {
         assert!((actual - expected).abs() < 2e-5, "{actual} != {expected}");
     }
 
-    fn shared_from_film_rgb(rgb: &[f32]) -> SharedDisplaySource {
+    // `pub(super)` so the `iso` child module's tests build the same fixtures
+    // rather than growing a second, drifting copy. `iso::tests` is a *sibling*
+    // of this module, not a descendant, so it cannot see private items here;
+    // `pub(super)` reaches exactly `gain_map` and its descendants, which is the
+    // narrowest visibility that works.
+    pub(super) fn shared_from_film_rgb(rgb: &[f32]) -> SharedDisplaySource {
         let scan = rgb.iter().map(|value| 1.0 - value).collect();
         let image = LinearImage::new((rgb.len() / 3) as u32, 1, scan, None).unwrap();
         let (film, _) =
@@ -513,7 +530,7 @@ mod tests {
         display_source(map_nc_film_rgb_v1(film), &PrintParams::default()).unwrap()
     }
 
-    fn config() -> GainMapConfig {
+    pub(super) fn config() -> GainMapConfig {
         GainMapConfig {
             highlight_compress: 0.0,
             offset_sdr: [1.0 / 64.0; 3],

@@ -645,8 +645,17 @@ pub fn estimate_peak(
             // buffers, and the optional u16 IR staging plane.
             let retained = sum(image, mul(pixels, 3 * WORKING_CHANNELS * F32_BYTES)?)?;
             // 20 B/px conservatively covers u8 base/map inputs, both compressed
-            // JPEGs, libultrahdr's owned input copies and destination, plus the
-            // Rust copy made before the native encoder is released.
+            // JPEGs, libultrahdr's owned input copies and destination, the Rust
+            // copy made before the native encoder is released, and — for
+            // `Dialects::LegacyPlusIso` — `insert_baseline_iso_segment`'s second
+            // full copy of the packaged JPEG, which exists alongside the first.
+            // Nothing is under-approved today: that dialect has no CLI caller, and
+            // the 20 B/px is deliberately loose against a package far smaller than
+            // the raw frame. Whoever wires the dialect up must still re-check this
+            // term, and `iso::encode_iso_gain_map` would add roughly 24 B/px of
+            // full-frame buffers (f32 per-channel normalization plus its
+            // deinterleaved planes) if it ever reaches a live path. Per CLAUDE.md,
+            // nothing tests this model against the code.
             let byte_staging = mul(pixels, 20)?;
             let ir_export = if export_ir && shape.ir_present {
                 mul(pixels, 2)?

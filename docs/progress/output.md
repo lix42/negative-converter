@@ -620,3 +620,269 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   Added `io/transactional-output-writes` as a real prerequisite so the TIFF
   encoders reuse one atomic-write boundary instead of duplicating it or writing
   directly to final paths.
+
+
+## iso-gain-map-metadata (continued)
+
+**Status:** in progress
+**Updated:** 2026-08-04
+
+- 2026-08-04: Re-checked the conformance gate and found the blocker is harder
+  than the 2026-07-30 entry recorded. **No accessible implementation implements
+  the final standard.** The vendored snapshot, upstream `main`, *and* the new
+  `v1.5.1` (released 2026-07-30) all still write `urn:iso:std:iso:ts:21496:-1`
+  (`lib/src/jpegr.cpp:63`). Worse, `lib/src/gainmapmetadata.cpp:129` carries an
+  upstream `TODO` saying "the draft says that this specifies the count of
+  channels … Should this be revised?" — an open question about one of the exact
+  fields this task must pin. Android's "ISO 21496-1 support" is that same
+  implementation, so the spike's platform matrix overstates it as independent
+  evidence. Conclusion: the "equivalently authoritative final-standard
+  implementation" route has no qualifying candidate.
+- 2026-08-04: **Decided to buy the licensed ISO 21496-1:2025 text** (user
+  decision, after briefly selecting the Apple-ImageIO-as-pin alternative and
+  reversing). Rationale: an implementation oracle can establish the byte layout
+  and dual-aware precedence empirically, but cannot establish mandatory-vs-
+  optional fields, legal ranges, or whether dual-dialect coexistence is
+  permitted at all — two of the four things this task's Design section must pin.
+  Apple ImageIO is retained as the independent decoder *oracle* for the
+  verification step, used **after** the text rather than instead of it. ISO
+  22028-5:2026 flagged for the same purchase since `hdr-avif-output` and
+  `lossless-hdr-tiff` hit the same gate. Licence discipline: the repo carries our
+  own field table and tests, never quoted normative text and no checked-in PDF —
+  the same pattern `pipeline/colorimetry/definitions.rs` uses for standards data.
+- 2026-08-04: Resolved an inconsistency inside the task file itself. Its Goal
+  sentence permitted "an authoritative final-standard checklist **or**
+  independent oracle", while its Design section demanded a checklist or an
+  authoritative *implementation*. Those are different bars, and a reader could
+  have concluded the task was startable on an oracle alone. The Design section
+  now names the licensed text as the pinning source and records why the
+  implementation route does not qualify.
+- 2026-08-04: Implemented the **standard-independent half** in the new child
+  module `src/pipeline/gain_map/iso.rs` — a child so it may destructure
+  `GainMapRender`'s private fields, which `gain_map.rs`'s module note already
+  reserved for exactly that. It contains **no byte serializer and no JPEG
+  placement**, so there is deliberately nothing here that could emit an ISO
+  segment before the text lands; that absence *is* the conformance gate, rather
+  than a flag someone could flip. Shipped: `Rational`/`UnsignedRational` with a
+  continued-fraction approximation following the reference implementation's
+  convention (so fields land where existing decoders expect) but with `f64`
+  internals and a loud error instead of a silent best-effort result; `project`,
+  which takes `log2` where the dialect stores logarithmic units; and
+  `encode_iso_gain_map`, which keeps the **three RGB channels** the ISO dialect
+  can signal, consuming the canonical ratios directly rather than re-deriving
+  them. Eleven tests. No production path touched — the render is byte-identical
+  and `pipeline_version` is unchanged.
+- 2026-08-04: Field semantics transcribed from the reference implementation, and
+  therefore **provisional pending the licensed text**: `gainMapMin`/`Max` store
+  `log2` of the content boost as *signed* rationals while our canonical model
+  holds *linear* ratios; `gamma` and both headroom fields are *unsigned*; offsets
+  are *signed*; `baseHdrHeadroom = log2(hdr_capacity_min)` and
+  `alternateHdrHeadroom = log2(hdr_capacity_max)`. The SDR base is at reference
+  white by construction, so its headroom is `1.0` linear / `0` log2.
+- 2026-08-04: Two findings worth carrying forward. **(a)** Per-channel
+  normalization means each channel's own min→0 and max→1, so *equal sample bytes
+  can represent different gains* — the chroma lives in the per-channel extrema,
+  not the bytes. A first test asserting raw-byte inequality failed for exactly
+  this reason; it now reconstructs the way a decoder does. Do not "fix" a future
+  byte-equality surprise by collapsing the windows. **(b)** Deinterleave the
+  planes once before downsampling: rebuilding one per output pixel makes the
+  resample quadratic in frame size (caught pre-review).
+- 2026-08-04: Recorded a determinism scope in the module note. Field values pass
+  through `log2`, and a 1-ulp transcendental difference can move a
+  continued-fraction expansion to a wildly different numerator/denominator pair.
+  ISO metadata bytes are therefore per-build/architecture only — consistent with
+  the spike's "Determinism and acceptance" scope, and **not** something to pin
+  with a checked-in cross-platform hash.
+- 2026-08-04: Gates green in CI order: `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build`, `cargo test`
+  (555 unit incl. 3 ignored + 130 integration). Remaining before merge: the
+  licensed field table, the APP2/MPF placement work below, the Apple-oracle
+  reconstruction check, and the deliberately-conflicting dual-dialect precedence
+  fixture.
+- 2026-08-04: Flagged the real engineering risk for the container half.
+  libultrahdr owns assembly (`io::ultra_hdr::package`), so injecting an ISO APP2
+  segment shifts **every MPF offset** and perturbs the marker order the shipped
+  `ultra-hdr-v1` path already verified. Expect that rewrite, not the field table,
+  to be the hard part — the spike already failed once at this exact seam. Owning
+  the segment ourselves is still preferred over enabling libultrahdr's draft-URN
+  ISO writer, which would put a conformance patch in vendored source and break
+  this task's "a correction changes only the ISO serializer" isolation rule.
+
+
+## iso-gain-map-metadata (licensed text in hand)
+
+**Status:** in progress
+**Updated:** 2026-08-04
+
+- 2026-08-04: **Correction to the two entries above, and to the 2026-07-30
+  entry.** The user supplied the licensed ISO 21496-1:2025 text the same day.
+  Reading it overturns the central claim: **the `ts:` URN is not draft-era.** C.3
+  and the C.4.6 segment-layout table both specify
+  `urn:iso:std:iso:ts:21496:-1` for the *published first edition* — 27 characters
+  plus a null, which is exactly the table's 28-byte length. So libultrahdr's
+  identifier is correct, and "still names the draft namespace" (2026-07-30) and
+  "no accessible implementation implements the final standard" (earlier today)
+  were both wrong on that evidence. Anyone re-deriving this from an
+  implementation's URN alone will reach the same wrong conclusion; the length
+  arithmetic in `segment_label_matches_the_published_length_and_identifier` is
+  the guard.
+- 2026-08-04: **The purchase still paid for itself immediately, for a different
+  reason: it found a real conformance defect in the reference implementation.**
+  The normative structure (C.2.2) has **no common-denominator compact form and no
+  `backwardDirection` field** — bits 5..0 of the flags byte are `reserved`, and
+  every value is an explicit numerator/denominator pair. `libultrahdr` sets flag
+  bit 3 and emits a shortened layout whenever all denominators match, and writes a
+  direction bit with no home in the structure. nc's uniform `1/64` offsets and
+  `gamma = 1` make all denominators match, so that compact path is the *common*
+  case for us — reusing the reference serializer would have written a
+  non-conformant payload on nearly every file. This is the concrete
+  justification for owning the serializer, and it was not knowable from the
+  implementation.
+- 2026-08-04: C.2.3 also resolves the upstream `channelCount` TODO that this task
+  flagged as an open semantic question: `is_multichannel` describes the
+  **per-channel metadata** count, and the standard states outright that it may
+  differ from the gain map's actual channel count (5.2.5.1 likewise). No
+  ambiguity remained to carry forward.
+- 2026-08-04: **Two of the four things the task set out to pin are not in this
+  standard at all**, and the task file previously assumed they would be. ISO
+  21496-1 is silent on Google's XMP dialect, so the "legal mapping between ISO and
+  Ultra HDR v1 metadata" cannot be derived from it — that mapping is ours to
+  define. And "a dual-aware decoder must prefer ISO metadata" traces to Android
+  guidance, not normative text, so it is decoder behaviour to measure, never an
+  ISO conformance claim. Both recorded in the task file.
+- 2026-08-04: Implemented the payload serializer against the text.
+  `serialize_metadata` writes C.2.2 big-endian with the reserved bits clear and
+  no compact form; `serialize_version` writes the 4-byte `GainMapVersion` that
+  C.4.3 requires in the *baseline* image; `app2_segment` wraps either payload per
+  the C.4.6 table, whose length counts itself and excludes the marker.
+  `validate_fields` enforces the standard's stated constraints —
+  `writer_version >= minimum_version`, `H_alternate != H_baseline` (5.2.7,
+  compared as *values* since `0/1` and `0/2` denote one headroom),
+  `max(G) >= min(G)` (5.2.5.3), non-zero denominators, and a non-zero gamma
+  numerator. 24 tests in the module, 561 unit + 130 integration overall, all four
+  gates green.
+- 2026-08-04: The strongest new test is
+  `gain_matches_the_standards_application_formula_round_trip`: it recovers the HDR
+  rendition from the SDR base and the canonical gain via Clause 6.3's
+  `Alternate = (Baseline + k_base) * 2^(W*G) - k_alt`. That independently confirms
+  nc's linear-ratio canonical model and the standard's log2 `G` are the same
+  thing, which is the agreement the dual-dialect requirement actually rests on.
+  It also confirms the spike's reference-white-relative common domain is the
+  standard's "gain map application space" (3.4, B.2) — scaled so reference white
+  is 1.0, exactly as pinned.
+- 2026-08-04: Still open before merge: APP2 insertion into both images plus the
+  MPF offset repair, the C.4.3 Exif-vs-JFIF baseline question, the co-sited
+  resampling decision, the Apple-oracle reconstruction check, and the
+  deliberately-conflicting precedence fixture. All recorded in the task file.
+
+
+## iso-gain-map-metadata (container half)
+
+**Status:** in progress
+**Updated:** 2026-08-04
+
+- 2026-08-04: **The MPF repair I flagged as "the hard part" is much smaller than
+  predicted, and a throwaway probe is what established that.** Probing
+  `package()` with APP2 segments pre-inserted into both input JPEGs showed
+  libultrahdr **rewrites the baseline image's marker segments** — dropping our
+  unknown APP2 entirely, and emitting SOI · APP0 JFIF · APP1 XMP · APP2 ICC ·
+  APP2 MPF — while **appending the gain-map image verbatim**, so a segment
+  inserted there survives untouched. Do not reason about this from the source;
+  the probe is cheap and the behaviour is asymmetric in a way that is easy to get
+  backwards (I had it backwards).
+- 2026-08-04: Consequence, and the key placement decision: MPF individual-image
+  offsets are measured from the byte **after** the `MPF\0` label (verified:
+  gain map at 2310 = TIFF start 2190 + stored offset 120). So inserting the
+  baseline's segment **immediately before the MPF segment** moves the reference
+  point and the appended gain map by the same amount and leaves *every stored
+  offset correct* — only the first image's recorded size grows. That is one `u32`
+  to patch, not an MPF rewrite. Inserting *after* MPF would invalidate every
+  offset; `insert_baseline_iso_segment` documents this and
+  `baseline_insertion_keeps_every_mpf_offset_resolvable` fails if the placement
+  ever moves.
+- 2026-08-04: Implemented `Dialects::{LegacyUltraHdrV1, LegacyPlusIso}` and
+  `encode_with`. The gain map's full `GainMapMetadata` segment goes in at encode
+  time via `jpeg_encoder::add_app_segment`; the baseline's 4-byte
+  `GainMapVersion` segment (C.4.3 requires version-only there, not the full
+  structure) is spliced in after packaging. `encode` keeps its signature and
+  delegates, so the shipped `ultra-hdr-v1` path is untouched.
+- 2026-08-04: **A dual-dialect file necessarily shares the achromatic luminance
+  gain map**, not the RGB one. Legacy XMP cannot signal a multichannel map, and
+  the task forbids generating a second map, so the shared image is the legacy
+  form and the ISO fields are projected from *that map's own encoded metadata*.
+  That is what makes the two dialects agree by construction rather than by
+  coincidence. `encode_iso_gain_map` (RGB) therefore has no caller in this path;
+  it is kept because 4.3 states the component count *should* match the baseline
+  for maximum accuracy, so an ISO-only output is the standard-preferred form and
+  the grayscale map is the legacy compromise.
+- 2026-08-04: `is_multichannel` stays `true` (3 metadata channels) even for the
+  achromatic map. C.2.3 explicitly permits the metadata count to differ from the
+  map's, and always writing 3 keeps the payload size independent of image
+  content. Deriving it from whether the channels happen to be identical would
+  make the byte length data-dependent for no benefit.
+- 2026-08-04: **No CLI surface added, deliberately.** `output/presets` owns the
+  neutral `gain-map-hdr` name and default activation, and `ultra-hdr-v1` is
+  contractually ISO-free — `tests/pipeline.rs` asserts its bytes contain no
+  "21496". Inventing a preset name here would hand `output/presets` a migration
+  instead of a capability, so `LegacyPlusIso` carries a documented dead-code
+  allowance naming that task as the consumer.
+- 2026-08-04: Six container tests: both segments present in the correct images
+  with the correct (differing) payloads; MPF offsets unmoved with the baseline
+  size grown by exactly the inserted bytes and the gain map still resolving to a
+  real SOI whose recorded size reaches the file end; libultrahdr still probes the
+  dual-dialect package; JFIF stays first and the ISO segment precedes MPF (the
+  ordering that already cost this epic an ImageIO decode once); and malformed or
+  MPF-less input fails loudly rather than corrupting a file. All four gates green:
+  566 unit + 130 integration.
+- 2026-08-04: **Code complete for this task, with one item blocked on an
+  unavailable standard** (below). Closed out in this pass:
+  - `encode_with` covered end-to-end on a real render through the production
+    stages, asserting two ISO segments in the dual file, **zero** in the legacy
+    one, the legacy XMP and Display P3 ICC in both, and the size difference.
+  - **Resampling phase decided, not inherited: staying centre-aligned.** 6.2.2
+    NOTE 1 prefers co-sited (H.265 ChromaLoc type 2), but the NOTE is informative,
+    and switching would change the already-shipped `ultra-hdr-v1` bytes for no
+    measured gain. Recorded on `resample_axis` with the condition for revisiting;
+    both dialects share that function, so they cannot diverge.
+  - **Conflicting-dialect fixture built** (`conflicting_dialect_fixture_really_
+    disagrees`): legacy XMP says `log2(4) = 2`, the ISO payload says `log2(8) = 3`,
+    both asserted present and in conflict. Precedence *selection* is deliberately
+    not asserted — libultrahdr reads only the legacy dialect and the standard is
+    silent on coexistence, so selection is external-decoder behaviour. The value
+    here is proving the fixture is not vacuous.
+  - **Exif tripwire** (`baseline_carries_no_exif_colorspace_claim`): C.4.4 branches
+    on Exif ColorSpace, and a value of 1 *forces* an sRGB reading that would
+    misidentify our Display P3 base. With no Exif, branch two applies and the ICC
+    governs. The test fails if Exif ever appears, so whoever adds it must choose
+    Uncalibrated.
+  - **`iso_sample_for_external_decoder`** (`#[ignore]`, honours
+    `NC_ISO_SAMPLE_DIR`) emits a dual-dialect file for the manual oracle gate,
+    since there is deliberately no CLI path to produce one.
+- 2026-08-04: **Independent verification with exiftool 13.55 and macOS `sips`.**
+  exiftool resolved the MPF index and *extracted* MPImage2's 1186 bytes:
+  `Number Of Images 2`, MPImage1 `Baseline MP Primary Image` length 2350 start 0,
+  MPImage2 length 1186 start 2350, and 2350 + 1186 = 3536 = the file size exactly.
+  That is a third-party reader confirming the patched baseline size and the
+  untouched relative offsets agree. JFIF 1.02, `hdrgm:Version 1.0`,
+  GContainer `Primary, GainMap`, and the Display P3 ICC (rXYZ
+  0.51512/0.2412/-0.00105, matching the registry values `display-p3-output`
+  recorded) all present; `sips` opens it. The single `[minor] XMP is missing
+  xpacket wrapper` warning is **byte-identical on the shipped legacy preset**, so
+  it is pre-existing libultrahdr behaviour, not introduced here.
+- 2026-08-04: **Blocked, and not worked around: C.4.3's CIPA DC-007 baseline
+  requirement.** C.4.3 requires a DC-007-compliant baseline image and its NOTE
+  explains that means Exif-compliant; we write JFIF and no Exif. What ISO 21496-1
+  alone settles is that our *colour space* signalling is unambiguous (C.4.4 branch
+  two: no Exif + ICC present ⇒ the ICC governs). What it cannot settle is DC-007's
+  own baseline requirements. DC-007 and DC-008 are **free** from CIPA
+  (`cipa.jp/e/std/std-sec.html`, DC-007-Translation-2025 and
+  DC-008-Translation-2026) but sit behind a JavaScript/POST disclaimer gate that
+  resisted scripted download — trivial to fetch in a browser. I deliberately did
+  **not** synthesise an Exif block against an unavailable standard: a partial one
+  claiming compliance we cannot verify is worse than a documented gap, and if it
+  used `ColorSpace = 1` it would actively mis-signal the P3 base.
+- 2026-08-04: Also still external, by nature: the Apple/Android decoder oracle
+  (an ISO-aware decoder reconstructing the HDR rendition, and observing which
+  dialect a dual-aware decoder selects). `iso_sample_for_external_decoder`
+  produces the file that gate needs. Final gates green: 568 unit (1 new ignored)
+  + 130 integration.
