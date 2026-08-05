@@ -109,7 +109,9 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   first CLI-reachable display (5b) consumer: `stages::render_gain_map_source`
   resolves one shared source, `pipeline::gain_map` feeds the implemented
   `pipeline::sdr` and `pipeline::hdr` stages, and `io::ultra_hdr` writes legacy
-  XMP/MPF metadata with no ISO claim. SDR returns opaque rendered-linear Display P3/sRGB
+  XMP/MPF metadata (`Dialects::LegacyUltraHdrV1`, the shipped preset, makes no ISO
+  claim; `LegacyPlusIso` adds ISO 21496-1 segments and has no CLI caller yet).
+  SDR returns opaque rendered-linear Display P3/sRGB
   pixels coupled to resolved 203-nit tone/gamut metadata;
   `color::encode_rendered_sdr` derives the matching transfer/profile without a
   second gamut transform. HDR returns either opaque display-linear BT.2020
@@ -391,6 +393,27 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     the resolved config — which is why `roll` and each per-frame override share it
     verbatim. `convert` must call **`validate_convert`**, which composes it with the
     flag-presence check above; `output/presets` is the next orchestrator that has to.
+  - *Gain-map container gotchas (ISO 21496-1 + MPF).* Five that cost time:
+    **(a)** libultrahdr **rewrites the baseline image's marker segments** while
+    packaging and drops unknown APP2s, but **appends the gain-map image verbatim** —
+    so the gain map's segment goes in at encode time
+    (`jpeg_encoder::add_app_segment`) while the baseline's must be spliced in
+    *after* packaging. Establish this by probe; it is easy to assume backwards.
+    **(b)** MPF individual-image offsets are relative to the byte **after** the
+    `MPF\0` label, so inserting before that segment moves the reference point and
+    the appended image together and every stored offset stays valid — only the
+    first image's recorded size needs patching. Inserting *after* MPF invalidates
+    all of them. **(c)** In `urn:iso:std:iso:ts:21496:-1` the `ts:` **is** what the
+    published first edition specifies (C.3 and the C.4.6 table: 27 chars + NUL =
+    28 bytes). It is not a draft identifier — reading it as one produced a wrong
+    conclusion once. **(d)** libultrahdr's own ISO serializer is
+    **non-conformant**: it emits a common-denominator compact layout and a
+    `backwardDirection` bit the normative C.2.2 structure has no place for (bits
+    5..0 are reserved), and nc's uniform `1/64` offsets + `gamma = 1` trigger that
+    path — hence nc owns `pipeline::gain_map::iso`. Never add the compact form.
+    **(e)** ISO 21496-1 is **silent** on coexistence with Google's Ultra HDR v1
+    XMP, so dual-aware decoder precedence is *observed behaviour*, never an ISO
+    conformance claim.
   - *`--strict` assertions need an IR-free fixture.* `tests/fixtures/hdri-64bit.tif`
     carries an IR plane, so every frame emits the "IR preserved but not used"
     warning and **any** `--strict` run on it exits non-zero regardless of the
