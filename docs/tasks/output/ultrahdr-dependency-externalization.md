@@ -68,15 +68,15 @@ assembly:
   is present only for libultrahdr's internal use, so it leaves with it.
 - **Write the legacy XMP ourselves** — the `hdrgm` gain-map packet and the
   GContainer directory, whose exact strings existing tests already assert.
-- **Write MPF ourselves — and budget for it.** There is **no MPF parser or emitter
-  in the tree today**: `io::ultra_hdr` hands both JPEGs to libultrahdr, and the
-  repo's other MPF mentions are marker/string checks. A *reader* (parse the MP
-  Index IFD, patch the first image's size) arrives with the prerequisite task
-  `output/iso-gain-map-metadata` as `insert_baseline_iso_segment`; this task must
-  still write the **emitter**, which that reader does not provide. Do not scope
-  this as "the same structure, already parsed" — that reading underestimates the
-  work, and removing the native library before the emitter validates offsets and
-  lengths would ship a broken container. Once the emitter exists,
+- **Write MPF ourselves — and budget for it.** The tree has a **reader, not an
+  emitter**. `insert_baseline_iso_segment` (from the prerequisite task
+  `output/iso-gain-map-metadata`) parses the MP Index IFD and patches the first
+  image's recorded size, but nothing constructs an MPF segment: assembly is still
+  libultrahdr's, and the repo's other MPF mentions are marker/string checks. This
+  task must write the **emitter**, which the reader does not provide. Do not scope
+  it as "the same structure, already parsed" — that underestimates the work, and
+  removing the native library before the emitter validates offsets and lengths
+  would ship a broken container. Once the emitter exists,
   `insert_baseline_iso_segment` is retired: with assembly under our control both
   ISO segments are placed directly instead of spliced in afterwards.
 - **Keep the ISO serializers unchanged.** `pipeline::gain_map::iso` (also from
