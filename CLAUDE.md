@@ -280,7 +280,27 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   a base/branch comparison (`--scope branch --base <ref>`) against the branch's
   fork point. Don't lean on the *default* base compare when the worktree's base
   lags `origin/main`: it shows confusing reverse-diffs of already-merged work —
-  pass the intended base explicitly. The command wraps
+  pass the intended base explicitly. **Neither scope covers both halves, and the
+  default silently picks one.** `review` (`reviewName === "Review"`) takes
+  `executeReviewRun`'s *native* branch: it assembles **no diff locally** and hands
+  Codex's built-in reviewer only a target — `{type: "uncommittedChanges"}` for
+  `working-tree`, `{type: "baseBranch", branch: <ref>}` for `branch` (the ref
+  string only; no merge-base is computed). Scope selection is
+  `resolveReviewTarget` in `scripts/lib/git.mjs`, where `--base` short-circuits
+  `--scope`, and `auto` takes working-tree whenever the tree is dirty **at all**
+  (staged, unstaged, *or* untracked), otherwise branch. So with committed *and*
+  uncommitted work, one `auto` run reviews the working tree and never looks at the
+  commits — run both scopes. Two traps: **don't pre-stage anything to "help" it**
+  (`git add -N` turns an untracked file into a tracked-unstaged one and *changes*
+  what `uncommittedChanges` means), and prefer a **ref** over a resolved SHA for
+  `--base`, since the field is named `branch` and SHA acceptance is unverified
+  (the type lives in a generated module absent from the plugin cache). Only
+  `adversarial-review` reaches `collectReviewContext`, and it alone carries the
+  local-assembly limits — a 24 KiB `MAX_UNTRACKED_BYTES` cap that degrades a large
+  untracked file to a `(skipped: …)` marker, and `buildBranchComparison`'s two-dot
+  `merge-base..HEAD` range. Both commands are `disable-model-invocation`, so an
+  agent must call `node "<script>" review|adversarial-review` directly. The
+  command wraps
   `node "<codex-plugin>/scripts/codex-companion.mjs" review --wait --scope
   working-tree` (`--wait` = foreground/verbatim, `--background` = detach; the
   plugin path is under `~/.claude/plugins/cache/openai-codex/...`). It is
@@ -298,6 +318,15 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   symlinks into it for Claude Code. Exception: `review-fix-loop` ships as two
   intentionally divergent variants — `.claude/skills/` (Claude Code two-engine
   loop) and `.agents/skills/` (tool-agnostic) — never symlink one to the other.
+- **Agent layout is deliberately *not* mirrored.** Subagent definitions live in
+  `.claude/agents/` only — `nc-reviewer` (the review engine) and `nc-fixer` (the
+  single actor allowed to edit during a review loop), both driven by the
+  `review-fix-loop` skill. There is no `.agents/` counterpart and no symlink:
+  Codex CLI doesn't read `.claude/agents/`, and that is the point — Codex is the
+  loop's *other* engine, so it must not inherit `nc-reviewer`'s project primer.
+  Each agent carries a summary of the rules below and is told **this file wins on
+  conflict**, so update CLAUDE.md first and treat an agent's primer as a lossy
+  cache, not a second source of truth.
 - **Value terms (high/low/bright/dark).** Before using these in code or docs, read
   design-spec §4 "Terminology & value domains". A pixel lives in several
   **per-channel** spaces; as scene luminance rises, `transmission ↓ · density ↑ ·
