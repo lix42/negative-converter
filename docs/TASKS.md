@@ -162,6 +162,7 @@ graph TD
     film-base/dmax-reference
     film-base/dense-base-dmax-plausibility
     film-base/dmax-anchor-reliability
+    film-base/dmax-per-channel-reduction
   end
   subgraph algo
     algo/interface
@@ -298,6 +299,8 @@ graph TD
   io/scanner-density-calibration --> algo/sigmoid-parameter-calibration
   film-base/dmax-reference --> film-base/dmax-anchor-reliability
   algo/reference-anchored-sigmoid --> film-base/dmax-anchor-reliability
+  film-base/dmax-reference --> film-base/dmax-per-channel-reduction
+  algo/reference-anchored-sigmoid --> film-base/dmax-per-channel-reduction
   algo/reference-anchored-sigmoid --> analysis/comparison-review-tooling
   algo/film-stock-profiles --> io/scanner-density-calibration
   io/input-data-semantics --> io/scanner-density-calibration
@@ -396,6 +399,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   leader-measured anchor is uncontrolled (same stock 0.295 apart while the base agrees to
   0.0005), is exceeded by real content, and `NOMINAL_DMAX = 2.0` is a poor fallback against
   measured rolls (0.90–1.74). `algo` candidates 2 and 3 are contingent on this
+- `film-base/dmax-per-channel-reduction` (post-MVP): `film-base/dmax-reference`, `algo/reference-anchored-sigmoid`
+  — sibling of `film-base/dmax-anchor-reliability` on a different axis: that one questions the
+  anchor's *level*, this one the per-channel *ratio* the gray-mean reduction discards
+  (`reference_dmax` measures `D_c` per channel, then averages). Measured spread is 0.05–0.14
+  density (0.16–0.46 stops) with inconsistent direction. Redundant with `print.white_balance`
+  under the **exponential** curve (a per-channel anchor is exactly a per-channel gain) but
+  **not** under the sigmoid, which is the intended default — hence an investigation with a
+  quantified verdict, not a presumed fix. Changes no pixels
 - `algo/interface`: `core/project-foundation`
 - `algo/simple`: `algo/interface`
 - `algo/density`: `algo/interface`
@@ -576,6 +587,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   and leaders are uniform so it is not a fogging gradient. `NOMINAL_DMAX = 2.0` is also a poor
   no-reference fallback against measured rolls (0.90–1.74, median ≈1.35). `algo` candidates 2
   and 3 are contingent on this.
+- [ ] [Per-channel Dmax and the gray-mean reduction](tasks/film-base/dmax-per-channel-reduction.md) —
+  `reference_dmax` measures `D_c` per channel then reduces by `(r+g+b)/3`, asserting the highlight
+  end shares the base's colour cast. Committed leader data says otherwise: spread 0.05–0.14 density
+  (0.16–0.46 stops), direction inconsistent across stocks. A per-channel anchor is *algebraically* a
+  per-channel gain, so it is redundant with `print.white_balance` under the exponential curve — but
+  **not** under the sigmoid default, where it shifts each channel's toe/shoulder position.
+  Investigation + impact verdict; ships no pixel change
 
 ### algo — [progress](progress/algo.md)
 > `src/algo/`: the `reconstruct` / `finish_print` surface, negative
