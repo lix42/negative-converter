@@ -212,15 +212,17 @@ detector proposes as possible rebate.
 ## 5. Output formats
 
 - **Current implemented containers:** TIFF (BigTIFF when size requires 64-bit
-  offsets) and, for the explicit `ultra-hdr-v1` preset, gain-map JPEG.
+  offsets), gain-map JPEG for the explicit `ultra-hdr-v1` preset, and 10-bit 4:4:4
+  AVIF for the explicit `hdr-pq` / `hdr-hlg` presets.
 - **Current implemented preset selection:**
-  `--output-preset <legacy|film-master|ultra-hdr-v1>` / recipe key
-  `output.preset` (default `legacy`). Exactly **three** names are
+  `--output-preset <legacy|film-master|ultra-hdr-v1|hdr-pq|hdr-hlg>` / recipe key
+  `output.preset` (default `legacy`). Exactly **five** names are
   accepted today; every other planned name below is rejected with a
   "does not accept yet" message, and the pre-release `scene-master` is rejected as an
   unreleased-schema break (no alias). `legacy` **is** the no-preset state, so it
   stays compatible with the legacy depth/profile/container flags;
-  `film-master` and `ultra-hdr-v1` are *named* presets and therefore atomic.
+  `film-master`, `ultra-hdr-v1`, `hdr-pq` and `hdr-hlg` are *named* presets and
+  therefore atomic.
 - **Current implemented bit depth:**
   - default (no preset, no `--output-hdr`) → 16-bit integer TIFF (standard
     archival positive).
@@ -235,6 +237,9 @@ detector proposes as possible rebate.
     default under a named preset).
   - `--output-preset ultra-hdr-v1` → fixed 8-bit Display P3 SDR primary JPEG plus
     a half-resolution grayscale gain-map JPEG and legacy Ultra HDR v1 metadata.
+  - `--output-preset hdr-pq` / `hdr-hlg` → fixed 10-bit, full-range, 4:4:4 AVIF
+    (AV1 High Profile). The depth follows from the preset; `output.hdr` must stay
+    at its default. Both require an `.avif` output path and are `convert`-only.
 - **Current legacy-TIFF color selection:** the output color space is a CLI
   option (`--output-profile`). The default depends on output depth:
   - 16-bit (default) output → **sRGB** (standard, display-ready positive).
@@ -272,8 +277,8 @@ detector proposes as possible rebate.
   - `gain-map-hdr` — future default, backward-compatible display HDR;
   - `display-p3` — 16-bit losslessly stored wide-gamut SDR TIFF;
   - `compatibility` — 16-bit losslessly stored sRGB SDR TIFF;
-  - `hdr-pq` — single-rendition BT.2020 / Rec.2100 PQ AVIF;
-  - `hdr-hlg` — explicit HLG/broadcast-oriented AVIF;
+  - `hdr-pq` ⇧ — single-rendition BT.2020 / Rec.2100 PQ AVIF (convert only);
+  - `hdr-hlg` ⇧ — explicit HLG/broadcast-oriented AVIF (convert only);
   - `hdr-linear-tiff` — 32-bit float display-linear BT.2020 HDR interchange TIFF;
   - `hdr-pq-tiff` — losslessly stored 16-bit BT.2020 / Rec.2100 PQ TIFF;
   - `hdr-hlg-tiff` — losslessly stored 16-bit BT.2020 / Rec.2100 HLG TIFF;
@@ -373,11 +378,18 @@ curve) and owns the resulting `FilmRgbImage` boundary:
 - `film-master` — `pipeline::stages::render` owns
   `reconstruct → FilmRgbImage → NC film RGB v1 → linear ACEScg → TIFF`; the
   unclamped f32 buffer carries the ACEScg profile and receives no output transform.
-- `ultra-hdr-v1` — `pipeline::stages::render_gain_map_source` owns
+- `ultra-hdr-v1` — `pipeline::stages::render_display_source` owns
   `reconstruct → FilmRgbImage → NC film RGB v1 → linear ACEScg → shared print
   controls`. The orchestrator then feeds that one adjusted source to the SDR and
   HDR renderers and packages their half-resolution luminance gain map with the
   Display P3 base as an explicitly legacy XMP/MPF JPEG (no ISO claim).
+- `hdr-pq` / `hdr-hlg` — the same `pipeline::stages::render_display_source` shared
+  source, then **one** rendition: `pipeline::hdr` renders display-linear BT.2020 and
+  encodes Rec.2100 PQ or HLG in place, and `io::avif` codes it as 10-bit full-range
+  4:4:4 AV1 (High Profile) inside an nc-written MIAF container. `av1C` is filled from
+  the encoded sequence header, and the `MA1A` brand is written only inside the AVIF
+  v1.2 Advanced Profile's published limits — otherwise the file is a valid
+  general-brand AVIF and the report says which limit it exceeded.
 
 Stage 5b's **shared print controls** (`render_split::display_source`) and both
 pure display renderers are implemented and unit-tested: `pipeline::sdr`
@@ -1776,8 +1788,8 @@ covers a full disk, a permissions error, a crash and `SIGINT`, and the remaining
 would cost a Unix-only code path for output that is reproducible by re-running.
 
 - `-o, --output <path>` (required)
-- `--output-preset <legacy|film-master|ultra-hdr-v1>` — the atomic output
-  **policy** choice;
+- `--output-preset <legacy|film-master|ultra-hdr-v1|hdr-pq|hdr-hlg>` — the atomic
+  output **policy** choice;
   recipe key `output.preset` (default `legacy`). One mutually-exclusive enum field,
   never parallel bools: a preset resolves a whole coherent container/depth/profile
   policy plus which branch of the ACEScg boundary runs.
@@ -1812,8 +1824,23 @@ would cost a Unix-only code path for output that is reproducible by re-running.
     post-ACEScg print controls, and makes no ISO 21496-1 claim. The canonical
     internal gain model remains RGB; the legacy serializer derives the
     single-channel Display P3 luminance gain that XMP mode can signal.
+  - `hdr-pq` and `hdr-hlg` are explicit single-rendition display-HDR presets,
+    accepted by `convert` only, each requiring an `.avif` output path. They write
+    10-bit, full-range, 4:4:4 AVIF (AV1 High Profile, level capped at 6.0 for the
+    Advanced Profile) with CICP `9/16/9` for PQ and `9/18/9` for HLG, a 203 cd/m²
+    reference white and a 1000 cd/m² mastering peak. PQ additionally carries a
+    `clli` content-light box **measured from the frame** — `MaxCLL` is its
+    brightest pixel's luminance in cd/m² and `MaxPALL`/`MaxFALL` its frame
+    average, both per CTA-861.3, so a dark frame reports dark numbers and never
+    the renderer's peak; HLG omits the box because HLG is display-referred and
+    absolute values would be a false claim. Being named
+    presets they are **atomic** on the same terms as `film-master`, and they consume
+    the shared post-ACEScg print controls. Encoder settings (quality, speed, one
+    thread, no tiling) are pinned parts of the preset, not knobs: repeated encodes on
+    one build are byte-identical. No EXIF, XMP, ICC, timestamp or identifier is
+    written.
   - Every other planned name (`gain-map-hdr`, `display-p3`, `compatibility`,
-    `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`,
+    `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`,
     `custom`) is rejected with a distinct "not accepted yet" message rather than
     a generic unknown-value error, and the pre-release `scene-master` is rejected
     as an unreleased-schema break naming the rename — **not** an alias. The flag
@@ -1847,8 +1874,9 @@ would cost a Unix-only code path for output that is reproducible by re-running.
 - `--bigtiff auto|on|off` (default `auto`)
 
 Planned `output/presets` replaces the depth-only default with `gain-map-hdr` and
-explicit `display-p3`, `compatibility`, `film-master`, `hdr-pq`, `hdr-hlg`, and
-`hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, and `custom` policies.
+explicit `display-p3`, `compatibility`, and `hdr-linear-tiff`, `hdr-pq-tiff`,
+`hdr-hlg-tiff`, and `custom` policies (`film-master`, `hdr-pq` and `hdr-hlg` are
+already accepted).
 `display-p3` and `compatibility` are 16-bit losslessly stored TIFF; `hdr-pq` and
 `hdr-hlg` are AVIF, while the three explicitly suffixed HDR TIFF policies provide
 linear-float or losslessly stored PQ/HLG interchange. `film-master` encodes NC

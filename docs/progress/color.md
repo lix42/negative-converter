@@ -1165,3 +1165,35 @@ What other epics need to know about `color`:
     requires the before/after comparison for them too.
   - Pixels re-verified after both fixes: legacy TIFF and `ultra-hdr-v1` on both
     fixtures still byte-identical to a pristine `b8ce1d7` build.
+
+- 2026-08-05 (added by `output/hdr-avif-output`, per step 7 of
+  `docs/colorimetry-maintenance.md`): Added one new artifact,
+  `pinned::BT2020_NCL_RGB_TO_YCBCR` — the BT.2020 non-constant-luminance
+  R'G'B' → Y'CbCr matrix that AVIF signals as `matrix_coefficients = 9`. New
+  `derive::ycbcr_from_luma` closes the standard's `Kr`/`Kb` formulas
+  (BT.2020-2 § 3.4, BT.2100-2 Table 6) into a matrix; new
+  `Source::YCbCrFromLuma` registers it in the audit catalog.
+  **No existing artifact moved and every new entry audits at `ulps = 0`**, so
+  this is an addition, not a pixel change: nothing shipped consumes it yet
+  (`io::avif` is not CLI-reachable), no `pipeline_version` decision is owed, and
+  none of the four Little-CMS-consumed spaces was touched.
+- 2026-08-05: Two things about that artifact worth knowing before editing it.
+  (1) It is the **first nonlinear-domain artifact** in the module — it multiplies
+  transfer-encoded PQ/HLG code values, not linear light, which is exactly what
+  "non-constant luminance" means. The file's other matrices are all linear-light
+  transforms, so the usual "this is a colour transform" intuition does not carry
+  over. (2) It is derived from the **tabulated** `BT2020_LUMA`, not from the
+  BT.2020 primaries, and that is load-bearing rather than incidental: decoders
+  invert the rounded tabulated form, so deriving from primaries would put nc's
+  forward transform ~2e-6 away from every decoder's inverse. A test asserts row 0
+  *is* the same pinned literal as `BT2020_LUMA`, so the two cannot desynchronize.
+- 2026-08-05: Verification anchors follow the module's "oracle must not share a
+  source" rule: the published four-decimal coefficients (as carried by ffmpeg /
+  libavif / dav1d colour tables) at ±5e-5; exact `0.5` at full blue's Cb and full
+  red's Cr, which is *why* the chroma rows carry the `2(1-Kb)` / `2(1-Kr)`
+  scaling; a round trip through the matrix's own inverse; and an achromatic sweep
+  over the **exact 10-bit code ladder**. That last bound is a measured maximum,
+  not a round number — worst chroma residual 2^-25 at code 546, worst luma
+  residual 2^-23. A first attempt swept 33 evenly-spaced values instead and
+  understated the peak by 8x, because the residual is a rounding artifact that
+  peaks near 0.5 rather than growing with the input.

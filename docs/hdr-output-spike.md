@@ -119,6 +119,16 @@ Both projects use permissive licenses and support static builds. The AOM patent
 license grants participating licensors' royalty-free rights, but normal legal
 review remains appropriate.
 
+> **Amended 2026-08-05 by `hdr-avif-output`, which owns this boundary.** The
+> library choice above is superseded: no published crate ships libavif ≥ 1.4.2
+> (`libavif-sys` 0.17 is libavif 1.0.4, predating `MA1A` brand writing), and
+> `avif-serialize` 0.8.9 cannot emit the required brands. That task instead uses
+> the published `libaom-sys` crate plus an nc-owned Rust MIAF/AVIF container
+> writer. Everything else in this section — the pinned encoder settings, brands,
+> profile limits, and CICP/content-light policy below — still stands, as do all
+> of this note's binding rendering numbers. See
+> [`tasks/output/hdr-avif-output.md`](tasks/output/hdr-avif-output.md).
+
 The dedicated [`hdr-avif-output`](tasks/output/hdr-avif-output.md) task owns this
 encoder/container boundary. Pin these encoder settings for the first
 implementation:

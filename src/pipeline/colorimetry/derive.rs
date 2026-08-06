@@ -146,3 +146,34 @@ pub fn rgb_to_rgb(source: ColorSpace, destination: ColorSpace, cone: ConeRespons
 pub fn luma_row(space: ColorSpace) -> [f64; 3] {
     normalized_primary_matrix(space)[1]
 }
+
+/// The non-constant-luminance R'G'B' → Y'CbCr matrix implied by a luma vector.
+///
+/// This is a **nonlinear-domain** transform: unlike every other artifact here it
+/// is applied to transfer-encoded R'G'B' (PQ/HLG code values), not to linear
+/// light. That is what "non-constant luminance" means — BT.2100-2 § 7 derives
+/// Y' from the *already nonlinear* signal, so the result is not a luminance.
+///
+/// Given `luma = [Kr, Kg, Kb]` with `Kr + Kg + Kb = 1`, BT.2020-2 § 3.4 /
+/// BT.2100-2 Table 6 define
+///
+/// ```text
+/// Y'  =  Kr·R' + Kg·G' + Kb·B'
+/// Cb  =  (B' - Y') / (2·(1 - Kb))
+/// Cr  =  (R' - Y') / (2·(1 - Kr))
+/// ```
+///
+/// Substituting `Y'` gives the closed form below. The `0.5` entries are exact by
+/// construction, and both chroma rows sum to zero, so an achromatic input maps to
+/// zero chroma with no rounding error at all — a property
+/// [`super::tests`] pins.
+pub fn ycbcr_from_luma(luma: [f64; 3]) -> Matrix3 {
+    let [kr, kg, kb] = luma;
+    let cb_scale = 2.0 * (1.0 - kb);
+    let cr_scale = 2.0 * (1.0 - kr);
+    [
+        [kr, kg, kb],
+        [-kr / cb_scale, -kg / cb_scale, 0.5],
+        [0.5, -kg / cr_scale, -kb / cr_scale],
+    ]
+}

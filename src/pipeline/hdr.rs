@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::pipeline::colorimetry::definitions::transfer;
 use crate::pipeline::colorimetry::pinned::{ACESCG_TO_BT2020, BT2020_LUMA};
 use crate::pipeline::render_split::SharedDisplaySource;
-use crate::types::{LinearImage, NcError, Result};
+use crate::types::{LinearImage, NcError, OutputPreset, Result};
 
 /// Binding display reference white for every named HDR rendition.
 pub const REFERENCE_WHITE_NITS: f32 = 203.0;
@@ -28,7 +28,6 @@ pub const LINEAR_HEADROOM: f32 = TARGET_PEAK_NITS / REFERENCE_WHITE_NITS;
 const HLG_SYSTEM_GAMMA: f32 = transfer::HLG_SYSTEM_GAMMA as f32;
 
 /// Rec.2100 transfer function selected for the encoded HDR pixels.
-#[allow(dead_code)] // variants become product-reachable with `output/presets`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HdrTransfer {
@@ -36,6 +35,35 @@ pub enum HdrTransfer {
     Pq,
     /// Hybrid log-gamma with the reference 1000-nit display OOTF.
     Hlg,
+}
+
+/// The Rec.2100 transfer a single-rendition display-HDR preset renders.
+///
+/// `None` for every preset that is not one, so the orchestrator can dispatch on
+/// the preset without restating the mapping. This lives here rather than on
+/// [`OutputPreset`] deliberately: `types` is the shared-types leaf and must not
+/// depend on a pipeline module, while this module already depends on `types`.
+pub fn transfer_for(preset: OutputPreset) -> Option<HdrTransfer> {
+    match preset {
+        OutputPreset::HdrPq => Some(HdrTransfer::Pq),
+        OutputPreset::HdrHlg => Some(HdrTransfer::Hlg),
+        OutputPreset::Legacy | OutputPreset::FilmMaster | OutputPreset::UltraHdrV1 => None,
+    }
+}
+
+/// Measured content-light levels for one rendered frame, in cd/m².
+///
+/// **Measured, not policy.** CTA-861.3 — and therefore AVIF's `clli` box —
+/// defines these as properties of *this content*: MaxCLL is the brightest pixel
+/// and MaxFALL the frame average. Displays tone-map from them, so a dark frame
+/// has to report a low peak; nothing here may be derived from the renderer's
+/// 1000-nit mastering ceiling or its 203-nit reference white.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ContentLightLevel {
+    /// Brightest per-pixel luminance in the frame, as whole cd/m².
+    pub max_cll_nits: u16,
+    /// Frame-average per-pixel luminance, as whole cd/m².
+    pub max_fall_nits: u16,
 }
 
 /// Policy metadata that describes the pre-transfer linear BT.2020 rendition.
@@ -56,6 +84,9 @@ pub struct LinearHdrMetadata {
 pub struct HdrRenderMetadata {
     pub transfer: HdrTransfer,
     pub linear: LinearHdrMetadata,
+    /// What this frame's pixels actually measured, for container metadata that
+    /// describes content rather than policy (AVIF `clli`).
+    pub content_light: ContentLightLevel,
     pub encoded_domain: &'static str,
     pub cicp_color_primaries: u8,
     pub cicp_transfer: u8,
@@ -76,17 +107,19 @@ pub struct HdrRenderMetadata {
 pub struct LinearBt2020Hdr {
     image: LinearImage,
     metadata: LinearHdrMetadata,
+    /// Measured here, where the pixels are still reference-white-relative linear
+    /// luminance, and carried forward — after the transfer they are nonlinear
+    /// codes that no longer state cd/m² directly.
+    content_light: ContentLightLevel,
 }
 
 impl LinearBt2020Hdr {
     /// Borrow the finite, non-negative, reference-white-relative BT.2020 pixels.
-    #[allow(dead_code)] // borrowed next by the pre-container gain-map seam.
     pub fn image(&self) -> &LinearImage {
         &self.image
     }
 
     /// Borrow the fully resolved linear rendering policy.
-    #[allow(dead_code)] // consumed next by output report wiring.
     pub fn metadata(&self) -> &LinearHdrMetadata {
         &self.metadata
     }
@@ -119,19 +152,16 @@ impl EncodedHdrImage {
     }
 
     /// Encoded image width in pixels.
-    #[allow(dead_code)] // consumed next by `output/hdr-avif-output`.
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Encoded image height in pixels.
-    #[allow(dead_code)] // consumed next by `output/hdr-avif-output`.
     pub fn height(&self) -> u32 {
         self.height
     }
 
     /// Borrow the full-range nonlinear PQ/HLG RGB samples.
-    #[allow(dead_code)] // consumed next by `output/hdr-avif-output`.
     pub fn rgb(&self) -> &[f32] {
         &self.rgb
     }
@@ -145,27 +175,29 @@ pub struct RenderedHdr {
 }
 
 impl RenderedHdr {
+    // The two borrows below exist for tests — this module's and `io::avif`'s, which
+    // check the encoded pixels and the declared contract before handing the pair to
+    // the encoder. Production never needs them: `render` builds the pair and
+    // `io::avif::encode` takes it apart with `into_parts`.
     /// Borrow the encoded full-range RGB signal.
-    #[allow(dead_code)] // consumed next by `output/hdr-avif-output`.
+    #[allow(dead_code)]
     pub fn image(&self) -> &EncodedHdrImage {
         &self.image
     }
 
     /// Borrow the fully resolved rendering and signaling contract.
-    #[allow(dead_code)] // consumed next by output report wiring.
+    #[allow(dead_code)]
     pub fn metadata(&self) -> &HdrRenderMetadata {
         &self.metadata
     }
 
     /// Consume the typed pair at the AVIF-encoding boundary.
-    #[allow(dead_code)] // consumed next by `output/hdr-avif-output`.
     pub(crate) fn into_parts(self) -> (EncodedHdrImage, HdrRenderMetadata) {
         (self.image, self.metadata)
     }
 }
 
 /// Render and transfer-encode the shared adjusted source as Rec.2100 HDR.
-#[allow(dead_code)] // activated by `output/presets`; currently exercised as a pure stage.
 pub fn render(
     shared: &SharedDisplaySource,
     transfer: HdrTransfer,
@@ -180,19 +212,39 @@ pub fn render(
 /// begins above reference white and reaches the 1000-nit peak with zero slope.
 /// Out-of-gamut colour moves radially toward the same-luminance neutral axis,
 /// preserving chroma direction instead of clipping channels independently.
+///
+/// This is also where [`ContentLightLevel`] is measured: the rendered values are
+/// BT.2020 luminance relative to reference white, so `dot(rgb, BT2020_LUMA) *
+/// REFERENCE_WHITE_NITS` is this pixel's luminance in cd/m².
 pub fn render_linear(
     shared: &SharedDisplaySource,
     highlight_compress: f32,
 ) -> Result<LinearBt2020Hdr> {
     let shoulder_start = shoulder_start(highlight_compress)?;
+    let source = shared.source.rgb().as_chunks::<3>().0;
     let mut rgb = Vec::with_capacity(shared.source.rgb().len());
-    for (index, px) in shared.source.rgb().as_chunks::<3>().0.iter().enumerate() {
+    let mut peak_luminance = 0.0_f32;
+    let mut luminance_sum = 0.0_f64;
+    for (index, px) in source.iter().enumerate() {
         let rendered = render_pixel_checked(*px, index, shoulder_start)?;
+        // Gamut mapping is luminance-preserving, so this is the rendered pixel's
+        // luminance whether or not it was moved to the cube boundary.
+        let luminance = dot(rendered, BT2020_LUMA).max(0.0);
+        peak_luminance = peak_luminance.max(luminance);
+        luminance_sum += f64::from(luminance);
         rgb.extend_from_slice(&rendered);
     }
+    let content_light = ContentLightLevel {
+        max_cll_nits: whole_nits(f64::from(peak_luminance)),
+        max_fall_nits: match source.len() {
+            0 => 0,
+            pixels => whole_nits(luminance_sum / pixels as f64),
+        },
+    };
     let image = LinearImage::new(shared.source.width(), shared.source.height(), rgb, None)?;
     Ok(LinearBt2020Hdr {
         image,
+        content_light,
         metadata: LinearHdrMetadata {
             reference_white_nits: REFERENCE_WHITE_NITS,
             target_peak_nits: TARGET_PEAK_NITS,
@@ -213,7 +265,6 @@ pub fn render_linear(
 /// (`gamma = 1.2`), then the reference OETF. HLG's inverse-OOTF result receives
 /// one final neutral-axis boundary intersection in scene-linear BT.2020 so the
 /// delivered full-range signal remains representable without channel clipping.
-#[allow(dead_code)] // consumed next by `output/hdr-avif-output`.
 pub fn encode_transfer(mut linear: LinearBt2020Hdr, transfer: HdrTransfer) -> Result<RenderedHdr> {
     for (index, px) in linear
         .image
@@ -248,6 +299,7 @@ pub fn encode_transfer(mut linear: LinearBt2020Hdr, transfer: HdrTransfer) -> Re
     let metadata = HdrRenderMetadata {
         transfer,
         linear: linear.metadata,
+        content_light: linear.content_light,
         encoded_domain: match transfer {
             HdrTransfer::Pq => "rec2100-pq-full-range",
             HdrTransfer::Hlg => "rec2100-hlg-full-range-reference-ootf",
@@ -265,6 +317,19 @@ pub fn encode_transfer(mut linear: LinearBt2020Hdr, transfer: HdrTransfer) -> Re
     };
     let image = EncodedHdrImage::from_linear_storage(linear.image)?;
     Ok(RenderedHdr { image, metadata })
+}
+
+/// Reference-white-relative luminance as whole cd/m², the unit `clli` codes.
+///
+/// Saturates at `u16::MAX` rather than wrapping. The renderer's own range bound
+/// keeps every rendered value at or under the 1000-nit peak, so the saturation is
+/// a guard on the type, not a reachable clamp.
+fn whole_nits(relative_luminance: f64) -> u16 {
+    let nits = relative_luminance * f64::from(REFERENCE_WHITE_NITS);
+    if !nits.is_finite() {
+        return 0;
+    }
+    nits.round().clamp(0.0, f64::from(u16::MAX)) as u16
 }
 
 fn shoulder_start(highlight_compress: f32) -> Result<f32> {
@@ -601,6 +666,48 @@ mod tests {
             assert_eq!(first.metadata().cicp_transfer, cicp_transfer);
             assert_eq!(first.metadata().cicp_matrix_coefficients, 9);
             assert!(first.metadata().full_range);
+        }
+    }
+
+    #[test]
+    fn content_light_is_measured_from_the_frame_in_absolute_nits() {
+        // Black, reference white, and the mastering peak in one row: rendered
+        // luminance is 0, 1 and LINEAR_HEADROOM relative to reference white, so the
+        // measurement must read 0, 203 and 1000 cd/m² — and the frame average is the
+        // mean of those three, 401.
+        let shared = shared_from_film_rgb(&[
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            LINEAR_HEADROOM,
+            LINEAR_HEADROOM,
+            LINEAR_HEADROOM,
+        ]);
+        let measured = render_linear(&shared, 0.0).unwrap().content_light;
+        assert_eq!(measured.max_cll_nits, TARGET_PEAK_NITS as u16);
+        assert_eq!(measured.max_fall_nits, 401);
+        assert!(measured.max_fall_nits <= measured.max_cll_nits);
+
+        // A dark frame reports a dark frame's numbers. This is the whole point:
+        // nothing may be inherited from the 1000-nit ceiling.
+        let dark = render_linear(&shared_from_film_rgb(&[0.05; 3]), 0.0)
+            .unwrap()
+            .content_light;
+        let bright = render_linear(&shared_from_film_rgb(&[1.0; 3]), 0.0)
+            .unwrap()
+            .content_light;
+        assert_eq!(bright.max_cll_nits, REFERENCE_WHITE_NITS as u16);
+        assert_eq!(dark.max_cll_nits, 10, "0.05 x 203 nits rounds to 10");
+        assert!(dark.max_cll_nits < bright.max_cll_nits);
+        // A uniform frame's peak is its average, in both transfer systems, and the
+        // measurement survives the transfer encode unchanged.
+        for transfer in [HdrTransfer::Pq, HdrTransfer::Hlg] {
+            let rendered = render(&shared_from_film_rgb(&[0.05; 3]), transfer, 0.0).unwrap();
+            assert_eq!(rendered.metadata().content_light, dark);
+            assert_eq!(dark.max_fall_nits, dark.max_cll_nits);
         }
     }
 

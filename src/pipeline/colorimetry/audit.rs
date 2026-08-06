@@ -64,6 +64,10 @@ enum Source {
     /// Transcribed from a normative table — *not* derived. Recorded so the audit
     /// file is complete and so the distinction stays visible in review.
     Tabulated([f64; 3]),
+    /// Non-constant-luminance R'G'B' → Y'CbCr matrix implied by a luma vector.
+    /// Derived from the *tabulated* luma, not from primaries — see
+    /// [`pinned::BT2020_NCL_RGB_TO_YCBCR`](super::pinned::BT2020_NCL_RGB_TO_YCBCR).
+    YCbCrFromLuma([f64; 3]),
 }
 
 /// The shipped literal an artifact is compared against, flattened row-major.
@@ -178,6 +182,12 @@ fn catalog() -> Vec<Artifact> {
             source: Source::Tabulated(definitions::BT2020_LUMA_TABULATED),
             shipped: Shipped::vector_f32(pinned::BT2020_LUMA),
         },
+        Artifact {
+            name: "BT2020_NCL_RGB_TO_YCBCR",
+            description: "nonlinear R'G'B' -> Y'CbCr from TABULATED bt2020 luma (AVIF matrix_coefficients=9)",
+            source: Source::YCbCrFromLuma(definitions::BT2020_LUMA_TABULATED),
+            shipped: Shipped::matrix_f32(pinned::BT2020_NCL_RGB_TO_YCBCR),
+        },
     ]
 }
 
@@ -204,6 +214,12 @@ fn canonical(source: Source) -> Vec<(String, f64)> {
             .enumerate()
             .map(|(i, &v)| (format!("[{i}]"), v))
             .collect(),
+        Source::YCbCrFromLuma(luma) => {
+            let m = derive::ycbcr_from_luma(luma);
+            (0..3)
+                .flat_map(|i| (0..3).map(move |j| (format!("[{i}][{j}]"), m[i][j])))
+                .collect()
+        }
     }
 }
 

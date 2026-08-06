@@ -1211,6 +1211,15 @@ pub enum OutputPreset {
     /// the later `gain-map-hdr` default is activated only after the separate ISO
     /// metadata task is complete.
     UltraHdrV1,
+    /// **`hdr-pq`** — a single-rendition 10-bit 4:4:4 AVIF carrying Rec.2100 PQ
+    /// (CICP 9/16/9, full range) with a 203 cd/m² reference white and 1000 cd/m²
+    /// mastering peak. Written by `io::avif`; requires an `.avif` output path.
+    HdrPq,
+    /// **`hdr-hlg`** — the same container and coding as [`HdrPq`](Self::HdrPq) but
+    /// Rec.2100 HLG (CICP 9/18/9) with the reference 1000-nit, zero-black OOTF at
+    /// system gamma 1.2. Being display-referred, it carries no absolute
+    /// content-light metadata.
+    HdrHlg,
 }
 
 impl OutputPreset {
@@ -1223,6 +1232,8 @@ impl OutputPreset {
             "legacy" => Ok(OutputPreset::Legacy),
             "film-master" => Ok(OutputPreset::FilmMaster),
             "ultra-hdr-v1" => Ok(OutputPreset::UltraHdrV1),
+            "hdr-pq" => Ok(OutputPreset::HdrPq),
+            "hdr-hlg" => Ok(OutputPreset::HdrHlg),
             // The pre-release name for the same branch. It was renamed *before*
             // release because "scene" wrongly implied physical scene-linear
             // recovery; nc is unreleased, so this is a schema break, not an alias.
@@ -1233,19 +1244,18 @@ impl OutputPreset {
                  scene-linear recovery). Use `film-master`; there is no alias."
                     .into(),
             )),
-            planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "hdr-pq" | "hdr-hlg"
-            | "hdr-linear-tiff" | "hdr-pq-tiff" | "hdr-hlg-tiff" | "custom") => {
-                Err(NcError::Usage(format!(
-                    "output preset `{planned}` is a planned name that this build does not \
-                 accept yet (it needs the display renderers / container work owned by \
+            planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "hdr-linear-tiff"
+            | "hdr-pq-tiff" | "hdr-hlg-tiff" | "custom") => Err(NcError::Usage(format!(
+                "output preset `{planned}` is a planned name that this build does not \
+                 accept yet (it needs the remaining container work owned by \
                  `output/presets`). Accepted today: `legacy` (the transitional TIFF \
                  path, the default), `film-master` (unclamped linear ACEScg float \
-                 TIFF), and `ultra-hdr-v1` (legacy XMP gain-map JPEG)."
-                )))
-            }
+                 TIFF), `ultra-hdr-v1` (legacy XMP gain-map JPEG), and `hdr-pq` / \
+                 `hdr-hlg` (10-bit 4:4:4 Rec.2100 AVIF)."
+            ))),
             other => Err(NcError::Usage(format!(
                 "unknown output preset `{other}` — accepted: `legacy`, `film-master`, \
-                 `ultra-hdr-v1`"
+                 `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`"
             ))),
         }
     }
@@ -1266,6 +1276,8 @@ impl OutputPreset {
             OutputPreset::Legacy => "legacy",
             OutputPreset::FilmMaster => "film-master",
             OutputPreset::UltraHdrV1 => "ultra-hdr-v1",
+            OutputPreset::HdrPq => "hdr-pq",
+            OutputPreset::HdrHlg => "hdr-hlg",
         }
     }
 }
@@ -1363,13 +1375,15 @@ impl OutputParams {
     ///   must stay at its default under the preset).
     /// - `ultra-hdr-v1` resolves [`OutDepth::U16`] only for optional IR TIFF
     ///   export; its primary image is fixed 8-bit JPEG.
+    /// - `hdr-pq` / `hdr-hlg` likewise resolve [`OutDepth::U16`] only for the IR
+    ///   TIFF; their primary image is fixed 10-bit AVIF.
     /// - legacy: `hdr = false` → [`OutDepth::U16`], `true` → [`OutDepth::F32`].
     pub fn depth(&self) -> OutDepth {
         match self.preset {
             OutputPreset::FilmMaster => OutDepth::F32,
-            // Used only by the optional IR TIFF export. The primary image is an
-            // 8-bit JPEG whose depth is fixed by the preset.
-            OutputPreset::UltraHdrV1 => OutDepth::U16,
+            // Used only by the optional IR TIFF export. The primary image's depth
+            // is fixed by the preset — 8-bit JPEG, or 10-bit AVIF.
+            OutputPreset::UltraHdrV1 | OutputPreset::HdrPq | OutputPreset::HdrHlg => OutDepth::U16,
             OutputPreset::Legacy => {
                 if self.hdr {
                     OutDepth::F32
@@ -1922,8 +1936,6 @@ mod tests {
             "gain-map-hdr",
             "display-p3",
             "compatibility",
-            "hdr-pq",
-            "hdr-hlg",
             "hdr-linear-tiff",
             "hdr-pq-tiff",
             "hdr-hlg-tiff",
@@ -1933,6 +1945,15 @@ mod tests {
             assert!(msg.contains("does not accept yet"), "{planned}: {msg}");
             assert!(msg.contains("film-master"), "{planned}: {msg}");
         }
+        // `hdr-pq` / `hdr-hlg` graduated out of that list when
+        // `output/hdr-avif-output` activated them; the *TIFF* PQ/HLG presets above
+        // are different presets and are still planned. Asserted here so the two
+        // families cannot be confused back together.
+        assert_eq!(OutputPreset::parse("hdr-pq").unwrap(), OutputPreset::HdrPq);
+        assert_eq!(
+            OutputPreset::parse("hdr-hlg").unwrap(),
+            OutputPreset::HdrHlg
+        );
         let msg = OutputPreset::parse("filmmaster").unwrap_err().to_string();
         assert!(msg.contains("unknown output preset"), "{msg}");
     }

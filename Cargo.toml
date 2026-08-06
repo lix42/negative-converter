@@ -8,6 +8,15 @@ clap = { version = "4.6.1", features = ["derive"] }
 image = "0.25.10"
 jpeg-encoder = "0.7.1"
 kamadak-exif = "0.6.1"
+# AV1 encoder for `io::avif`. The crate vendors libaom's source and links it
+# statically with no network access, so the exact codec is pinned by
+# `Cargo.lock` — the dependency shape `output/ultrahdr-dependency-externalization`
+# wants, and the reason nc does not carry an in-repo libaom snapshot. nc writes
+# the AVIF container itself (see `io::avif`), so no libavif dependency exists;
+# the decoder half is a dev-dependency, since the product only ever encodes.
+libaom-sys = { version = "0.17.2", default-features = false, features = [
+    "av1_encoder",
+] }
 lcms2 = "6.1.1"
 lcms2-sys = "4.0.7"
 libc = "0.2"
@@ -20,6 +29,14 @@ tiff = "0.11.3"
 ultrahdr-sys = { path = "vendor/ultrahdr-sys", default-features = false, features = ["vendored", "xmp"] }
 
 [dev-dependencies]
+# Enables libaom's decoder for `io::avif`'s round-trip tests only. Resolver v3
+# keeps dev-dependency features out of a plain `cargo build`, so the shipped
+# binary stays encoder-only. Note this decoder shares an implementation with the
+# encoder, so it verifies self-consistency, not conformance — the independent
+# dav1d/`avifdec` decode the task requires belongs to the codec-bounds work.
+libaom-sys = { version = "0.17.2", default-features = false, features = [
+    "av1_decoder",
+] }
 # Reused by the e2e tests (same version as the runtime dep, so `Cargo.lock` is
 # unchanged) to synthesize a near-opaque "reference leader" TIFF fixture on the
 # fly: the real light-struck leader frames (Ektar/Phoenix) aren't committed, and

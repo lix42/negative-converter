@@ -15,7 +15,7 @@ Step-1 (MVP) plan for the `nc` CLI negative→positive converter. See
 ### Overview
 A command-line tool (`nc`) that reads a film-negative scan (SilverFast HDR/HDRi
 first), converts it to a positive image, and writes a TIFF or explicitly selected
-`ultra-hdr-v1` gain-map JPEG. "AI-friendly" means
+`ultra-hdr-v1` gain-map JPEG or `hdr-pq`/`hdr-hlg` AVIF. "AI-friendly" means
 **every conversion parameter is a CLI flag** and the tool is deterministic and
 scriptable with JSON recipes/reports — not that ML processes the image.
 
@@ -30,10 +30,11 @@ decode → validate input semantics → film-base → preset dispatch
   ├→ film-master: stages::render
   │    → tagged reconstruction (simple | density, including density curve)
   │    → FilmRgbImage → NC film RGB v1 → linear ACEScg → TIFF encode
-  └→ ultra-hdr-v1: stages::render_gain_map_source
+  └→ display presets: stages::render_display_source
        → tagged reconstruction (simple | density, including density curve)
        → FilmRgbImage → NC film RGB v1 → linear ACEScg → shared print controls
-       → SDR/HDR + gain map → JPEG package
+       → ultra-hdr-v1: SDR/HDR + gain map → JPEG package
+       → hdr-pq / hdr-hlg: HDR → Rec.2100 PQ/HLG → 10-bit 4:4:4 AVIF
 ```
 
 The target `film-master` branch preserves NC's intentional film, lens,
@@ -197,6 +198,7 @@ graph TD
     output/ultrahdr-dependency-externalization
     output/iso-gain-map-metadata
     output/hdr-avif-output
+    output/hdr-avif-windows-packaging
     output/lossless-hdr-tiff
     output/presets
   end
@@ -330,6 +332,7 @@ graph TD
   io/transactional-output-writes --> output/lossless-hdr-tiff
   output/iso-gain-map-metadata --> output/presets
   output/hdr-avif-output --> output/presets
+  output/hdr-avif-output --> output/hdr-avif-windows-packaging
   output/lossless-hdr-tiff --> output/presets
   algo/reference-anchored-sigmoid --> output/presets
   core/roll-conversion --> output/presets
@@ -446,6 +449,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   or the ISO container work gets written twice
 - `output/iso-gain-map-metadata` (post-MVP): `output/gain-map-hdr-output`
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
+- `output/hdr-avif-windows-packaging` (post-MVP): `output/hdr-avif-output`
 - `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`, `io/transactional-output-writes`
 - `output/presets` (post-MVP): `output/iso-gain-map-metadata`, `output/hdr-avif-output`, `output/lossless-hdr-tiff`, `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `core/conversion-versioning`
 - `telemetry/perf-instrumentation` (post-MVP, **parked**): `core/pipeline-orchestration`
@@ -641,7 +645,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Ultra HDR v1 gain-map JPEG output](tasks/output/gain-map-hdr-output.md) — write an explicit backward-compatible Display P3 JPEG plus public Ultra HDR v1 gain-map metadata
 - [ ] [Remove the Ultra HDR native dependency](tasks/output/ultrahdr-dependency-externalization.md) — **deferred maintenance**, **re-scoped 2026-08-05** (id kept): delete `vendor/ultrahdr-sys` and end the C/C++ dependency by writing the Ultra HDR v1 XMP and MPF container in Rust, so neither `cargo build` nor `cargo test` needs CMake/clang/nasm/libjpeg or a network fetch. Only 6 native calls are on the shipping path and they merely assemble XMP+MPF around two JPEGs nc already encodes itself. The decode oracle is **replaced by captured goldens**, not kept as a dev-dependency (that would leave the native toolchain in CI). The published-crate route is recorded but not pursued — it fetches libjpeg-turbo at a mutable tag or links a system library, and no version bump changes that. Blocks no output work
 - [~] [Final ISO gain-map metadata](tasks/output/iso-gain-map-metadata.md) — add verified ISO 21496-1:2025 metadata to the same JPEG and prove dual-dialect agreement. **Metadata and container halves implemented against the licensed text** (2026-08-04: `pipeline/gain_map/iso.rs` C.2.2 payload + normative validation; `io/ultra_hdr.rs` `Dialects::LegacyPlusIso` writing C.4.3/C.4.6 segments into both images, MPF-safe). **Code complete**; verified with exiftool (MPF index resolves, second image extracts, 2350+1186=3536 bytes) and `sips`. Remaining is non-code: C.4.3's CIPA DC-007 baseline requirement is **blocked** on that free-but-gated document (no Exif synthesised against an unread standard), the external ISO-aware decoder oracle, and CLI activation (owned by `output/presets`). **Note the `ts:` URN is the published first edition's, not a draft** — and libultrahdr's compact-denominator ISO layout is *non-conformant*, so nc owns its serializer.
-- [ ] [HDR AVIF output](tasks/output/hdr-avif-output.md) — encode the rendered 10-bit BT.2020 PQ/HLG signals as deterministic AVIF v1.2 Advanced Profile files
+- [x] [HDR AVIF output](tasks/output/hdr-avif-output.md) — 10-bit 4:4:4 Rec.2100 PQ/HLG AVIF via published `libaom-sys` plus an **nc-written MIAF container** (no libavif: no published crate ships ≥ 1.4.2, and `avif-serialize` cannot emit `MA1A`). `hdr-pq`/`hdr-hlg` are live as explicit `convert`-only presets; `av1C` is parsed back out of the codestream; `MA1A` only inside the published Advanced-Profile limits, else general-brand-only **with the reason reported**; `cq_level` and codec bounds calibrated and pinned by equality against `avifdec`/dav1d; `RunProfile::HdrAvif` calibrated on two real scans. Windows deferred → `output/hdr-avif-windows-packaging`; counsel review of the AOM patent grant stays with release
+- [ ] [HDR AVIF Windows packaging](tasks/output/hdr-avif-windows-packaging.md) — add the missing `windows-latest` CI job and prove the static libaom build under MSVC; encoding behavior unchanged, and cross-build byte identity is explicitly not required
 - [ ] [Lossless HDR TIFF outputs](tasks/output/lossless-hdr-tiff.md) — preserve display-linear BT.2020 as 32-bit float TIFF and Rec.2100 PQ/HLG as losslessly stored 16-bit TIFF code values with truthful signaling
 - [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
 
