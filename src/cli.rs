@@ -27,7 +27,7 @@ use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
 use crate::pipeline::memory::{self, MemoryReport, RunProfile, SamplePlan};
-use crate::pipeline::{film_base, gain_map, hdr, stages, working_space};
+use crate::pipeline::{color, film_base, gain_map, hdr, stages, working_space};
 use crate::telemetry;
 use crate::types::{
     AnchorPlacement, BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams,
@@ -586,8 +586,13 @@ pub struct OutputOverrides {
     /// Named output policy: `legacy` (default — the transitional TIFF path, where
     /// the print controls run before the output ICC transform), `film-master`
     /// (unclamped 32-bit float linear ACEScg TIFF taken straight from the NC film
-    /// RGB v1 mapping, bypassing every print/display control), or `ultra-hdr-v1`
-    /// (legacy gain-map JPEG through the shared display stages). Recipe key
+    /// RGB v1 mapping, bypassing every print/display control), `ultra-hdr-v1`
+    /// (legacy gain-map JPEG through the shared display stages), `hdr-pq` /
+    /// `hdr-hlg` (10-bit 4:4:4 Rec.2100 PQ/HLG AVIF, requires `.avif`), or
+    /// `hdr-linear-tiff` (32-bit float display-linear BT.2020 interchange TIFF with
+    /// no transfer applied), or `hdr-pq-tiff` / `hdr-hlg-tiff` (the same Rec.2100
+    /// PQ/HLG signal as the AVIF presets, stored as full-range 16-bit TIFF code
+    /// values) — the three TIFF HDR presets all require `.tif`/`.tiff`. Recipe key
     /// `output.preset`. A named preset is atomic: it resolves container, depth, and
     /// profile itself, so it rejects a non-default `--output-hdr` /
     /// `--output-profile` / `--bigtiff` (from a flag or the recipe alike; a value that
@@ -596,12 +601,12 @@ pub struct OutputOverrides {
     /// cannot produce. On top
     /// of that, `film-master` rejects the frame-local measurements
     /// `--auto-d-max`/`--auto-balance-range` plus every non-default
-    /// downstream control; `ultra-hdr-v1` consumes those controls instead.
-    /// `--output-hdr` is a *rendered* float TIFF and is never
-    /// an alias for `film-master`. The remaining planned preset names
-    /// (`gain-map-hdr`, `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`,
-    /// `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, `custom`) are not
-    /// accepted yet.
+    /// downstream control; every display preset consumes those controls instead.
+    /// `--output-hdr` is a *rendered* float TIFF: it is never an alias for
+    /// `film-master`, nor for `hdr-linear-tiff` (which is display-linear BT.2020,
+    /// not the selected output space). The remaining planned preset names
+    /// (`gain-map-hdr`, `display-p3`, `compatibility`, `custom`) are not accepted
+    /// yet.
     #[arg(long = "output-preset", value_name = "PRESET")]
     pub output_preset: Option<String>,
     /// Write a 32-bit float TIFF (full HDR, no precision loss) instead of the
@@ -861,6 +866,111 @@ pub struct AvifResult {
     pub codestream_bytes: usize,
 }
 
+/// What the `hdr-linear-tiff` encoder wrote, and the luminance semantics the file
+/// cannot state for itself. Serialize-only.
+///
+/// **This block is authoritative for the HDR semantics, and deliberately so.** The
+/// embedded ICC profile describes the colorimetry (BT.2020 primaries, D65, a linear
+/// TRC) but its PCS stops at the media white, so no v4 profile can express that
+/// `1.0` is 203 cd/m² and that highlights legitimately run to
+/// `linear_headroom`. Anything consuming these files for luminance must read this,
+/// not the profile — `interoperability` says so in the artifact itself rather than
+/// leaving it to documentation.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct HdrLinearTiffResult {
+    /// Stable identifier of the pixel contract
+    /// ([`encode::HDR_LINEAR_PIXEL_CONTRACT`]).
+    pub pixel_contract: &'static str,
+    /// Bits per sample as written (32).
+    pub bits_per_sample: u16,
+    /// TIFF `SampleFormat` as written (3 = IEEE float).
+    pub sample_format: u16,
+    /// Whether the file was written as BigTIFF.
+    pub bigtiff: bool,
+    /// Size of the embedded linear-BT.2020 ICC profile, in bytes.
+    pub icc_bytes: usize,
+    /// The sample value that represents diffuse reference white, always `1.0`.
+    pub reference_white_sample: f32,
+    /// Reference white in cd/m² (the binding 203).
+    pub reference_white_nits: f32,
+    /// Mastering target peak in cd/m² (the binding 1000).
+    pub target_peak_nits: f32,
+    /// The sample value that represents `target_peak_nits` (≈4.926108) — the
+    /// largest value the renderer will produce, and the reason this output cannot
+    /// be a 16-bit integer TIFF.
+    pub linear_headroom: f32,
+    /// Resolved highlight-shoulder control and where the shoulder begins.
+    pub highlight_compress: f32,
+    pub shoulder_start: f32,
+    /// Pinned tone-curve / gamut-mapping / linear-domain identifiers, straight from
+    /// the renderer's own metadata rather than restated here.
+    pub tone_curve: &'static str,
+    pub gamut_mapping: &'static str,
+    pub linear_domain: &'static str,
+    /// This frame's **measured** light levels in cd/m² — peak and frame-average
+    /// pixel luminance, not the mastering policy above.
+    pub max_cll_nits: u16,
+    pub max_fall_nits: u16,
+    /// Plain statement of what the file alone does and does not communicate.
+    pub interoperability: &'static str,
+}
+
+/// What the `hdr-pq-tiff` / `hdr-hlg-tiff` encoder wrote: the signalling contract,
+/// the one quantization step's measured cost, and the honest limits of the file.
+/// Serialize-only.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct HdrCodedTiffResult {
+    /// Stable identifier of the pixel contract (see `io::encode`).
+    pub pixel_contract: &'static str,
+    /// Bits per sample as written (16).
+    pub bits_per_sample: u16,
+    /// TIFF `SampleFormat` as written (1 = unsigned integer).
+    pub sample_format: u16,
+    /// Whether the file was written as BigTIFF.
+    pub bigtiff: bool,
+    /// Size of the embedded ICC profile in bytes.
+    pub icc_bytes: usize,
+    /// The CICP triple the embedded profile's `cicp` tag declares, as
+    /// `[ColourPrimaries, TransferCharacteristics, MatrixCoefficients]`.
+    ///
+    /// **MatrixCoefficients is 0 here and 9 in the `avif` block for the same
+    /// rendition**, and that is required rather than inconsistent:
+    /// ICC.1:2022 §10.3 mandates 0 for an RGB data space, while AVIF stores
+    /// Y'CbCr.
+    pub cicp: [u8; 3],
+    /// Whether full-range coding is signalled (always `true`).
+    pub full_range: bool,
+    /// Largest quantization error over the frame, in code units. At most `0.5` by
+    /// construction — rounding cannot be worse than half a step.
+    pub max_quantization_error_codes: f32,
+    /// Root-mean-square quantization error over the frame, in code units.
+    pub rms_quantization_error_codes: f32,
+    /// Reference white in cd/m² (203) and the mastering peak (1000).
+    pub reference_white_nits: f32,
+    pub target_peak_nits: f32,
+    /// This frame's **measured** peak and average light levels in cd/m², for PQ.
+    ///
+    /// Present only for PQ, mirroring the `clli` box `io::avif` writes for the same
+    /// rendition: the values are absolute luminance, which HLG — being
+    /// display-referred — cannot state. TIFF has no `clli` equivalent, so without
+    /// these fields the measurement `pipeline::hdr::render_linear` took would be lost
+    /// from both the file and the report, leaving a consumer tone-mapping this image
+    /// with no way to learn its actual peak.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cll_nits: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fall_nits: Option<u16>,
+    /// HLG's reference-display assumptions, absent for PQ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hlg_system_gamma: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hlg_reference_display_peak_nits: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hlg_reference_display_black_nits: Option<f32>,
+    /// What the file does and does not establish, stated in the artifact.
+    pub interoperability: &'static str,
+}
+
 /// Which branch out of the NC film RGB v1 ACEScg boundary this conversion took,
 /// and what that branch did (design-spec §5/§8). Serialize-only.
 ///
@@ -966,6 +1076,41 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
              transfer, 203 cd/m² reference white and a 1000 cd/m² mastering peak; \
              a rendered display image, not a film master",
         ),
+        OutputPreset::HdrLinearTiff => (
+            true,
+            true,
+            "display-linear-bt2020-float-tiff",
+            "display-linear HDR interchange: BT.2020/D65 primaries with **no \
+             transfer function applied**, samples relative to the 203 cd/m² \
+             reference white and running to the 1000 cd/m² peak at ≈4.926108. \
+             Print controls, the reference-white-preserving shoulder and BT.2020 \
+             gamut mapping have all run, so this is a rendered display image and \
+             not a film master; and being linear it is not a Rec.2100 PQ/HLG signal \
+             either",
+        ),
+        OutputPreset::HdrPqTiff => (
+            true,
+            true,
+            "rec2100-pq-u16-tiff",
+            "single-rendition display HDR: BT.2020 primaries with the ST 2084 (PQ) \
+             transfer, 203 cd/m² reference white and a 1000 cd/m² mastering peak, \
+             stored as full-range 16-bit code values. 16 bits is TIFF's \
+             quantization, not one of BT.2100's own bit depths (it specifies 10 and \
+             12); the stored codes are exact and the one quantization step is \
+             reported. A rendered display image, not a film master",
+        ),
+        OutputPreset::HdrHlgTiff => (
+            true,
+            true,
+            "rec2100-hlg-u16-tiff",
+            "single-rendition display HDR: BT.2020 primaries with the HLG transfer \
+             under the reference 1000-nit zero-black OOTF at system gamma 1.2, \
+             stored as full-range 16-bit code values (TIFF's quantization, not a \
+             BT.2100 bit depth). The embedded ICC profile is scene-referred because \
+             HLG's OOTF is not per-channel separable; this block and the CICP tag \
+             carry the display-referred contract. A rendered display image, not a \
+             film master",
+        ),
         OutputPreset::HdrHlg => (
             true,
             true,
@@ -1041,6 +1186,17 @@ pub struct Report {
     /// brand decision without re-parsing the container.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avif: Option<AvifResult>,
+    /// What the `hdr-linear-tiff` encoder wrote (`convert` with that preset), and
+    /// the reference-white / peak / headroom semantics the embedded ICC cannot
+    /// carry. Absent for every other preset. **Authoritative** for this output's
+    /// luminance meaning — see [`HdrLinearTiffResult`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr_linear_tiff: Option<HdrLinearTiffResult>,
+    /// What the `hdr-pq-tiff` / `hdr-hlg-tiff` encoder wrote (`convert` with either
+    /// preset): the CICP signalling, the measured quantization cost, and the
+    /// documented interoperability limits. Absent for every other preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdr_coded_tiff: Option<HdrCodedTiffResult>,
     /// What the decoder found (`inspect`): format, dimensions, channels, bit
     /// depth, IR presence, scanner metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1241,8 +1397,36 @@ struct LoadedRecipe {
 /// (`--dump-params`'s exact shape).
 #[derive(Debug, Serialize)]
 struct SidecarEnvelope<'a> {
-    meta: &'a Identity,
+    meta: SidecarMeta<'a>,
     params: &'a ResolvedConfig,
+}
+
+/// The sidecar's `meta` block: run identity, plus the output artifact's own
+/// contract when its container cannot carry one.
+///
+/// **Why the contract has to live here and not beside `params`.** The HDR TIFFs'
+/// luminance semantics — reference white, peak, headroom, tone/gamut identifiers,
+/// the measured quantization cost — are deliberately *not* recipe keys, and the
+/// embedded ICC provably cannot express them (its PCS stops at the media white). The
+/// task requires the **sidecar** to be authoritative for them, so putting them only
+/// in the stdout `Report` loses them on any run that discards it (`--report none` is
+/// exactly how a batch script would call this).
+///
+/// It cannot be a third sibling key either: [`SidecarEnvelopeIn`] is
+/// `deny_unknown_fields`, so `{meta, params, output}` would make **every** new
+/// sidecar fail to reload through `--params`. Inside `meta` is safe because the read
+/// side keeps `meta` as an ignored raw `Value`.
+///
+/// The blocks are the *same types* the report serializes, so the sidecar and the
+/// report cannot drift apart.
+#[derive(Debug, Serialize)]
+struct SidecarMeta<'a> {
+    #[serde(flatten)]
+    identity: &'a Identity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hdr_linear_tiff: Option<HdrLinearTiffResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hdr_coded_tiff: Option<HdrCodedTiffResult>,
 }
 
 /// The read side of [`SidecarEnvelope`]. `meta` is kept as a raw `Value` on
@@ -1963,6 +2147,13 @@ fn required_extensions(preset: OutputPreset) -> Option<&'static [&'static str]> 
     match preset {
         OutputPreset::UltraHdrV1 => Some(&["jpg", "jpeg"]),
         OutputPreset::HdrPq | OutputPreset::HdrHlg => Some(&["avif"]),
+        // A TIFF like the legacy path and `film-master` — but unlike them this
+        // preset states the rule, because a `.jpg` path under an f32 BT.2020 master
+        // is a mistake worth catching at the CLI boundary rather than writing a
+        // TIFF with a misleading name.
+        OutputPreset::HdrLinearTiff | OutputPreset::HdrPqTiff | OutputPreset::HdrHlgTiff => {
+            Some(&["tif", "tiff"])
+        }
         // `film-master` is a TIFF like the legacy path; its suffix policy arrives
         // with the rest of the table in `output/presets`.
         OutputPreset::Legacy | OutputPreset::FilmMaster => None,
@@ -2247,10 +2438,14 @@ fn linear_range_is_default(cfg: &ResolvedConfig) -> bool {
 ///    *frame-local measurements* — `auto` `Dmax` and an actually-consulted `auto`
 ///    `balance_range` — which normalize per frame and break the cross-frame
 ///    consistency a master exists to preserve.
-/// 3. **A non-default `print.linear_range` is display-only.** `ultra-hdr-v1`
-///    consumes it through the shared display stage (`pipeline::render_split`),
-///    while the legacy path's frozen ordering does not include it. A knob that
-///    legacy would silently ignore is a loud error here.
+/// 3. **A non-default `print.linear_range` is display-only.** Every display preset
+///    consumes it through the shared display stage (`pipeline::render_split`) —
+///    `ultra-hdr-v1`, `hdr-pq`/`hdr-hlg`, `hdr-linear-tiff`, and
+///    `hdr-pq-tiff`/`hdr-hlg-tiff` — while the legacy path's frozen ordering does
+///    not include it. A knob that legacy would silently ignore is a loud error
+///    there. The check below keys on `preset == Legacy` and so is
+///    preset-agnostic: a new display preset inherits acceptance automatically, and
+///    `film-master` rejects the knob separately under rule 2.
 fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
     let usage = NcError::Usage;
     let preset = cfg.output.preset;
@@ -3011,20 +3206,39 @@ enum FrameRender {
         convert: stages::ConvertReport,
         timings: stages::StageTimings,
     },
+    /// `hdr-linear-tiff`: the pre-transfer BT.2020 rendition, written verbatim.
+    HdrLinearTiff {
+        render: Box<hdr::LinearBt2020Hdr>,
+        convert: stages::ConvertReport,
+        timings: stages::StageTimings,
+    },
+    /// `hdr-pq-tiff` / `hdr-hlg-tiff`: the same rendition `HdrAvif` carries, coded
+    /// as 16-bit TIFF instead.
+    HdrCodedTiff {
+        render: Box<hdr::RenderedHdr>,
+        convert: stages::ConvertReport,
+        timings: stages::StageTimings,
+    },
 }
 
 impl FrameRender {
     fn convert(&self) -> stages::ConvertReport {
         match self {
             Self::Tiff(rendered) => rendered.convert,
-            Self::UltraHdr { convert, .. } | Self::HdrAvif { convert, .. } => *convert,
+            Self::UltraHdr { convert, .. }
+            | Self::HdrAvif { convert, .. }
+            | Self::HdrLinearTiff { convert, .. }
+            | Self::HdrCodedTiff { convert, .. } => *convert,
         }
     }
 
     fn timings(&self) -> stages::StageTimings {
         match self {
             Self::Tiff(rendered) => rendered.timings,
-            Self::UltraHdr { timings, .. } | Self::HdrAvif { timings, .. } => *timings,
+            Self::UltraHdr { timings, .. }
+            | Self::HdrAvif { timings, .. }
+            | Self::HdrLinearTiff { timings, .. }
+            | Self::HdrCodedTiff { timings, .. } => *timings,
         }
     }
 }
@@ -3085,6 +3299,12 @@ fn convert_frame(
                 export_ir: export_ir_planned,
             },
             OutputPreset::HdrPq | OutputPreset::HdrHlg => RunProfile::HdrAvif {
+                export_ir: export_ir_planned,
+            },
+            OutputPreset::HdrLinearTiff => RunProfile::HdrLinearTiff {
+                export_ir: export_ir_planned,
+            },
+            OutputPreset::HdrPqTiff | OutputPreset::HdrHlgTiff => RunProfile::HdrCodedTiff {
                 export_ir: export_ir_planned,
             },
             OutputPreset::Legacy | OutputPreset::FilmMaster => RunProfile::Convert {
@@ -3229,51 +3449,109 @@ fn convert_frame(
     // Clear any stale lcms2 flag so only errors from *this* render are counted.
     let _ = cms_error_occurred();
     // Stages 3–4 — reconstruction → legacy print → output color transform.
-    let rendered = if cfg.output.preset == OutputPreset::UltraHdrV1 {
-        let source =
-            stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
-        let convert = source.convert;
-        let mut timings = source.timings;
-        let display_started = Instant::now();
-        let render = gain_map::render(
-            &source.shared,
-            gain_map::GainMapConfig::ultra_hdr_v1(cfg.print.highlight_compress),
-        )?;
-        // Both independent SDR/HDR display renders plus the common-domain gain
-        // construction are color work. Keep them out of encode_ms so stage
-        // totals account for every pixel operation even when telemetry is off.
-        timings.color_ms += elapsed_ms(display_started);
-        FrameRender::UltraHdr {
-            render: Box::new(render),
-            convert,
-            timings,
+    // Exhaustive on the preset, deliberately: the *container* is what selects the
+    // branch, and two presets can share a transfer (`hdr-pq` and `hdr-pq-tiff` render
+    // an identical rendition into different containers). An `if let Some(transfer) =
+    // transfer_for(..)` chain would silently hand the TIFF presets to the AVIF
+    // encoder, so the compiler is made to enumerate the cases instead.
+    let rendered = match cfg.output.preset {
+        OutputPreset::UltraHdrV1 => {
+            let source =
+                stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
+            let convert = source.convert;
+            let mut timings = source.timings;
+            let display_started = Instant::now();
+            let render = gain_map::render(
+                &source.shared,
+                gain_map::GainMapConfig::ultra_hdr_v1(cfg.print.highlight_compress),
+            )?;
+            // Both independent SDR/HDR display renders plus the common-domain gain
+            // construction are color work. Keep them out of encode_ms so stage
+            // totals account for every pixel operation even when telemetry is off.
+            timings.color_ms += elapsed_ms(display_started);
+            FrameRender::UltraHdr {
+                render: Box::new(render),
+                convert,
+                timings,
+            }
         }
-    } else if let Some(transfer) = hdr::transfer_for(cfg.output.preset) {
-        // `hdr-pq` / `hdr-hlg`: one rendition off the same shared display source
-        // the gain-map path uses, so both consume an identically resolved
-        // reconstruction and print stage.
-        let source =
-            stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
-        let convert = source.convert;
-        let mut timings = source.timings;
-        let display_started = Instant::now();
-        let render = hdr::render(&source.shared, transfer, cfg.print.highlight_compress)?;
-        // The display render and its PQ/HLG transfer are colour work, like the
-        // gain-map branch above — AVIF coding alone belongs to encode_ms.
-        timings.color_ms += elapsed_ms(display_started);
-        FrameRender::HdrAvif {
-            render: Box::new(render),
-            convert,
-            timings,
+        OutputPreset::HdrLinearTiff => {
+            // The same shared display source as every other display preset, stopped
+            // one stage earlier — `render_linear` without `encode_transfer`, so the
+            // samples stay display-linear BT.2020 and no transfer is ever applied.
+            let source =
+                stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
+            let convert = source.convert;
+            let mut timings = source.timings;
+            let display_started = Instant::now();
+            let render = hdr::render_linear(&source.shared, cfg.print.highlight_compress)?;
+            // The linear display render is colour work, like the PQ/HLG and gain-map
+            // branches. Only the TIFF write belongs to encode_ms.
+            timings.color_ms += elapsed_ms(display_started);
+            FrameRender::HdrLinearTiff {
+                render: Box::new(render),
+                convert,
+                timings,
+            }
         }
-    } else {
-        FrameRender::Tiff(stages::render(
+        OutputPreset::HdrPq
+        | OutputPreset::HdrHlg
+        | OutputPreset::HdrPqTiff
+        | OutputPreset::HdrHlgTiff => {
+            // One rendition off the same shared display source the gain-map path
+            // uses, so every display preset consumes an identically resolved
+            // reconstruction and print stage. The transfer comes from the preset;
+            // only the container below differs.
+            let transfer = hdr::transfer_for(cfg.output.preset).ok_or_else(|| {
+                NcError::Other(format!(
+                    "`{}` reached the HDR render branch without a Rec.2100 transfer",
+                    cfg.output.preset.name()
+                ))
+            })?;
+            let source =
+                stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
+            let convert = source.convert;
+            let mut timings = source.timings;
+            let display_started = Instant::now();
+            let render = hdr::render(&source.shared, transfer, cfg.print.highlight_compress)?;
+            // The display render and its PQ/HLG transfer are colour work, like the
+            // gain-map branch above — coding alone belongs to encode_ms.
+            timings.color_ms += elapsed_ms(display_started);
+            let render = Box::new(render);
+            // Exhaustive, like the outer match and for the same reason: a `_` arm
+            // here would hand a future coded preset the AVIF container silently.
+            // `unreachable` is not used — the outer arm's pattern is the only way in,
+            // but stating the remaining presets keeps the compiler as the guard.
+            match cfg.output.preset {
+                OutputPreset::HdrPqTiff | OutputPreset::HdrHlgTiff => FrameRender::HdrCodedTiff {
+                    render,
+                    convert,
+                    timings,
+                },
+                OutputPreset::HdrPq | OutputPreset::HdrHlg => FrameRender::HdrAvif {
+                    render,
+                    convert,
+                    timings,
+                },
+                OutputPreset::Legacy
+                | OutputPreset::FilmMaster
+                | OutputPreset::UltraHdrV1
+                | OutputPreset::HdrLinearTiff => {
+                    return Err(NcError::Other(format!(
+                        "`{}` reached the shared Rec.2100 render arm, which only the \
+                         AVIF and coded-TIFF presets may enter",
+                        cfg.output.preset.name()
+                    )));
+                }
+            }
+        }
+        OutputPreset::Legacy | OutputPreset::FilmMaster => FrameRender::Tiff(stages::render(
             &image,
             &base.base,
             &cfg.reconstruction,
             &cfg.print,
             &cfg.output,
-        )?)
+        )?),
     };
     // lcms2 transform/profile failures reach us only through the global handler
     // (`transform_in_place` is infallible), so check the flag it sets.
@@ -3327,9 +3605,13 @@ fn convert_frame(
     let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
         let stage_started = Instant::now();
-        // Use the preset's resolved `depth()` for the IR TIFF: 16-bit for the legacy
-        // default and `ultra-hdr-v1` (whose primary is a fixed 8-bit JPEG), f32 for
-        // legacy `--output-hdr` and `film-master` (which resolves f32 without touching `output.hdr`). The IR
+        // Use the preset's resolved `depth()` for the IR TIFF. u16 for the legacy
+        // default, `ultra-hdr-v1` (fixed 8-bit JPEG primary), `hdr-pq`/`hdr-hlg`
+        // (10-bit AVIF primary) and `hdr-pq-tiff`/`hdr-hlg-tiff` (whose primary is
+        // itself u16); f32 for legacy `--output-hdr`, `film-master` and
+        // `hdr-linear-tiff` — the last two resolve f32 without touching
+        // `output.hdr`, and `hdr-linear-tiff`'s f32 IR is why
+        // `RunProfile::HdrLinearTiff` charges nothing for the export. The IR
         // *samples* are unchanged either way — the plane is carried, never converted —
         // so the only difference is quantization headroom. Documented in design-spec §9.
         pending.push(encode::export_ir(&image, cfg.output.depth(), path)?);
@@ -3341,6 +3623,8 @@ fn convert_frame(
     let stage_started = Instant::now();
     let render_timings = rendered.timings();
     let mut avif_summary = None;
+    let mut hdr_tiff_summary = None;
+    let mut hdr_coded_summary = None;
     let (primary, outcome) = match rendered {
         FrameRender::Tiff(rendered) => {
             encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?
@@ -3349,6 +3633,31 @@ fn convert_frame(
         FrameRender::HdrAvif { render, .. } => {
             let (staged, outcome, summary) = avif::encode(*render, output)?;
             avif_summary = Some(summary);
+            (staged, outcome)
+        }
+        FrameRender::HdrCodedTiff { render, .. } => {
+            // Keyed off the transfer the render *actually applied*, not off the
+            // preset: that is the value the stored code values were produced with
+            // (and the one `pixel_contract` is derived from), so the profile and the
+            // codes cannot disagree. Matching on the preset here would let a future
+            // coded preset silently inherit the PQ profile.
+            let icc = match render.metadata().transfer {
+                hdr::HdrTransfer::Pq => color::hdr_pq_tiff_icc()?,
+                hdr::HdrTransfer::Hlg => color::hdr_hlg_tiff_icc()?,
+            };
+            let (staged, outcome, summary) =
+                encode::encode_hdr_coded(*render, &cfg.output, &icc, output)?;
+            hdr_coded_summary = Some(Box::new(summary));
+            (staged, outcome)
+        }
+        FrameRender::HdrLinearTiff { render, .. } => {
+            // The profile is resolved here, not inside the encoder, so the embedded
+            // blob is provably the one the orchestrator chose — the same rule the
+            // legacy arm follows with `rendered.icc`.
+            let icc = color::hdr_linear_bt2020_icc()?;
+            let (staged, outcome, summary) =
+                encode::encode_hdr_linear(*render, &cfg.output, &icc, output)?;
+            hdr_tiff_summary = Some(summary);
             (staged, outcome)
         }
     };
@@ -3391,6 +3700,95 @@ fn convert_frame(
             codestream_bytes: summary.codestream_bytes,
         });
     }
+    if let Some(summary) = hdr_coded_summary {
+        // Same reason as the linear TIFF below: the profile is built inside the
+        // encode arm, so the `auto` BigTIFF promotion is reported from what the
+        // encoder resolved rather than predicted before it.
+        if cfg.output.bigtiff == BigTiff::Auto && summary.bigtiff {
+            push_warning_buf(
+                warnings,
+                log,
+                "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+            );
+        }
+        let metadata = summary.metadata;
+        report.hdr_coded_tiff = Some(HdrCodedTiffResult {
+            pixel_contract: summary.pixel_contract,
+            bits_per_sample: summary.bits_per_sample,
+            sample_format: summary.sample_format,
+            bigtiff: summary.bigtiff,
+            icc_bytes: summary.icc_bytes,
+            // Deliberately **not** `metadata.cicp_matrix_coefficients`: that is the
+            // AVIF value (9, Y'CbCr). An RGB ICC profile requires 0, and the profile
+            // this file embeds writes 0 — so the report states what the artifact
+            // carries, not what the renderer declared for a different container.
+            cicp: [metadata.cicp_color_primaries, metadata.cicp_transfer, 0],
+            full_range: metadata.full_range,
+            max_quantization_error_codes: summary.max_quantization_error_codes,
+            rms_quantization_error_codes: summary.rms_quantization_error_codes,
+            reference_white_nits: metadata.linear.reference_white_nits,
+            target_peak_nits: metadata.linear.target_peak_nits,
+            // PQ only, for the same reason `io::avif` omits `clli` on HLG: HLG is
+            // display-referred, so absolute content-light values would be a false
+            // claim rather than a missing one.
+            max_cll_nits: match metadata.transfer {
+                hdr::HdrTransfer::Pq => Some(metadata.content_light.max_cll_nits),
+                hdr::HdrTransfer::Hlg => None,
+            },
+            max_fall_nits: match metadata.transfer {
+                hdr::HdrTransfer::Pq => Some(metadata.content_light.max_fall_nits),
+                hdr::HdrTransfer::Hlg => None,
+            },
+            hlg_system_gamma: metadata.hlg_system_gamma,
+            hlg_reference_display_peak_nits: metadata.hlg_reference_display_peak_nits,
+            hlg_reference_display_black_nits: metadata.hlg_reference_display_black_nits,
+            interoperability: "16-bit is TIFF's quantization, not one of BT.2100's specified bit \
+                 depths (10 and 12): the file carries BT.2100's transfer function at \
+                 TIFF's precision. The stored code values are exact and the single \
+                 quantization step is reported above. Automatic HDR presentation is \
+                 not claimed — TIFF has no CICP tag of its own, so the signalling \
+                 lives in the embedded ICC profile's `cicp` tag, which only a \
+                 CICP-aware colour-managed reader honours; treat this as \
+                 limited-interoperability interchange rather than a display-ready \
+                 deliverable, and see the AVIF or gain-map presets for delivery",
+        });
+    }
+    if let Some(summary) = hdr_tiff_summary {
+        // Reported after the write, from what the encoder resolved — the `auto`
+        // BigTIFF promotion above cannot cover this preset, because its ICC is built
+        // inside the encode arm and `plans_bigtiff` would need the length first.
+        if cfg.output.bigtiff == BigTiff::Auto && summary.bigtiff {
+            push_warning_buf(
+                warnings,
+                log,
+                "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+            );
+        }
+        let linear = summary.linear;
+        report.hdr_linear_tiff = Some(HdrLinearTiffResult {
+            pixel_contract: summary.pixel_contract,
+            bits_per_sample: summary.bits_per_sample,
+            sample_format: summary.sample_format,
+            bigtiff: summary.bigtiff,
+            icc_bytes: summary.icc_bytes,
+            reference_white_sample: 1.0,
+            reference_white_nits: linear.reference_white_nits,
+            target_peak_nits: linear.target_peak_nits,
+            linear_headroom: linear.linear_headroom,
+            highlight_compress: linear.highlight_compress,
+            shoulder_start: linear.shoulder_start,
+            tone_curve: linear.tone_curve,
+            gamut_mapping: linear.gamut_mapping,
+            linear_domain: linear.linear_domain,
+            max_cll_nits: summary.content_light.max_cll_nits,
+            max_fall_nits: summary.content_light.max_fall_nits,
+            interoperability: "the embedded ICC profile states the BT.2020/D65 \
+                               primaries and the linear transfer only; its PCS stops \
+                               at the media white, so the reference-white, peak and \
+                               headroom values in this block — not the profile — \
+                               define the luminance semantics of these samples",
+        });
+    }
     let loss = outcome.loss;
     report.loss = Some(loss);
     // Report-only statistics of the samples as written — the numeric basis a
@@ -3426,7 +3824,14 @@ fn convert_frame(
     // canonical recipe body computed above, so the sidecar and the advertised
     // `params_hash` can't disagree.
     let sidecar_json = serde_json::to_string_pretty(&SidecarEnvelope {
-        meta: &identity,
+        meta: SidecarMeta {
+            identity: &identity,
+            // Taken from the report blocks rather than rebuilt, so an HDR TIFF's
+            // companion metadata states exactly what its report does even when the
+            // report itself is discarded.
+            hdr_linear_tiff: report.hdr_linear_tiff,
+            hdr_coded_tiff: report.hdr_coded_tiff,
+        },
         params: cfg,
     })
     .map_err(|e| NcError::Other(format!("serializing sidecar: {e}")))?;
@@ -4108,13 +4513,19 @@ fn load_manifest(path: &Path) -> Result<RollManifest> {
 /// `input.export_ir` path — which every frame would overwrite — is nonsensical.
 /// Reject it loudly rather than silently clobbering one IR file N times.
 fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
-    // Every named preset with its own container is `convert`-only until
+    // Every preset that pins an output suffix is `convert`-only until
     // `output/presets` makes roll naming/manifests container-aware.
+    //
+    // The gate is suffix *contract*, not "is it a TIFF": `hdr-linear-tiff` writes a
+    // TIFF and is still refused here, because roll derives each frame's output name
+    // itself and nothing yet makes that derivation honour a preset's required
+    // extension — so a roll would produce paths the equivalent `convert` run would
+    // have rejected. (`film-master` pins no suffix, so it stays roll-capable.)
     if required_extensions(cfg.output.preset).is_some() {
         return Err(NcError::Usage(format!(
-            "output.preset = \"{}\" is currently supported only by `nc convert`; \
-             roll naming and collision handling for non-TIFF containers are owned by \
-             the later output/presets task",
+            "output.preset = \"{}\" is currently supported only by `nc convert`; it \
+             pins a required output extension, and roll naming and collision handling \
+             for preset-resolved containers are owned by the later output/presets task",
             cfg.output.preset.name()
         )));
     }
@@ -6778,6 +7189,209 @@ mod tests {
             // The IR TIFF export resolves u16; the primary is fixed 10-bit AVIF.
             assert_eq!(cfg.output.depth(), crate::types::OutDepth::U16);
         }
+    }
+
+    #[test]
+    fn coded_hdr_tiff_presets_are_convert_only_and_require_a_tiff_suffix() {
+        for (preset, name) in [
+            (OutputPreset::HdrPqTiff, "hdr-pq-tiff"),
+            (OutputPreset::HdrHlgTiff, "hdr-hlg-tiff"),
+        ] {
+            let cfg = ResolvedConfig {
+                output: OutputParams {
+                    preset,
+                    ..OutputParams::default()
+                },
+                ..ResolvedConfig::default()
+            };
+            let mut args = parse_convert(&["--output-preset", name]);
+            args.output = PathBuf::from("out.avif");
+            let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+            assert!(err.contains(".tif"), "{name}: {err}");
+            assert!(err.contains(name), "{name}: {err}");
+            args.output = PathBuf::from("out.TIF");
+            validate_convert(&cfg, &args).unwrap();
+
+            // Convert-only, like every suffix-pinning preset.
+            let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
+            assert!(err.contains(name), "{name}: {err}");
+
+            // Atomic: the legacy selectors cannot ride along.
+            let mut sdr = parse_convert(&["--output-preset", name, "--output-sdr"]);
+            sdr.output = PathBuf::from("out.tif");
+            assert!(
+                validate_convert(&cfg, &sdr).is_err(),
+                "{name} must reject --output-sdr"
+            );
+            let hdr_flag = ResolvedConfig {
+                output: OutputParams {
+                    preset,
+                    hdr: true,
+                    ..OutputParams::default()
+                },
+                ..ResolvedConfig::default()
+            };
+            assert!(
+                validate(&hdr_flag).is_err(),
+                "{name} must reject a non-default output.hdr"
+            );
+            // `--bigtiff on` is the third selector the atomic rule covers, and it is
+            // stated here at the CLI level (through `merge`) rather than by poking a
+            // resolved value, so the flag spelling is what the assertion pins.
+            let big = merge(
+                ResolvedConfig::default(),
+                &parse_convert(&["--output-preset", name, "--bigtiff", "on"]),
+            )
+            .unwrap();
+            let err = validate(&big).unwrap_err().to_string();
+            assert!(err.contains("output.bigtiff"), "{name}: {err}");
+            // Control: `--bigtiff auto` is the documented default and asks the preset
+            // for nothing, so it must still pass — otherwise the assertion above
+            // would also hold for a rule that rejected the flag outright.
+            let auto = merge(
+                ResolvedConfig::default(),
+                &parse_convert(&["--output-preset", name, "--bigtiff", "auto"]),
+            )
+            .unwrap();
+            validate(&auto).unwrap_or_else(|e| panic!("{name}: --bigtiff auto: {e}"));
+
+            // These resolve u16 for the primary *and* the IR plane.
+            assert_eq!(cfg.output.depth(), crate::types::OutDepth::U16);
+            // And they render a Rec.2100 transfer — the property that makes them
+            // share a rendition with the AVIF presets.
+            assert!(hdr::transfer_for(preset).is_some(), "{name}");
+        }
+
+        // The distinction the suffix hides: `hdr-pq` and `hdr-pq-tiff` render the
+        // same transfer into different containers, so the *container* rules must
+        // differ while the transfer agrees.
+        assert_eq!(
+            hdr::transfer_for(OutputPreset::HdrPq),
+            hdr::transfer_for(OutputPreset::HdrPqTiff)
+        );
+        assert_eq!(
+            required_extensions(OutputPreset::HdrPq),
+            Some(&["avif"][..])
+        );
+        assert_eq!(
+            required_extensions(OutputPreset::HdrPqTiff),
+            Some(&["tif", "tiff"][..])
+        );
+    }
+
+    #[test]
+    fn hdr_linear_tiff_is_convert_only_and_requires_a_tiff_suffix() {
+        let cfg = ResolvedConfig {
+            output: OutputParams {
+                preset: OutputPreset::HdrLinearTiff,
+                ..OutputParams::default()
+            },
+            ..ResolvedConfig::default()
+        };
+
+        // `.jpg` is rejected and the message names both the preset and what it wants.
+        let mut args = parse_convert(&["--output-preset", "hdr-linear-tiff"]);
+        args.output = PathBuf::from("out.jpg");
+        let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+        assert!(err.contains(".tif"), "{err}");
+        assert!(err.contains("hdr-linear-tiff"), "{err}");
+
+        // Both spellings pass, in any case.
+        for name in ["out.tif", "out.TIFF", "out.tiff"] {
+            args.output = PathBuf::from(name);
+            validate_convert(&cfg, &args)
+                .unwrap_or_else(|e| panic!("{name} should be accepted: {e}"));
+        }
+
+        // Roll refuses it — and the reason must be the suffix contract, not a claim
+        // that the container is not a TIFF (it is one).
+        let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
+        assert!(err.contains("convert"), "{err}");
+        assert!(err.contains("hdr-linear-tiff"), "{err}");
+        assert!(
+            !err.contains("non-TIFF"),
+            "the refusal must not claim this preset is not a TIFF: {err}"
+        );
+
+        // Atomic like every named preset. `--output-sdr` is rejected by presence
+        // (it forces 16-bit integer output this preset cannot produce)...
+        let mut sdr = parse_convert(&["--output-preset", "hdr-linear-tiff", "--output-sdr"]);
+        sdr.output = PathBuf::from("out.tiff");
+        assert!(
+            validate_convert(&cfg, &sdr).is_err(),
+            "must reject --output-sdr"
+        );
+        // ...and a non-default `output.hdr` / `output_profile` by resolved value.
+        // `--output-hdr` is the *rendered* float TIFF in the selected output space,
+        // which is a different image from display-linear BT.2020 — accepting it
+        // would silently promise one and deliver the other.
+        for offender in [
+            OutputParams {
+                preset: OutputPreset::HdrLinearTiff,
+                hdr: true,
+                ..OutputParams::default()
+            },
+            OutputParams {
+                preset: OutputPreset::HdrLinearTiff,
+                output_profile: Some("acescg".into()),
+                ..OutputParams::default()
+            },
+        ] {
+            let bad = ResolvedConfig {
+                output: offender,
+                ..ResolvedConfig::default()
+            };
+            assert!(
+                validate(&bad).is_err(),
+                "must reject a non-default legacy selector: {:?}",
+                bad.output
+            );
+        }
+        // `--bigtiff on` is the third selector of that rule, stated at the CLI level
+        // (through `merge`) so the flag spelling is what is pinned — with
+        // `--bigtiff auto`, the documented default, as the falsifiable control.
+        let big = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--output-preset", "hdr-linear-tiff", "--bigtiff", "on"]),
+        )
+        .unwrap();
+        let err = validate(&big).unwrap_err().to_string();
+        assert!(err.contains("output.bigtiff"), "{err}");
+        let auto = merge(
+            ResolvedConfig::default(),
+            &parse_convert(&["--output-preset", "hdr-linear-tiff", "--bigtiff", "auto"]),
+        )
+        .unwrap();
+        validate(&auto).unwrap();
+
+        // But a non-default `--linear-range` **is** accepted: unlike the legacy path
+        // (whose frozen ordering never applies it) this preset genuinely consumes it
+        // through the shared display stage, so rejecting it would refuse a knob that
+        // works. This is the falsifiable half of that rule.
+        let ranged = ResolvedConfig {
+            output: OutputParams {
+                preset: OutputPreset::HdrLinearTiff,
+                ..OutputParams::default()
+            },
+            print: PrintParams {
+                linear_range: [0.05, 0.95],
+                ..PrintParams::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        validate(&ranged).unwrap();
+        // Control: the same range under the legacy path is still an error, so the
+        // assertion above is proving preset-specific behaviour and not that the rule
+        // stopped working altogether.
+        let legacy_ranged = ResolvedConfig {
+            print: ranged.print.clone(),
+            ..ResolvedConfig::default()
+        };
+        assert!(validate(&legacy_ranged).is_err());
+
+        // The primary *and* the IR export are f32 here — the preset resolves depth
+        // without consulting `output.hdr`.
+        assert_eq!(cfg.output.depth(), crate::types::OutDepth::F32);
 
         // The transfer mapping is the single place the preset becomes a transfer.
         assert_eq!(
@@ -6788,7 +7402,14 @@ mod tests {
             hdr::transfer_for(OutputPreset::HdrHlg),
             Some(hdr::HdrTransfer::Hlg)
         );
+        // `hdr-linear-tiff` belongs in this list and is the subtle member:
+        // it *is* an HDR rendition and answers `None` only because it applies no
+        // transfer at all, where the other three answer `None` for the opposite
+        // reason — they are not HDR renditions. Both readings are "no transfer", so
+        // the mapping must be pinned for it too or the interesting case is the one
+        // nothing guards.
         for other in [
+            OutputPreset::HdrLinearTiff,
             OutputPreset::Legacy,
             OutputPreset::FilmMaster,
             OutputPreset::UltraHdrV1,

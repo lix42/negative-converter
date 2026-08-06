@@ -39,15 +39,27 @@ pub enum HdrTransfer {
 
 /// The Rec.2100 transfer a single-rendition display-HDR preset renders.
 ///
-/// `None` for every preset that is not one, so the orchestrator can dispatch on
-/// the preset without restating the mapping. This lives here rather than on
-/// [`OutputPreset`] deliberately: `types` is the shared-types leaf and must not
-/// depend on a pipeline module, while this module already depends on `types`.
+/// `None` for every preset that renders no Rec.2100 signal. This lives here rather
+/// than on [`OutputPreset`] deliberately: `types` is the shared-types leaf and must
+/// not depend on a pipeline module, while this module already depends on `types`.
+///
+/// **It answers "which transfer", never "which container".** Two presets share each
+/// answer — `hdr-pq` writes AVIF and `hdr-pq-tiff` writes TIFF from the identical
+/// rendition — so an orchestrator must not use a `Some(_)` here to pick an encoder.
+/// `convert_frame` matches on the preset itself for that, exhaustively, so a new
+/// preset cannot silently inherit another's container.
 pub fn transfer_for(preset: OutputPreset) -> Option<HdrTransfer> {
     match preset {
-        OutputPreset::HdrPq => Some(HdrTransfer::Pq),
-        OutputPreset::HdrHlg => Some(HdrTransfer::Hlg),
-        OutputPreset::Legacy | OutputPreset::FilmMaster | OutputPreset::UltraHdrV1 => None,
+        OutputPreset::HdrPq | OutputPreset::HdrPqTiff => Some(HdrTransfer::Pq),
+        OutputPreset::HdrHlg | OutputPreset::HdrHlgTiff => Some(HdrTransfer::Hlg),
+        // `hdr-linear-tiff` is `None` because it applies **no** transfer at all —
+        // it stops at [`render_linear`]. That is a different thing from the presets
+        // below, which are not HDR renditions in the first place; both answers are
+        // "no transfer", for opposite reasons.
+        OutputPreset::HdrLinearTiff
+        | OutputPreset::Legacy
+        | OutputPreset::FilmMaster
+        | OutputPreset::UltraHdrV1 => None,
     }
 }
 
@@ -123,6 +135,21 @@ impl LinearBt2020Hdr {
     pub fn metadata(&self) -> &LinearHdrMetadata {
         &self.metadata
     }
+
+    /// Consume the typed value at the linear-TIFF encoding boundary.
+    ///
+    /// The mirror of [`RenderedHdr::into_parts`], and it exists for the same
+    /// reason: `io::encode::encode_hdr_linear` writes these samples verbatim, so
+    /// taking the buffer by value keeps the encode from staging a second
+    /// full-frame `f32` image. Encoding from [`image`](Self::image)'s borrow would
+    /// silently add ~12 B/px that `pipeline::memory` does not model.
+    ///
+    /// [`ContentLightLevel`] comes out too: it was measured while these pixels
+    /// were still reference-white-relative *linear* luminance, and the linear TIFF
+    /// reports it rather than re-deriving it.
+    pub(crate) fn into_parts(self) -> (LinearImage, LinearHdrMetadata, ContentLightLevel) {
+        (self.image, self.metadata, self.content_light)
+    }
 }
 
 /// Opaque nonlinear Rec.2100 RGB signal ready for an HDR container encoder.
@@ -175,18 +202,22 @@ pub struct RenderedHdr {
 }
 
 impl RenderedHdr {
-    // The two borrows below exist for tests — this module's and `io::avif`'s, which
-    // check the encoded pixels and the declared contract before handing the pair to
-    // the encoder. Production never needs them: `render` builds the pair and
-    // `io::avif::encode` takes it apart with `into_parts`.
     /// Borrow the encoded full-range RGB signal.
+    ///
+    /// Tests only — this module's and `io::encode`'s, which check the encoded pixels
+    /// before handing the pair to an encoder. Production takes the buffer apart with
+    /// [`into_parts`](Self::into_parts) instead.
     #[allow(dead_code)]
     pub fn image(&self) -> &EncodedHdrImage {
         &self.image
     }
 
     /// Borrow the fully resolved rendering and signaling contract.
-    #[allow(dead_code)]
+    ///
+    /// **A production call site exists:** `cli::convert_frame` reads
+    /// `metadata().transfer` to pick the coded-TIFF ICC profile, deliberately keying
+    /// the profile off the transfer that produced the code values rather than off the
+    /// preset. Hence no `dead_code` allow here.
     pub fn metadata(&self) -> &HdrRenderMetadata {
         &self.metadata
     }
@@ -447,6 +478,66 @@ fn pq_encode_nits(nits: f32) -> f32 {
     ((c1 + c2 * power) / (1.0 + c3 * power)).powf(m2)
 }
 
+/// PQ EOTF (ST 2084): a code value back to absolute display luminance in cd/m².
+///
+/// The exact inverse of [`pq_encode_nits`], in **binary64** — it exists to build
+/// the tabulated tone curve of the `hdr-pq-tiff` ICC profile, where the values are
+/// quantized to 16 bits once at the end, so carrying `f32` rounding through the
+/// intermediate powers would waste precision for nothing. It is deliberately not
+/// used on any pixel path: the renderer encodes, it never decodes.
+pub fn pq_decode_nits(code: f64) -> f64 {
+    if code <= 0.0 {
+        return 0.0;
+    }
+    let power = code.powf(1.0 / transfer::pq::M2);
+    // ST 2084's own `max(0, …)`, and it guards the **low** end, not the high one:
+    // `power` falls below `C1` for codes under ≈7.31e-7, and without the clamp that
+    // negative base to a fractional power would be NaN.
+    //
+    // Codes above 1.0 are **out of contract** and not made safe by this — the only
+    // caller is the ICC table builder over `[0, 1]`. Above 1.0 the numerator is
+    // positive so the clamp does nothing, the result is nonsense long before that
+    // matters (code 1.5 decodes to ≈3.1e6 cd/m²), and the *denominator*
+    // `C2 - C3·power` crosses zero at code ≈1.99206, past which this returns NaN.
+    let numerator = (power - transfer::pq::C1).max(0.0);
+    let denominator = transfer::pq::C2 - transfer::pq::C3 * power;
+    transfer::pq::PEAK_NITS * (numerator / denominator).powf(1.0 / transfer::pq::M1)
+}
+
+/// Inverse of the BT.2100 HLG reference OETF: a code value back to normalized
+/// scene linear.
+///
+/// Binary64 for the same reason as [`pq_decode_nits`], and used for the same one
+/// thing: the `hdr-hlg-tiff` profile's tone curve. Note what it deliberately does
+/// **not** include — the OOTF. That is why the HLG profile is scene-referred; see
+/// `color::hdr_hlg_tiff_icc`.
+pub fn hlg_decode_scene(code: f64) -> f64 {
+    if code <= 0.0 {
+        0.0
+    } else if code <= 0.5 {
+        code * code / 3.0
+    } else {
+        let a = transfer::hlg::OETF_A;
+        let b = 1.0 - 4.0 * a;
+        let c = 0.5 - a * (4.0 * a).ln();
+        (((code - c) / a).exp() + b) / 12.0
+    }
+}
+
+/// The HLG signal level this renderer produces for 203-nit reference white.
+///
+/// ≈0.75, which is BT.2100's nominal diffuse-white signal — but it is *computed*
+/// from the shipped OOTF and OETF rather than asserted, so it cannot drift away
+/// from what the renderer actually writes. Both the `hdr-hlg-tiff` profile (which
+/// anchors its PCS here) and
+/// `hlg_inverse_ootf_places_203_nit_reference_white_near_signal_075` read it, so
+/// the profile's anchor and the renderer's output are the same number by
+/// construction.
+pub fn hlg_reference_white_signal() -> f32 {
+    let display = [REFERENCE_WHITE_NITS / TARGET_PEAK_NITS; 3];
+    hlg_oetf(hlg_inverse_ootf(display)[0])
+}
+
 /// Inverse of the BT.2100 HLG reference OOTF for a 1000-nit display with a
 /// zero-black reference model.
 fn hlg_inverse_ootf(display_linear: [f32; 3]) -> [f32; 3] {
@@ -543,6 +634,48 @@ mod tests {
         close(encoded[0], 0.749_877_4);
         close(encoded[0], encoded[1]);
         close(encoded[1], encoded[2]);
+        // The `hdr-hlg-tiff` profile anchors its PCS on this exact value, so the
+        // accessor it reads must be the same number this test pins.
+        close(hlg_reference_white_signal(), encoded[0]);
+    }
+
+    #[test]
+    fn transfer_decoders_invert_their_encoders() {
+        // The ICC tone curves are built from these inverses, so a sign or constant
+        // error would silently mis-describe every coded TIFF. Checked against the
+        // shipped *forward* functions rather than against restated constants.
+        // 5e-5 relative, and the bound is the *forward* function's precision, not
+        // the decoder's: `pq_encode_nits` computes in `f32`, and PQ's log-log slope
+        // at the dark end amplifies its ~6e-8 relative rounding by ~190x, giving
+        // ~1.1e-5 at 0.1 nits (measured). Tightening this would be asserting that
+        // the shipped encoder has more precision than it does.
+        for nits in [
+            0.1_f32,
+            1.0,
+            10.0,
+            100.0,
+            REFERENCE_WHITE_NITS,
+            500.0,
+            TARGET_PEAK_NITS,
+        ] {
+            let code = pq_encode_nits(nits);
+            let back = pq_decode_nits(f64::from(code));
+            let error = (back - f64::from(nits)).abs() / f64::from(nits);
+            assert!(
+                error < 5e-5,
+                "PQ round trip at {nits} nits: code {code} decoded to {back} (rel {error:.2e})"
+            );
+        }
+        for scene in [0.0_f32, 1.0 / 12.0, 0.1, 0.26, 0.5, 1.0] {
+            let code = hlg_oetf(scene);
+            let back = hlg_decode_scene(f64::from(code)) as f32;
+            assert!(
+                (back - scene).abs() < 1e-5,
+                "HLG round trip at scene {scene}: code {code} decoded to {back}"
+            );
+        }
+        // The piecewise join: the standard splits at scene 1/12, i.e. code 0.5.
+        assert!((hlg_decode_scene(0.5) - 1.0 / 12.0).abs() < 1e-12);
     }
 
     #[test]

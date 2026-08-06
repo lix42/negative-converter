@@ -36,6 +36,8 @@ use lcms2::{
 };
 
 use crate::pipeline::colorimetry::definitions::{self, ColorSpace, transfer};
+use crate::pipeline::colorimetry::pinned;
+use crate::pipeline::hdr;
 use crate::pipeline::sdr::{RenderedSdr, SdrGamut, SdrRenderMetadata};
 use crate::types::{LinearImage, NcError, OutDepth, OutputParams, Result};
 
@@ -193,6 +195,513 @@ pub fn encode_rendered_sdr(
     };
     transform_in_place(&mut image, &linear, &output)?;
     Ok((image, profile_icc(&output)?, metadata))
+}
+
+/// The ICC blob for the `hdr-linear-tiff` output: linear BT.2020 / D65.
+///
+/// **No transform runs here, and that is the whole point.** `pipeline::hdr` already
+/// rendered into BT.2020 primaries, so this only *describes* the samples the
+/// encoder writes verbatim. Routing them through [`to_output`] would treat
+/// display-linear BT.2020 as Rec.709 working RGB and remap it a second time — the
+/// same trap [`encode_rendered_sdr`] documents for the SDR rendition.
+///
+/// Two deliberate omissions, both recorded so they are not "fixed" later:
+///
+/// * **No `cicpTag`.** ICC.1:2022 §9.2.17 would permit one here (RGB data space,
+///   Display class), and the PQ/HLG TIFFs in `output/lossless-hdr-tiff`'s second
+///   half do carry one. But H.273's `VideoFullRangeFlag` describes a *bounded*
+///   code range, and these samples deliberately run past 1.0 to the ≈4.926108
+///   peak — so a CICP claim would add nothing the colorants and linear TRC do not
+///   already state, while over-stating the range. A linear transfer code point
+///   (H.273 value 8) is not a substitute for that.
+/// * **No attempt to encode luminance semantics in the profile.** The ICC PCS
+///   stops at the media white, so no v4 profile can say "1.0 means 203 cd/m² and
+///   4.926108 means 1000 cd/m²". The report and sidecar own those facts; the task
+///   requires that this profile never be claimed to carry them.
+///
+/// ⚠ This is the **fifth** runtime consumer of a `colorimetry::definitions` colour
+/// space (after `REC709`, `DISPLAY_P3`, `ACESCG` and `PROPHOTO`): editing
+/// `definitions::BT2020` now changes ICC bytes and every lcms2-transformed pixel on
+/// this path *even with `pinned.rs` untouched and every audit ulp at 0*. Nothing
+/// automated catches it — `PIPELINE_FINGERPRINTS` stops before lcms2 and the audit
+/// only compares pinned artifacts. Treat a `BT2020` edit as a pixel change.
+pub fn hdr_linear_bt2020_icc() -> Result<Vec<u8>> {
+    let (white, primaries) = lcms_inputs(definitions::BT2020);
+    let mut profile = synth(white, primaries, 1.0)?;
+    // A real name, like the coded-HDR profiles carry. `Profile::new_rgb` leaves
+    // Little CMS's default `"RGB built-in"`, which is useless in an application's
+    // profile list — and this profile is one a user picks out of such a list.
+    //
+    // Deliberately **not** applied to the older sRGB/P3/ACEScg/ProPhoto builders:
+    // doing that in the shared `synth` helper would change the embedded ICC bytes of
+    // already-shipped outputs, which is a separate reviewed decision.
+    describe(&mut profile, "NC Display-Linear BT.2020 (D65)")?;
+    profile_icc(&profile)
+}
+
+/// Set a profile's `profileDescriptionTag`.
+///
+/// Tagged **`en`/`US`**, not the null locale, for two reasons. ICC.1:2022 §10.15
+/// specifies each `multiLocalizedUnicodeType` record's language as an ISO 639-1 code
+/// and its country as an ISO 3166-1 one, and an all-zero pair is neither; and Little
+/// CMS's own default path writes `enUS` for the `cprt` tag it fills in, so a null
+/// `desc` record left the *same profile* internally inconsistent. A reader that asks
+/// for a specific locale without falling back to record 0 then found no description
+/// at all — the defect naming the profile was meant to remove.
+///
+/// `synth_coded_hdr` writes its text through `cmsMLUsetASCII` with the same pair, so
+/// every profile nc names agrees.
+fn describe(profile: &mut Profile, description: &str) -> Result<()> {
+    let mut text = lcms2::MLU::new(1);
+    // The `bool` is checked, not discarded: dropping it would let a failed
+    // `set_text` produce a description-*less* profile while this function still
+    // returned `Ok`, which is the silent-wrong-output shape the project forbids.
+    // `synth_coded_hdr` checks every `cmsMLUsetASCII` next door for the same reason.
+    if !text.set_text(description, lcms2::Locale::new("en_US")) {
+        return Err(NcError::Other(format!(
+            "failed to set the ICC profile description text {description:?}"
+        )));
+    }
+    if profile.write_tag(
+        lcms2::TagSignature::ProfileDescriptionTag,
+        lcms2::Tag::MLU(&text),
+    ) {
+        Ok(())
+    } else {
+        Err(NcError::Other(format!(
+            "failed to write the ICC profile description {description:?}"
+        )))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coded-HDR (PQ / HLG) A2B profiles
+// ---------------------------------------------------------------------------
+
+/// Entries in the tabulated tone curve of a coded-HDR profile.
+///
+/// 1024 was chosen by measurement, not habit: against the exact transfer function,
+/// 1024 and 4096 entries give the *same* accuracy (≤0.1% above 20 nits) because the
+/// limit is the 16-bit quantization of each stored value, not the table length —
+/// so the larger table would cost 18 KB of profile for nothing. Adobe's reference
+/// BT.2100 profiles use 512.
+const CODED_CURVE_ENTRIES: usize = 1024;
+
+/// ICC PCSXYZ in a 16-bit LUT tag is a **`u1Fixed15Number`** (ICC.1:2022 §4.8):
+/// *unsigned*, 15 fractional bits, so `1.0` encodes as `0x8000` and the
+/// representable maximum is `65535/32768 ≈ 1.99997`. A CMM scales by that when it
+/// reads the tag, so the matrix stage is pre-divided by it and the pipeline's PCS
+/// output is true XYZ.
+///
+/// The *unsigned* part matters: read as a signed 1.15 type the maximum would be
+/// ≈0.99997 and this scale would be mis-derived by 2x.
+///
+/// Not a fudge factor and not guessed: Adobe's reference BT.2100 profiles carry
+/// exactly this halving in their own matrix (their entries are the BT.2020
+/// colorants × 0.5), and omitting it makes every luminance come out 2× — which is
+/// how it was found.
+const PCS_XYZ_U1FIXED15: f64 = 32768.0 / 65535.0;
+
+/// What a coded-HDR ICC profile must state, gathered in one place so the PQ and HLG
+/// builders differ only in data.
+struct CodedHdrProfile {
+    /// `profileDescriptionTag` — a real name, unlike the `"RGB built-in"` Little
+    /// CMS puts on nc's matrix-shaper profiles.
+    description: &'static str,
+    /// CICP `(ColourPrimaries, TransferCharacteristics, MatrixCoefficients,
+    /// VideoFullRangeFlag)` per ITU-T H.273.
+    cicp: (u8, u8, u8, u8),
+    /// PCS-relative value the largest code (`1.0`) maps to — `10000/203` for PQ.
+    /// The matrix carries this scale, which is what puts the HDR range above
+    /// PCS `1.0`; the curve itself stays inside `[0, 1]` as ICC requires.
+    peak_relative: f64,
+    /// `code -> normalized value in [0, 1]`, i.e. the transfer function's own
+    /// inverse divided by its peak. Multiplying by
+    /// [`peak_relative`](Self::peak_relative) recovers the PCS value.
+    curve: fn(f64) -> f64,
+}
+
+/// The ICC blob for `hdr-pq-tiff`: BT.2020 primaries, the ST 2084 transfer, full
+/// range, PCS `Y = L / 203`. **See [`synth_coded_hdr`] for two open ICC conformance
+/// gaps** (`BToA0Tag`, `chromaticAdaptationTag`) — this is a valid *source* profile,
+/// not yet a fully conformant Display-class one.
+///
+/// **Display-referred and unclipped.** A 203 cd/m² diffuse white lands on PCS
+/// `1.0`, and highlights carry on past it to `10000/203 ≈ 49.26` — an *extended
+/// range* PCS. That is what makes the profile simultaneously honest (it is a pure
+/// scaling of absolute luminance: nothing is clipped, nothing invented, so it
+/// satisfies ICC.1:2022 §9.2.17's requirement that the profile encoding be
+/// "equivalent to the data colour space encoding" the [`cicp`](CodedHdrProfile::cicp)
+/// tag declares) and useful (a CMM that ignores `cicp` still renders diffuse white
+/// correctly instead of at 2% of it). "Equivalent" here is about the *encoding*
+/// the `cicp` tag declares; it is a separate question from the two Display-class
+/// tag requirements [`synth_coded_hdr`] documents as still open.
+///
+/// It is an **A2B pipeline, not a matrix-shaper**, and it has to be: a
+/// `redTRCTag` curve output is confined to `[0, 1]`, so a shaper profile could only
+/// reach an HDR range by clipping at reference white or by normalizing to
+/// 10,000 nits and rendering everything near-black. Adobe's reference BT.2100
+/// profiles take the same A2B route for the same reason.
+///
+/// **The extended range survives only in a floating-point CMM pipeline**, and that
+/// limit belongs with the claim rather than buried. The `AToB0`'s own output
+/// encoding is the same `u1Fixed15` PCS, capped at ≈1.99997 — about 406 cd/m² here —
+/// so any *integer* ICC pipeline (including Little CMS's own `cmsDoTransform` with
+/// 16-bit pixel formats) clamps there and flattens every highlight. The ≈49.26 the
+/// tests measure survives because lcms evaluates in float **and** the identity B
+/// curves are parametric, hence unclamped. A consumer that colour-manages in 16-bit
+/// therefore sees a 406-nit ceiling, not the full range; the `cicp` tag, which such a
+/// consumer can read directly, remains the reliable signal.
+///
+/// Measured accuracy of the round trip through Little CMS: ≤0.1% above 20 nits,
+/// ≤0.8% above 5 nits, degrading below ~1 nit where the 16-bit curve step
+/// (0.153 nits) dominates — an absolute error under 0.08 nits, i.e. below any
+/// display's black level. **This affects only how a colour-managed viewer
+/// interprets the file; the stored code values are untouched.**
+pub fn hdr_pq_tiff_icc() -> Result<Vec<u8>> {
+    synth_coded_hdr(&CodedHdrProfile {
+        description: "Rec.ITU-R BT.2100 PQ Full Range (nc)",
+        // 9-16-0-1 — ICC.1:2022 §10.3 lists this quadruple as "PQ R'G'B' full range
+        // representation specified in Recommendation ITU-R BT.2100-2, Table 9".
+        // MatrixCoefficients is **0 because the data colour space is RGB**, which
+        // §10.3 requires; `io::avif` writes 9 for the same rendition because AVIF
+        // stores Y'CbCr. Copying that 9 here would be non-conformant.
+        cicp: (9, 16, 0, 1),
+        peak_relative: transfer::pq::PEAK_NITS / f64::from(hdr::REFERENCE_WHITE_NITS),
+        curve: |code| hdr::pq_decode_nits(code) / transfer::pq::PEAK_NITS,
+    })
+}
+
+/// The ICC blob for `hdr-hlg-tiff`: BT.2020 primaries, the HLG transfer, full
+/// range, **scene-referred** PCS with diffuse white at `1.0`. **See
+/// [`synth_coded_hdr`] for two open ICC conformance gaps.**
+///
+/// **Why scene-referred, when the PQ profile is display-referred.** HLG's OOTF is
+/// `R_D = α · Y_S^(γ-1) · R_S` — it scales each channel by a function of the
+/// *pixel's* scene luminance, so it is not separable per channel and no set of 1D
+/// curves can represent it. Applying it as a per-channel power anyway is a common
+/// shortcut and a wrong one, so this profile stops at the inverse OETF and states
+/// scene-referred values; the OOTF is the display's job, which is what HLG's design
+/// intends. Adobe ships exactly this split — their BT.2100 HLG *Scene* profiles are
+/// 1D-plus-matrix like this one, while their *Display* profiles are ~66 KB because
+/// they need a 3D CLUT for the same reason.
+///
+/// The PCS is anchored so [`hdr::hlg_reference_white_signal`] — the signal level
+/// the renderer actually produces for 203 cd/m², ≈0.75, i.e. BT.2100's nominal
+/// diffuse white — maps to PCS `1.0`, matching the PQ profile's placement of
+/// diffuse white. The `cicp` tag remains the authoritative signal, and the
+/// report's `hdr_coded_tiff` block carries the display-referred contract
+/// (1000-nit peak, zero black, system gamma 1.2) that this profile deliberately
+/// does not encode.
+pub fn hdr_hlg_tiff_icc() -> Result<Vec<u8>> {
+    let white_signal = f64::from(hdr::hlg_reference_white_signal());
+    let white_scene = hdr::hlg_decode_scene(white_signal);
+    if !(white_scene.is_finite() && white_scene > 0.0) {
+        return Err(NcError::Other(format!(
+            "HLG reference-white scene value is not usable as a PCS anchor ({white_scene})"
+        )));
+    }
+    synth_coded_hdr(&CodedHdrProfile {
+        description: "Rec.ITU-R BT.2100 HLG Scene-Referred Full Range (nc)",
+        // 9-18-0-1, the HLG row of the same §10.3 table; MatrixCoefficients 0 for
+        // the same normative reason as PQ.
+        cicp: (9, 18, 0, 1),
+        // Scene 1.0 is the largest code's value, so the peak relative to diffuse
+        // white is `1 / scene(diffuse white)` and the curve needs no normalization
+        // of its own — the inverse OETF already lands in `[0, 1]`.
+        peak_relative: 1.0 / white_scene,
+        curve: hdr::hlg_decode_scene,
+    })
+}
+
+/// Build a coded-HDR profile: `mAB` pipeline (tone curves → scaled colorant matrix
+/// → identity) plus the `cicp` tag, description, and D50 media white.
+///
+/// # Two known conformance gaps, verified against ICC.1:2022 and deliberately open
+///
+/// This profile is **not yet a fully conformant Display-class profile**, and the
+/// surrounding documentation must not claim it is. Both gaps are in the normative
+/// text, checked rather than assumed:
+///
+/// * **§8.4.2 requires `BToA0Tag` as well as `AToB0Tag`** for an N-component
+///   LUT-based Display profile. Only `AToB0Tag` is written, so a strict CMM cannot
+///   use this profile as a transform *destination* (Little CMS's output-LUT reader
+///   has neither a `B2A0` nor matrix-shaper tags to fall back on). It works as a
+///   *source*, which is the only direction nc needs — an embedded profile describing
+///   this file's pixels — and macOS ColorSync accepts it in practice.
+/// * **§8.2 requires `chromaticAdaptationTag`** "when the measurement data used to
+///   calculate the profile was specified for an adopted white with a chromaticity
+///   different from that of the PCS adopted white". The colorants are Bradford
+///   D65→D50 adapted and `mediaWhitePointTag` declares D50, so `chad` is required
+///   and is missing; without it a consumer cannot recover that the *encoding* white
+///   is D65. Every profile Little CMS builds for nc carries it automatically —
+///   including `hdr_linear_bt2020_icc` — because `Profile::new_rgb` writes it.
+///
+/// Neither gap affects the stored code values, and the `cicp` tag remains the
+/// authoritative signal. **Both are owned by `output/presets`** (deferred there by
+/// decision on 2026-08-06, with the full closing recipe in its task file): fixing
+/// them needs two more pinned colorimetry artifacts — the inverse colorant matrix
+/// and the Bradford D65→D50 matrix — and changes these profiles' bytes, which wants
+/// one re-review alongside that task's preset activation.
+///
+/// Note also that a conformant `BToA0` is *inherently* range-limited here: its PCS
+/// input is `u1Fixed15Number`, capping it at ≈1.99997 — about 406 cd/m² — so it
+/// cannot round-trip the extended range the `AToB0` carries. That is a property to
+/// document, not to engineer around.
+///
+/// **One of two places nc reaches past the safe `lcms2` wrapper**, and they are
+/// unsafe for unrelated reasons. *Here* it is to **build a profile**: the safe crate
+/// cannot insert stages into a `Pipeline` (it exposes only `cat`) and does not expose
+/// a profile's raw handle, so an A2B profile is unreachable through it. The unsafe
+/// region is confined to profile *construction* — no pixel ever passes through this
+/// code, and the result is plain ICC bytes that the safe API reads back (the tests do
+/// exactly that). The other is `cli`'s startup call to
+/// `lcms2_sys::cmsSetLogErrorHandler`, which **installs a process-global handler**
+/// (the safe wrapper exposes only per-`ThreadContext` ones, and `color.rs` transforms
+/// on the global context); that one is the wider-reaching of the two — it changes
+/// process-wide state for the whole run rather than producing a byte buffer.
+fn synth_coded_hdr(spec: &CodedHdrProfile) -> Result<Vec<u8>> {
+    use lcms2_sys as sys;
+
+    // The curve stays in `[0, 1]` (an ICC `curveType` cannot express more) and the
+    // matrix below carries `peak_relative`. That split is the only way a 16-bit
+    // curve can describe an HDR range at all.
+    let table: Vec<u16> = (0..CODED_CURVE_ENTRIES)
+        .map(|i| {
+            let code = i as f64 / (CODED_CURVE_ENTRIES as f64 - 1.0);
+            ((spec.curve)(code).clamp(0.0, 1.0) * 65535.0).round() as u16
+        })
+        .collect();
+
+    let matrix: Vec<f64> = pinned::BT2020_TO_XYZ_D50
+        .iter()
+        .flatten()
+        .map(|value| value * spec.peak_relative * PCS_XYZ_U1FIXED15)
+        .collect();
+
+    let description = cstring(spec.description)?;
+    let copyright = cstring("No copyright, use freely")?;
+    let language = cstring("en")?;
+    let country = cstring("US")?;
+    // ICC.1:2022's PCS white point: X = 0,9642, Y = 1,0000, Z = 0,8249.
+    //
+    // ⚠ **Known inconsistency, deferred to `output/presets` with the `chad` work.**
+    // `pinned::BT2020_TO_XYZ_D50` adapts to `definitions::D50.to_xyz()` — D50 derived
+    // from its *rounded chromaticities*, which is `[0.96429568, 1, 0.82510460]` — so
+    // a neutral maps ≈2.4e-4 away from the white declared here. Small and invisible,
+    // but real, and the fix belongs with `chromaticAdaptationTag`: that tag must use
+    // the same white, and both together are one profile-bytes change wanting one
+    // re-review. Do not "fix" the media white to match the matrix — the spec value
+    // above is the correct target; the *matrix* is what should adapt to it.
+    let media_white = sys::CIEXYZ {
+        X: 0.9642,
+        Y: 1.0,
+        Z: 0.8249,
+    };
+    let (primaries, transfer_characteristics, matrix_coefficients, full_range) = spec.cicp;
+    let cicp = sys::VideoSignalType {
+        ColourPrimaries: primaries,
+        TransferCharacteristics: transfer_characteristics,
+        MatrixCoefficients: matrix_coefficients,
+        VideoFullRangeFlag: full_range,
+    };
+
+    // SAFETY (whole block): every raw pointer below is either freshly allocated by
+    // Little CMS and checked non-null before use, or a pointer to a local that
+    // outlives the call it is passed to. `cmsWriteTag` copies the data it is given,
+    // so the locals may be dropped afterwards. Each owned handle is released on
+    // every path via the guards, including the early returns `fail!` performs.
+    unsafe {
+        let profile = sys::cmsCreateProfilePlaceholder(std::ptr::null_mut());
+        if profile.is_null() {
+            return Err(NcError::Other("failed to allocate an ICC profile".into()));
+        }
+        let profile = ProfileHandle(profile);
+
+        sys::cmsSetDeviceClass(profile.0, sys::ProfileClassSignature::DisplayClass);
+        sys::cmsSetColorSpace(profile.0, sys::ColorSpaceSignature::RgbData);
+        sys::cmsSetPCS(profile.0, sys::ColorSpaceSignature::XYZData);
+        sys::cmsSetProfileVersion(profile.0, 4.4);
+        sys::cmsSetHeaderRenderingIntent(profile.0, sys::Intent::RelativeColorimetric);
+
+        macro_rules! fail {
+            ($what:expr) => {
+                return Err(NcError::Other(format!(
+                    "failed to write the {} of the {} ICC profile",
+                    $what, spec.description
+                )))
+            };
+        }
+
+        if sys::cmsWriteTag(
+            profile.0,
+            sys::TagSignature::MediaWhitePointTag,
+            (&raw const media_white).cast(),
+        ) == 0
+        {
+            fail!("media white point");
+        }
+        if sys::cmsWriteTag(
+            profile.0,
+            sys::TagSignature::CicpTag,
+            (&raw const cicp).cast(),
+        ) == 0
+        {
+            fail!("cicp tag");
+        }
+        for (tag, text) in [
+            (sys::TagSignature::ProfileDescriptionTag, &description),
+            (sys::TagSignature::CopyrightTag, &copyright),
+        ] {
+            let mlu = sys::cmsMLUalloc(std::ptr::null_mut(), 1);
+            if mlu.is_null() {
+                fail!("localized text allocation");
+            }
+            let mlu = MluHandle(mlu);
+            if sys::cmsMLUsetASCII(mlu.0, language.as_ptr(), country.as_ptr(), text.as_ptr()) == 0
+                || sys::cmsWriteTag(profile.0, tag, mlu.0.cast()) == 0
+            {
+                fail!("localized text");
+            }
+        }
+
+        let curve = sys::cmsBuildTabulatedToneCurve16(
+            std::ptr::null_mut(),
+            u32::try_from(table.len()).map_err(|_| {
+                NcError::Other("coded-HDR tone curve is too large for ICC".to_string())
+            })?,
+            table.as_ptr(),
+        );
+        if curve.is_null() {
+            fail!("tone curve");
+        }
+        let curve = CurveHandle(curve);
+        // Little CMS serializes `mAB ` only for a stage pattern it recognizes. The
+        // compact one that fits here is M curves → Matrix → B curves, so the
+        // identity B curves must be present even though they do nothing; a
+        // two-stage pipeline is rejected with "LUT is not suitable to be saved as
+        // LutAToB".
+        let identity = sys::cmsBuildGamma(std::ptr::null_mut(), 1.0);
+        if identity.is_null() {
+            fail!("identity curve");
+        }
+        let identity = CurveHandle(identity);
+
+        let pipeline = sys::cmsPipelineAlloc(std::ptr::null_mut(), 3, 3);
+        if pipeline.is_null() {
+            fail!("A2B pipeline");
+        }
+        let pipeline = PipelineHandle(pipeline);
+        for (stage, what) in [
+            (
+                sys::cmsStageAllocToneCurves(
+                    std::ptr::null_mut(),
+                    3,
+                    [curve.0.cast_const(); 3].as_ptr(),
+                ),
+                "tone-curve stage",
+            ),
+            (
+                sys::cmsStageAllocMatrix(
+                    std::ptr::null_mut(),
+                    3,
+                    3,
+                    matrix.as_ptr(),
+                    std::ptr::null(),
+                ),
+                "matrix stage",
+            ),
+            (
+                sys::cmsStageAllocToneCurves(
+                    std::ptr::null_mut(),
+                    3,
+                    [identity.0.cast_const(); 3].as_ptr(),
+                ),
+                "identity stage",
+            ),
+        ] {
+            // Leak window, stated accurately: all three stages are allocated
+            // *eagerly* when the array literal is built, before any insert runs, so a
+            // null from the matrix or identity alloc leaks its already-allocated
+            // siblings — not merely "a failed insert". `cmsPipelineInsertStage` takes
+            // ownership on success, so inserted stages are the pipeline's. Reachable
+            // only under an lcms allocation failure that fails the run anyway, which
+            // is why it is documented rather than given a guard per stage.
+            if stage.is_null()
+                || sys::cmsPipelineInsertStage(pipeline.0, sys::StageLoc::AT_END, stage) == 0
+            {
+                fail!(what);
+            }
+        }
+        if sys::cmsWriteTag(
+            profile.0,
+            sys::TagSignature::AToB0Tag,
+            pipeline.0.cast_const().cast(),
+        ) == 0
+        {
+            fail!("A2B0 tag");
+        }
+
+        let mut length: u32 = 0;
+        if sys::cmsSaveProfileToMem(profile.0, std::ptr::null_mut(), &raw mut length) == 0 {
+            fail!("profile size");
+        }
+        let mut bytes = vec![0u8; length as usize];
+        if sys::cmsSaveProfileToMem(profile.0, bytes.as_mut_ptr().cast(), &raw mut length) == 0 {
+            fail!("serialized profile");
+        }
+        // Same determinism rule as every other nc profile: Little CMS stamps the
+        // wall-clock creation time, so zero it or two runs seconds apart embed
+        // different bytes.
+        if let Some(datetime) = bytes.get_mut(ICC_HEADER_DATETIME) {
+            datetime.fill(0);
+        }
+        Ok(bytes)
+    }
+}
+
+fn cstring(text: &str) -> Result<std::ffi::CString> {
+    std::ffi::CString::new(text)
+        .map_err(|e| NcError::Other(format!("ICC profile text is not representable: {e}")))
+}
+
+/// RAII guards for the Little CMS handles [`synth_coded_hdr`] owns, so an early
+/// return cannot leak one. Each frees exactly what it holds.
+struct ProfileHandle(lcms2_sys::HPROFILE);
+impl Drop for ProfileHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `cmsCreateProfilePlaceholder` and is closed
+        // exactly once, here.
+        unsafe { lcms2_sys::cmsCloseProfile(self.0) };
+    }
+}
+
+struct MluHandle(*mut lcms2_sys::MLU);
+impl Drop for MluHandle {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `cmsMLUalloc`; `cmsWriteTag` copies, so freeing
+        // after the write is correct.
+        unsafe { lcms2_sys::cmsMLUfree(self.0) };
+    }
+}
+
+struct CurveHandle(*mut lcms2_sys::ToneCurve);
+impl Drop for CurveHandle {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `cmsBuildTabulatedToneCurve16` / `cmsBuildGamma`.
+        // `cmsStageAllocToneCurves` duplicates the curves it is given, so this does
+        // not free anything the pipeline still owns.
+        unsafe { lcms2_sys::cmsFreeToneCurve(self.0) };
+    }
+}
+
+struct PipelineHandle(*mut lcms2_sys::Pipeline);
+impl Drop for PipelineHandle {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `cmsPipelineAlloc`. `cmsWriteTag` duplicates the
+        // pipeline, so freeing it after the write does not disturb the profile.
+        unsafe { lcms2_sys::cmsPipelineFree(self.0) };
+    }
 }
 
 fn transform_in_place(image: &mut LinearImage, input: &Profile, output: &Profile) -> Result<()> {
@@ -789,6 +1298,311 @@ mod tests {
             assert!(
                 (x - ex).abs() < 3e-3 && (y - ey).abs() < 3e-3,
                 "recovered ({x},{y}) != registered ({ex},{ey})"
+            );
+        }
+    }
+
+    #[test]
+    fn hdr_linear_bt2020_profile_is_rgb_display_class_with_a_linear_trc() {
+        // Two properties, both load-bearing.
+        //
+        // **Linear TRC.** A gamma-1.0 curve is what makes the profile describe the
+        // samples the encoder writes; any other curve would claim a transfer
+        // function that `render_linear` never applied.
+        //
+        // **RGB data space + Display class.** ICC.1:2022 §9.2.17 permits a `cicpTag`
+        // only for an RGB/YCbCr/XYZ data space in an Input or Display profile. This
+        // profile carries no `cicpTag` (see `hdr_linear_bt2020_icc`), but the PQ/HLG
+        // TIFFs in this task's second half must, and they are built by the same
+        // `synth` helper — so pinning the class and space here is what tells the next
+        // author the permission holds before they add the tag.
+        use lcms2::{ColorSpaceSignature, ProfileClassSignature, Tag, TagSignature};
+        let (white, primaries) = lcms_inputs(definitions::BT2020);
+        let profile = synth(white, primaries, 1.0).unwrap();
+
+        let Tag::ToneCurve(trc) = profile.read_tag(TagSignature::RedTRCTag) else {
+            panic!("missing red TRC");
+        };
+        assert!(
+            trc.is_linear(),
+            "the linear-BT.2020 profile's TRC must be linear (parametric type {})",
+            trc.parametric_type()
+        );
+        assert_eq!(profile.color_space(), ColorSpaceSignature::RgbData);
+        assert_eq!(profile.device_class(), ProfileClassSignature::DisplayClass);
+    }
+
+    #[test]
+    fn hdr_linear_bt2020_decodes_to_the_bt2020_primaries() {
+        // The same independent end-to-end decode `display_p3_decodes_to_registered_
+        // d65_encoding` performs, against the BT.2020 profile: push encoded
+        // white/R/G/B through Little CMS into the D50 PCS, un-adapt to D65, and
+        // recover chromaticities. This is what proves the profile actually describes
+        // BT.2020 rather than merely having been built from those numbers.
+        let (white, primaries) = lcms_inputs(definitions::BT2020);
+        let profile = synth(white, primaries, 1.0).unwrap();
+        let xyz = Profile::new_xyz();
+        let t: Transform<[f32; 3], [f32; 3]> = Transform::new(
+            &profile,
+            PixelFormat::RGB_FLT,
+            &xyz,
+            PixelFormat::XYZ_FLT,
+            Intent::RelativeColorimetric,
+        )
+        .unwrap();
+        let mut px = [
+            [1.0f32, 1.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        t.transform_in_place(&mut px);
+        // Taken from `definitions::BT2020` rather than retyped, so the test cannot
+        // drift from the source of truth it is checking.
+        let [red, green, blue] = definitions::BT2020.primaries.as_array();
+        let expect = [
+            (definitions::BT2020.white.x, definitions::BT2020.white.y),
+            (red.x, red.y),
+            (green.x, green.y),
+            (blue.x, blue.y),
+        ];
+        for (got, (ex, ey)) in px.into_iter().zip(expect) {
+            let (x, y) = xy_of(bradford_d50_to_d65(got));
+            assert!(
+                (x - ex as f32).abs() < 3e-3 && (y - ey as f32).abs() < 3e-3,
+                "recovered ({x},{y}) != BT.2020 ({ex},{ey})"
+            );
+        }
+    }
+
+    #[test]
+    fn hdr_linear_bt2020_icc_is_deterministic_and_named() {
+        // Same dateTime-zeroing guarantee the other synthesized profiles get: two
+        // builds seconds apart must be byte-identical, or the TIFF's determinism
+        // contract fails on a single seconds byte buried in the profile header.
+        let first = hdr_linear_bt2020_icc().unwrap();
+        let second = hdr_linear_bt2020_icc().unwrap();
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+        // And it is *not* the ACEScg or Rec.709 profile — a copy-paste of the wrong
+        // `definitions` constant would otherwise pass every assertion above.
+        assert_ne!(first, icc_profile(&OutputSpace::AcesCg).unwrap());
+        assert_ne!(first, icc_profile(&OutputSpace::SRgb).unwrap());
+        // Carries a real description, not Little CMS's default "RGB built-in".
+        let profile = Profile::new_icc(&first).unwrap();
+        let description = profile
+            .info(lcms2::InfoType::Description, lcms2::Locale::none())
+            .unwrap_or_default();
+        assert!(
+            description.contains("BT.2020") && description.contains("Linear"),
+            "unexpected profile description {description:?}"
+        );
+        // The older shipped profiles are deliberately left alone, so their bytes
+        // do not move: this asserts the scope of the naming change.
+        let srgb = Profile::new_icc(&icc_profile(&OutputSpace::SRgb).unwrap()).unwrap();
+        assert_eq!(
+            srgb.info(lcms2::InfoType::Description, lcms2::Locale::none())
+                .unwrap_or_default(),
+            "sRGB built-in",
+            "the sRGB profile description must not change here"
+        );
+    }
+
+    /// The language/country of tag `sig`'s first `multiLocalizedUnicodeType` record,
+    /// read straight out of the profile's tag table.
+    ///
+    /// Deliberately *not* via `Profile::info`: that takes a [`lcms2::Locale`], so
+    /// asking with the same null locale a bug would have written round-trips
+    /// trivially and proves nothing. Parsing the bytes is what makes the assertion
+    /// falsifiable.
+    fn mluc_locale(icc: &[u8], sig: &[u8; 4]) -> (Vec<u8>, Vec<u8>) {
+        let be32 = |at: usize| u32::from_be_bytes(icc[at..at + 4].try_into().unwrap()) as usize;
+        let count = be32(128);
+        let (offset, _) = (0..count)
+            .map(|i| 132 + i * 12)
+            .find(|&e| &icc[e..e + 4] == sig)
+            .map(|e| (be32(e + 4), be32(e + 8)))
+            .unwrap_or_else(|| panic!("{} tag is absent", String::from_utf8_lossy(sig)));
+        assert_eq!(&icc[offset..offset + 4], b"mluc");
+        // `mluc`: sig, reserved, record count, record size, then records of
+        // (language, country, length, offset).
+        assert!(be32(offset + 8) >= 1, "no localized records");
+        let record = offset + 16;
+        (
+            icc[record..record + 2].to_vec(),
+            icc[record + 2..record + 4].to_vec(),
+        )
+    }
+
+    #[test]
+    fn every_named_profile_tags_its_description_en_us() {
+        // ICC.1:2022 §10.15 wants an ISO 639-1 language and an ISO 3166-1 country; an
+        // all-zero pair is neither, and a reader that requests a locale without
+        // falling back to record 0 then shows no description at all. The linear
+        // profile used to write the null locale while Little CMS's own default path
+        // put `enUS` on the *same profile's* `cprt` — internally inconsistent, which
+        // is the shape of the bug this pins.
+        for icc in [
+            hdr_linear_bt2020_icc().unwrap(),
+            hdr_pq_tiff_icc().unwrap(),
+            hdr_hlg_tiff_icc().unwrap(),
+        ] {
+            assert_eq!(
+                mluc_locale(&icc, b"desc"),
+                (b"en".to_vec(), b"US".to_vec()),
+                "description locale"
+            );
+            // And it agrees with the copyright record in the same profile, which is
+            // the comparison that exposed the inconsistency.
+            assert_eq!(mluc_locale(&icc, b"desc"), mluc_locale(&icc, b"cprt"));
+        }
+    }
+
+    /// PQ code values for known absolute luminances, from the ST 2084 OETF
+    /// evaluated independently (Python, binary64) rather than by calling nc's own
+    /// encoder — so these anchor the profile against the standard, not against the
+    /// function under test.
+    const PQ_CODE_FOR_NITS: [(f64, f64); 8] = [
+        (0.062_336_866, 0.1),
+        (0.149_945_732, 1.0),
+        (0.299_699_092, 10.0),
+        (0.357_012_408, 20.0),
+        (0.440_281_573, 50.0),
+        (0.508_078_422, 100.0),
+        (0.580_688_881, 203.0),
+        (0.751_827_096, 1000.0),
+    ];
+
+    /// Transform a neutral code value through a profile into PCS XYZ.
+    ///
+    /// Takes the code in `f64` because the anchors are computed in binary64; the
+    /// narrowing to the transform's `f32` pixel format happens here, once.
+    fn pcs_y_of(icc: &[u8], code: f64) -> f64 {
+        let profile = Profile::new_icc(icc).unwrap();
+        let xyz = Profile::new_xyz();
+        let transform: Transform<[f32; 3], [f32; 3]> = Transform::new(
+            &profile,
+            PixelFormat::RGB_FLT,
+            &xyz,
+            PixelFormat::XYZ_FLT,
+            Intent::RelativeColorimetric,
+        )
+        .unwrap();
+        let mut pixel = [[code as f32; 3]];
+        transform.transform_in_place(&mut pixel);
+        f64::from(pixel[0][1])
+    }
+
+    #[test]
+    fn pq_tiff_profile_places_reference_white_at_pcs_one_and_does_not_clip() {
+        // The property the whole A2B design exists for: diffuse white at PCS 1.0
+        // (so a CMM ignoring `cicp` renders it correctly) *and* an extended range
+        // above it (so highlights are not destroyed). A matrix-shaper profile can
+        // have one or the other, never both.
+        let icc = hdr_pq_tiff_icc().unwrap();
+        let mut worst = 0.0_f64;
+        for (code, nits) in PQ_CODE_FOR_NITS {
+            let recovered = pcs_y_of(&icc, code) * f64::from(hdr::REFERENCE_WHITE_NITS);
+            let error = (recovered - nits).abs() / nits;
+            // Above 20 nits the transform is accurate to ~0.1%; below ~1 nit the
+            // 16-bit curve step (0.153 nits) dominates, which is an absolute error
+            // under 0.08 nits — measured, and documented on the builder.
+            let allowed = if nits >= 20.0 { 0.005 } else { 1.0 };
+            assert!(
+                error < allowed,
+                "PQ profile at {nits} nits recovered {recovered:.4} (rel {error:.4})"
+            );
+            if nits >= 20.0 {
+                worst = worst.max(error);
+            }
+        }
+        assert!(worst < 0.005, "worst error above 20 nits was {worst:.5}");
+
+        // Extended range, and the peak lands on the renderer's own headroom.
+        let peak = pcs_y_of(&icc, 1.0);
+        assert!(peak > 40.0, "PCS peak {peak} is not an extended range");
+        let thousand = pcs_y_of(&icc, 0.751_827_096);
+        assert!(
+            (thousand - f64::from(hdr::LINEAR_HEADROOM)).abs() < 0.01,
+            "1000 nits should land on LINEAR_HEADROOM ({}), got {thousand}",
+            hdr::LINEAR_HEADROOM
+        );
+    }
+
+    #[test]
+    fn hlg_tiff_profile_is_scene_referred_with_diffuse_white_at_pcs_one() {
+        // Scene-referred by design (the OOTF is not per-channel separable), so the
+        // only luminance claim it makes is where diffuse white sits.
+        let icc = hdr_hlg_tiff_icc().unwrap();
+        let white = pcs_y_of(&icc, f64::from(hdr::hlg_reference_white_signal()));
+        assert!(
+            (white - 1.0).abs() < 0.005,
+            "HLG diffuse white should be PCS 1.0, got {white}"
+        );
+        let peak = pcs_y_of(&icc, 1.0);
+        assert!(
+            peak > 3.0,
+            "HLG peak {peak} should carry scene range above diffuse white"
+        );
+        assert!(pcs_y_of(&icc, 0.0).abs() < 1e-6, "black must be zero");
+    }
+
+    #[test]
+    fn coded_tiff_profiles_carry_the_normative_cicp_quadruples() {
+        use lcms2::{Tag, TagSignature};
+        for (icc, want, name) in [
+            (hdr_pq_tiff_icc().unwrap(), (9u8, 16u8, 0u8, 1u8), "pq"),
+            (hdr_hlg_tiff_icc().unwrap(), (9, 18, 0, 1), "hlg"),
+        ] {
+            let profile = Profile::new_icc(&icc).unwrap();
+            let Tag::VideoSignal(cicp) = profile.read_tag(TagSignature::CicpTag) else {
+                panic!("{name}: no cicp tag");
+            };
+            let got = (
+                cicp.ColourPrimaries,
+                cicp.TransferCharacteristics,
+                cicp.MatrixCoefficients,
+                cicp.VideoFullRangeFlag,
+            );
+            assert_eq!(got, want, "{name}: cicp quadruple");
+            // The one that is easy to get wrong: ICC.1:2022 §10.3 requires
+            // MatrixCoefficients 0 for an RGB data space. `io::avif` writes 9 for
+            // the same rendition because AVIF stores Y'CbCr; if that value ever
+            // leaks in here the file is non-conformant.
+            assert_eq!(
+                cicp.MatrixCoefficients, 0,
+                "{name}: MatrixCoefficients must be 0 for an RGB profile, not AVIF's 9"
+            );
+            // `cicp` is only permitted for an RGB/YCbCr/XYZ data space in an Input
+            // or Display profile, so the class and space are part of its validity.
+            assert_eq!(profile.color_space(), ColorSpaceSignature::RgbData);
+            assert_eq!(
+                profile.device_class(),
+                lcms2::ProfileClassSignature::DisplayClass
+            );
+        }
+    }
+
+    #[test]
+    fn coded_tiff_profiles_are_deterministic_named_and_distinct() {
+        let pq = hdr_pq_tiff_icc().unwrap();
+        let hlg = hdr_hlg_tiff_icc().unwrap();
+        assert_eq!(pq, hdr_pq_tiff_icc().unwrap(), "PQ profile is not stable");
+        assert_eq!(
+            hlg,
+            hdr_hlg_tiff_icc().unwrap(),
+            "HLG profile is not stable"
+        );
+        assert_ne!(pq, hlg, "PQ and HLG profiles must differ");
+        // Unlike the matrix-shaper profiles, these carry a real description rather
+        // than Little CMS's default "RGB built-in".
+        for (icc, expect) in [(&pq, "PQ"), (&hlg, "HLG")] {
+            let profile = Profile::new_icc(icc).unwrap();
+            let description = profile.info(lcms2::InfoType::Description, lcms2::Locale::none());
+            let description = description.unwrap_or_default();
+            assert!(
+                description.contains("BT.2100") && description.contains(expect),
+                "profile description {description:?} does not name the encoding"
             );
         }
     }

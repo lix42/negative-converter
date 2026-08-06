@@ -48,11 +48,91 @@ What other epics need to know about `output`:
   encoder config. Windows static builds are deferred (no Windows CI runner) →
   `output/hdr-avif-windows-packaging`.
 - **`hdr-pq` and `hdr-hlg` are live**, as explicit `convert`-only presets
-  requiring an `.avif` path — so five preset names are now accepted. Two things
+  requiring an `.avif` path — and **`hdr-linear-tiff`** since 2026-08-05, requiring
+  `.tif`/`.tiff`, so **six** preset names were accepted at that point (eight once
+  chunk B's `hdr-pq-tiff`/`hdr-hlg-tiff` landed — see below). Two things
   downstream tasks inherit: the suffix and convert-only rules are driven by one
   `cli::required_extensions` table (extend *that*, don't add a parallel check), and
   `stages::render_gain_map_source` is now **`render_display_source`** returning
-  `DisplaySource`, because every display preset shares it.
+  `DisplaySource`, because every display preset shares it. Note what the table's
+  coupling actually means: pinning a suffix *is* what makes a preset
+  `convert`-only, because roll derives frame names itself and nothing yet makes that
+  derivation honour a required extension. `film-master` pins no row and stays
+  roll-capable — so `output/presets` must add roll-aware naming before any of the
+  suffix-pinning presets (four at this point, six now) can run in a roll, and
+  `hdr-linear-tiff` writes a TIFF
+  yet is still refused there.
+- **`hdr-linear-tiff` is the display-linear HDR interchange master**, and its three
+  non-identities are the point: it is not `film-master` (linear ACEScg *before*
+  display rendering), not `hdr-pq`/`hdr-hlg` (no transfer applied), and not
+  `--output-hdr` (print-rendered float in the selected output space). It writes
+  `pipeline::hdr::render_linear`'s pre-transfer BT.2020/D65 samples verbatim as
+  unclamped f32 — bit-exact, values running to ≈4.926108. Three things other epics
+  inherit: **(a)** `io::encode::encode_hdr_linear` takes the opaque
+  `LinearBt2020Hdr` **by value** (via a new `into_parts`), so a future consumer must
+  not reintroduce a borrow-and-copy; **(b)** the **report block, not the ICC
+  profile, is authoritative** for reference white / peak / headroom — the ICC PCS
+  stops at the media white, so no v4 profile can carry them, and the profile
+  deliberately has no `cicpTag` because the full-range flag would over-state a
+  range these samples exceed; **(c)** its peak memory phase is the **render**, not
+  the encode (no quantization buffer, and `tiff` streams strips instead of
+  assembling a container), so adding lossless TIFF compression later reintroduces a
+  staging term. It is **not** the only such profile — `HdrCodedTiff` and
+  `UltraHdrV1` peak at render too. Which phase peaks is per-profile and measured:
+  read it off `pipeline::memory`'s
+  `which_phase_peaks_is_per_profile_and_measured_not_assumed`, never off a
+  category, because prose about it has been wrong twice.
+- **`definitions::BT2020` is now fed to Little CMS** by
+  `color::hdr_linear_bt2020_icc`, making **five** lcms2-consumed colour spaces
+  (`REC709`, `DISPLAY_P3`, `ACESCG`, `PROPHOTO`, `BT2020`). Editing any of the five
+  changes embedded ICC bytes and lcms2-transformed pixels *even with `pinned.rs`
+  untouched and every audit ulp at 0*, and nothing automated catches it. The
+  definitions module note used to say `BT2020` had no runtime consumer; that is
+  fixed.
+- **`hdr-pq-tiff` and `hdr-hlg-tiff` are live**, so **eight** preset names are now
+  accepted. They store the *same rendition* the AVIF presets code, as full-range
+  16-bit TIFF codes. Five things downstream tasks inherit:
+  **(a)** for an **RGB** data space ICC.1:2022 §10.3 *requires*
+  `MatrixCoefficients = 0`, so the `9` in
+  `HdrRenderMetadata::cicp_matrix_coefficients` (correct for AVIF, which stores
+  Y'CbCr) must never be copied into an RGB profile — the report writes 0 for that
+  reason; **(b)** `hdr::transfer_for` now answers for **four** presets, so it can
+  never be used to pick a container — `convert_frame` matches the preset
+  exhaustively, and reintroducing an `if let Some(transfer)` chain there would hand
+  the TIFF presets to the AVIF encoder; **(c)** the PQ profile is an
+  **extended-range A2B** (PCS `Y = L/203`, unclipped) built through `lcms2-sys`,
+  because the safe crate cannot insert pipeline stages and a matrix-shaper TRC
+  cannot exceed `[0, 1]`; **(d)** the HLG profile is **scene-referred** since HLG's
+  OOTF is not per-channel separable — a display-referred one needs a 3D CLUT;
+  **(e)** they are documented as **limited-interoperability interchange, never
+  display-ready**, since TIFF has no CICP tag of its own. macOS ColorSync *parses*
+  them (`sips` names the profile), and the 2026-08-06 viewer gate confirmed they
+  render correctly — but that gate was **not discriminating** for HDR presentation
+  (diffuse-highlight scene, and the still-default exponential curve rather than the
+  sigmoid), so presentation stays unclaimed.
+- **⚠ The coded-HDR profiles are valid *source* profiles, not conformant
+  Display-class ones, and `output/presets` owns closing that.** Verified against
+  ICC.1:2022: §8.4.2 requires `BToA0Tag` (only `AToB0Tag` is written, so a strict CMM
+  cannot use them as a transform *destination*) and §8.2 requires
+  `chromaticAdaptationTag` (missing, so the D65 encoding white is unrecoverable).
+  Deferred there on 2026-08-06 because closing them needs two more pinned colorimetry
+  artifacts and **changes the profile bytes**. Anyone reading `synth_coded_hdr`'s
+  conformance notes should treat the `cicp` tag — not the profile's tag completeness —
+  as the authoritative signal. A conformant `BToA0` is also inherently capped at
+  ≈406 cd/m² by the `u1Fixed15` PCS, so it can never carry the `AToB0`'s range.
+- **ICC PCSXYZ in a LUT tag is `u1Fixed15Number`** (`1.0` → `0x8000`), so any future
+  A2B matrix must be pre-divided by `32768/65535` or every luminance comes out 2×.
+  And Little CMS serializes `mAB ` only for a recognized stage pattern — M curves →
+  Matrix → B curves is the compact one, and the identity B curves are mandatory.
+- **`pinned::BT2020_TO_XYZ_D50` exists because nc now authors a profile itself.**
+  Every other nc profile lets Little CMS derive colorants from pinned primaries;
+  an A2B pipeline cannot, so the colorant matrix became a pinned artifact with its
+  own audit entry and an independent anchor (the colorants lcms itself computed,
+  read back with `exiftool`).
+- **ISO 22028-5:2026 was never a blocker for the TIFF work**, correcting
+  `iso-gain-map-metadata`'s 2026-08-04 note that grouped `lossless-hdr-tiff` with it.
+  The reference-white and peak numbers come from the closed spike; TIFF 6.0,
+  ICC.1:2022, H.273 and BT.2100-3 are all obtainable.
 - **The preset/`RunProfile` ownership rule, from the `ultra-hdr-v1` and now AVIF
   precedents:** whichever task ships an explicit `convert`-only preset also adds
   and calibrates that preset's `memory::RunProfile`. `output/presets` verifies
@@ -909,6 +989,519 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   Added `io/transactional-output-writes` as a real prerequisite so the TIFF
   encoders reuse one atomic-write boundary instead of duplicating it or writing
   directly to final paths.
+
+
+## lossless-hdr-tiff (chunk A — hdr-linear-tiff)
+
+**Status:** in progress
+**Updated:** 2026-08-05
+
+- 2026-08-05: Started after `output/hdr-avif-output` merged (`3d62db7`) made this
+  task executable. Split delivery in two chunks with user approval — A
+  `hdr-linear-tiff`, B `hdr-pq-tiff`/`hdr-hlg-tiff` — because the task file itself
+  requires the PQ/HLG *signaling contract* to be pinned before that variant is
+  implemented, and the linear half has no signaling ambiguity to resolve. Presets
+  are activated in-task per the `hdr-pq`/`hdr-hlg` precedent and the epic summary's
+  rule, not deferred to `output/presets`.
+- 2026-08-05: **Corrected a recorded blocker: this task is not gated on a paywalled
+  standard.** `iso-gain-map-metadata`'s 2026-08-04 entry flagged ISO 22028-5:2026
+  for purchase "since `hdr-avif-output` and `lossless-hdr-tiff` hit the same gate".
+  They do not: the 203-nit reference white and 1000-nit peak were pinned by the
+  *closed* HDR spike and this task only records them, while the signaling contract
+  comes from ICC.1:2022, ITU-T H.273, BT.2100-3 and TIFF 6.0 — all obtainable. AVIF
+  shipped on the same footing.
+- 2026-08-05: **Read ICC.1:2022 §9.2.17/§10.3 rather than working from memory**, and
+  it settles Chunk B's contract in advance. The `cicpTag` is 12 bytes (`'cicp'`,
+  four reserved zero bytes, then ColourPrimaries/TransferCharacteristics/
+  MatrixCoefficients/VideoFullRangeFlag as `uInt8` per ITU-T H.273), permitted only
+  for an RGB/YCbCr/XYZ data space in an Input or Display profile. The spec's own
+  examples name our code points verbatim — `9-16-0-1` = "PQ R'G'B' full range
+  representation specified in Recommendation ITU-R BT.2100-2, Table 9", `9-18-0-1`
+  = the HLG equivalent. **The trap worth carrying forward: MatrixCoefficients must
+  be 0 for an RGB data space** (§10.3 requires it), whereas the AVIF path writes 9
+  because AVIF stores Y'CbCr — so copying `HdrRenderMetadata::
+  cicp_matrix_coefficients` into a TIFF profile would be non-conformant. The tag
+  *supplements* rather than replaces the transform tags, so a real TRC is still
+  needed beside it. `lcms2` 6.1.1 can write it in **safe Rust**
+  (`Profile::write_tag(TagSignature::CicpTag, Tag::VideoSignal(…))`, Little CMS
+  2.19) — no `lcms2-sys` FFI, unlike the global error handler.
+- 2026-08-05: Implemented Chunk A. `hdr::LinearBt2020Hdr::into_parts` (mirroring
+  `RenderedHdr::into_parts`) hands the buffer to the new
+  `io::encode::encode_hdr_linear`, which takes the render **by value** — encoding
+  from `image()`'s borrow would have put a second full-frame f32 image on the heap
+  that the memory model does not account for. The encoder is a *domain-typed* entry
+  point rather than a flag on `encode`: it accepts the opaque BT.2020 type so those
+  samples cannot be confused with the Rec.709 working-space images `encode` handles,
+  while reusing the same `encode_planar` writer, `resolve_bigtiff`,
+  `scan_non_finite` and `channel_means_f32`. The linear-BT.2020 profile is
+  `color::hdr_linear_bt2020_icc`, built from `definitions::BT2020` at gamma 1.0
+  through the existing dateTime-zeroing path; the orchestrator resolves it and
+  passes it in, so the embedded blob is provably the one it chose.
+- 2026-08-05: **`definitions::BT2020` is now the fifth lcms2-consumed colour space**,
+  and the module note that said it had no runtime consumer was stale — it claimed
+  `BT2020` was reached "only from the `#[cfg(test)]` derivation and audit harness".
+  Fixed, and the note now carries the enumerated hazard list (`REC709`,
+  `DISPLAY_P3`, `ACESCG`, `PROPHOTO`, `BT2020`): editing any of the five changes
+  embedded ICC bytes and every lcms2-transformed pixel *even with `pinned.rs`
+  untouched and every audit ulp at 0*, and nothing automated catches it. The
+  `color` epic summary had already predicted this task would do exactly that.
+- 2026-08-05: **Deliberately no `cicpTag` on the linear profile.** ICC would permit
+  one (RGB + Display class, verified by `exiftool`), and Chunk B's PQ/HLG profiles
+  will carry one — but H.273's `VideoFullRangeFlag` describes a *bounded* code range
+  while these samples deliberately run past 1.0 to ≈4.926108, so the claim would
+  over-state the encoding while adding nothing the colorants and linear TRC already
+  say. Recorded on the builder so it is not "fixed" later.
+- 2026-08-05: The **report block is authoritative for the luminance semantics, by
+  necessity.** The ICC PCS stops at the media white, so no v4 profile can state that
+  `1.0` is 203 cd/m² and highlights reach 1000 cd/m². `report.hdr_linear_tiff`
+  carries reference white / peak / headroom / shoulder / tone / gamut ids plus the
+  frame's *measured* MaxCLL/MaxFALL, and an `interoperability` string that says
+  plainly the profile does not convey them. The task required that the profile never
+  be claimed to communicate all HDR semantics; this is that requirement in the
+  artifact rather than only in documentation.
+- 2026-08-05: **This is the only display profile whose peak phase is the render, not
+  the encode**, and that is a property of the model rather than an oversight:
+  f32 needs no quantization buffer (like `Convert`'s `OutDepth::F32` arm) and the
+  `tiff` writer streams strips straight into the staged `BufWriter` under the
+  default `Predictor::None`, so nothing assembles a container in memory the way
+  AVIF and the gain-map JPEGs do. Verified by reading `tiff` 0.11.3's
+  `write_strip`/`write_data` rather than assuming. **A lossless-compression option
+  would reintroduce a staging term** — noted at the model.
+- 2026-08-05: `RunProfile::HdrLinearTiff` calibrated on the same two real scans as
+  `HdrAvif`. 18.66 MP: accounted 820,917,504 against a measured 906,526,720-byte
+  peak RSS (9.5% under, allowance covers it; estimate 1,078,272,857). 74.65 MP:
+  accounted 3,284,582,400 against measured 3,578,101,760 (8.2% under; estimate
+  3,911,487,488). Clean linear scaling, and **no free constant to tune** — every
+  term is an enumerated buffer, so the 8–9.5% gap is unmodelled allocator/writer
+  overhead and inventing a term to close it would be fabrication. The render phase
+  reproduces by hand: `2·image + 12·px` = 2·298,515,456 + 223,886,592 =
+  820,917,504 exactly. Its `--export-ir` term is **4** B/px, not the 2 B/px the AVIF
+  and gain-map profiles stage, because this preset resolves `OutDepth::F32`.
+- 2026-08-05: Verified on real scans with independent tools. `exiftool`:
+  `BitsPerSample 32 32 32`, `SampleFormat Float; Float; Float`,
+  `PhotometricInterpretation RGB`, `Compression Uncompressed`,
+  `ProfileClass Display Device Profile`, `ColorSpaceData RGB`, D50 media white.
+  Its reported colorants match an **independent** Bradford D65→D50 adaptation of the
+  BT.2020 primaries to 2.2e-4 — consistent with Little CMS's own adaptation
+  rounding and well inside the ±2e-3 band `display_p3_colorants_match_icc_registry_
+  reference` already accepts. `sips` opens both files at 32 bits.
+- 2026-08-05: **The strongest real-scan evidence**: decoding the produced 18.66 MP
+  file back gives `min 0.09329889 max 4.9261084` with **7.92%** of samples above
+  reference white and zero non-finite — the maximum is *exactly*
+  `hdr::LINEAR_HEADROOM`, so the 1000-nit peak survives the round trip bit-for-bit.
+  That is the task's "values between reference white and peak, and values near the
+  supported maximum" clause discharged on real data rather than a fixture.
+- 2026-08-05: Tests: 12 new unit + 2 integration (603 + 135, from 591 + 133). The
+  round-trip test was **mutation-checked** — inserting a `clamp(0.0, 1.0)` in the
+  encoder fails exactly `hdr_linear_tiff_round_trips_every_sample_bit_exactly` and
+  `hdr_linear_tiff_counts_non_finite_without_laundering_it`, so both are
+  falsifiable rather than incidentally green. The `--strict` integration run uses
+  the **IR-free** `hdr-48bit.tif`, so "no promotable warning" is a real assertion.
+  The drift gate was **checked, not assumed**: `PIPELINE_FINGERPRINTS` and
+  `params_hash` are unmoved, since the default preset stays `legacy`.
+- 2026-08-05: Two stale things fixed while passing through, both pre-existing:
+  the `--output-preset` help still listed `hdr-pq`/`hdr-hlg` as "not accepted yet"
+  after `hdr-avif-output` activated them, and design-spec §8's `encoding` identifier
+  list omitted the shipped JPEG and AVIF names. Also reworded
+  `reject_roll_unsupported`, whose message blamed "non-TIFF containers" — false for
+  a TIFF preset. The real rule is the **suffix contract**: a preset that pins a
+  required extension is `convert`-only because roll derives frame names itself and
+  nothing makes that derivation honour one. `film-master` pins no row, which is
+  exactly why it stays roll-capable.
+- 2026-08-05: **Observation, deliberately not acted on:** every nc-synthesized
+  profile carries Little CMS's default `ProfileDescription: "RGB built-in"`,
+  including this one — unhelpful in an application's profile list. Setting a real
+  description only here would be inconsistent, and setting it in the shared `synth`
+  helper would change the embedded ICC bytes of already-shipped outputs. Left for a
+  deliberate decision (a natural `output/presets` or release-readiness item) rather
+  than changed silently as a side effect of this task.
+- 2026-08-05: Chunk A gates green in CI order: `cargo fmt --all --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo build`, `cargo test`.
+  **Still open for Chunk B:** the fallback-TRC probe with viewer evidence, u16
+  quantization with reported max/RMS error, the `cicpTag` profiles, and the
+  truthful-naming decision about 16-bit not being one of BT.2100's specified depths.
+
+
+## lossless-hdr-tiff (chunk B — hdr-pq-tiff / hdr-hlg-tiff)
+
+**Status:** done
+**Updated:** 2026-08-06
+
+- 2026-08-06: **STEP 0 overturned the plan's own default, which is why it existed.**
+  Chunk A left the fallback TRC as "probe, and default to the exact PQ inverse
+  (÷10,000 nits) if inconclusive". The probe was *not* inconclusive: it found that
+  real-world practice does a third thing neither candidate covered, and that the
+  planned default is the worst of the three. Measured through Little CMS, Adobe's
+  reference `9-16-0-1 BT2100-PQ-Display-Full.icc` maps **203 nits → PCS Y ≈ 1.0 and
+  does not clip**, carrying extended range to ~49.6 — i.e. reference-white-relative
+  luminance, exactly nc's own linear-domain semantics. Went back to the user rather
+  than applying a default whose premise had changed.
+- 2026-08-06: Facts about that reference profile worth keeping, since it is the only
+  known prior art for HDR TIFF in Photoshop/macOS. It is **Adobe-authored, ICC
+  v4.2** (not 4.4 — a `cicpTag` does not require 4.4), Display-class, and
+  **LUT-based**: `AToB0`/`AToB1`/`BToA0`/`BToA1` with **no** `redTRC`/matrix-column
+  tags at all. Its `mAB` is A curves (`curv`, 512 entries) → CLUT → M curves
+  (`para` type 1) → matrix → B curves (`curv`, count 0 = identity), and its matrix
+  is the BT.2020 colorants × **0.5** — which is how the PCS encoding factor below
+  was found. Its dark end is more accurate than nc's because the 16-bit
+  quantization happens in the *perceptual* A-curve domain and the range expansion
+  is a continuous parametric M curve; nc's simpler 3-stage form quantizes the linear
+  output instead. Recorded as a known, accepted difference, not a defect.
+- 2026-08-06: **Decision (user-approved): extended-range A2B, Adobe-compatible.**
+  A matrix-shaper profile cannot express it — an ICC `curveType` output is confined
+  to `[0, 1]`, so a shaper could only clip at reference white or normalize to
+  10,000 nits and render everything at 2% — and the extended-range form is
+  simultaneously the *honest* one: a pure scaling of absolute luminance satisfies
+  ICC.1:2022 §9.2.17's "equivalent to the data colour space encoding" without
+  clipping or inventing anything.
+- 2026-08-06: **The safe `lcms2` crate cannot build an A2B profile**, established
+  before committing to the approach: it exposes no way to insert a stage into a
+  `Pipeline` (only `cat`), and `Profile::handle` is `pub(crate)` so the raw handle
+  is unreachable. So `color::synth_coded_hdr` builds the whole profile through
+  `lcms2-sys`. The unsafe region is confined to profile *construction* — no pixel
+  passes through it, the result is plain ICC bytes the safe API reads back, and
+  every handle has an RAII guard so the early-return `fail!` paths cannot leak.
+- 2026-08-06: **Two things the probe taught that no amount of reading would have.**
+  (1) Little CMS refuses to serialize a 2-stage pipeline: "LUT is not suitable to be
+  saved as LutAToB". Its `mAB` writer accepts only recognized patterns, and the
+  compact one that fits is **M curves → Matrix → B curves**, so identity B curves
+  must be present even though they do nothing. (2) Every luminance came out exactly
+  **2× too large** until the matrix was pre-divided by `32768/65535`: ICC PCSXYZ in
+  a LUT tag is `s1Fixed15Number`, where `1.0` encodes as `0x8000`. Adobe's matrix
+  carries the same halving, which confirmed the reading rather than leaving it a
+  guessed fudge factor.
+- 2026-08-06: Curve resolution settled by measurement: **1024 entries**, because
+  1024 and 4096 give *identical* accuracy (the limit is the 16-bit quantization of
+  each stored value, not the table length) and 4096 would cost 18 KB of profile for
+  nothing. Measured accuracy of the whole round trip through Little CMS: ≤0.1% above
+  20 nits, ≤0.8% above 5 nits, degrading below ~1 nit where the 16-bit step
+  (0.153 nits) dominates — an absolute error under 0.08 nits, below any display's
+  black level. It affects only how a colour-managed viewer interprets the file; the
+  stored code values are untouched.
+- 2026-08-06: **HLG's profile is scene-referred, and that is forced, not a
+  shortcut.** HLG's OOTF is `R_D = α · Y_S^(γ-1) · R_S` — each channel scaled by a
+  function of the *pixel's* scene luminance — so it is not per-channel separable and
+  no 1D curve set can represent it. Applying it as a per-channel power anyway is a
+  common and wrong shortcut. Adobe ships exactly this split: their HLG **Scene**
+  profiles are 1D-plus-matrix like nc's (7.2 KB) while their HLG **Display**
+  profiles are ~66 KB because they need a 3D CLUT. nc's PCS is anchored on
+  `hdr::hlg_reference_white_signal()` — the signal the renderer actually produces
+  for 203 nits (≈0.7499, BT.2100's nominal diffuse white), *computed* rather than
+  asserted, so the profile's anchor and the renderer's output cannot drift apart.
+- 2026-08-06: `pinned::BT2020_TO_XYZ_D50` added through the documented colorimetry
+  workflow, with a new `derive::rgb_to_xyz_adapted` and audit `Source` variant. It is
+  the first artifact nc needs *because* it authors a profile itself: every other nc
+  profile lets Little CMS derive colorants from pinned primaries, which a
+  matrix-shaper can do and an A2B cannot. Held in `f64` (its consumer is an
+  `s15Fixed16` matrix stage, not an `f32` pixel loop) and derived with the canonical
+  `BRADFORD`. Its independent anchor is the colorant matrix **Little CMS itself
+  computed**, read out of chunk A's profile with `exiftool` — a different
+  implementation, quantized through ICC and printed by a third tool, agreeing to
+  2.2e-4. A second test pins the structural invariant that the columns sum to the
+  D50 adopted white, which a colorant check alone would not catch.
+- 2026-08-06: Replaced `convert_frame`'s render dispatch if-chain with an
+  **exhaustive match on the preset**. This was a real latent bug, not tidying:
+  `hdr::transfer_for` now legitimately answers for four presets (PQ and HLG each
+  have an AVIF *and* a TIFF preset rendering an identical rendition), so the old
+  `else if let Some(transfer) = transfer_for(..)` would have silently handed the new
+  TIFF presets to the AVIF encoder. The transfer and the container are independent
+  choices; the compiler now enumerates the containers.
+- 2026-08-06: Quantization is one pinned `round` (half away from zero) to full-range
+  16-bit, and out-of-domain samples are **rejected, not clipped** — the opposite of
+  the legacy `encode` path, where clipping is an expected outcome of an unclamped
+  render and is *counted*. Here the transfer stage guarantees finite `[0, 1]`, so an
+  out-of-domain sample means that stage is broken; the error names the pixel index.
+  On a real 18.66 MP scan the measured RMS error is **0.286 codes against the 0.2887
+  (`1/√12`) a uniform rounding residual predicts**, and on the 74.65 MP scan it is
+  **0.2875** — converging on the theoretical value as the sample count grows, which
+  is a strong independent sign the quantizer behaves as theory says. Max is 0.5, its
+  structural ceiling. The 74.65 MP file is 448 MB (exactly `px · 3 · 2`,
+  uncompressed) and stays ClassicTIFF, as the 4 GiB threshold implies.
+- 2026-08-06: **The strongest verification is cross-artifact.** Converting one real
+  scan to both `hdr-linear-tiff` and `hdr-pq-tiff` and decoding the PQ codes with an
+  *independent* ST 2084 EOTF recovers the linear TIFF's samples to **0.0149% worst
+  case over all 55,971,648 samples** (above ~4 nits), with the above-reference-white
+  count matching exactly (4,433,118 = 7.92%). That simultaneously confirms the
+  quantization, the transfer, and that the two presets really do share one rendition.
+- 2026-08-06: Independent metadata verification with `exiftool`: 16-bit unsigned RGB,
+  uncompressed, ICC v4.4 Display class, and the `cicp` fields decoded as
+  `ColorPrimaries: BT.2020, BT.2100` with `TransferCharacteristics: SMPTE ST 2084,
+  ITU BT.2100 PQ` / `BT.2100 HLG, ARIB STD-B67`, `MatrixCoefficients: Identity
+  matrix`, `VideoFullRangeFlag: Full`. **macOS `sips` reports both profiles by name**
+  ("Rec.ITU-R BT.2100 PQ Full Range (nc)"), so ColorSync parses and accepts an
+  extended-range A2B profile nc authored. That is evidence of *parsing*, and it is
+  deliberately not written up as evidence of HDR presentation — the visual
+  Photoshop/Preview check stays an external manual gate, and the documented
+  compatibility is not broadened past it.
+- 2026-08-06: Named the new profiles (user-approved scope): the PQ, HLG **and**
+  chunk A's linear-BT.2020 profiles carry real `profileDescriptionTag` values instead
+  of Little CMS's default `"RGB built-in"`. Deliberately *not* retrofitted to the
+  older sRGB/P3/ACEScg/ProPhoto profiles, which would change the embedded bytes of
+  already-shipped outputs; that stays a separate decision.
+- 2026-08-06: `RunProfile::HdrCodedTiff` calibrated on the same 18.66 MP scan:
+  accounted 820,917,504 against a measured 906,346,496-byte peak RSS (PQ) and
+  906,330,112 (HLG). Render is still the peak, so the number matches
+  `HdrLinearTiff` exactly — the +6 B/px quantize buffer lands in the encode phase,
+  which stays below render. Every display profile now shares one render term
+  (`2·image + 12·px`), which the tests assert directly so a future divergence is
+  visible.
+- 2026-08-06: **Truthful naming, in the artifact rather than only the docs.** The
+  report's `hdr_coded_tiff.interoperability` string states that 16 bits is TIFF's
+  quantization and not one of BT.2100's specified depths (10 and 12), that the
+  signalling lives in the ICC `cicpTag` because TIFF has none of its own, that only
+  a CICP-aware reader honours it, and that these are limited-interoperability
+  interchange rather than display-ready — pointing at the AVIF and gain-map presets
+  for delivery. The report's `cicp` triple deliberately writes **0** for
+  MatrixCoefficients rather than echoing `HdrRenderMetadata`'s 9, because it
+  describes the artifact (an RGB ICC profile) and not the renderer's AVIF contract.
+- 2026-08-06: **The manual viewer gate ran, and the result is "valid and correct,
+  but not discriminating."** A review set was generated from a real Portra 400 roll
+  (`portra400-2026-08-04`, frames 1244/1249) with the *same* recipe across five
+  formats — `hdr-pq-tiff`, `hdr-hlg-tiff`, the equivalent `hdr-pq` AVIF as a control
+  (macOS presents AVIF PQ as HDR natively), `hdr-linear-tiff`, and the legacy sRGB
+  TIFF as an SDR baseline. User verdict: **every TIFF and AVIF renders correctly and
+  all of them look good, with little visible difference between them.**
+  - What that **does** establish: the files are well-formed, ColorSync accepts the
+    hand-authored extended-range A2B profiles, and nothing renders garish, inverted,
+    or crushed — the failure modes a broken profile or a wrong PCS scale would show.
+  - What it **does not** establish: visible HDR presentation. "No difference from the
+    SDR baseline" is equally consistent with the viewer tone-mapping to SDR, so the
+    documented compatibility stays exactly where it was — **limited-interoperability
+    interchange, not display-ready**. Do not upgrade that claim on this evidence.
+  - Two reasons the test was under-powered, both worth fixing before a retest.
+    **(a) The scene.** 6.96% of samples sit above reference white with the max at the
+    1000-nit peak, so there *is* HDR content — but it is diffuse (sky/highlights),
+    not the small specular glints that make eDR obvious. **(b) The rendering.** The
+    set was converted with the **default reconstruction, which is still the
+    exponential curve** (`DensityCurve::default()`), every print control neutral —
+    not the reference-anchored sigmoid. So it exercised the container and profile,
+    which was the point, but not the intended product look.
+  - A discriminating retest needs a specular-highlight frame *and* an explicit
+    sigmoid reconstruction, and should compare **A against C** (PQ TIFF vs PQ AVIF,
+    the same rendition in two containers) rather than against the legacy SDR
+    baseline, which renders through a different path entirely.
+- 2026-08-06: Dmax was **not measurable on that roll**, which is itself a datapoint
+  for `film-base/dmax-anchor-reliability`: frame 1229 (the fully-exposed reference)
+  is clipped to zero transmission in *all three* channels, so it is denser than the
+  scan captured and `estimate --d-max-region` correctly refuses it. The review used
+  `--d-max 1.35`, the median of previously measured rolls. Also worth recording
+  against that task: the film **base does not transfer between capture sessions** as
+  cleanly as the earlier "0.0005 agreement" note implies — this roll's own measured
+  base (`0.5122/0.2270/0.1417`, from 1230 with `--grid`) differs from the other
+  Portra 400 roll's by **13% on green**, enough to blow highlights when borrowed.
+- 2026-08-06: **Code review (two engines) — eight findings, seven fixed, one
+  deliberately deferred.** Fixed: the `HdrLinearTiff` memory profile charged 4 B/px
+  for an f32 IR-export buffer that is **never allocated** (`export_ir_to_writer`'s
+  f32 arms pass the existing slice straight to the writer, which is exactly why
+  `Convert`'s f32 arm charges 0) — it over-stated the peak and could reject runs that
+  fit, and a test had pinned the wrong number; two `_` catch-all arms inside the
+  dispatch whose own comment called it "exhaustive" (the ICC choice now keys off
+  `render.metadata().transfer`, the value that actually produced the codes); the
+  measured MaxCLL/MaxFALL being dropped from the PQ TIFF report while the AVIF path
+  writes them into `clli`; missing RSS calibration rows for both new profiles; and
+  four stale doc/count errors. **Deferred with the reason recorded:** two real ICC
+  conformance gaps — §8.4.2 requires `BToA0Tag` and §8.2 requires
+  `chromaticAdaptationTag` — both verified against the normative text and now
+  documented on `synth_coded_hdr` instead of being papered over. Closing them needs
+  two more pinned artifacts and **changes the profile bytes**, which would invalidate
+  the review set above, so it is a reviewed decision rather than a silent edit.
+- 2026-08-06: A claim about peak phase was wrong **twice**, and the second time a
+  test caught it. The first version said `hdr-linear-tiff` was the *only*
+  render-peaking profile (its coded sibling is too); the correction said every
+  non-TIFF profile peaks at encode, which `ultra-hdr-v1` immediately falsified —
+  its four simultaneous display buffers make render 72 B/px against encode's 68.
+  There is no category: `which_phase_peaks_is_per_profile_and_measured_not_assumed`
+  now pins each profile's peak phase so the next author reads it off a test rather
+  than a sentence.
+- 2026-08-06: **Decision: the two ICC conformance gaps are deferred to
+  `output/presets`** (user call). The full closing recipe went into that task file
+  rather than being left as a comment — the two pinned artifacts it needs
+  (`XYZ_D50_TO_BT2020` and the Bradford D65→D50 matrix), the mirrored `mBA ` stage
+  order, and the warning that Little CMS accepts only recognized stage patterns. Two
+  reasons it belongs there: closing them **changes the profile bytes**, so it wants
+  one re-review, which that task already performs for preset activation; and the
+  existing `output/lossless-hdr-tiff --> output/presets` edge already carries it, so
+  **no dependency-graph change was needed** (verified in both the diagram and the
+  canonical list). `color::synth_coded_hdr` now names `output/presets` as the owner
+  instead of describing the work as an undecided question.
+- 2026-08-06: **Second review round (Codex + the nc reviewer), eleven findings, all
+  addressed.** The one that mattered was a genuine requirement gap neither the first
+  round nor I had caught:
+  - **P1 — the sidecar did not carry the HDR contract at all.** The task makes the
+    *sidecar* authoritative for semantics the ICC provably cannot express, but the
+    reference-white / peak / headroom / tone / quantization values were added only to
+    `Report`. Any run that discards stdout — `--report none`, which is exactly how a
+    batch script calls it, and how this task's own review set was generated — wrote a
+    file whose luminance semantics existed nowhere. Fixed by extending the sidecar's
+    `meta`. It could **not** be a third sibling key: `SidecarEnvelopeIn` is
+    `deny_unknown_fields`, so `{meta, params, output}` would make every new sidecar
+    fail to reload through `--params`. `meta` is safe because the read side keeps it
+    as an ignored raw `Value`, and the blocks are the *same types* the report
+    serializes, so the two cannot drift. Pinned by
+    `hdr_tiff_sidecars_carry_the_luminance_contract_and_still_reload`, which also
+    asserts the envelope shape is unmoved and that a sidecar replays byte-identically.
+  - **The extended-range claim was over-stated, and the correction is worth keeping.**
+    The `AToB0`'s *own* output encoding is the same `u1Fixed15` PCS, so an
+    **integer** ICC pipeline (including lcms's own `cmsDoTransform` with 16-bit
+    formats) clamps at ≈1.99997 — about 406 cd/m² — and flattens every highlight. The
+    ≈49.26 the tests measure survives only because lcms evaluates in float *and* the
+    identity B curves are parametric. The cap was previously attributed to `BToA0`
+    alone; it applies in the shipped direction too, for any 16-bit consumer.
+  - The ICC type was misnamed `s1Fixed15Number`; ICC.1:2022 §4.8 defines
+    **`u1Fixed15Number`** — unsigned. Read as signed, the maximum would be ≈0.99997
+    and the matrix scale would be mis-derived by 2x, so the name mattered.
+  - **`--output-preset --help` said `hdr-pq-tiff`/`hdr-hlg-tiff` were not accepted**
+    while `parse` accepted them — the primary discovery surface contradicting the
+    parser. `OutputPreset`'s own rustdoc still said "Only three variants are accepted
+    today" (stale since #78 and extended by this change). Both now say eight, with a
+    note that these three places have to move together.
+  - Also fixed: the `media_white` literal was `0.82491` where ICC.1:2022 §7 states
+    **0.8249** — a small profile-bytes change, made because no reading justifies the
+    old value; the design-spec copy of the "only render-peaking preset" claim; the
+    `required_extensions` row list omitting the coded presets; a stale
+    `#[allow(dead_code)]` on `RenderedHdr::metadata()` that production now calls; the
+    IR-export depth comment omitting five shipped presets; and a **vacuous
+    assertion** — `message.contains('1')` always passed because the error text
+    carries a `1` via "`[0, 1]`", so a missing index would not have failed it.
+  - **Deferred to `output/presets`, folded into the `chad` work:**
+    `pinned::BT2020_TO_XYZ_D50` adapts to `definitions::D50.to_xyz()`
+    (`[0.96429568, 1, 0.82510460]`, D50 from *rounded chromaticities*) rather than to
+    the spec's PCS white, so a neutral lands ≈2.4e-4 off the declared media white.
+    The matrix must adapt to the spec value *and* share it with the new `chad` tag,
+    so re-deriving it belongs in that single profile-bytes change. Recorded there,
+    including that the existing lcms-observed anchor test tolerates 2.5e-4 and so does
+    not currently catch it.
+- 2026-08-06: Tests: chunk B plus both review rounds bring this to **617 unit + 137
+  integration** (from 591 + 133 before this task began, and 603 + 135 after
+  chunk A).
+- 2026-08-06: **Third and fourth review rounds (the `/review-fix-loop` two-engine
+  pass, then `/ship`'s reviewers). One substantive correctness defect, found only on
+  the fourth pass.** `quantize_coded_u16` scaled in `f32`, which rounds **twice** —
+  into the product, then in `round()`. A sample whose exact product sits just under
+  a half-code boundary was pushed onto it and rounded away from the nearest code:
+  `0.996_498_05_f32 · 65535` evaluates to exactly `65305.5_f32` and stored 65306
+  where the exact product is 65305.4995957 and the nearest code is 65305. The `f32`
+  residual then *reported* 0.5 while the stored code was really 0.5004 away, so both
+  the "at most half a code" claim in the report block and the assertion in our own
+  test were false for those inputs. **271 of the 167,772 `f32` values in
+  `[0.99, 1.0)` disagree on the nearest code** — concentrated exactly where PQ puts
+  highlights. Now scaled and measured in binary64. This **changed stored codes** for
+  `hdr-pq-tiff`/`hdr-hlg-tiff` by up to 1 code on ~0.16% of samples;
+  `hdr-linear-tiff` is untouched (verbatim f32, no quantization).
+- 2026-08-06: **Two test oracles computed in `f32` and would have confirmed the
+  defect rather than caught it** — the same blind spot as an lcms-round-trip test
+  that shares an implementation with what it checks. Both now compute in binary64.
+  The regression test pins the stored code *and* that the reported error does not
+  understate the true one, and asserts the `f32` path still reproduces the defect so
+  the witness value cannot silently go stale. Verified cross-target-safe: every
+  operation involved (f32 multiply, f64 multiply, `round`) is exactly rounded per
+  IEEE-754, not transcendental, so the assertions are bit-stable on x86_64 Linux too.
+- 2026-08-06: **The "only render-peaking profile" claim needed a third correction**,
+  which is worth recording as a pattern rather than an incident. Rounds 2 and 3 fixed
+  the module doc, the design-spec, and the test; the fourth found it still live on the
+  `HdrLinearTiff` *variant rustdoc* and, worse, inside the test comment meant to be
+  the authority ("Every other profile peaks at encode" — false, `UltraHdrV1` peaks at
+  render at 72 vs 68 B/px). The lesson encoded in the comments now: what is unique to
+  `HdrLinearTiff` is the **absent staging term**, not the peak phase, and the peak
+  phase is per-profile and must be read off
+  `which_phase_peaks_is_per_profile_and_measured_not_assumed`.
+- 2026-08-06: Five smaller round-four fixes: the eagerly-allocated pipeline stages
+  mean a null alloc leaks its *siblings*, not just "a failed insert" as the SAFETY
+  note claimed; `describe` discarded `MLU::set_text`'s `bool`, so a failure would
+  have produced a description-less profile while returning `Ok`; "four TIFF-HDR rows"
+  where five were added; `validate_output_preset`'s rule-3 doc still naming only
+  `ultra-hdr-v1` for `print.linear_range`; and the `io::encode` module header
+  documenting only one of the two HDR entry points. Final: **619 unit + 137
+  integration**, all four gates green. All four gates green in CI
+  order plus `colorimetry::audit` in check mode and
+  `scripts/check-vendored-native.py`. The drift gate is unmoved — the default preset
+  is still `legacy`, verified rather than assumed.
+- 2026-08-06: **Correction to the second-review entry above: the vacuous assertion
+  was *not* fixed then.** That entry lists "a **vacuous assertion** —
+  `message.contains('1')`" among the round's fixes. The claim was false: the line
+  was still `message.contains('1')` in
+  `io::encode`'s `coded_hdr_tiff_rejects_an_out_of_domain_sample_instead_of_clipping`,
+  so the property it advertised — that the error names the *offending sample index*,
+  the whole reason that path refuses instead of clipping — remained unguarded. A
+  third review round caught it; it is asserted on the rendered index now
+  (`message.contains("sample 1 is outside")`) and **verified falsifiable**: removing
+  `{index}` from `quantize_coded_u16`'s message makes the test fail, which was
+  confirmed by doing it and then restoring the message. Logged as a new entry
+  because this file's dated history is append-only — the earlier entry stands as
+  written, wrong.
+
+  Two things worth carrying forward. First, a fix listed in a progress entry is not
+  evidence the fix landed; only the code is. Second, an assertion on an error
+  *message* is worth a moment's thought about what else the message contains — the
+  `1` this one matched came from the "finite values in [0, 1]" tail, which no amount
+  of re-reading the assertion in isolation would reveal.
+- 2026-08-06: **Third review round (Codex + the nc reviewer), fifteen findings.**
+  Beyond the vacuous assertion above, three were substantive and the rest were
+  doc/comment accuracy:
+  - **The `describe` helper tagged the linear profile's `desc` record with the null
+    locale** while `synth_coded_hdr` wrote `en`/`US` through `cmsMLUsetASCII` — so
+    the *same profile* carried `lang=\x00\x00 ctry=\x00\x00` on `desc` and `enUS` on
+    the `cprt` Little CMS fills in by default. ICC.1:2022 §10.15 wants an ISO 639-1
+    language and ISO 3166-1 country, and a reader that requests a locale without
+    falling back to record 0 showed *no* description — the exact defect naming the
+    profile was meant to remove. Now `Locale::new("en_US")`, pinned by
+    `every_named_profile_tags_its_description_en_us`, which parses the language and
+    country bytes **out of the tag table** rather than asking `Profile::info` with a
+    locale: querying through lcms with the same null locale round-trips trivially
+    and proves nothing. Verified externally on written bytes before and after.
+    Profile length is unchanged (only the two locale fields move), so no size or
+    `icc_bytes` expectation shifted.
+  - **`pq_decode_nits`'s comment misattributed its own guard.** It said `.max(0.0)`
+    existed because a code above 1.0 would take a negative base to a fractional
+    power; false — above 1.0 the numerator is positive and the clamp does nothing.
+    It is ST 2084's own `max(0, …)` protecting the **low** end: `power` drops below
+    `C1` for codes under ≈7.31e-7. Above 1.0 the function is simply out of contract,
+    and worth stating why: the *denominator* `C2 − C3·power` crosses zero at code
+    ≈1.99206, past which it returns NaN, and well before that the values are
+    nonsense (code 1.5 → ≈3.1e6 cd/m²). No live bug — the only caller is the ICC
+    table builder over `[0, 1]` — but the fn is `pub`, so the comment was actively
+    misleading a future caller.
+  - **`hdr::transfer_for(HdrLinearTiff) == None` was unpinned**, though it is the
+    subtle member of that answer: it *is* an HDR rendition and answers `None` only
+    because it applies no transfer, where `Legacy`/`FilmMaster`/`UltraHdrV1` answer
+    `None` because they are not HDR renditions at all. Added to the array, so the
+    interesting case is no longer the one nothing guards. In the same pass the two
+    new atomicity tests gained the **`output.bigtiff`** case they were missing
+    (`--bigtiff on` rejected, `--bigtiff auto` accepted as the falsifiable control),
+    driven through `merge` so the *flag* spelling is what is pinned.
+  - Doc/comment accuracy, all verified against the code: the Epic summary's "only
+    render-peaking display profile" claim (`HdrCodedTiff` and `UltraHdrV1` peak at
+    render too — read it off
+    `which_phase_peaks_is_per_profile_and_measured_not_assumed`, never off a
+    category); both suffix-pinning preset counts, which were off by one (**four** at
+    chunk A, **six** now); the remaining `s1Fixed15Number` → `u1Fixed15Number` spots,
+    each of which paired the wrong name with the *unsigned* ≈1.99997 maximum and so
+    was internally contradictory; `color.rs`'s "the one place nc reaches past the
+    safe `lcms2` wrapper", which ignored `cli`'s process-global
+    `cmsSetLogErrorHandler` — the wider-reaching of the two; design-spec §5's
+    identity-only description of the sidecar `meta` (it now carries
+    `hdr_linear_tiff` / `hdr_coded_tiff`, and §5 now says *why* they cannot be a
+    third sibling key); §9's `--export-ir` depth entry, which listed three cases out
+    of eight and said "sidecar" where it meant the IR TIFF; and the missing name for
+    the `hdr_coded_tiff` report block.
+  - Recorded in `output/presets`, not fixed here: an **open option** for the deferred
+    `BToA0` gap — declaring the coded profiles **Input** class would close it with no
+    inverse at all (ICC.1:2022 §8.3.2 requires only `AToB0Tag` for an N-component
+    LUT-based Input profile, and §9.2.17 permits `cicpTag` for Input as well as
+    Display), leaving `chad` as the only requirement. Deliberately logged as
+    *unresolved*: every ColorSync acceptance observation was made with a
+    Display-class profile, and a class change may be a coarser break than the byte
+    change already planned. Also recorded there: `colorimetry/tests.rs`'s
+    `bt2020_to_xyz_d50_maps_white_to_the_d50_adopted_white` pins the column sums to
+    **1e-12**, so correcting the adaptation target will fail it loudly and it must
+    move in that same change — the task file previously noted only the looser
+    2.5e-4 lcms anchor, which would not catch it.
+- 2026-08-06: Tests after the third round: **618 unit + 137 integration** (the one
+  addition is `every_named_profile_tags_its_description_en_us`; the round's other
+  work tightened existing assertions rather than adding cases). All four gates green
+  in CI order, plus `colorimetry::audit` in check mode and
+  `scripts/check-vendored-native.py`. Nothing in the round moved a pinned
+  colorimetry artifact, so `derived-artifacts.txt` and the drift gate are unmoved.
 
 
 ## iso-gain-map-metadata (continued)

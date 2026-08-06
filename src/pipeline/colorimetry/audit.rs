@@ -34,8 +34,8 @@
 use std::fmt::Write as _;
 
 use super::definitions::{
-    self, ACESCG, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, ColorSpace, ConeResponse,
-    DISPLAY_P3, REC709,
+    self, ACESCG, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, Chromaticity, ColorSpace,
+    ConeResponse, DISPLAY_P3, REC709,
 };
 use super::derive;
 use super::pinned;
@@ -68,6 +68,12 @@ enum Source {
     /// Derived from the *tabulated* luma, not from primaries — see
     /// [`pinned::BT2020_NCL_RGB_TO_YCBCR`](super::pinned::BT2020_NCL_RGB_TO_YCBCR).
     YCbCrFromLuma([f64; 3]),
+    /// Linear RGB → XYZ adapted to another white: an ICC colorant matrix.
+    RgbToXyzAdapted {
+        source: ColorSpace,
+        destination_white: Chromaticity,
+        cone: ConeResponse,
+    },
 }
 
 /// The shipped literal an artifact is compared against, flattened row-major.
@@ -133,6 +139,16 @@ fn catalog() -> Vec<Artifact> {
                 cone: BRADFORD,
             },
             shipped: Shipped::matrix_f32(pinned::ACESCG_TO_SRGB),
+        },
+        Artifact {
+            name: "BT2020_TO_XYZ_D50",
+            description: "bt2020/d65 -> xyz/d50 colorants, cone=bradford",
+            source: Source::RgbToXyzAdapted {
+                source: BT2020,
+                destination_white: definitions::D50,
+                cone: BRADFORD,
+            },
+            shipped: Shipped::matrix_f64(pinned::BT2020_TO_XYZ_D50),
         },
         Artifact {
             name: "ACESCG_TO_DISPLAY_P3",
@@ -216,6 +232,16 @@ fn canonical(source: Source) -> Vec<(String, f64)> {
             .collect(),
         Source::YCbCrFromLuma(luma) => {
             let m = derive::ycbcr_from_luma(luma);
+            (0..3)
+                .flat_map(|i| (0..3).map(move |j| (format!("[{i}][{j}]"), m[i][j])))
+                .collect()
+        }
+        Source::RgbToXyzAdapted {
+            source,
+            destination_white,
+            cone,
+        } => {
+            let m = derive::rgb_to_xyz_adapted(source, destination_white, cone);
             (0..3)
                 .flat_map(|i| (0..3).map(move |j| (format!("[{i}][{j}]"), m[i][j])))
                 .collect()

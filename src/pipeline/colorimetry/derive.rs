@@ -147,6 +147,30 @@ pub fn luma_row(space: ColorSpace) -> [f64; 3] {
     normalized_primary_matrix(space)[1]
 }
 
+/// Linear RGB → XYZ **adapted to another white**: the ICC "colorant" matrix.
+///
+/// This is [`normalized_primary_matrix`] followed by a chromatic adaptation,
+/// stopping at XYZ instead of continuing into a second RGB space the way
+/// [`rgb_to_rgb`] does. It exists because an ICC profile's PCS *is* XYZ under the
+/// D50 adopted white: the three columns are exactly the `redColorantTag` /
+/// `greenColorantTag` / `blueColorantTag` values, which is what a `lutAtoBType`
+/// matrix stage must contain when nc writes an A2B profile itself rather than
+/// letting Little CMS synthesize one from primaries.
+///
+/// Unlike `rgb_to_rgb` there is no same-white short-circuit: a D50-adopted source
+/// would legitimately compose with an identity adaptation, and skipping it would
+/// silently make this function's result depend on *which* white was requested in a
+/// way the caller cannot see.
+pub fn rgb_to_xyz_adapted(
+    space: ColorSpace,
+    destination_white: Chromaticity,
+    cone: ConeResponse,
+) -> Matrix3 {
+    let npm = normalized_primary_matrix(space);
+    let cat = adaptation(cone, space.white, destination_white);
+    multiply(cat, npm)
+}
+
 /// The non-constant-luminance R'G'B' → Y'CbCr matrix implied by a luma vector.
 ///
 /// This is a **nonlinear-domain** transform: unlike every other artifact here it

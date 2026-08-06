@@ -139,6 +139,46 @@ pub const BT2020_TO_DISPLAY_P3: [[f32; 3]; 3] = [
     [0.002_821_787_3, -0.019_598_495, 1.016_776_7],
 ];
 
+/// BT.2020 linear RGB → XYZ under the **D50** ICC adopted white, Bradford-adapted.
+///
+/// The three columns are the `redColorantTag` / `greenColorantTag` /
+/// `blueColorantTag` values of a BT.2020 ICC profile, and this is the matrix
+/// `pipeline::color` puts in the `lutAtoBType` matrix stage of the
+/// `hdr-pq-tiff` / `hdr-hlg-tiff` profiles.
+///
+/// **Why nc needs it explicitly at all**, when every other nc profile lets Little
+/// CMS derive colorants from pinned primaries: those are matrix-shaper profiles
+/// built by `Profile::new_rgb`, whose TRC output is confined to `[0, 1]` and which
+/// therefore cannot express an HDR PCS. The coded PQ/HLG profiles are authored as
+/// A2B pipelines instead, so nc supplies the matrix — which makes it a
+/// standards-derived coefficient the runtime multiplies by, and those live here
+/// rather than in a stage.
+///
+/// Held in `f64` because its consumer is an ICC `s15Fixed16` matrix stage built in
+/// binary64, not an `f32` pixel loop; narrowing it early would throw away
+/// precision the serializer still wants. Canonical [`BRADFORD`] (exact `f64`
+/// inverse), *not* the published-inverse variant — that one exists only for the
+/// frozen `nc-film-rgb-v1` mapping.
+///
+/// [`BRADFORD`]: super::definitions::BRADFORD
+pub const BT2020_TO_XYZ_D50: [[f64; 3]; 3] = [
+    [
+        0.673_515_463_188_276,
+        0.165_697_263_703_904_64,
+        0.125_082_949_537_387_08,
+    ],
+    [
+        0.279_059_005_141_120_7,
+        0.675_318_005_749_109_7,
+        0.045_622_989_109_769_654,
+    ],
+    [
+        -0.001_932_427_134_004_349_5,
+        0.029_977_826_792_829_163,
+        0.797_059_202_851_635_6,
+    ],
+];
+
 /// BT.2020 non-constant-luminance luma weights, as used by `pipeline::hdr`.
 ///
 /// **This one is a transcription of a normative table, not a derivation** — see

@@ -117,6 +117,89 @@ suffix validation, roll naming, reports, and user guidance.
 - `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo build`, and `cargo test` pass.
 
+## Status
+
+**Done (2026-08-06)**, delivered in two chunks — A `hdr-linear-tiff`, B
+`hdr-pq-tiff` / `hdr-hlg-tiff` — following this file's own instruction to pin the
+PQ/HLG signaling contract before implementing that variant. See
+[progress/output.md](../../progress/output.md) for the execution record.
+
+Three decisions worth carrying forward, all recorded there in full:
+
+- The PQ profile is an **extended-range A2B** (`lutAtoBType`), PCS `Y = L / 203`
+  unclipped to ≈49.26, matching Adobe's reference BT.2100 profiles. A matrix-shaper
+  profile cannot express it — a TRC output is confined to `[0, 1]` — so it would
+  have to clip at reference white or render everything near-black.
+- The HLG profile is **scene-referred**, because HLG's OOTF is not per-channel
+  separable and no 1D curve set can carry it. A display-referred one needs a 3D
+  CLUT (Adobe's are ~66 KB for exactly this reason); nc does not generate one.
+- Both are documented as **limited-interoperability interchange, never
+  "display-ready"**: TIFF has no CICP tag of its own, so the signalling lives in the
+  ICC `cicpTag` and only a CICP-aware reader honours it. macOS ColorSync accepts and
+  names the profiles (`sips`), which is evidence of parsing, **not** of HDR
+  presentation — that remains a manual visual gate.
+
+The manual viewer gate **ran on 2026-08-06** and came back "valid and correct, but
+not discriminating": every TIFF and AVIF renders correctly and looks good, with
+little visible difference between them. That confirms the files are well-formed and
+that ColorSync accepts the profiles; it does **not** confirm visible HDR
+presentation, so the documented compatibility stays where it is. A discriminating
+retest needs a specular-highlight scene and an explicit **sigmoid** reconstruction
+(the default is still exponential), comparing the PQ TIFF against the PQ AVIF rather
+than against the legacy SDR baseline. See the progress log.
+
+Two ICC conformance gaps are documented on `color::synth_coded_hdr` and
+**deferred to `output/presets`** (decision 2026-08-06; the closing recipe lives in
+[that task file](presets.md)). Both verified against ICC.1:2022: §8.4.2 requires
+`BToA0Tag` (only `AToB0Tag` is written, so these are valid *source* profiles but not
+conformant Display-class ones) and §8.2 requires `chromaticAdaptationTag` (missing,
+so a consumer cannot recover that the encoding white is D65). Neither affects the
+stored code values and the `cicp` tag remains authoritative. Deferred because
+closing them needs two more pinned colorimetry artifacts and **changes the profile
+bytes**, which wants a re-review alongside preset activation. The existing
+dependency edge `output/lossless-hdr-tiff --> output/presets` already carries it, so
+no graph change was needed.
+
+**No paywalled standard blocks this task**, correcting the 2026-08-04 assumption in
+`output/iso-gain-map-metadata`'s log that ISO 22028-5:2026 would have to be bought
+"since `hdr-avif-output` and `lossless-hdr-tiff` hit the same gate". The 203-nit
+reference white and 1000-nit peak were pinned by the *closed* HDR spike and are
+only recorded here; the signaling contract comes from ICC.1:2022, ITU-T H.273,
+BT.2100-3 and TIFF 6.0, all obtainable.
+
+The **PQ/HLG signaling contract is already researched** (do not re-derive it):
+ICC.1:2022 §9.2.17 `cicpTag` / §10.3 `cicpType` — a 12-byte tag (`'cicp'`, four
+reserved zero bytes, then ColourPrimaries / TransferCharacteristics /
+MatrixCoefficients / VideoFullRangeFlag as `uInt8`, encoded per ITU-T H.273),
+permitted only for an RGB/YCbCr/XYZ data space in an Input or Display profile —
+which nc's synthesized profiles satisfy (verified: `exiftool` reports
+`ColorSpaceData: RGB`, `ProfileClass: Display Device Profile`). The specification's
+own examples name the exact code points: `9-16-0-1` is "PQ R'G'B' full range
+representation specified in Recommendation ITU-R BT.2100-2, Table 9" and
+`9-18-0-1` the HLG equivalent. **MatrixCoefficients must be 0**, because §10.3
+requires it for an RGB data space — the AVIF path's `9` reflects AVIF storing
+Y'CbCr, so `HdrRenderMetadata::cicp_matrix_coefficients` must not be copied into a
+TIFF profile. `cicpTag` *supplements* the transform tags rather than replacing them
+("the colour encoding specified by the CICP tag content shall be equivalent to the
+data colour space encoding represented by this ICC profile"), so a real TRC is
+still required beside it. `lcms2` 6.1.1 can write the `cicpTag` itself in safe Rust —
+`Profile::write_tag(TagSignature::CicpTag, Tag::VideoSignal(&VideoSignalType{…}))`
+against Little CMS 2.19. **The surrounding profile, however, is built entirely
+through `lcms2-sys` FFI**: the safe crate cannot insert stages into a `Pipeline`
+(only `cat`) and does not expose a profile's raw handle, so an A2B profile is
+unreachable through it.
+
+Chunk B's fallback TRC was **decided by probe** (see the progress log): neither
+candidate above was chosen. Adobe's reference BT.2100 profiles place a 203-nit
+diffuse white at PCS `1.0` *without clipping*, carrying extended range to ≈49.26,
+and that is what shipped — it is both colorimetrically equivalent to the declared
+encoding and correct-looking in a naive CMM, which neither original candidate was. `github.com/digitaltvguy/ICC-v4.4-Profiles-with-CICP-Tags-for-HDR-and-SDR-Broadcast-Applications`
+is prior art worth reading in a browser (a scripted README fetch failed).
+
+Also note for Chunk B: 16-bit is **not** one of BT.2100's specified depths (it
+specifies 10 and 12), so those files carry BT.2100's *transfer* at TIFF's
+quantization and must be described that way.
+
 ## Dependencies
 
 - [Display-HDR rendering](hdr-display-rendering.md)

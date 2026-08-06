@@ -44,8 +44,8 @@
 
 use super::audit::ulps_f32;
 use super::definitions::{
-    ACESCG, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, BT2020_LUMA_TABULATED, ColorSpace, D65,
-    DISPLAY_P3, PROPHOTO, REC709,
+    ACESCG, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, BT2020_LUMA_TABULATED, ColorSpace, D50,
+    D65, DISPLAY_P3, PROPHOTO, REC709,
 };
 use super::derive::{self, Matrix3, inverse, multiply, rgb_to_rgb, transform};
 use super::pinned;
@@ -565,6 +565,61 @@ fn bt2020_ycbcr_matches_the_published_rounded_coefficients() {
                  published {want}",
             );
         }
+    }
+}
+
+/// Bradford D65→D50 adapted BT.2020 colorants, as **Little CMS independently
+/// computes them** — read out of a synthesized BT.2020 profile with `exiftool`
+/// during `output/lossless-hdr-tiff` chunk A:
+///
+/// ```text
+/// RedMatrixColumn:   0.67348  0.27904  -0.00194
+/// GreenMatrixColumn: 0.16566  0.67534   0.02998
+/// BlueMatrixColumn:  0.12505  0.04561   0.79684
+/// ```
+///
+/// A genuinely independent anchor: a different implementation (lcms's own
+/// adaptation code, quantized through ICC `s15Fixed16` and printed to five
+/// decimals by a third tool) reaching the same matrix nc derives in binary64.
+const BT2020_XYZ_D50_LCMS_OBSERVED: [[f64; 3]; 3] = [
+    [0.67348, 0.16566, 0.12505],
+    [0.27904, 0.67534, 0.04561],
+    [-0.00194, 0.02998, 0.79684],
+];
+
+#[test]
+fn bt2020_to_xyz_d50_matches_the_colorants_little_cms_computes() {
+    for (i, (row, observed)) in pinned::BT2020_TO_XYZ_D50
+        .iter()
+        .zip(BT2020_XYZ_D50_LCMS_OBSERVED)
+        .enumerate()
+    {
+        for (j, (&shipped, want)) in row.iter().zip(observed).enumerate() {
+            // 2.5e-4 covers ICC `s15Fixed16` quantization plus `exiftool`'s
+            // five-decimal printing; the worst observed entry is ~2.2e-4 (blue Z).
+            assert!(
+                (shipped - want).abs() <= 2.5e-4,
+                "BT2020_TO_XYZ_D50[{i}][{j}] = {shipped} disagrees with the colorants \
+                 Little CMS independently computed ({want})",
+            );
+        }
+    }
+}
+
+#[test]
+fn bt2020_to_xyz_d50_maps_white_to_the_d50_adopted_white() {
+    // The defining property of an ICC colorant matrix: R=G=B=1 must land on the
+    // PCS adopted white. `MediaWhitePointTag` states D50, so if this failed the
+    // profile would claim a white it does not produce — and every neutral would
+    // carry a tint no colorant check on its own would reveal.
+    let sum: [f64; 3] =
+        std::array::from_fn(|i: usize| -> f64 { pinned::BT2020_TO_XYZ_D50[i].iter().sum() });
+    let d50 = D50.to_xyz();
+    for (axis, (&got, want)) in sum.iter().zip(d50).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-12,
+            "column sum axis {axis} = {got}, D50 adopted white is {want}",
+        );
     }
 }
 

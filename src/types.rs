@@ -1171,13 +1171,16 @@ impl EncodeReport {
 /// a preset resolves a whole coherent policy, so it can never be a bag of
 /// independent bools. Serializes kebab-case (`"legacy"` / `"film-master"`).
 ///
-/// **Only three variants are accepted today.** The remaining planned preset names
-/// (`gain-map-hdr`, `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`,
-/// `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, `custom`) need the SDR/HDR
-/// display renderers and the container work owned by `output/presets`;
-/// [`parse`](Self::parse) rejects them with a pinned "does not accept yet"
-/// message rather than a generic unknown-value error, and rejects the
+/// **Eight variants are accepted today** — `legacy`, `film-master`,
+/// `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff` and
+/// `hdr-hlg-tiff`. The remaining planned names (`gain-map-hdr`, `display-p3`,
+/// `compatibility`, `custom`) need the default-activation and guidance work owned by
+/// `output/presets`; [`parse`](Self::parse) rejects them with a pinned "does not
+/// accept yet" message rather than a generic unknown-value error, and rejects the
 /// pre-release name `scene-master` as an unreleased-schema break.
+///
+/// Keep this list in step with `parse` and with `OutputOverrides::output_preset`'s
+/// help text — it has gone stale twice, and the help text is what `--help` shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputPreset {
@@ -1220,6 +1223,45 @@ pub enum OutputPreset {
     /// system gamma 1.2. Being display-referred, it carries no absolute
     /// content-light metadata.
     HdrHlg,
+    /// **`hdr-linear-tiff`** — the display-linear HDR *interchange* master: an
+    /// unclamped 32-bit float TIFF holding the HDR renderer's pre-transfer
+    /// BT.2020/D65 samples verbatim, with a synthesized linear-BT.2020 ICC
+    /// profile. Requires a `.tif`/`.tiff` output path.
+    ///
+    /// Distinct from all three neighbours, and the distinctions are the point:
+    /// - **not** [`FilmMaster`](Self::FilmMaster) — that is linear ACEScg *before*
+    ///   any display rendering, whereas this has been through the shared print
+    ///   controls, the reference-white-preserving shoulder, and BT.2020 gamut
+    ///   mapping;
+    /// - **not** [`HdrPq`](Self::HdrPq)/[`HdrHlg`](Self::HdrHlg) — no transfer
+    ///   function has been applied, so these are linear luminance values, not
+    ///   Rec.2100 code values;
+    /// - **not** the legacy `--output-hdr` float TIFF, which is a *print*-rendered
+    ///   image in the selected output space.
+    ///
+    /// Samples are reference-white-relative: `1.0` is the 203 cd/m² reference
+    /// white and highlights legitimately reach the 1000 cd/m² peak at
+    /// `pipeline::hdr::LINEAR_HEADROOM` (≈4.926108). Nothing is clamped, so the
+    /// embedded ICC — whose PCS stops at 1.0 — cannot by itself convey those
+    /// luminance semantics; the report and sidecar are authoritative for them.
+    HdrLinearTiff,
+    /// **`hdr-pq-tiff`** — the Rec.2100 PQ signal stored as full-range 16-bit TIFF
+    /// code values, with an extended-range BT.2020 ICC profile carrying the
+    /// `cicp` 9-16-0-1 tag. Requires a `.tif`/`.tiff` output path.
+    ///
+    /// Lossless *relative to the quantized signal*: the renderer's normalized
+    /// output is quantized once with one pinned rounding rule and TIFF stores every
+    /// resulting code exactly, with the measured max/RMS quantization error
+    /// reported. **16 bits is TIFF's quantization, not one of BT.2100's own bit
+    /// depths** (it specifies 10 and 12), so the file carries BT.2100's transfer
+    /// function at TIFF's precision — the report says exactly that rather than
+    /// implying a Rec.2100 system claim.
+    HdrPqTiff,
+    /// **`hdr-hlg-tiff`** — as [`HdrPqTiff`](Self::HdrPqTiff) but the HLG transfer,
+    /// with `cicp` 9-18-0-1. Its ICC profile is deliberately **scene-referred**
+    /// (HLG's OOTF is not per-channel separable, so no 1D curve set can express
+    /// it); the display-referred contract lives in the report.
+    HdrHlgTiff,
 }
 
 impl OutputPreset {
@@ -1234,6 +1276,9 @@ impl OutputPreset {
             "ultra-hdr-v1" => Ok(OutputPreset::UltraHdrV1),
             "hdr-pq" => Ok(OutputPreset::HdrPq),
             "hdr-hlg" => Ok(OutputPreset::HdrHlg),
+            "hdr-linear-tiff" => Ok(OutputPreset::HdrLinearTiff),
+            "hdr-pq-tiff" => Ok(OutputPreset::HdrPqTiff),
+            "hdr-hlg-tiff" => Ok(OutputPreset::HdrHlgTiff),
             // The pre-release name for the same branch. It was renamed *before*
             // release because "scene" wrongly implied physical scene-linear
             // recovery; nc is unreleased, so this is a schema break, not an alias.
@@ -1244,18 +1289,22 @@ impl OutputPreset {
                  scene-linear recovery). Use `film-master`; there is no alias."
                     .into(),
             )),
-            planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "hdr-linear-tiff"
-            | "hdr-pq-tiff" | "hdr-hlg-tiff" | "custom") => Err(NcError::Usage(format!(
-                "output preset `{planned}` is a planned name that this build does not \
+            planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "custom") => {
+                Err(NcError::Usage(format!(
+                    "output preset `{planned}` is a planned name that this build does not \
                  accept yet (it needs the remaining container work owned by \
                  `output/presets`). Accepted today: `legacy` (the transitional TIFF \
                  path, the default), `film-master` (unclamped linear ACEScg float \
-                 TIFF), `ultra-hdr-v1` (legacy XMP gain-map JPEG), and `hdr-pq` / \
-                 `hdr-hlg` (10-bit 4:4:4 Rec.2100 AVIF)."
-            ))),
+                 TIFF), `ultra-hdr-v1` (legacy XMP gain-map JPEG), `hdr-pq` / \
+                 `hdr-hlg` (10-bit 4:4:4 Rec.2100 AVIF), `hdr-linear-tiff` \
+                 (display-linear BT.2020 float TIFF), and `hdr-pq-tiff` / \
+                 `hdr-hlg-tiff` (16-bit Rec.2100 code values in a TIFF)."
+                )))
+            }
             other => Err(NcError::Usage(format!(
                 "unknown output preset `{other}` — accepted: `legacy`, `film-master`, \
-                 `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`"
+                 `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, \
+                 `hdr-pq-tiff`, `hdr-hlg-tiff`"
             ))),
         }
     }
@@ -1278,6 +1327,9 @@ impl OutputPreset {
             OutputPreset::UltraHdrV1 => "ultra-hdr-v1",
             OutputPreset::HdrPq => "hdr-pq",
             OutputPreset::HdrHlg => "hdr-hlg",
+            OutputPreset::HdrLinearTiff => "hdr-linear-tiff",
+            OutputPreset::HdrPqTiff => "hdr-pq-tiff",
+            OutputPreset::HdrHlgTiff => "hdr-hlg-tiff",
         }
     }
 }
@@ -1380,10 +1432,19 @@ impl OutputParams {
     /// - legacy: `hdr = false` → [`OutDepth::U16`], `true` → [`OutDepth::F32`].
     pub fn depth(&self) -> OutDepth {
         match self.preset {
-            OutputPreset::FilmMaster => OutDepth::F32,
+            // Both are unclamped 32-bit float TIFFs, resolved by the preset without
+            // consulting `output.hdr` — which is why a non-default `--output-hdr`
+            // under either is an atomicity error rather than a redundant request.
+            OutputPreset::FilmMaster | OutputPreset::HdrLinearTiff => OutDepth::F32,
             // Used only by the optional IR TIFF export. The primary image's depth
             // is fixed by the preset — 8-bit JPEG, or 10-bit AVIF.
-            OutputPreset::UltraHdrV1 | OutputPreset::HdrPq | OutputPreset::HdrHlg => OutDepth::U16,
+            // `hdr-*-tiff` resolves u16 for the primary *and* the optional IR
+            // plane; the AVIF/JPEG presets only use it for IR.
+            OutputPreset::UltraHdrV1
+            | OutputPreset::HdrPq
+            | OutputPreset::HdrHlg
+            | OutputPreset::HdrPqTiff
+            | OutputPreset::HdrHlgTiff => OutDepth::U16,
             OutputPreset::Legacy => {
                 if self.hdr {
                     OutDepth::F32
@@ -1932,28 +1993,62 @@ mod tests {
 
         // A planned-but-unimplemented name gets its own diagnosis rather than a bare
         // "unknown", so an agent can tell "not yet" from "typo".
-        for planned in [
-            "gain-map-hdr",
-            "display-p3",
-            "compatibility",
-            "hdr-linear-tiff",
-            "hdr-pq-tiff",
-            "hdr-hlg-tiff",
-            "custom",
-        ] {
+        for planned in ["gain-map-hdr", "display-p3", "compatibility", "custom"] {
             let msg = OutputPreset::parse(planned).unwrap_err().to_string();
             assert!(msg.contains("does not accept yet"), "{planned}: {msg}");
             assert!(msg.contains("film-master"), "{planned}: {msg}");
         }
         // `hdr-pq` / `hdr-hlg` graduated out of that list when
-        // `output/hdr-avif-output` activated them; the *TIFF* PQ/HLG presets above
-        // are different presets and are still planned. Asserted here so the two
-        // families cannot be confused back together.
+        // `output/hdr-avif-output` activated them, and `hdr-linear-tiff`,
+        // `hdr-pq-tiff` and `hdr-hlg-tiff` when `output/lossless-hdr-tiff` did — all
+        // six are accepted now. They are asserted here name by name so the AVIF, the
+        // linear-TIFF, and the coded-TIFF families cannot be confused back together.
         assert_eq!(OutputPreset::parse("hdr-pq").unwrap(), OutputPreset::HdrPq);
         assert_eq!(
             OutputPreset::parse("hdr-hlg").unwrap(),
             OutputPreset::HdrHlg
         );
+        assert_eq!(
+            OutputPreset::parse("hdr-linear-tiff").unwrap(),
+            OutputPreset::HdrLinearTiff
+        );
+        // The three TIFF HDR presets are distinct names, and `hdr-pq` vs
+        // `hdr-pq-tiff` differing only by suffix is exactly the confusion worth
+        // pinning: one writes AVIF, the other TIFF, from an identical rendition.
+        assert_eq!(
+            OutputPreset::parse("hdr-pq-tiff").unwrap(),
+            OutputPreset::HdrPqTiff
+        );
+        assert_eq!(
+            OutputPreset::parse("hdr-hlg-tiff").unwrap(),
+            OutputPreset::HdrHlgTiff
+        );
+        assert_ne!(OutputPreset::HdrPq, OutputPreset::HdrPqTiff);
+        // Both coded TIFFs resolve u16 for the primary and the IR plane alike.
+        for preset in [OutputPreset::HdrPqTiff, OutputPreset::HdrHlgTiff] {
+            assert_eq!(
+                OutputParams {
+                    preset,
+                    ..OutputParams::default()
+                }
+                .depth(),
+                OutDepth::U16
+            );
+        }
+        // The linear TIFF resolves f32 without consulting `output.hdr` — the
+        // property that makes a non-default `--output-hdr` under it an atomicity
+        // error rather than a redundant request.
+        for hdr in [false, true] {
+            assert_eq!(
+                OutputParams {
+                    preset: OutputPreset::HdrLinearTiff,
+                    hdr,
+                    ..OutputParams::default()
+                }
+                .depth(),
+                OutDepth::F32
+            );
+        }
         let msg = OutputPreset::parse("filmmaster").unwrap_err().to_string();
         assert!(msg.contains("unknown output preset"), "{msg}");
     }
