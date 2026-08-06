@@ -97,14 +97,39 @@ only the **legacy** dialect, so it never was an ISO oracle, and the manual
 Apple/Android gate answers the same question with real consumer decoders.
 Replace it with:
 
-- **captured goldens**: a small checked-in reference file plus the reconstruction
-  values libultrahdr produces today, recorded once while the dependency is still
-  present, so independence is banked at the moment of capture;
-- **exiftool structural validation**, already in use and already proving MPF/XMP/
-  ICC correctness; and
+- **an in-repo reconstructor that decodes each newly generated file — not a static
+  golden alone.** This is the coverage that must not be lost, and a checked-in
+  reference file cannot supply it: today
+  `tests/pipeline.rs::ultra_hdr_v1_native_reconstruction_covers_odd_dimensions_and_hdr_vectors`
+  reconstructs the output nc *just produced*, so a wrong XMP value or a mis-linked
+  gain map fails CI. Values captured from the old file only prove our reader
+  reproduces them from *that* file; they say nothing about what the new writer
+  emits. Nor can it be closed by byte-comparing against libultrahdr's output,
+  since the migration deliberately changes the XMP serialization. So this task
+  owes a Rust reader able to parse our own MPF/XMP/gain map back and assert the
+  reconstruction vectors on freshly generated files. Capture the goldens from
+  libultrahdr **before** removing it, but treat them as the *reference values*
+  that reader is checked against, not as the check itself;
+- **an exiftool-based structural check, which is new work — not something already
+  in place.** A repo-wide search finds exiftool only in `scripts/analysis/*` and
+  `scripts/real-scan-verify/harness.sh`, both TIFF/asset inspection; there is no
+  Ultra HDR MPF/XMP/ICC validator in `tests/` or `.github/`, and today's Ultra HDR
+  assertions are marker/string checks plus the native decoder. Budget installing
+  exiftool in both CI jobs, invoking it on generated output, and asserting its
+  parsed fields; and
 - **the documented external-decoder gate** for real HDR selection, re-run by hand
   when the writer changes. `iso_sample_for_external_decoder` already emits the
-  file it needs.
+  file it needs. This one is a manual gate and never counts as CI coverage.
+
+**Recalibrate the memory preflight in the same change.** `pipeline/memory.rs`'s
+`RunProfile::UltraHdrV1` spends a calibrated **20 B/px** `byte_staging` term
+explicitly on libultrahdr's owned input copies, its native destination, and the
+Rust copy taken before the encoder is released. Those allocations disappear or
+change shape under Rust assembly, and this is a **user-facing gate**: over
+`--max-memory` it hard-rejects with exit 6, so a stale term can refuse a
+conversion whose real peak fits, while an under-estimate silently over-approves.
+Re-measure and update the term and its comment — CLAUDE.md's standing warning is
+that nothing tests this model against the code.
 
 The migration must not change gain-map math, renderer behavior, CLI/recipe
 semantics, metadata claims, or output preset defaults. It *will* change the
@@ -137,8 +162,9 @@ the JPEG encoder and therefore output bytes.
 
 ## How to Verify
 
-- `cargo build` and `cargo test` both succeed with **no** CMake, clang, nasm, or
-  libjpeg installed, and with the network disabled (`cargo build --offline`).
+- `cargo build` and `cargo test` both succeed with **no** CMake, nasm, or libjpeg
+  installed, and with the network disabled (`cargo build --offline`). A C compiler
+  is still required — `lcms2-sys` keeps one in the build; see the Goal.
 - CI drops its native prerequisites; the Linux and macOS jobs still pass all four
   gates.
 - The final executable has no runtime dependency on libultrahdr or libjpeg on
@@ -147,9 +173,16 @@ the JPEG encoder and therefore output bytes.
   check: marker order with JFIF first, `hdrgm` and GContainer XMP, Display P3 ICC,
   MPF index whose offsets resolve and whose lengths sum to the file size, odd
   dimensions, and both ISO segments in the right images.
-- exiftool independently resolves the MPF index and extracts the second image.
-- The captured-golden reconstruction values still match, and the goldens were
-  recorded from libultrahdr **before** it was removed.
+- exiftool independently resolves the MPF index and extracts the second image —
+  **from CI**, via the newly added validator, not from a hand-run command.
+- The in-repo reconstructor decodes each **freshly generated** file and matches the
+  reconstruction vectors, so the coverage
+  `ultra_hdr_v1_native_reconstruction_covers_odd_dimensions_and_hdr_vectors`
+  provides today is preserved rather than downgraded to a structural check. The
+  reference values were captured from libultrahdr **before** it was removed.
+- `pipeline/memory.rs`'s `RunProfile::UltraHdrV1` is re-measured against a real
+  scan and its `byte_staging` term and comment updated; a conversion that fits the
+  budget is not rejected, and the estimate still covers the new peak.
 - `vendor/ultrahdr-sys`, the snapshot manifest, the force-tracking guard, and
   `scripts/check-vendored-native.py` are all deleted together.
 - `README.md`, `THIRD_PARTY_NOTICES.md`, and the distribution-license bundle no
@@ -163,5 +196,13 @@ the JPEG encoder and therefore output bytes.
 - [Ultra HDR v1 gain-map JPEG output](gain-map-hdr-output.md)
 - [Final ISO gain-map metadata](iso-gain-map-metadata.md) — re-implementing
   assembly must reproduce **both** dialects, so it needs that task's C.4.3/C.4.6
-  placement rules settled first; doing it earlier would mean writing the ISO
-  container work twice.
+  placement rules settled first.
+  **On `insert_baseline_iso_segment` being retired later:** that is deliberate, not
+  waste, and the edge is not a scheduling mistake. The splice is a small, tested
+  adapter that let the ISO dialect ship against libultrahdr's existing assembly
+  instead of blocking it behind a full container rewrite; inverting the order would
+  have held the ISO work hostage to this deferred, non-blocking task. What the ISO
+  task contributes permanently is the part that survives — the C.2.2/C.4.6 field
+  table, its serializers, and the placement rules — while only the insertion
+  adapter is replaced once nc owns assembly. The ordering is also now settled in
+  fact: the ISO task merged as #76 before this one started.
