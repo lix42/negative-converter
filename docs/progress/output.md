@@ -1991,3 +1991,78 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   requirement (the document is still unfetched), and CLI activation, which
   `output/presets` owns. The Android half of the "Android 15+ and target Apple
   software" bullet is also still unrun — Apple is now covered.
+
+## iso-gain-map-metadata (CIPA DC-007 read — verdict)
+
+**Status:** in progress
+**Updated:** 2026-08-06
+
+- 2026-08-06: **The CIPA documents are no longer blocked.** The "JavaScript/POST
+  disclaimer gate that resisted scripted download" is just an undocumented POST
+  contract: `std/js/dll.js` copies the page's query string into a hidden
+  `dlltarget` field and posts it to `std/documents/dll.cgi`. So
+  `curl -X POST .../dll.cgi --data-urlencode dlltarget=CIPA_DC-007-2025_E` returns
+  the PDF directly; no browser needed. Same for `CIPA_DC-008-2026-E`. Both are
+  free downloads gated only on accepting a no-warranty disclaimer. **Do not commit
+  either PDF** — they were read from the scratchpad and only restated here.
+- 2026-08-06: **First correction: DC-007 is Multi-Picture Format, not Exif.**
+  DC-008 is Exif. Earlier entries here said "DC-007 ⇒ Exif-compliant", which is
+  right only transitively — DC-007 §4.2.1 says a Baseline MP File *uses the
+  compressed image file format of the Exif standard*, and §5.1 places the MP
+  Extensions APP2 "immediately after the Exif Attributes in the APP1 marker
+  segment". So the Exif requirement reaches us through MPF, and both documents are
+  in scope.
+- 2026-08-06: **DC-007-2025 explicitly anticipates us.** §4.2.1 names "gain map
+  images specified by ISO 21496-1" as a recordable Dependent Image, and Table 4
+  assigns them **MP Type Code `050000`**, with details to "follow the provisions of
+  Annex C of ISO 21496-1". This is the interop contract nc is actually writing
+  against, and it is far more on-point than the C.4.3 NOTE suggested.
+- 2026-08-06: **Concrete non-conformance found, and it is small: nc's gain map is
+  typed `Undefined`.** Measured on the dual-dialect file — MPImage1 is `030000`
+  (Baseline MP Primary Image, correct) but MPImage2 is `000000`, which Table 4
+  marks **× = "shall not be used"** in a Baseline MP file (.JPG). The correct value
+  is `050000`. **This comes from libultrahdr, not from nc's code** — its own
+  reference output (`ultrahdr_app` v1.4.0) writes `000000` too, unsurprisingly,
+  since the gain-map type code postdates it. nc ships the file, so it is nc's gap.
+  The repair is a 4-byte field in the MPEntry array, in the same post-packaging
+  patch that already fixes the first image's recorded size. Note it would change
+  the shipped `ultra-hdr-v1` bytes, which is why it is **not** being folded into
+  the oracle fix.
+- 2026-08-06: **Second gap, larger: the baseline is JFIF with no Exif APP1.** nc's
+  header is `APP0 JFIF · APP1 XMP · APP2 ICC · APP2 ISO · APP2 MPF`, so the MP
+  Extensions do not follow Exif Attributes as §5.1 specifies. Weighing how hard
+  this binds: §7's tag-level requirement is "**should** be followed" for
+  non-thumbnail Individual Images, and its tables are pinned to Exif 2.32 / DCF 2.0
+  — so the *tag* obligations are recommendations. The structural statements in
+  §4.2.1/§5.1 are the stronger ones. Adding Exif also changes the baseline's marker
+  layout, which is precisely the class of change that just cost this task a
+  silently inert feature, so it must be re-run against the ImageIO oracle rather
+  than trusted to `cargo test`. Whether libultrahdr's `package()` preserves,
+  rewrites or drops an APP1 Exif is **unknown and must be established by probe**
+  (it has an `-x` Exif-insertion flag, so the native API may be the right route);
+  the 2026-08-04 asymmetry lesson applies — do not reason it out from source.
+- 2026-08-06: **Verdict: both items move to a follow-up task**
+  (`output/mp-container-conformance`). Neither is required for the ISO metadata to
+  function — Apple ImageIO reconstructs HDR from nc's file today with the type code
+  `Undefined` and no Exif present — so they are conformance-claim work, not
+  functional work, and they change shipped container bytes. Keeping them here would
+  hold `output/presets` behind a container change that has nothing to do with the
+  metadata this task owns. `baseline_carries_no_exif_colorspace_claim` stays as the
+  tripwire; whoever adds Exif must still choose `Uncalibrated`, never `1`.
+
+## mp-container-conformance
+
+**Status:** not started
+**Updated:** 2026-08-06
+
+- Goal: make the gain-map JPEG a conformant CIPA DC-007 Baseline MP File — type
+  the gain map `050000` instead of `Undefined`, and settle the Exif-baseline
+  requirement (or narrow the claim, with the reason cited).
+- Filed 2026-08-06 out of `iso-gain-map-metadata`'s DC-007 read; the findings and
+  the reasoning behind the split are in that task's
+  `## iso-gain-map-metadata (CIPA DC-007 read — verdict)` section above, and the
+  approach is in [the task file](../tasks/output/mp-container-conformance.md).
+- The one thing to carry forward before touching anything: a marker-layout change
+  is exactly what silently disabled the ISO metadata (see the oracle section
+  above), so **re-run the ImageIO decoder oracle** — the Rust suite provably
+  cannot catch a placement regression on its own.
