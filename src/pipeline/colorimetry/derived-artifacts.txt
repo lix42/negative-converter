@@ -39,6 +39,19 @@
   [2][1] derived=-0.1289689760649706      shipped=-0.12896898      ulps=1
   [2][2] derived=1.1529723328695893       shipped=1.1529723        ulps=0
 
+[BT2020_TO_XYZ_D50]
+  bt2020/d65 -> xyz/d50 colorants, cone=bradford
+  compared as f64
+  [0][0] derived=0.673515463188276        shipped=0.673515463188276        absdiff=0.000e0
+  [0][1] derived=0.16569726370390464      shipped=0.16569726370390464      absdiff=0.000e0
+  [0][2] derived=0.12508294953738708      shipped=0.12508294953738708      absdiff=0.000e0
+  [1][0] derived=0.2790590051411207       shipped=0.2790590051411207       absdiff=0.000e0
+  [1][1] derived=0.6753180057491097       shipped=0.6753180057491097       absdiff=0.000e0
+  [1][2] derived=0.045622989109769654     shipped=0.045622989109769654     absdiff=0.000e0
+  [2][0] derived=-0.0019324271340043495   shipped=-0.0019324271340043495   absdiff=0.000e0
+  [2][1] derived=0.029977826792829163     shipped=0.029977826792829163     absdiff=0.000e0
+  [2][2] derived=0.7970592028516356       shipped=0.7970592028516356       absdiff=0.000e0
+
 [ACESCG_TO_DISPLAY_P3]
   acescg/aces-white -> display-p3/d65, cone=bradford
   compared as f32

@@ -377,6 +377,343 @@ fn avif_boxes(buf: &[u8]) -> Vec<(String, usize)> {
 }
 
 #[test]
+fn hdr_linear_tiff_writes_a_bit_exact_display_linear_bt2020_master() {
+    use tiff::decoder::{Decoder, DecodingResult};
+    use tiff::tags::Tag;
+
+    let tmp = TempDir::new("hdr-linear-tiff");
+    let first = tmp.path("first.tif");
+    let second = tmp.path("second.TIFF");
+    for output in [&first, &second] {
+        // `hdr-48bit.tif` is the IR-free fixture, so `--strict` is a real assertion
+        // here: the run must produce *no* promotable warning at all. On the HDRi
+        // fixture every run trips the "IR preserved but not used" warning and this
+        // would prove nothing.
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            "hdr-linear-tiff",
+            "--film-base",
+            "1,1,1",
+            "--strict",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        let report = json(&stdout);
+        assert_eq!(report["recipe"]["output"]["preset"], "hdr-linear-tiff");
+        assert_eq!(
+            report["output_render"]["encoding"],
+            "display-linear-bt2020-float-tiff"
+        );
+        // Both flags are true: this branch runs the print controls *and* a display
+        // render, which is what distinguishes it from `film-master`.
+        assert_eq!(report["output_render"]["print_controls"], true);
+        assert_eq!(report["output_render"]["display_render"], true);
+
+        let block = &report["hdr_linear_tiff"];
+        assert_eq!(
+            block["pixel_contract"],
+            "rgb-f32-display-linear-bt2020-d65-relative-to-203-nit-reference-white"
+        );
+        assert_eq!(block["bits_per_sample"], 32);
+        assert_eq!(block["sample_format"], 3, "3 == IEEE float");
+        assert_eq!(block["bigtiff"], false);
+        assert_eq!(block["reference_white_sample"], 1.0);
+        assert_eq!(block["reference_white_nits"], 203.0);
+        assert_eq!(block["target_peak_nits"], 1000.0);
+        assert!(block["icc_bytes"].as_u64().unwrap() > 0);
+        let headroom = block["linear_headroom"].as_f64().unwrap();
+        assert!(
+            (headroom - 1000.0 / 203.0).abs() < 1e-6,
+            "headroom {headroom} is not 1000/203"
+        );
+        // Measured content light, not the mastering policy: a real frame must not
+        // report the 1000/203 constants back.
+        let cll = block["max_cll_nits"].as_u64().unwrap();
+        let fall = block["max_fall_nits"].as_u64().unwrap();
+        assert!(fall <= cll, "MaxFALL {fall} exceeds MaxCLL {cll}");
+        assert!(cll <= 1000, "MaxCLL {cll} above the mastering peak");
+        assert!(
+            cll != 1000 || fall != 203,
+            "content light looks like the policy constants, not a measurement"
+        );
+        // No PQ/HLG signalling on this path — it is linear, so there is no transfer
+        // to declare and no `avif` block.
+        assert!(report["avif"].is_null());
+    }
+
+    // Same build, same input ⇒ byte-identical (the ICC dateTime is zeroed).
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&second).unwrap(),
+        "repeated hdr-linear-tiff encodes must be byte-identical"
+    );
+
+    // Independently decode the file and check the storage contract plus the linear
+    // domain. A PQ-encoded frame would have no sample above 1.0 at all, so the
+    // headroom assertion is what proves no transfer was applied.
+    let bytes = std::fs::read(&first).unwrap();
+    let mut decoder = Decoder::new(std::io::Cursor::new(&bytes)).unwrap();
+    assert!(
+        decoder.get_tag_u8_vec(Tag::IccProfile).is_ok(),
+        "no embedded ICC profile"
+    );
+    let samples = match decoder.read_image().unwrap() {
+        DecodingResult::F32(data) => data,
+        other => panic!("expected 32-bit float samples, got {other:?}"),
+    };
+    assert!(samples.iter().all(|v| v.is_finite()));
+    let max = samples.iter().copied().fold(f32::MIN, f32::max);
+    assert!(
+        max > 1.0,
+        "no sample above the 203-nit reference white ({max}); either the fixture \
+         has no highlights or a transfer/clamp was applied"
+    );
+    assert!(
+        max <= 1000.0 / 203.0 + 1e-6,
+        "sample {max} exceeds the 1000-nit peak"
+    );
+
+    // The sidecar rides along and reloads as a recipe.
+    let sidecar = PathBuf::from(format!("{}.json", first.display()));
+    let envelope: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(envelope["params"]["output"]["preset"], "hdr-linear-tiff");
+}
+
+#[test]
+fn coded_hdr_tiffs_store_exact_codes_and_signal_cicp_in_the_profile() {
+    use tiff::decoder::{Decoder, DecodingResult};
+    use tiff::tags::Tag;
+
+    let tmp = TempDir::new("hdr-coded-tiff");
+    for (preset, transfer_code, expect_hlg) in
+        [("hdr-pq-tiff", 16u64, false), ("hdr-hlg-tiff", 18, true)]
+    {
+        let output = tmp.path(&format!("{preset}.tif"));
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+            "--strict",
+        ]);
+        assert_eq!(code, 0, "{preset}: {err}");
+        let report = json(&stdout);
+        assert_eq!(report["recipe"]["output"]["preset"], preset);
+
+        let block = &report["hdr_coded_tiff"];
+        assert_eq!(block["bits_per_sample"], 16);
+        assert_eq!(block["sample_format"], 1, "1 == unsigned integer");
+        assert_eq!(block["full_range"], true);
+        assert_eq!(block["cicp"][0], 9, "BT.2020 primaries");
+        assert_eq!(block["cicp"][1], transfer_code);
+        // The normative difference from the AVIF block: an RGB ICC profile requires
+        // MatrixCoefficients 0, where AVIF writes 9 for the same rendition.
+        assert_eq!(block["cicp"][2], 0);
+        assert_eq!(block["reference_white_nits"], 203.0);
+        assert_eq!(block["target_peak_nits"], 1000.0);
+        // Rounding cannot cost more than half a code, and the report must say so
+        // with a real measurement rather than a constant.
+        let max = block["max_quantization_error_codes"].as_f64().unwrap();
+        let rms = block["rms_quantization_error_codes"].as_f64().unwrap();
+        assert!(max > 0.0 && max <= 0.5, "{preset}: max error {max}");
+        assert!(rms > 0.0 && rms <= max, "{preset}: rms {rms} vs max {max}");
+        // Truthful naming, in the artifact.
+        let notes = block["interoperability"].as_str().unwrap();
+        assert!(notes.contains("limited-interoperability"), "{notes}");
+        assert!(
+            notes.contains("not one of BT.2100's specified bit depths"),
+            "{notes}"
+        );
+        // HLG carries its reference-display assumptions; PQ has none to carry.
+        assert_eq!(block["hlg_system_gamma"].is_null(), !expect_hlg);
+        assert!(report["avif"].is_null(), "{preset}: no AVIF block here");
+        // No clipping and no non-finite: the domain is verified before quantizing,
+        // so `--strict` (exit 0 above) is a real assertion on the IR-free fixture.
+        assert_eq!(report["loss"]["clipped_high"], 0);
+        assert_eq!(report["loss"]["non_finite"], 0);
+
+        // Independently decode: 16-bit unsigned samples plus an embedded profile
+        // whose `cicp` tag a third-party reader can find.
+        let bytes = std::fs::read(&output).unwrap();
+        let mut decoder = Decoder::new(std::io::Cursor::new(&bytes)).unwrap();
+        let icc = decoder
+            .get_tag_u8_vec(Tag::IccProfile)
+            .expect("no embedded ICC profile");
+        // Walk the ICC tag table (count at byte 128, then 12-byte
+        // signature/offset/size entries) to the `cicp` tag data, rather than
+        // scanning for the bytes — the first `cicp` in the file is the *table
+        // entry*, whose next four bytes are an offset, not the reserved zeros.
+        let count = u32::from_be_bytes(icc[128..132].try_into().unwrap()) as usize;
+        let mut cicp_at = None;
+        for i in 0..count {
+            let entry = 132 + i * 12;
+            if &icc[entry..entry + 4] == b"cicp" {
+                let offset = u32::from_be_bytes(icc[entry + 4..entry + 8].try_into().unwrap());
+                let size = u32::from_be_bytes(icc[entry + 8..entry + 12].try_into().unwrap());
+                assert_eq!(size, 12, "cicpType is a 12-byte structure");
+                cicp_at = Some(offset as usize);
+            }
+        }
+        let tag_at = cicp_at.expect("no cicp tag in the embedded profile");
+        let tag = &icc[tag_at..tag_at + 12];
+        assert_eq!(&tag[0..4], b"cicp", "cicpType signature");
+        assert_eq!(&tag[4..8], &[0, 0, 0, 0], "reserved bytes must be zero");
+        assert_eq!(tag[8], 9, "ColourPrimaries");
+        assert_eq!(u64::from(tag[9]), transfer_code, "TransferCharacteristics");
+        assert_eq!(tag[10], 0, "MatrixCoefficients must be 0 for RGB");
+        assert_eq!(tag[11], 1, "VideoFullRangeFlag");
+
+        let samples = match decoder.read_image().unwrap() {
+            DecodingResult::U16(data) => data,
+            other => panic!("{preset}: expected u16 samples, got {other:?}"),
+        };
+        // A real frame must use a wide part of the code range, and PQ/HLG place a
+        // 203-nit white well below full scale — so a file pinned at 65535 would mean
+        // the transfer was skipped.
+        let max_code = samples.iter().copied().max().unwrap();
+        assert!(
+            max_code > 1000,
+            "{preset}: max code {max_code} is implausibly low"
+        );
+    }
+
+    // The two transfers must produce genuinely different files from one input.
+    let pq = std::fs::read(tmp.path("hdr-pq-tiff.tif")).unwrap();
+    let hlg = std::fs::read(tmp.path("hdr-hlg-tiff.tif")).unwrap();
+    assert_ne!(pq, hlg, "PQ and HLG TIFFs must differ");
+}
+
+#[test]
+fn hdr_tiff_sidecars_carry_the_luminance_contract_and_still_reload() {
+    // The task makes the **sidecar** authoritative for semantics the ICC provably
+    // cannot carry. Putting them only in the stdout report loses them whenever the
+    // report is discarded, so this runs with `--report none` — the way a batch script
+    // would call it — and then proves the sidecar is still loadable as a recipe,
+    // which is the constraint that forced the contract inside `meta` rather than
+    // beside `params` (`SidecarEnvelopeIn` is `deny_unknown_fields`).
+    let tmp = TempDir::new("hdr-sidecar");
+    for (preset, block, transfer) in [
+        ("hdr-pq-tiff", "hdr_coded_tiff", Some(16u64)),
+        ("hdr-hlg-tiff", "hdr_coded_tiff", Some(18)),
+        ("hdr-linear-tiff", "hdr_linear_tiff", None),
+    ] {
+        let output = tmp.path(&format!("{preset}.tif"));
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+            "--report",
+            "none",
+        ]);
+        assert_eq!(code, 0, "{preset}: {err}");
+        assert!(stdout.trim().is_empty(), "{preset}: --report none printed");
+
+        let sidecar: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(PathBuf::from(format!("{}.json", output.display()))).unwrap(),
+        )
+        .unwrap();
+        // Top-level shape is untouched — a third sibling key would break reloading.
+        let mut top: Vec<&String> = sidecar.as_object().unwrap().keys().collect();
+        top.sort();
+        assert_eq!(
+            top,
+            vec!["meta", "params"],
+            "{preset}: envelope shape moved"
+        );
+
+        let contract = &sidecar["meta"][block];
+        assert!(!contract.is_null(), "{preset}: no {block} in sidecar meta");
+        assert_eq!(contract["reference_white_nits"], 203.0, "{preset}");
+        assert_eq!(contract["target_peak_nits"], 1000.0, "{preset}");
+        // Identity still rides alongside it.
+        assert!(!sidecar["meta"]["params_hash"].is_null(), "{preset}");
+        if let Some(code_point) = transfer {
+            assert_eq!(contract["cicp"][1], code_point, "{preset}");
+            let max = contract["max_quantization_error_codes"].as_f64().unwrap();
+            assert!(max > 0.0 && max <= 0.5, "{preset}: quantization {max}");
+        } else {
+            // The linear TIFF reports measured content light instead.
+            assert!(!contract["max_cll_nits"].is_null(), "{preset}");
+            assert!(contract["interoperability"].as_str().is_some(), "{preset}");
+        }
+
+        // And the sidecar is still a valid recipe.
+        let replay = tmp.path(&format!("{preset}-replay.tif"));
+        let (code, _, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            replay.to_str().unwrap(),
+            "--params",
+            &format!("{}.json", output.display()),
+            "--report",
+            "none",
+        ]);
+        assert_eq!(code, 0, "{preset}: sidecar failed to reload: {err}");
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            std::fs::read(&replay).unwrap(),
+            "{preset}: replay from its own sidecar is not byte-identical"
+        );
+    }
+}
+
+#[test]
+fn hdr_linear_tiff_rejects_a_non_tiff_path_and_conflicting_flags() {
+    let tmp = TempDir::new("hdr-linear-reject");
+    let base = [
+        "convert",
+        "--output-preset",
+        "hdr-linear-tiff",
+        "--film-base",
+        "1,1,1",
+    ];
+    let input = fixture("hdr-48bit.tif");
+
+    // Wrong suffix: exit 2 and the path is never rewritten.
+    let jpg = tmp.path("out.jpg");
+    let mut args = vec![
+        base[0],
+        input.to_str().unwrap(),
+        "-o",
+        jpg.to_str().unwrap(),
+    ];
+    args.extend_from_slice(&base[1..]);
+    let (code, _, err) = run(&args);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(".tif"), "{err}");
+    assert!(!jpg.exists(), "a rejected run must write nothing");
+
+    // `--output-hdr` is the *rendered* float TIFF, a different image — rejected
+    // rather than silently treated as a synonym.
+    let out = tmp.path("out.tif");
+    let mut args = vec![
+        base[0],
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ];
+    args.extend_from_slice(&base[1..]);
+    args.push("--output-hdr");
+    let (code, _, err) = run(&args);
+    assert_eq!(code, 2, "{err}");
+    assert!(!out.exists(), "a rejected run must write nothing");
+}
+
+#[test]
 fn hdr_pq_writes_a_deterministic_advanced_profile_avif() {
     let tmp = TempDir::new("hdr-pq");
     let first = tmp.path("first.avif");

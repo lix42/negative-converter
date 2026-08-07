@@ -150,8 +150,90 @@ gain-map outputs are display HDR; the current rendered float path aliases neithe
 Because nc is unreleased, prefer a clear schema over compatibility aliases that
 preserve misleading terminology.
 
+### Inherited: finish the coded-HDR TIFF ICC profiles
+
+Deferred here from `output/lossless-hdr-tiff` (user decision, 2026-08-06). The
+`hdr-pq-tiff` / `hdr-hlg-tiff` profiles built by `color::synth_coded_hdr` have two
+**verified** ICC.1:2022 conformance gaps. They are valid *source* profiles — which
+is the only direction an embedded profile is used, and macOS ColorSync accepts them
+— but they are not conformant Display-class profiles:
+
+- **§8.4.2 requires `BToA0Tag`** as well as `AToB0Tag` for an N-component LUT-based
+  Display profile. Only `AToB0Tag` is written, so a strict CMM cannot use the
+  profile as a transform *destination*.
+- **§8.2 requires `chromaticAdaptationTag`** when the colorants' adopted white
+  differs from the PCS adopted white. The colorants are Bradford D65→D50 adapted and
+  `mediaWhitePointTag` declares D50, so `chad` is required and is missing; without
+  it a consumer cannot recover that the *encoding* white is D65.
+
+A **third, related fix rides with them**: `pinned::BT2020_TO_XYZ_D50` adapts to
+`definitions::D50.to_xyz()` — D50 derived from its rounded chromaticities,
+`[0.96429568, 1, 0.82510460]` — while the profile declares ICC.1:2022's PCS white
+`[0.9642, 1.0, 0.8249]`. A neutral therefore lands ≈2.4e-4 from the declared white.
+The matrix is what should adapt to the spec value, not the reverse, and it must use
+the *same* white as the new `chad` tag — so re-deriving it belongs in this one
+profile-bytes change rather than as a separate byte-moving edit. Note the existing
+lcms-observed anchor test tolerates 2.5e-4 and so does not currently catch it;
+tighten it once the adaptation target is corrected.
+
+What closing them needs, and why it landed here rather than in the originating task:
+
+- Two more pinned colorimetry artifacts — the **inverse** colorant matrix
+  (`XYZ_D50_TO_BT2020`) and the **Bradford D65→D50** matrix — each through
+  `docs/colorimetry-maintenance.md` with an audit entry and an independent anchor.
+  `derive::rgb_to_xyz_adapted` and `derive::adaptation` already exist; the runtime
+  may not invert a matrix itself.
+- The `BToA0` pipeline is the mirror of the shipped `mAB`: identity B curves →
+  inverse scaled matrix → forward-transfer (OETF) M curves, serialized as `mBA `.
+  Little CMS accepts only recognized stage patterns, so expect the same
+  "LUT is not suitable to be saved as LutAToB" class of failure while getting the
+  order right.
+- **It changes the profile bytes**, which is the real reason for deferral: it
+  invalidates any prior visual-review artifacts and wants one re-review, which fits
+  naturally with this task's own preset activation and acceptance pass.
+- `src/pipeline/colorimetry/tests.rs`'s
+  `bt2020_to_xyz_d50_maps_white_to_the_d50_adopted_white` asserts the matrix's column
+  sums equal `D50.to_xyz()` to **1e-12**, so correcting the adaptation target to
+  ICC's `[0.9642, 1.0, 0.8249]` **will fail that test loudly** and it has to move in
+  the same change. (The note above mentions only the looser lcms-observed anchor at
+  2.5e-4, which would *not* catch the discrepancy — this one will.)
+
+**Open option, not a decision: declare the coded profiles Input class instead.**
+Worth evaluating before committing to the `BToA0` work above, because it would close
+that gap without writing an inverse at all. ICC.1:2022 **§8.3.2** requires only
+`AToB0Tag` for an N-component LUT-based **Input** profile — `BToA0Tag` is *not*
+required — and **§9.2.17** permits `cicpTag` for an Input profile as well as a
+Display one, so the authoritative signalling would survive the class change. That
+would leave `chad` as the only remaining requirement: one artifact, and
+`derive::adaptation` can produce it today. It also sidesteps the range limitation
+noted below entirely, since there would be no inverse to be capped.
+
+Two things are **unresolved** and must be settled before this is chosen over the
+`BToA0` route:
+
+1. **Is Display class load-bearing for any real consumer?** Every acceptance
+   observation on hand — macOS ColorSync parsing the profile, `sips` naming it, the
+   2026-08-06 viewer gate — was made with a *Display*-class profile. Nothing has been
+   tested with Input class, so "ColorSync accepts it" cannot be carried over.
+2. **Is a class change a bigger break than the byte change already planned?** The
+   `BToA0` + `chad` route moves bytes inside a profile that keeps its declared class;
+   this route changes what the profile *claims to be*, which is a coarser signal a
+   consumer may branch on.
+
+Note a genuine limitation to state rather than engineer around: a conformant
+`BToA0` is **inherently range-limited** here, because its PCS input is
+`u1Fixed15Number` and therefore caps at ≈1.99997 — about 406 cd/m². It cannot
+round-trip the extended range the `AToB0` carries (up to ≈49.26, i.e. 10,000 nits).
+Adobe's reference BT.2100 profiles ship a `BToA0` anyway; matching that is the
+precedent, but the tag's limits should be documented, not overclaimed.
+
 ## How to Verify
 
+- The three inherited coded-HDR profile fixes are closed: `exiftool -icc_profile:all`
+  on a written `hdr-pq-tiff` / `hdr-hlg-tiff` shows `chad` and `B2A0` present, and a
+  test asserts both tags exist alongside the existing `cicp` assertions. The
+  `BToA0`'s range limit is documented rather than claimed away, and the profiles'
+  `A2B0` accuracy is unchanged from the pinned values.
 - With an output path but no output-selection options, resolution selects
   `gain-map-hdr` with reference-anchored sigmoid reconstruction and records every
   effective setting.

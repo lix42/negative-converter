@@ -25,11 +25,22 @@
 //! ## Why the dead-code allow
 //!
 //! Several definitions here have no *runtime* consumer by design: the runtime
-//! multiplies by [`super::pinned`]'s reviewed literals and never derives, so
-//! `BT2020`, both cone-response matrices, and the tabulated BT.2020 luma are
-//! reached only from the `#[cfg(test)]` derivation and audit harness. A
-//! source-of-truth module is meant to describe the colorimetry completely, not
-//! only the parts today's code paths happen to touch.
+//! multiplies by [`super::pinned`]'s reviewed literals and never derives, so both
+//! cone-response matrices and the tabulated BT.2020 luma are reached only from the
+//! `#[cfg(test)]` derivation and audit harness. A source-of-truth module is meant
+//! to describe the colorimetry completely, not only the parts today's code paths
+//! happen to touch.
+//!
+//! ## The lcms2-consumed spaces are a pixel-change hazard
+//!
+//! [`REC709`], [`DISPLAY_P3`], [`ACESCG`], [`PROPHOTO`] and — since
+//! `hdr-linear-tiff` — [`BT2020`] are handed **directly to Little CMS** by
+//! `pipeline::color` to synthesize profiles. Editing any of those five changes
+//! embedded ICC bytes and every lcms2-transformed pixel on the affected path *even
+//! with `pinned.rs` untouched and every audit `ulps` at 0*, and **nothing
+//! automated catches it**: `version::PIPELINE_FINGERPRINTS` stops before lcms2 and
+//! the audit only compares pinned artifacts. Treat an edit to one of the five as a
+//! pixel change and verify by same-machine before/after comparison.
 //!
 //! The allow is scoped to `not(test)` so the lint stays **on** in a test build:
 //! a definition that nothing at all references — not even the audit — is still
@@ -150,6 +161,12 @@ pub const DISPLAY_P3: ColorSpace = ColorSpace {
 ///
 /// Source: ITU-R BT.2020-2. BT.2100-2 references these primaries unchanged, so
 /// the Rec.2100 PQ/HLG renditions in `pipeline::hdr` share this definition.
+///
+/// ⚠ **Also fed straight to Little CMS**, by
+/// `color::hdr_linear_bt2020_icc` for the `hdr-linear-tiff` output — so an edit
+/// here changes embedded ICC bytes even when `pinned.rs` is untouched and every
+/// audit `ulps` is 0. See the module note's warning about the lcms2-consumed
+/// definitions; this is the fifth.
 pub const BT2020: ColorSpace = ColorSpace {
     name: "bt2020",
     primaries: Primaries::new(xy(0.708, 0.292), xy(0.170, 0.797), xy(0.131, 0.046)),

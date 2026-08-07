@@ -14,7 +14,8 @@ Step-1 (MVP) plan for the `nc` CLI negative→positive converter. See
 
 ### Overview
 A command-line tool (`nc`) that reads a film-negative scan (SilverFast HDR/HDRi
-first), converts it to a positive image, and writes a TIFF or explicitly selected
+first), converts it to a positive image, and writes a TIFF (including the
+display-linear and Rec.2100-coded HDR TIFFs) or an explicitly selected
 `ultra-hdr-v1` gain-map JPEG or `hdr-pq`/`hdr-hlg` AVIF. "AI-friendly" means
 **every conversion parameter is a CLI flag** and the tool is deterministic and
 scriptable with JSON recipes/reports — not that ML processes the image.
@@ -35,6 +36,8 @@ decode → validate input semantics → film-base → preset dispatch
        → FilmRgbImage → NC film RGB v1 → linear ACEScg → shared print controls
        → ultra-hdr-v1: SDR/HDR + gain map → JPEG package
        → hdr-pq / hdr-hlg: HDR → Rec.2100 PQ/HLG → 10-bit 4:4:4 AVIF
+       → hdr-pq-tiff / hdr-hlg-tiff: the same signal → 16-bit TIFF codes
+       → hdr-linear-tiff: HDR, no transfer → 32-bit float BT.2020 TIFF
 ```
 
 The target `film-master` branch preserves NC's intentional film, lens,
@@ -665,8 +668,8 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [~] [Final ISO gain-map metadata](tasks/output/iso-gain-map-metadata.md) — add verified ISO 21496-1:2025 metadata to the same JPEG and prove dual-dialect agreement. **Metadata and container halves implemented against the licensed text** (2026-08-04: `pipeline/gain_map/iso.rs` C.2.2 payload + normative validation; `io/ultra_hdr.rs` `Dialects::LegacyPlusIso` writing C.4.3/C.4.6 segments into both images, MPF-safe). **Code complete**; verified with exiftool (MPF index resolves, second image extracts, 2350+1186=3536 bytes) and `sips`. Remaining is non-code: C.4.3's CIPA DC-007 baseline requirement is **blocked** on that free-but-gated document (no Exif synthesised against an unread standard), the external ISO-aware decoder oracle, and CLI activation (owned by `output/presets`). **Note the `ts:` URN is the published first edition's, not a draft** — and libultrahdr's compact-denominator ISO layout is *non-conformant*, so nc owns its serializer.
 - [x] [HDR AVIF output](tasks/output/hdr-avif-output.md) — 10-bit 4:4:4 Rec.2100 PQ/HLG AVIF via published `libaom-sys` plus an **nc-written MIAF container** (no libavif: no published crate ships ≥ 1.4.2, and `avif-serialize` cannot emit `MA1A`). `hdr-pq`/`hdr-hlg` are live as explicit `convert`-only presets; `av1C` is parsed back out of the codestream; `MA1A` only inside the published Advanced-Profile limits, else general-brand-only **with the reason reported**; `cq_level` and codec bounds calibrated and pinned by equality against `avifdec`/dav1d; `RunProfile::HdrAvif` calibrated on two real scans. Windows deferred → `output/hdr-avif-windows-packaging`; counsel review of the AOM patent grant stays with release
 - [ ] [HDR AVIF Windows packaging](tasks/output/hdr-avif-windows-packaging.md) — add the missing `windows-latest` CI job and prove the static libaom build under MSVC; encoding behavior unchanged, and cross-build byte identity is explicitly not required
-- [ ] [Lossless HDR TIFF outputs](tasks/output/lossless-hdr-tiff.md) — preserve display-linear BT.2020 as 32-bit float TIFF and Rec.2100 PQ/HLG as losslessly stored 16-bit TIFF code values with truthful signaling
-- [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers
+- [x] [Lossless HDR TIFF outputs](tasks/output/lossless-hdr-tiff.md) — preserve display-linear BT.2020 as 32-bit float TIFF and Rec.2100 PQ/HLG as losslessly stored 16-bit TIFF code values with truthful signaling. **Done 2026-08-06** in two chunks: A = `hdr-linear-tiff` (bit-exact f32 display-linear BT.2020), B = `hdr-pq-tiff`/`hdr-hlg-tiff` (full-range 16-bit codes stored exactly + the ICC `cicpTag` contract). Never blocked on a paywalled standard — ICC.1:2022 §9.2.17/§10.3 pins the code points (`9-16-0-1` PQ, `9-18-0-1` HLG) with **MatrixCoefficients 0** for RGB, unlike the AVIF path's 9. The PQ profile is an **extended-range A2B** (PCS `Y = L/203`, unclipped to ≈49.26) matching Adobe's reference BT.2100 profiles, since a matrix-shaper TRC cannot exceed 1.0; HLG's is scene-referred because its OOTF is not per-channel separable. Verified end to end: PQ-decoding the stored codes recovers the linear TIFF's samples to 0.0149% on a real 18.66 MP scan. Documented as **limited-interoperability interchange, not display-ready** — only a CICP-aware reader honours the tag; the 2026-08-06 viewer gate confirmed the files render correctly but was **not discriminating** for HDR presentation (diffuse-highlight scene, exponential default curve). **Two ICC conformance gaps are documented and deferred to `output/presets`** (§8.4.2 `BToA0Tag`, §8.2 `chromaticAdaptationTag`): the coded profiles are valid *sources* but not conformant Display-class profiles. Neither moves a stored code value; closing them changes the profile bytes, so it rides with preset activation
+- [ ] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers. **Also inherits** (deferred 2026-08-06) the two ICC conformance gaps in the `hdr-pq-tiff`/`hdr-hlg-tiff` profiles — §8.4.2 `BToA0Tag` and §8.2 `chromaticAdaptationTag` — which need two more pinned colorimetry artifacts and change the profile bytes
 
 ### telemetry — [progress](progress/telemetry.md)
 > `src/telemetry.rs` and the opt-in upload stack (schema, ingestion service,

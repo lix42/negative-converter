@@ -68,8 +68,20 @@ A pure-function pipeline orchestrated by a thin CLI layer.
 ```text
 decode → film-base → tagged reconstruction → FilmRgbImage
   ├ legacy (default, no preset) → finish_print → output color transform → encode
-  └ film-master → NC film RGB v1 → linear ACEScg → encode (unclamped f32, no transform)
+  ├ film-master → NC film RGB v1 → linear ACEScg → encode (unclamped f32, no transform)
+  └ display presets → NC film RGB v1 → linear ACEScg → shared print controls
+      ├ ultra-hdr-v1            → SDR + HDR + gain map → JPEG
+      ├ hdr-pq / hdr-hlg        → HDR → Rec.2100 PQ/HLG → 10-bit 4:4:4 AVIF
+      ├ hdr-pq-tiff / hdr-hlg-tiff → the same signal → full-range 16-bit TIFF
+      └ hdr-linear-tiff         → HDR, no transfer → 32-bit float BT.2020 TIFF
 ```
+
+Eight preset names are accepted today (`legacy`, `film-master`, `ultra-hdr-v1`,
+`hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`); the
+remaining planned names (`gain-map-hdr`, `display-p3`, `compatibility`, `custom`)
+and the default migration are `output/presets`. Keep this list, `OutputPreset::parse`,
+`OutputPreset`'s rustdoc, and `OutputOverrides::output_preset`'s **help text** in
+step — those three have gone stale twice, and the help text is what `--help` prints.
 
 **Target replacement architecture (open roadmap tasks):**
 
@@ -132,10 +144,11 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   ACEScg mapper; `render_split` is the named-output split out of that boundary —
   `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
   controls `WB → exposure → black point → linear_range`, resolved once and
-  *borrowed* by both display branches. The `film-master` half and the explicit
-  `ultra-hdr-v1` / `hdr-pq` / `hdr-hlg` consumers are wired; a non-default
-  `print.linear_range` is accepted only by those display presets (legacy ignores it
-  and film-master rejects it);
+  *borrowed* by both display branches. The `film-master` half and all six explicit
+  display consumers (`ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
+  `hdr-pq-tiff`, `hdr-hlg-tiff`) are wired; a non-default `print.linear_range` is
+  accepted only by those display presets (legacy ignores it — so it is rejected
+  there rather than silently dropped — and film-master rejects it);
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
@@ -171,12 +184,13 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   out of a naive grep, and two luma vectors inline in a `match` arm). Four
   gotchas that have already cost time:
   - **`pinned.rs` is not the only runtime consumer of a definition.**
-    `pipeline::color` feeds `definitions::{REC709, DISPLAY_P3, ACESCG, PROPHOTO}`
-    straight into Little CMS, so editing one of those four changes ICC bytes and
-    every lcms2-transformed pixel *even with `pinned.rs` untouched and every
-    audit `ulps` at 0*. Nothing automated catches it: `PIPELINE_FINGERPRINTS`
-    stops before lcms2 and the audit only compares pinned artifacts. Treat those
-    four as a pixel change regardless of the ulp column.
+    `pipeline::color` feeds `definitions::{REC709, DISPLAY_P3, ACESCG, PROPHOTO,
+    BT2020}` straight into Little CMS, so editing one of those **five** changes ICC
+    bytes and every lcms2-transformed pixel *even with `pinned.rs` untouched and
+    every audit `ulps` at 0*. (`BT2020` joined them with `hdr-linear-tiff`.)
+    Nothing automated catches it: `PIPELINE_FINGERPRINTS` stops before lcms2 and
+    the audit only compares pinned artifacts. Treat those five as a pixel change
+    regardless of the ulp column.
   - **Two Bradford conventions coexist deliberately.** `BRADFORD` (exact `f64`
     inverse) is canonical; `BRADFORD_PUBLISHED_INVERSE` (Lindbloom's printed
     7-decimal inverse) exists *only* because `NC_FILM_RGB_V1_TO_ACESCG` was
@@ -284,7 +298,17 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   paths; `RunProfile::UltraHdrV1` separately counts shared-source, dual-render,
   gain-map, JPEG, native-copy, and package staging; `RunProfile::HdrAvif` counts one
   rendition plus a single lumped `AVIF_STAGING_BYTES_PER_PX` for everything libaom
-  allocates. Future presets must add and calibrate their own profile before
+  allocates; `RunProfile::HdrLinearTiff` and `HdrCodedTiff` count that same
+  rendition with **no container staging at all** (the `tiff` writer streams strips
+  under `Predictor::None`), the coded one adding only its 6 B/px u16 quantize
+  buffer. Those two therefore peak at the **render** phase, not encode — as does
+  `UltraHdrV1`, for the different reason that it holds four display buffers at once.
+  Which phase peaks is **per profile**; a sentence claiming otherwise has been wrong
+  twice, so read it off
+  `memory`'s `which_phase_peaks_is_per_profile_and_measured_not_assumed`. Note an
+  f32 `--export-ir` costs nothing (the plane is written from its existing slice, no
+  `quantize_u16`), which is why `HdrLinearTiff` charges 0 for it.
+  Future presets must add and calibrate their own profile before
   activation. **Calibrate by solving across two frame sizes, not one** — the AVIF
   constant came from an 18.66 MP and a 74.65 MP scan, which separated the 78.47 B/px
   slope from a ~7.9 MB fixed cost. And leave `accounted` slightly *under* measured:

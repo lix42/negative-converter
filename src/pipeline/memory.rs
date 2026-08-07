@@ -44,6 +44,23 @@
 //! The transfer (PQ or HLG) is applied *in place* to the rendition, so it adds
 //! nothing. [`AVIF_STAGING_BYTES_PER_PX`] is the calibrated 48.
 //!
+//! `hdr-linear-tiff` ([`RunProfile::HdrLinearTiff`]) shares that render row and then
+//! drops the staging entirely — f32 is written verbatim, and the `tiff` writer
+//! streams strips rather than assembling the file in memory:
+//!
+//! ```text
+//! render     decoded + shared ACEScg + BT.2020 rendition      2·decoded + 12 + 12·s B/px
+//! encode     decoded + rendition                             28 + 12·s B/px
+//! ```
+//!
+//! Its peak is therefore the **render** phase rather than encode, as it is for
+//! `hdr-pq-tiff`/`hdr-hlg-tiff` (no container is assembled in memory) and — for a
+//! different reason — for `ultra-hdr-v1`, whose four simultaneous display buffers
+//! outweigh its encode set. Which phase peaks is **per profile**, not a property of
+//! any category: `which_phase_peaks_is_per_profile_and_measured_not_assumed` pins
+//! each one, because prose about it has been wrong twice. Note a lossless-TIFF
+//! compression option would add a staging term and could move this peak to encode.
+//!
 //! `s` is the sampled rectangle as a fraction of the frame ([`SamplePlan`]): `0`
 //! for an explicit `--film-base` (nothing is sampled), ~0.69 for the `auto` path's
 //! frame interior on a 3:2 frame, up to 1.0 for a full-frame `--base-region` /
@@ -138,6 +155,11 @@
 //! | `hdr-pq` 18.66 MP (explicit base, no IR export) | 1.765 GB | 1.472 GB | +19.9% |
 //! | `hdr-pq` 74.65 MP (explicit base, no IR export) | 6.659 GB | 5.866 GB | +13.5% |
 //! | `hdr-hlg` 18.66 MP (explicit base, no IR export) | 1.765 GB | 1.503 GB | +17.5% |
+//! | `hdr-linear-tiff` 18.66 MP (explicit base, no IR export) | 1.078 GB | 0.907 GB | +18.9% |
+//! | `hdr-linear-tiff` 74.65 MP (explicit base, no IR export) | 3.911 GB | 3.578 GB | +9.3% |
+//! | `hdr-pq-tiff` 18.66 MP (explicit base, no IR export) | 1.078 GB | 0.906 GB | +19.0% |
+//! | `hdr-hlg-tiff` 18.66 MP (explicit base, no IR export) | 1.078 GB | 0.906 GB | +19.0% |
+//! | `hdr-pq-tiff` 74.65 MP (explicit base, no IR export) | 3.911 GB | (not measured) | — |
 //!
 //! Two sources of slack are visible and deliberate. Small frames run looser
 //! (+39.4% for the u16 18.66 MP run) because [`ALLOWANCE_FIXED_BYTES`] stops being negligible —
@@ -153,6 +175,16 @@
 //! therefore retains the TIFF model's conservative 2 B/px u16 staging term;
 //! tests pin that structural increment without claiming it as a calibrated RSS
 //! observation. The same holds for `hdr-pq`/`hdr-hlg` with `--export-ir`.
+//!
+//! The five TIFF-HDR rows share one number per frame size because all three presets
+//! peak at the **render** phase, which is identical across them (they share
+//! `hdr::render_linear`); the u16 quantize buffer that distinguishes `hdr-*-tiff`
+//! lands in the cheaper encode phase and never sets the peak. Their margin is wider
+//! than `hdr-pq`'s at the same size because the AVIF profile's calibrated codec
+//! staging pushes *its* peak to encode, where the model was fitted; here the peak is
+//! a phase built only from enumerated buffers, so the residual is unmodelled
+//! allocator and writer overhead. Every one of these estimates stays **above**
+//! measured, which is the direction the gate requires.
 //!
 //! The two `hdr-pq` rows are the *pair* that solved
 //! [`AVIF_STAGING_BYTES_PER_PX`] — they are a fit, not two independent
@@ -307,6 +339,33 @@ pub enum RunProfile {
     /// encoder that the JPEG path does not.
     HdrAvif {
         /// Whether a u16 IR TIFF is staged before the primary AVIF.
+        export_ir: bool,
+    },
+    /// `hdr-linear-tiff`: one display rendition written verbatim as 32-bit float.
+    ///
+    /// The **cheapest** display profile, and the only one that adds **no staging
+    /// term at all**: f32 is written as-is (no quantization buffer) and the `tiff`
+    /// writer streams strips through the staged `BufWriter` under `Predictor::None`
+    /// (no in-memory container), so encode holds strictly less than render did.
+    ///
+    /// Its peak is therefore the **render** phase — but it is *not* alone in that:
+    /// [`HdrCodedTiff`](Self::HdrCodedTiff) peaks at render too, and so does
+    /// [`UltraHdrV1`](Self::UltraHdrV1), whose four simultaneous display buffers
+    /// outweigh its encode set. Which phase peaks is **per profile**; read it off
+    /// `which_phase_peaks_is_per_profile_and_measured_not_assumed` rather than any
+    /// sentence, this one included.
+    HdrLinearTiff {
+        /// Whether an f32 IR TIFF is staged before the primary TIFF.
+        export_ir: bool,
+    },
+    /// `hdr-pq-tiff` / `hdr-hlg-tiff`: one display rendition plus the u16 code-value
+    /// buffer it is quantized into.
+    ///
+    /// Between [`HdrLinearTiff`](Self::HdrLinearTiff) and [`HdrAvif`](Self::HdrAvif):
+    /// it pays for a quantization buffer the linear TIFF does not need, but not for
+    /// a native codec's working set.
+    HdrCodedTiff {
+        /// Whether a u16 IR TIFF is staged before the primary TIFF.
         export_ir: bool,
     },
     /// `inspect` / `estimate`: decode, then sample — no render, no encode.
@@ -772,6 +831,68 @@ pub fn estimate_peak(
                 sum(sum(sum(retained, avif_staging)?, ir_export)?, sampled)?,
             )
         }
+        RunProfile::HdrCodedTiff { export_ir } => {
+            // Render: identical to `HdrAvif` and `HdrLinearTiff` — they share
+            // `render_linear`, and `encode_transfer` mutates the rendition in place.
+            let rendition = mul(pixels, WORKING_CHANNELS * F32_BYTES)?;
+            let render = sum(mul(image, 2)?, rendition)?;
+
+            // Encode: decoded + the retained f32 rendition + the u16 code buffer it
+            // is quantized into (3 channels x 2 B). Like `HdrLinearTiff` there is no
+            // container staging — `tiff` streams strips — so the quantize buffer is
+            // the only term the linear profile does not also pay.
+            let quantize = mul(pixels, mul(WORKING_CHANNELS, 2)?)?;
+            let retained = sum(sum(image, rendition)?, quantize)?;
+            let ir_export = if export_ir && shape.ir_present {
+                // u16 IR, matching this preset's resolved `OutDepth::U16`.
+                mul(pixels, 2)?
+            } else {
+                0
+            };
+            (
+                sum(render, sampled)?,
+                sum(sum(retained, ir_export)?, sampled)?,
+            )
+        }
+        // `export_ir` is deliberately not consulted — see the comment on
+        // `ir_export` below. The field stays on the variant because the CLI sets it
+        // uniformly for every profile and its *shape* should not depend on whether
+        // this particular model happens to charge for it.
+        RunProfile::HdrLinearTiff { export_ir: _ } => {
+            // Render: identical to `HdrAvif` — decoded (held for `--export-ir` /
+            // the report) plus the `image`-shaped shared adjusted ACEScg source
+            // (16 B/px on an HDRi input, because reconstruction carries the IR
+            // plane through `AcesCgImage`), plus the BT.2020 rendition beside it.
+            // No `encode_transfer` runs on this path: the samples stay linear.
+            let rendition = mul(pixels, WORKING_CHANNELS * F32_BYTES)?;
+            let render = sum(mul(image, 2)?, rendition)?;
+
+            // Encode: decoded + the rendition it writes, and **nothing else of
+            // consequence**. This is the one display path with no staging term:
+            //   * f32 is written verbatim, so there is no quantization buffer (the
+            //     same reason `Convert`'s `OutDepth::F32` arm contributes 0); and
+            //   * the file is not assembled in memory the way AVIF and the gain-map
+            //     JPEGs are — `tiff`'s `write_data` writes one strip at a time
+            //     straight into the staged `BufWriter` under the default
+            //     `Predictor::None`, with no full-frame intermediate.
+            //
+            // So encode is strictly cheaper than render here, and `accounted_bytes`
+            // legitimately lands on the render phase. If a future lossless TIFF
+            // *compression* option is added, its codec buffers become a real term
+            // and this comment stops being true — add it here rather than trusting
+            // the allowance to absorb it. Per CLAUDE.md, nothing tests this model
+            // against the code.
+            // **`--export-ir` costs nothing here**, which is not an omission. This
+            // preset resolves `OutDepth::F32`, and `export_ir_to_writer`'s f32 arms
+            // hand `image.ir`'s existing `&[f32]` straight to `encode_planar` —
+            // there is no `quantize_u16` and so no staging `Vec` to charge for. That
+            // is exactly why `Convert`'s `OutDepth::F32` arm above contributes `0`
+            // even when `export_ir` is set. Charging the u16 path's 2 B/px, or the
+            // plane's own 4 B/px, would over-state the peak and reject runs the
+            // machine could serve.
+            let retained = sum(image, rendition)?;
+            (sum(render, sampled)?, sum(retained, sampled)?)
+        }
     };
 
     let accounted_bytes = decode_bytes
@@ -1129,6 +1250,215 @@ mod tests {
         .unwrap();
         assert!(no_ir.render_bytes < gain_map.render_bytes);
         assert!(no_ir.encode_bytes > gain_map.encode_bytes);
+    }
+
+    #[test]
+    fn hdr_linear_tiff_profile_peaks_at_render_with_no_staging_term() {
+        // 10x10, no IR: render = 12 (decoded) + 24 (shared ACEScg + rendition) = 36
+        // B/px — identical to `HdrAvif`, since the two share `render_linear`. Encode
+        // is 12 + 12 = 24: f32 is written verbatim (no quantize buffer) and the
+        // `tiff` writer streams strips (no in-memory container), so there is nothing
+        // else to count.
+        let no_ir = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::HdrLinearTiff { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(no_ir.render_bytes, 3_600);
+        assert_eq!(no_ir.encode_bytes, 2_400);
+
+        // **The distinguishing property is the absent staging term, not the peak
+        // phase.** No staging *is* unique to this profile. Peaking at render is not:
+        // `HdrCodedTiff` and `UltraHdrV1` do too — see
+        // `which_phase_peaks_is_per_profile_and_measured_not_assumed`, which is the
+        // authority. (An earlier version of this comment claimed "every other
+        // profile peaks at encode"; both halves were false against code in this
+        // same file, which is the third time that claim has had to be corrected.)
+        assert_eq!(no_ir.accounted_bytes, no_ir.render_bytes);
+        assert!(no_ir.encode_bytes < no_ir.render_bytes);
+
+        // Its render phase matches the AVIF profile exactly (same shared source,
+        // same single rendition); only encode diverges.
+        let avif = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::HdrAvif { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(no_ir.render_bytes, avif.render_bytes);
+        assert!(
+            no_ir.encode_bytes < avif.encode_bytes,
+            "the linear TIFF must be cheaper at encode than AVIF (no codec staging)"
+        );
+        // And therefore cheaper overall than every other display preset.
+        let gain_map = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::UltraHdrV1 { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert!(no_ir.accounted_bytes < avif.accounted_bytes);
+        assert!(no_ir.accounted_bytes < gain_map.accounted_bytes);
+    }
+
+    #[test]
+    fn hdr_coded_tiff_profile_sits_between_the_linear_tiff_and_avif() {
+        // 10x10, no IR: render is the shared 36 B/px every display profile pays;
+        // encode is 12 (decoded) + 12 (rendition) + 6 (u16 codes) = 30 B/px.
+        let coded = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::HdrCodedTiff { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(coded.render_bytes, 3_600);
+        assert_eq!(coded.encode_bytes, 3_000);
+
+        let linear = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::HdrLinearTiff { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let avif = estimate_peak(
+            &shape(10, 10, false),
+            RunProfile::HdrAvif { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        // Every display profile shares `render_linear`, so the render phase is
+        // identical across all three; only encode distinguishes them.
+        assert_eq!(coded.render_bytes, linear.render_bytes);
+        assert_eq!(coded.render_bytes, avif.render_bytes);
+        // The quantize buffer is exactly the 6 B/px the linear TIFF does not pay...
+        assert_eq!(coded.encode_bytes - linear.encode_bytes, 600);
+        // ...and it is far cheaper than a native codec's working set.
+        assert!(coded.encode_bytes < avif.encode_bytes);
+        // Render still wins overall here too, because the quantize buffer is smaller
+        // than the shared source it replaces.
+        assert_eq!(coded.accounted_bytes, coded.render_bytes);
+    }
+
+    #[test]
+    fn hdr_coded_tiff_ir_export_stages_a_u16_plane() {
+        // Unlike `HdrLinearTiff` (f32, 4 B/px) this preset resolves `OutDepth::U16`,
+        // so its IR plane costs 2 B/px — the same as the AVIF and gain-map profiles.
+        let with_ir_no_export = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrCodedTiff { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let with_ir = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrCodedTiff { export_ir: true },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(with_ir.encode_bytes - with_ir_no_export.encode_bytes, 200);
+        // Render pays for the IR plane twice (decoded + shared ACEScg source).
+        assert_eq!(with_ir_no_export.render_bytes, 4_400);
+    }
+
+    #[test]
+    fn hdr_linear_tiff_ir_export_is_free_because_f32_needs_no_staging() {
+        // `export_ir_to_writer`'s f32 arms pass the existing `&[f32]` straight to the
+        // writer — no `quantize_u16`, so no staging buffer — which is why `Convert`'s
+        // `OutDepth::F32` arm also contributes 0. Charging anything here would
+        // over-state the peak and reject runs that fit. Pinned in both directions:
+        // the increment is zero, and the u16 profiles' is not.
+        let with_ir_no_export = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrLinearTiff { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let with_ir = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrLinearTiff { export_ir: true },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(
+            with_ir.encode_bytes, with_ir_no_export.encode_bytes,
+            "an f32 IR export allocates nothing, so it must cost nothing"
+        );
+        assert_eq!(with_ir_no_export.render_bytes, 4_400);
+
+        // The same flag on a u16-depth profile *does* cost 2 B/px, so the zero above
+        // is a property of the depth and not a dropped term.
+        let coded_off = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrCodedTiff { export_ir: false },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let coded_on = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::HdrCodedTiff { export_ir: true },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(coded_on.encode_bytes - coded_off.encode_bytes, 200);
+        // And the legacy f32 path agrees — this is the established convention.
+        let convert_f32_off = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::Convert {
+                depth: OutDepth::F32,
+                export_ir: false,
+            },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        let convert_f32_on = estimate_peak(
+            &shape(10, 10, true),
+            RunProfile::Convert {
+                depth: OutDepth::F32,
+                export_ir: true,
+            },
+            SamplePlan::none(),
+        )
+        .unwrap();
+        assert_eq!(convert_f32_on.encode_bytes, convert_f32_off.encode_bytes);
+    }
+
+    #[test]
+    fn which_phase_peaks_is_per_profile_and_measured_not_assumed() {
+        // Pins the actual peak phase of every profile, because a plain-language
+        // claim about it has now been wrong twice: the `hdr-linear-tiff` comment
+        // first said it was the *only* render-peaking profile (its coded sibling is
+        // too), and the correction then said every non-TIFF profile peaks at encode
+        // — which this test immediately falsified for `ultra-hdr-v1`, whose four
+        // display buffers make render (72 B/px) exceed encode (68 B/px).
+        //
+        // No category, then. Just the measured truth, so the next author reads it
+        // off a test instead of a sentence.
+        let peak_phase = |profile| {
+            let e = estimate_peak(&shape(10, 10, false), profile, SamplePlan::none()).unwrap();
+            if e.accounted_bytes == e.render_bytes {
+                "render"
+            } else if e.accounted_bytes == e.encode_bytes {
+                "encode"
+            } else {
+                "neither"
+            }
+        };
+        for (profile, expected) in [
+            (RunProfile::HdrLinearTiff { export_ir: false }, "render"),
+            (RunProfile::HdrCodedTiff { export_ir: false }, "render"),
+            (RunProfile::UltraHdrV1 { export_ir: false }, "render"),
+            (RunProfile::HdrAvif { export_ir: false }, "encode"),
+            (
+                RunProfile::Convert {
+                    depth: OutDepth::U16,
+                    export_ir: false,
+                },
+                "encode",
+            ),
+        ] {
+            assert_eq!(peak_phase(profile), expected, "{profile:?}");
+        }
     }
 
     /// The largest scan on hand (`largest.tif`), the calibration reference.

@@ -163,12 +163,15 @@ pub fn render(
         // Every display preset renders from the shared source instead, so that
         // reconstruction and the print controls resolve exactly once for whichever
         // rendition(s) the preset needs.
-        OutputPreset::UltraHdrV1 | OutputPreset::HdrPq | OutputPreset::HdrHlg => {
-            Err(crate::types::NcError::Other(format!(
-                "`{}` must use stages::render_display_source",
-                output_params.preset.name()
-            )))
-        }
+        OutputPreset::UltraHdrV1
+        | OutputPreset::HdrPq
+        | OutputPreset::HdrHlg
+        | OutputPreset::HdrLinearTiff
+        | OutputPreset::HdrPqTiff
+        | OutputPreset::HdrHlgTiff => Err(crate::types::NcError::Other(format!(
+            "`{}` must use stages::render_display_source",
+            output_params.preset.name()
+        ))),
     }
 }
 
