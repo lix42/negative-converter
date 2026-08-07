@@ -289,7 +289,8 @@ detector proposes as possible rebate.
   rejected with a "not accepted yet" message):
   - `legacy` ⇧ — the no-preset transitional TIFF path (the default);
   - `film-master` ⇧ — unclamped 32-bit float linear ACEScg TIFF preserving NC's film rendering;
-  - `ultra-hdr-v1` ⇧ — explicit legacy Display P3 gain-map JPEG (convert only);
+  - `ultra-hdr-v1` ⇧ — explicit legacy Display P3 gain-map JPEG (convert only;
+    reads as plain SDR on Apple platforms, which ignore the legacy XMP dialect);
   - `gain-map-hdr` — future default, backward-compatible display HDR;
   - `display-p3` — 16-bit losslessly stored wide-gamut SDR TIFF;
   - `compatibility` — 16-bit losslessly stored sRGB SDR TIFF;
@@ -1890,6 +1891,15 @@ would cost a Unix-only code path for output that is reproducible by re-running.
     post-ACEScg print controls, and makes no ISO 21496-1 claim. The canonical
     internal gain model remains RGB; the legacy serializer derives the
     single-channel Display P3 luminance gain that XMP mode can signal.
+    **Interop caveat, measured 2026-08-06:** Apple platforms ignore the legacy
+    Ultra HDR v1 XMP dialect entirely, so this preset's output opens as an
+    ordinary **SDR** JPEG on macOS/iOS — correct and backward-compatible, but not
+    HDR there. Apple ImageIO reports no gain map of either kind and decodes at
+    headroom 1.0; only the ISO 21496-1 dialect
+    (`output/iso-gain-map-metadata`, no CLI surface yet) is read. Android and
+    libultrahdr-based readers do consume the legacy dialect. This is why the
+    future `gain-map-hdr` default is dual-dialect rather than legacy-only; see
+    `scripts/iso-decoder-oracle/` for the harness that measures it.
   - `hdr-pq` and `hdr-hlg` are explicit single-rendition display-HDR presets,
     accepted by `convert` only, each requiring an `.avif` output path. They write
     10-bit, full-range, 4:4:4 AVIF (AV1 High Profile, level capped at 6.0 for the

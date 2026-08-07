@@ -25,6 +25,24 @@ What other epics need to know about `output`:
   Before final-ISO conformance is available, the explicit `ultra-hdr-v1` JPEG
   path uses only the public Android/Adobe XMP + MPF/GContainer dialect and must
   not be labeled ISO-conformant.
+- **`ultra-hdr-v1` is not HDR on Apple platforms — measured, not inferred
+  (2026-08-06).** Apple ignores Google's legacy Ultra HDR v1 XMP entirely, so
+  that preset's file opens as an ordinary SDR JPEG on macOS/iOS (ImageIO reports
+  no gain map of either kind, headroom 1.0). Only the ISO 21496-1 dialect is read
+  there. Matters to `analysis/display-output-acceptance`, whose cross-device pass
+  must expect SDR from the legacy preset rather than treat it as a failure, and
+  it is why the future `gain-map-hdr` default is dual-dialect. The ISO dialect
+  (`Dialects::LegacyPlusIso`) is implemented and Apple-verified but still has
+  **no CLI path** — `output/gain-map-dialect-activation`.
+- **Verify gain-map output with `scripts/iso-decoder-oracle/`** (Apple ImageIO,
+  macOS-only, not in CI). exiftool and libultrahdr both accept a file no decoder
+  parses — that is exactly how a placement defect shipped. Two traps when using
+  it: the sample set needs `NC_ISO_SAMPLE_EV=3.0` or the gain map is inert
+  (`GainMapMax` ≈ 1.003x at defaults, because the exponential curve leaves
+  content below the SDR shoulder), and the reported `headroom 4.9261084` is nc's
+  own declared `1000/203` echoed back rather than a measurement — it reads the
+  same on a flat map, so the pass condition is `PRESENT` **plus** a `GainMapMax`
+  above 0.
 - **Native dependency packaging:** the shipped Ultra HDR implementation keeps
   the audited libultrahdr/libjpeg-turbo snapshot in-tree. **The plan changed on
   2026-08-05** (`output/ultrahdr-dependency-externalization`, id kept, scope now
@@ -2108,3 +2126,49 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   number is `GainMapMax`; the harness README now states the criterion that way
   and names the echo explicitly, as do the task file, `TASKS.md`, and
   `insert_baseline_iso_segment`'s rustdoc.
+
+## iso-gain-map-metadata (closed)
+
+**Status:** done
+**Updated:** 2026-08-07
+
+- 2026-08-07: Closed after PR #81 merged. Landed: nc-serialized ISO 21496-1
+  C.2.2 metadata in both images (C.4.3 version-only in the baseline, C.4.6 full
+  structure in the gain map), placed in the **header block** — the correction the
+  decoder oracle forced, see the two sections above. Verified by Apple ImageIO
+  reading every field back as written and by libultrahdr still decoding the
+  legacy dialect from the same file.
+- 2026-08-07: **Shipped without two of its own verification bullets, deliberately
+  and with the user's call.** Android 15+ was never exercised, and there is still
+  no CLI path to a dual-dialect file (`Dialects::LegacyPlusIso` keeps its
+  `#[allow(dead_code)]`). Both moved to `output/gain-map-dialect-activation`
+  rather than being dropped. The reason to close anyway: the Apple oracle is a
+  genuine independent ISO implementation and it agrees field-for-field, so the
+  serializer is evidenced; holding the task open past that only kept
+  `output/presets` — the plan's biggest hub — blocked behind a device test.
+- 2026-08-07: **Do not repeat the headroom mistake.** The oracle's
+  `HDR decode: headroom 4.9261084` is `2^AlternateHeadroom`, nc's own declared
+  `1000/203` echoed back; it reads identically on a completely flat gain map.
+  Evidence of a working reconstruction is `PRESENT` **plus** a `GainMapMax`
+  materially above 0. Three documents briefly carried the wrong framing before
+  the ship review caught it.
+- 2026-08-07: Also filed out of this task's DC-007 read:
+  `output/mp-container-conformance` (MP Type `000000` where Table 4 assigns
+  `050000`; JFIF-not-first in the dependent image; the missing Exif baseline).
+  Conformance only — none of it functional, all of it changing shipped container
+  bytes.
+
+## gain-map-dialect-activation
+
+**Status:** not started
+**Updated:** 2026-08-07
+
+- Goal: verify the dual-dialect file on Android 15+, and give the ISO dialect a
+  CLI path so a user can produce one.
+- Filed 2026-08-07 out of `iso-gain-map-metadata`'s close-out; rationale and the
+  `output/presets` boundary are in
+  [the task file](../tasks/output/gain-map-dialect-activation.md).
+- Two things to carry in: the sample set needs `NC_ISO_SAMPLE_EV=3.0` or the gain
+  map is inert and the test discriminates nothing; and whichever of this task and
+  `output/presets` ships a CLI surface first owns the `gain-map-hdr` name — the
+  shipped `ultra-hdr-v1` is contractually ISO-free and must not be re-pointed.
