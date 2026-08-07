@@ -970,3 +970,49 @@ Four real findings on PR #56, plus one document-only deferral.
   n=7 is too small to fix a shipped constant, and Portra400's own 1.7383 is one of the suspects.
 - `algo` candidates 2 and 3 are contingent on this: candidate 3 halves a Dmax error
   (`dA/dDmax = 0.5`, so 0.046 → 0.15 stop but 0.295 → 0.98 stop); candidate 2 passes it in full.
+
+## dmax-per-channel-reduction
+
+**Status:** not started
+**Updated:** 2026-08-06
+
+- Goal: decide whether the gray-mean reduction in `reference_dmax` discards a
+  per-channel term that matters, and if so where that term belongs. An
+  investigation — "the scalar is justified" is a valid outcome. Ships no pixel change.
+- Origin: raised 2026-08-06 while drafting user-facing usage documentation.
+  Working through why `Dmin` is per-channel and `Dmax` scalar surfaced the
+  assumption underneath: since
+  `D_c` is base-relative, a scalar anchor asserts the **highlight end shares the
+  base's colour cast**. Not previously stated anywhere.
+- The committed data already contradicts it. Recomputed from the leader-uniformity
+  table in `reports/sigmoid-reference-baseline.md` (per-channel base-relative
+  densities = per-channel `Dmax`):
+
+  | roll | R | G | B | gray mean | fixture Dmax | spread | stops | widest |
+  |---|---|---|---|---|---|---|---|---|
+  | Gold 200 | 1.2242 | 1.2340 | 1.3628 | 1.2737 | 1.2758 | 0.1386 | 0.46 | B |
+  | Ektar | 1.2724 | 1.2865 | 1.3201 | 1.2930 | 1.2933 | 0.0477 | 0.16 | B |
+  | Portra 160 | 1.4402 | 1.3297 | 1.3807 | 1.3835 | 1.3816 | 0.1105 | 0.37 | R |
+
+  The gray mean reproduces each fixture `Dmax` to ~4 decimals, which confirms the
+  reduction is `(r+g+b)/3`. Direction is **not** consistent (B densest twice, R
+  once), so no single constant absorbs it. Gold 200's leader renders
+  `R 0.892 / G 0.913 / B 1.228` at `gamma = 1` — a blue "white" with blue clipping.
+- Why it may still be fine, and the one case where it is not: for the
+  **exponential** curve a per-channel anchor is *exactly* a per-channel gain
+  (`10^(γ(D'−Dmax_c))` factorises into the scalar form times a constant), so
+  `print.white_balance` / `reconstruction.density.offset` already span it — nothing
+  is lost. The **sigmoid** is nonlinear, so a per-channel anchor moves each channel
+  to a different toe/shoulder position and no downstream gain reproduces it. The
+  sigmoid is the intended default, so the question gets *more* relevant over time,
+  not less.
+- Cheapest first step is the **ratio-stability** question, and it is a pure re-read
+  of existing measurements: `dmax-anchor-reliability` established the leader's
+  *level* is uncontrolled, but level and ratio are different claims — the level
+  depends on how much light hit the leader, the inter-channel ratio may be a dye
+  property. Same-stock sibling pairs (`Portra400` vs `Portra400-leica-flaw`; the
+  Portra 160 pair) separate them. Confound to respect: if the three layers differ
+  in contrast, a ratio measured at an unknown exposure level is not the ratio at a
+  different level.
+- Coordinate with `dmax-anchor-reliability` — same leader measurements, different
+  axis; neither blocks the other.
