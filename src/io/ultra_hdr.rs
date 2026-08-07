@@ -61,17 +61,29 @@ pub fn encode_with(
     path: &Path,
     dialects: Dialects,
 ) -> Result<(Staged, EncodeOutcome)> {
-    let gain = gain_map::encode_legacy_gain_map(&render)?;
-    let (base, icc, _) = color::encode_rendered_sdr(render.into_sdr())?;
-    let (base_rgb, loss, stats) = quantize_base(&base.rgb);
-
+    let (images, outcome) = compress_images(render)?;
     // The ISO fields describe the very map just encoded, so both dialects
     // report the same normalization window.
     let iso = match dialects {
         Dialects::LegacyUltraHdrV1 => None,
-        Dialects::LegacyPlusIso => Some(iso::project(&gain.metadata)?),
+        Dialects::LegacyPlusIso => Some(iso::project(&images.gain.metadata)?),
     };
+    let staged = package_images(&images, iso.as_ref(), path)?;
+    Ok((staged, outcome))
+}
 
+/// The two compressed images plus the gain map's own metadata — everything the
+/// container needs, and nothing that depends on which dialects it will carry.
+struct CompressedImages {
+    base_jpeg: Vec<u8>,
+    gain: gain_map::EncodedGainMap,
+}
+
+/// Render half of [`encode_with`]: consume the render into the two JPEGs.
+fn compress_images(render: gain_map::GainMapRender) -> Result<(CompressedImages, EncodeOutcome)> {
+    let gain = gain_map::encode_legacy_gain_map(&render)?;
+    let (base, icc, _) = color::encode_rendered_sdr(render.into_sdr())?;
+    let (base_rgb, loss, stats) = quantize_base(&base.rgb);
     let base_jpeg = encode_jpeg(
         &base_rgb,
         base.width,
@@ -81,11 +93,32 @@ pub fn encode_with(
         ColorType::Rgb,
         None,
     )?;
+    Ok((
+        CompressedImages { base_jpeg, gain },
+        EncodeOutcome { loss, stats },
+    ))
+}
+
+/// Container half of [`encode_with`]: the **one** path that assembles a finished
+/// gain-map JPEG, so nothing — not the sample writers, not the marker-order
+/// tests — can assert against or ship a container that differs from the
+/// product's. Anything added here (an Exif APP1, an MPEntry patch) is therefore
+/// seen by every caller at once. The single exception is
+/// `baseline_insertion_keeps_every_mpf_offset_resolvable`, which calls `package`
+/// directly because it needs the *pre*-insertion package as its "before".
+///
+/// `iso` is already resolved rather than derived from [`Dialects`] here, which
+/// is what lets `iso_oracle_samples` emit its deliberately conflicting file —
+/// legacy metadata from `images.gain`, ISO fields from a divergent copy —
+/// through this same code.
+///
+/// Returns the bytes; [`package_images`] is the same thing written to a path.
+fn assemble(images: &CompressedImages, iso: Option<&iso::IsoGainMapFields>) -> Result<Vec<u8>> {
+    let gain = &images.gain;
     // The gain map's segment goes in before packaging: libultrahdr appends this
     // image verbatim, so the segment survives. The baseline's cannot — see
     // `insert_baseline_iso_segment`.
     let gain_app2 = iso
-        .as_ref()
         .map(|fields| iso::serialize_metadata(fields).map(|payload| iso::segment_content(&payload)))
         .transpose()?;
     let gain_jpeg = encode_jpeg(
@@ -97,16 +130,23 @@ pub fn encode_with(
         ColorType::Luma,
         gain_app2,
     )?;
-    let mut packaged = package(&base_jpeg, &gain_jpeg, &gain.metadata)?;
-    if let Some(fields) = &iso {
+    let mut packaged = package(&images.base_jpeg, &gain_jpeg, &gain.metadata)?;
+    if let Some(fields) = iso {
         let version = iso::app2_segment(&iso::serialize_version(fields))?;
         packaged = insert_baseline_iso_segment(&packaged, &version)?;
     }
+    Ok(packaged)
+}
 
-    // Staged like the TIFF path: the whole package is built in memory first, so the
-    // final path only ever sees a complete Ultra HDR file.
-    let staged = staged::stage_bytes(path, &packaged)?;
-    Ok((staged, EncodeOutcome { loss, stats }))
+/// [`assemble`] written to `path`, staged like the TIFF path: the whole package
+/// is built in memory first, so the final path only ever sees a complete Ultra
+/// HDR file.
+fn package_images(
+    images: &CompressedImages,
+    iso: Option<&iso::IsoGainMapFields>,
+    path: &Path,
+) -> Result<Staged> {
+    staged::stage_bytes(path, &assemble(images, iso)?)
 }
 
 fn encode_jpeg(
@@ -281,9 +321,11 @@ fn package(
 ///    segment, which libultrahdr emits *after* `SOF0` and the tables — so the
 ///    segment was well-formed, correctly sized, and simply never parsed. Apple
 ///    ImageIO reported no gain map at all and decoded the file as plain SDR;
-///    moving the same bytes into the header block made it reconstruct HDR at
-///    4.93 headroom. Verified 2026-08-06 against ImageIO on macOS 26.5 — see
-///    `docs/progress/output.md`.
+///    moving the same bytes into the header block flipped it to `PRESENT`, with
+///    every ISO field reading back as written. (The decoder's reported headroom
+///    is *not* the evidence — it echoes nc's declared `AlternateHeadroom`, so it
+///    reads 4.93 even on a flat gain map.) Verified 2026-08-06 against ImageIO
+///    on macOS 26.5 — see `docs/progress/output.md`.
 /// 2. **Before the `MPF\0` label.** MPF individual-image offsets are measured
 ///    from the byte after that label, so inserting before it moves the reference
 ///    point and the appended gain map by the same amount and leaves every stored
@@ -364,7 +406,7 @@ fn insert_baseline_iso_segment(packaged: &[u8], segment: &[u8]) -> Result<Vec<u8
     let size_field = size_field.ok_or_else(|| malformed("no MP Entry array (tag 0xB002)"))?;
     if size_field < segment_start {
         return Err(malformed(
-            "the MP Entry array precedes the MPF segment, so insertion would move it",
+            "the MP Entry array precedes the insertion point, so inserting would move it",
         ));
     }
     let recorded = read_u32(size_field)?;
@@ -509,12 +551,23 @@ mod tests {
                         break;
                     };
                     let length = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-                    let label_end = (position + 4 + 32).min(bytes.len());
+                    // Keep the label inside this segment: a short one would
+                    // otherwise borrow the next segment's bytes into the name
+                    // printed by a failing assertion.
+                    let label_end = (position + 2 + length.max(2))
+                        .min(position + 4 + 32)
+                        .min(bytes.len());
                     let label = String::from_utf8_lossy(&bytes[position + 4..label_end])
                         .chars()
                         .take_while(|c| c.is_ascii_graphic())
                         .collect::<String>();
                     markers.push(format!("APP{} ({label})", marker - 0xE0));
+                    // Bounded for the same reason as the frame-header arm below:
+                    // a garbage length must end the walk, not skip past markers
+                    // a test is about to assert on.
+                    if length < 2 || position + 2 + length > bytes.len() {
+                        break;
+                    }
                     position += 2 + length;
                 }
                 // Frame headers: 0xC0..=0xCF except DHT (0xC4), JPG (0xC8) and
@@ -527,6 +580,13 @@ mod tests {
                         break;
                     };
                     let length = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+                    // A spurious `FF Cx` pair inside another segment's payload
+                    // would yield a garbage length here; stop the walk rather
+                    // than skipping past real markers (MPF, say) and turning a
+                    // clean assertion failure into a confusing one.
+                    if length < 2 || position + 2 + length > bytes.len() {
+                        break;
+                    }
                     position += 2 + length;
                 }
                 _ => position += 2,
@@ -575,12 +635,18 @@ mod tests {
         (tiff, images)
     }
 
-    /// Build a small dual-dialect package the way `encode_with` does, without
-    /// touching the filesystem.
+    /// Build a small dual-dialect package through the product's own
+    /// [`assemble`], without touching the filesystem.
+    ///
+    /// Going through `assemble` rather than re-listing its steps is what makes
+    /// the marker-order tests below binding: a future container change (the Exif
+    /// APP1 or MPEntry patch `output/mp-container-conformance` owns) moves these
+    /// fixtures with the product, instead of leaving them green while the
+    /// shipped layout drifts. Only the two tiny JPEGs are hand-built here.
     fn dual_dialect_package() -> (Vec<u8>, iso::IsoGainMapFields) {
         let metadata = probe_metadata();
         let fields = iso::project(&metadata).unwrap();
-        let base = encode_jpeg(
+        let base_jpeg = encode_jpeg(
             &[64, 64, 64, 192, 192, 192, 64, 64, 64, 192, 192, 192],
             2,
             2,
@@ -590,23 +656,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let gain_payload = iso::serialize_metadata(&fields).unwrap();
-        let gain = encode_jpeg(
-            &[0, 255, 0, 255],
-            2,
-            2,
-            None,
-            "test gain",
-            ColorType::Luma,
-            Some(iso::segment_content(&gain_payload)),
-        )
-        .unwrap();
-        let packaged = package(&base, &gain, &metadata).unwrap();
-        let version = iso::app2_segment(&iso::serialize_version(&fields)).unwrap();
-        (
-            insert_baseline_iso_segment(&packaged, &version).unwrap(),
-            fields,
-        )
+        let images = CompressedImages {
+            base_jpeg,
+            gain: gain_map::EncodedGainMap {
+                width: 2,
+                height: 2,
+                samples: vec![0, 255, 0, 255],
+                metadata,
+            },
+        };
+        (assemble(&images, Some(&fields)).unwrap(), fields)
     }
 
     #[test]
@@ -785,7 +844,7 @@ mod tests {
         divergent.gain_max = [8.0; 3]; // legacy says 4.0; ISO will say 8.0
         let fields = iso::project(&divergent).unwrap();
 
-        let base = encode_jpeg(
+        let base_jpeg = encode_jpeg(
             &[64, 64, 64, 192, 192, 192, 64, 64, 64, 192, 192, 192],
             2,
             2,
@@ -795,31 +854,36 @@ mod tests {
             None,
         )
         .unwrap();
-        let payload = iso::serialize_metadata(&fields).unwrap();
-        let gain = encode_jpeg(
-            &[0, 255, 0, 255],
-            2,
-            2,
-            None,
-            "test gain",
-            ColorType::Luma,
-            Some(iso::segment_content(&payload)),
-        )
-        .unwrap();
-        // Package with the *legacy* metadata, so XMP and ISO disagree on purpose.
-        let bytes = package(&base, &gain, &legacy).unwrap();
+        // Assembled the product's way, with the *legacy* metadata in the
+        // container and divergent ISO fields beside it — the same construction
+        // `iso_oracle_samples` ships to the external decoder.
+        let images = CompressedImages {
+            base_jpeg,
+            gain: gain_map::EncodedGainMap {
+                width: 2,
+                height: 2,
+                samples: vec![0, 255, 0, 255],
+                metadata: legacy,
+            },
+        };
+        let bytes = assemble(&images, Some(&fields)).unwrap();
 
         // The legacy dialect reports log2(4.0) = 2.
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("hdrgm:GainMapMax"), "no legacy GainMapMax");
 
-        // The ISO payload reports log2(8.0) = 3. Locate it and read channel 0's
-        // max: 4 version + 1 flags + 16 headroom, then min pair, then max pair.
+        // The ISO payload reports log2(8.0) = 3. Read channel 0's max out of the
+        // **second** label occurrence: the first is the baseline's version-only
+        // C.4.3 segment, the second the gain map's full C.4.6 structure. Then
+        // 4 version + 1 flags + 16 headroom, then min pair, then max pair.
         let label = b"urn:iso:std:iso:ts:21496:-1\0";
         let at = bytes
             .windows(label.len())
-            .position(|window| window == label)
-            .expect("ISO segment present")
+            .enumerate()
+            .filter(|(_, window)| *window == label)
+            .map(|(index, _)| index)
+            .nth(1)
+            .expect("full ISO structure present in the gain-map image")
             + label.len();
         let max_numerator = i32::from_be_bytes([
             bytes[at + 29],
@@ -959,25 +1023,6 @@ mod tests {
         assert!(dual.len() > legacy.len());
     }
 
-    /// Emit a dual-dialect file for the manual decoder-oracle gate, which needs
-    /// an ISO-aware decoder nc cannot host (Apple ImageIO, Android 15+). There is
-    /// deliberately no CLI path yet, so this is the only way to produce one.
-    ///
-    /// `NC_ISO_SAMPLE_DIR=/some/dir cargo test -- --ignored iso_sample`
-    #[test]
-    #[ignore = "writes a sample file for external decoder verification"]
-    fn iso_sample_for_external_decoder() {
-        let dir = std::env::var("NC_ISO_SAMPLE_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir());
-        let path = dir.join("nc-dual-dialect-sample.jpg");
-        let (staged, _) = encode_with(real_render(), &path, Dialects::LegacyPlusIso).unwrap();
-        staged.commit().unwrap();
-        println!("wrote dual-dialect sample: {}", path.display());
-        println!("verify with: exiftool -a -G1 '{}'", path.display());
-        println!("and with:    sips -g all '{}'", path.display());
-    }
-
     /// The render behind [`iso_oracle_samples`]: the toy fixture by default, or
     /// a real scan when `NC_ISO_SAMPLE_INPUT` names one. Reads only derived
     /// numbers out — it writes JPEGs and prints statistics, never pixels.
@@ -994,7 +1039,15 @@ mod tests {
             .split(',')
             .map(|part| part.trim().parse().expect("film base component"))
             .collect();
-        let film_base = FilmBase::from([base[0], base[1], base[2]]);
+        // Arity is checked here rather than by indexing, so a two-component
+        // value reports what was wrong instead of panicking on `base[2]`.
+        let base: [f32; 3] = base.as_slice().try_into().unwrap_or_else(|_| {
+            panic!(
+                "NC_ISO_SAMPLE_BASE needs exactly three components (r,g,b); got {}",
+                base.len()
+            )
+        });
+        let film_base = FilmBase::from(base);
         let dmax: f32 = std::env::var("NC_ISO_SAMPLE_DMAX")
             .expect("NC_ISO_SAMPLE_DMAX is required with NC_ISO_SAMPLE_INPUT")
             .parse()
@@ -1003,6 +1056,9 @@ mod tests {
             .map(|value| value.parse().expect("ev"))
             .unwrap_or(0.0);
 
+        // The stage-0 memory gate is deliberately bypassed (`u64::MAX`): this is
+        // an opt-in sample writer run by hand on a known scan, not a conversion
+        // path, and the budget would otherwise also cap the TIFF read buffers.
         let (image, _) =
             crate::io::decode::decode_within(std::path::Path::new(&input), u64::MAX).unwrap();
         let reconstruction = serde_json::from_value(serde_json::json!({
@@ -1027,8 +1083,20 @@ mod tests {
 
     /// Emit the full three-file set the decoder-oracle gate compares:
     /// legacy-only, dual-dialect, and a dual file whose two dialects
-    /// deliberately disagree. All three share one render, so any difference an
-    /// external decoder reports is attributable to the metadata alone.
+    /// deliberately disagree. All three are packaged from **one** render and
+    /// one pair of compressed images, so any difference an external decoder
+    /// reports is attributable to the metadata alone — and a real scan is
+    /// decoded and rendered once, not three times.
+    ///
+    /// There is deliberately no CLI path to a dual-dialect file, so this is the
+    /// only way to produce one; it superseded the narrower
+    /// `iso_sample_for_external_decoder` on 2026-08-06. The reader that consumes
+    /// these files is `scripts/iso-decoder-oracle/`.
+    ///
+    /// Note this calls [`compress_images`] and [`package_images`] directly, one
+    /// step short of the product: [`encode_with`]'s [`Dialects`] → `iso::project`
+    /// dispatch is *not* exercised by anything the oracle reads, and is covered
+    /// instead by `encode_with_writes_both_dialects_end_to_end`.
     ///
     /// `NC_ISO_SAMPLE_DIR=/some/dir cargo test --bin nc -- --ignored iso_oracle_samples`
     ///
@@ -1045,64 +1113,37 @@ mod tests {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::env::temp_dir());
 
-        for (name, dialects) in [
-            ("oracle-legacy-only.jpg", Dialects::LegacyUltraHdrV1),
-            ("oracle-dual-dialect.jpg", Dialects::LegacyPlusIso),
+        let (images, _) = compress_images(oracle_render()).unwrap();
+        let agreeing = iso::project(&images.gain.metadata).unwrap();
+
+        // The conflicting file: the same container, packaged with the true
+        // legacy metadata but carrying ISO fields projected from a copy whose
+        // `gain_max` is doubled — exactly one stop apart, whatever the render
+        // measured, which any decoder that actually reads its chosen dialect
+        // must report differently.
+        let mut divergent = images.gain.metadata;
+        divergent.gain_max = images.gain.metadata.gain_max.map(|max| max * 2.0);
+        let conflicting = iso::project(&divergent).unwrap();
+
+        for (name, fields) in [
+            ("oracle-legacy-only.jpg", None),
+            ("oracle-dual-dialect.jpg", Some(&agreeing)),
+            ("oracle-conflicting.jpg", Some(&conflicting)),
         ] {
             let path = dir.join(name);
-            let (staged, _) = encode_with(oracle_render(), &path, dialects).unwrap();
-            staged.commit().unwrap();
+            package_images(&images, fields, &path)
+                .unwrap()
+                .commit()
+                .unwrap();
             println!("wrote {}", path.display());
+            println!("  inspect with: exiftool -a -G1 '{}'", path.display());
+            println!("  and with:     sips -g all '{}'", path.display());
         }
-
-        // The conflicting file: package with the true legacy metadata, but write
-        // ISO fields projected from a divergent copy. Legacy says log2(gain_max)
-        // over 4.0; ISO says over 8.0 — one stop apart, which any decoder that
-        // actually reads its chosen dialect must report differently.
-        let render = oracle_render();
-        let gain = gain_map::encode_legacy_gain_map(&render).unwrap();
-        let (base, icc, _) = color::encode_rendered_sdr(render.into_sdr()).unwrap();
-        let (base_rgb, _, _) = quantize_base(&base.rgb);
-
-        let mut divergent = gain.metadata;
-        divergent.gain_max = gain.metadata.gain_max.map(|max| max * 2.0);
-        let fields = iso::project(&divergent).unwrap();
-
-        let base_jpeg = encode_jpeg(
-            &base_rgb,
-            base.width,
-            base.height,
-            Some(&icc),
-            "SDR base",
-            ColorType::Rgb,
-            None,
-        )
-        .unwrap();
-        let payload = iso::serialize_metadata(&fields).unwrap();
-        let gain_jpeg = encode_jpeg(
-            &gain.samples,
-            gain.width,
-            gain.height,
-            None,
-            "gain map",
-            ColorType::Luma,
-            Some(iso::segment_content(&payload)),
-        )
-        .unwrap();
-        let packaged = package(&base_jpeg, &gain_jpeg, &gain.metadata).unwrap();
-        let version = iso::app2_segment(&iso::serialize_version(&fields)).unwrap();
-        let packaged = insert_baseline_iso_segment(&packaged, &version).unwrap();
-
-        let path = dir.join("oracle-conflicting.jpg");
-        staged::stage_bytes(&path, &packaged)
-            .unwrap()
-            .commit()
-            .unwrap();
-        println!("wrote {}", path.display());
         println!(
             "conflicting: legacy gain_max {:?} vs ISO gain_max {:?}",
-            gain.metadata.gain_max, divergent.gain_max
+            images.gain.metadata.gain_max, divergent.gain_max
         );
+        println!("read back with: scripts/iso-decoder-oracle/oracle <files>");
     }
 
     fn probe_metadata() -> gain_map::GainMapMetadata {

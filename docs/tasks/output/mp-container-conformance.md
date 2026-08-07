@@ -4,16 +4,20 @@
 
 Make nc's gain-map JPEG a conformant **Baseline MP File** per CIPA
 DC-007-Translation-2025: type the gain map as a gain map rather than
-`Undefined`, and settle the Exif-baseline requirement. Both were found by reading
-the licensed-but-free CIPA text on 2026-08-06 and are recorded in
+`Undefined`, settle the Exif-baseline requirement, and decide the JFIF ordering
+in the dependent image. The first two were found by reading the licensed-but-free
+CIPA text on 2026-08-06 and are recorded in
 [progress/output.md](../../progress/output.md) under
-`## iso-gain-map-metadata (CIPA DC-007 read — verdict)`.
+`## iso-gain-map-metadata (CIPA DC-007 read — verdict)`; the third came from
+review the same day and is filed at the end of that file's
+`## mp-container-conformance` section.
 
-Neither item is required for the ISO 21496-1 metadata to *function* — Apple
-ImageIO reconstructs HDR from nc's file today with the type code `Undefined` and
-no Exif present. This is conformance-claim work. It is split out precisely
-because it changes shipped container bytes and must not hold `output/presets`
-behind a change unrelated to the metadata `output/iso-gain-map-metadata` owns.
+**None of the three** is required for the ISO 21496-1 metadata to *function* —
+Apple ImageIO reconstructs HDR from nc's file today with the type code
+`Undefined`, no Exif present, and JFIF second in the gain-map image. This is
+conformance-claim work. It is split out precisely because it changes shipped
+container bytes and must not hold `output/presets` behind a change unrelated to
+the metadata `output/iso-gain-map-metadata` owns.
 
 ## Design
 
@@ -66,6 +70,19 @@ Three constraints on anyone who does add Exif:
   (`baseline_iso_segment_precedes_the_frame_header`). Re-run the decoder oracle;
   the Rust suite alone provably cannot catch a placement regression.
 
+### 3. JFIF is not first in the gain-map image (pre-existing, same territory)
+
+Surfaced by review on 2026-08-06, in the **dependent** image rather than the
+baseline: libultrahdr prepends its own XMP when it appends the gain map, so that
+image's markers read `SOI · APP1 XMP · APP0 JFIF · …` — `APP0 JFIF` is not the
+first marker segment after `SOI`, which JFIF requires. nc's own gain-map JPEG is
+well-formed before packaging; the reordering happens inside `package()`, so this
+is libultrahdr's layout, not nc's. No reader has complained, and the ISO segment
+in that image is unaffected. Weigh it with the Exif question — both are the same
+"does the container structurally conform" call, and both would be resolved at a
+stroke by `ultrahdr-dependency-externalization`, which replaces the packager
+outright.
+
 ### Source documents
 
 CIPA DC-007-Translation-2025 (Multi-Picture Format) and DC-008-Translation-2026
@@ -89,6 +106,10 @@ subclauses, as this repo already does for ISO 21496-1.
   `ColorSpace = Uncalibrated`, and the MP Extensions APP2 follows it.
 - If Exif is *not* added: the residual non-conformance is stated explicitly, cited
   to DC-007 §4.2.1/§5.1, and the product claim is narrowed to match.
+- The gain-map image's `APP0 JFIF` is either first after `SOI` or the deviation is
+  recorded with its reason (libultrahdr prepends the XMP) and folded into the same
+  narrowed claim — decided either way, not left unexamined. Whatever the outcome,
+  the ISO segment in that image must still precede its `SOF0`.
 
 ## Dependencies
 

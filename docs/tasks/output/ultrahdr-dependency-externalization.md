@@ -118,8 +118,10 @@ Replace it with:
   exiftool in both CI jobs, invoking it on generated output, and asserting its
   parsed fields; and
 - **the documented external-decoder gate** for real HDR selection, re-run by hand
-  when the writer changes. `iso_sample_for_external_decoder` already emits the
-  file it needs. This one is a manual gate and never counts as CI coverage.
+  when the writer changes. `iso_oracle_samples` already emits the files it needs
+  (it superseded `iso_sample_for_external_decoder` on 2026-08-06), and the reader
+  is `scripts/iso-decoder-oracle/`. This one is a manual gate and never counts as
+  CI coverage.
 
 **Recalibrate the memory preflight in the same change.** `pipeline/memory.rs`'s
 `RunProfile::UltraHdrV1` spends a calibrated **20 B/px** `byte_staging` term

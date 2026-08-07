@@ -485,17 +485,26 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     the resolved config — which is why `roll` and each per-frame override share it
     verbatim. `convert` must call **`validate_convert`**, which composes it with the
     flag-presence check above; `output/presets` is the next orchestrator that has to.
-  - *Gain-map container gotchas (ISO 21496-1 + MPF).* Five that cost time:
+  - *Gain-map container gotchas (ISO 21496-1 + MPF).* Six that cost time:
     **(a)** libultrahdr **rewrites the baseline image's marker segments** while
     packaging and drops unknown APP2s, but **appends the gain-map image verbatim** —
     so the gain map's segment goes in at encode time
     (`jpeg_encoder::add_app_segment`) while the baseline's must be spliced in
     *after* packaging. Establish this by probe; it is easy to assume backwards.
-    **(b)** MPF individual-image offsets are relative to the byte **after** the
-    `MPF\0` label, so inserting before that segment moves the reference point and
-    the appended image together and every stored offset stays valid — only the
-    first image's recorded size needs patching. Inserting *after* MPF invalidates
-    all of them. **(c)** In `urn:iso:std:iso:ts:21496:-1` the `ts:` **is** what the
+    **(b)** The baseline's spliced-in segment has **two** placement constraints and
+    meeting only one ships an inert file. It must go **before `SOF0`**, because a
+    reader stops scanning for `APPn` at the frame header — and libultrahdr emits
+    MPF *after* `SOF0`, so "immediately before MPF" (the rule as first written,
+    satisfying only the second constraint) produced a well-formed, correctly sized,
+    MPF-safe segment that **no decoder ever parsed**: Apple ImageIO saw no gain map
+    and decoded plain SDR. And it must go **before the `MPF\0` label**, because MPF
+    individual-image offsets are relative to the byte after it, so inserting there
+    moves the reference point and the appended image together and every stored
+    offset stays valid — only the first image's recorded size needs patching
+    (inserting *after* MPF invalidates all of them). `insert_baseline_iso_segment`
+    satisfies both with `leading_app_segment_end(packaged)?.min(mpf_start)`.
+    Exiftool resolving the MPF index does not test the first constraint; only an
+    external decoder does. **(c)** In `urn:iso:std:iso:ts:21496:-1` the `ts:` **is** what the
     published first edition specifies (C.3 and the C.4.6 table: 27 chars + NUL =
     28 bytes). It is not a draft identifier — reading it as one produced a wrong
     conclusion once. **(d)** libultrahdr's own ISO serializer is
@@ -505,7 +514,16 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     path — hence nc owns `pipeline::gain_map::iso`. Never add the compact form.
     **(e)** ISO 21496-1 is **silent** on coexistence with Google's Ultra HDR v1
     XMP, so dual-aware decoder precedence is *observed behaviour*, never an ISO
-    conformance claim.
+    conformance claim. **(f)** Verify with the external decoder oracle,
+    `scripts/iso-decoder-oracle/` (Apple ImageIO, macOS-only, **not in CI**) —
+    exiftool and libultrahdr both pass a file no decoder parses, which is exactly
+    how (b) shipped. Two things it teaches: Apple **ignores Google's Ultra HDR v1
+    XMP entirely**, so the shipped `ultra-hdr-v1` preset decodes as plain **SDR**
+    on macOS/iOS and only the ISO dialect makes it HDR there; and its
+    `HDR decode: headroom 4.9261084` is **not** a measurement — it is nc's
+    declared `1000/203` echoed back and reads identically on a flat gain map, so
+    the pass condition is `PRESENT` **plus** a `GainMapMax` above 0, never the
+    headroom.
   - *`--strict` assertions need an IR-free fixture.* `tests/fixtures/hdri-64bit.tif`
     carries an IR plane, so every frame emits the "IR preserved but not used"
     warning and **any** `--strict` run on it exits non-zero regardless of the

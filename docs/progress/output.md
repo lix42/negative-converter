@@ -2066,3 +2066,45 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   is exactly what silently disabled the ISO metadata (see the oracle section
   above), so **re-run the ImageIO decoder oracle** — the Rust suite provably
   cannot catch a placement regression on its own.
+- 2026-08-06 (review pass on the oracle branch): that instruction is now
+  followable — the Swift harness moved out of the scratchpad into
+  `scripts/iso-decoder-oracle/` (macOS-only, not in CI, with a README covering
+  build, sample generation, why `_EV` is required, and how to read `PRESENT` +
+  headroom). Two supporting changes: `io::ultra_hdr` gained a container seam
+  (`compress_images` + `package_images`) so the oracle's three files and the
+  product go through **one** assembly path — a future Exif/MPEntry change cannot
+  leave the oracle measuring a container nc no longer ships — and the three files
+  now come from one render rather than three (`encode_with`'s output is
+  byte-identical across the refactor, checked by sha256). Also recorded here
+  because review surfaced it: in the **gain-map** image libultrahdr prepends its
+  XMP, so `APP1` precedes `APP0 JFIF` — JFIF is not first in the dependent image.
+  Pre-existing, harmless so far, filed as a third item on
+  `output/mp-container-conformance`.
+- 2026-08-06 (second review round): the seam went one level deeper —
+  `io::ultra_hdr::assemble` now returns the container bytes and `package_images`
+  is a thin `stage_bytes` wrapper, because the `dual_dialect_package` **test
+  fixture** was still a second assembly path, and it is the fixture behind all
+  four marker-order tests. Left as it was, an Exif APP1 added to the product
+  would have moved the shipped layout while those tests stayed green — the same
+  shape of hole this branch exists to close. The fixture now calls `assemble`;
+  its bytes are unchanged (checked by a temporary equality test against the old
+  inline construction), and
+  `baseline_iso_segment_precedes_the_frame_header` was re-confirmed falsifiable
+  through the new path by restoring the defective insertion point. Also retired
+  `iso_sample_for_external_decoder`: `iso_oracle_samples` produces the same
+  dual-dialect file (sha256 `8039f2ad…9216`, identical) plus the other two.
+  Shipped `ultra-hdr-v1` still `67911f22…5540` on the Ektar frame.
+- 2026-08-06 (third review round): **correction to how the oracle's result was
+  reported above — the 4.926 headroom figure is not evidence of reconstruction.**
+  ImageIO's `HDR decode: headroom 4.9261084` is `2^AlternateHeadroom`, i.e. nc's
+  own declared `1000/203` policy constant parsed back out of the metadata.
+  Measured both ways on 2026-08-06: the toy fixture with no `_EV`, whose gain map
+  is flat (`GainMapMax = 0.000000` on all three channels), reports the *same*
+  4.9261084 as the real frame at `+3 EV` (`GainMapMax = 1.095282`). So a pass
+  condition of "PRESENT + headroom above 1.0" cannot fail on any file nc
+  produces. What the oracle did establish is unchanged and still load-bearing:
+  the **ABSENT → PRESENT flip** when the segment moved before `SOF0`, and
+  ImageIO's field-by-field parse agreeing with what nc wrote. The discriminating
+  number is `GainMapMax`; the harness README now states the criterion that way
+  and names the echo explicitly, as do the task file, `TASKS.md`, and
+  `insert_baseline_iso_segment`'s rustdoc.
