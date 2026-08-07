@@ -53,12 +53,27 @@ predicted an MPF rewrite would be the hard part; that prediction was wrong and i
 corrected here. libultrahdr rewrites the baseline image's segments and drops
 unknown APP2s, but appends the gain-map image **verbatim** — so the gain map's
 segment goes in at encode time and only the baseline's must be spliced in after
-packaging. Placement then does the work: MPF offsets are relative to the byte
-after `MPF\0`, so inserting *before* that segment moves the reference point and
-the gain map together, leaving every stored offset valid and needing only the
-first image's recorded size patched. See
-`io::ultra_hdr::insert_baseline_iso_segment`. Verified independently with
-exiftool, which resolved and extracted the second MPF image.
+packaging. Placement then does the work — and the placement rule as stated on
+2026-08-04, preserved here, was **half of one**: MPF offsets are relative to the
+byte after `MPF\0`, so inserting *before* that segment moves the reference point
+and the gain map together, leaving every stored offset valid and needing only the
+first image's recorded size patched. Verified independently with exiftool, which
+resolved and extracted the second MPF image.
+
+**Correction (2026-08-06), found by the decoder oracle.** Satisfying only the MPF
+constraint is what shipped an **inert** segment. libultrahdr emits MPF *after*
+`SOF0` and the tables, and a JPEG reader stops scanning for `APPn` at the frame
+header — so "immediately before MPF" put the segment past the boundary. It was
+well-formed, correctly sized, MPF-safe, and simply never parsed: Apple ImageIO
+reported no gain map at all and decoded plain SDR. Exiftool resolving the MPF
+index says nothing about this, which is why the earlier verification passed.
+**Both constraints must hold at once — before `SOF0`, and before the `MPF\0`
+label** — which `io::ultra_hdr::insert_baseline_iso_segment` now does with
+`leading_app_segment_end(packaged)?.min(mpf_start)`, keeping JFIF first. Ordering
+against MPF alone provably cannot catch the defect (both markers sat on the wrong
+side of `SOF0` together), so `baseline_iso_segment_precedes_the_frame_header`
+pins the frame header instead. Anyone changing the baseline's marker layout — the
+Exif half of `output/mp-container-conformance` above all — must keep both.
 
 The later `output/presets` task may make the neutral `gain-map-hdr` dual-dialect
 output the default only after this task is complete. This task adds no CLI
@@ -73,23 +88,42 @@ Remaining container questions:
   co-sited (H.265 ChromaLoc type 2), but the NOTE is informative and switching
   would change already-shipped `ultra-hdr-v1` bytes for no measured gain. Recorded
   on `gain_map::resample_axis`; both dialects share it, so they cannot diverge.
-- **Blocked — C.4.3's CIPA DC-007 baseline requirement.** C.4.3 requires a
-  DC-007-compliant baseline and its NOTE explains that means Exif-compliant; nc
-  writes JFIF and no Exif. ISO 21496-1 alone does settle that our *colour space*
-  signalling is unambiguous (C.4.4 branch two: no Exif + ICC present ⇒ the ICC
-  governs), but not DC-007's own requirements. **DC-007 and DC-008 are free** from
-  CIPA (`cipa.jp/e/std/std-sec.html`) behind a JavaScript/POST disclaimer gate —
-  easy in a browser, resistant to scripting. Do **not** synthesise an Exif block
-  before reading it, and never with `ColorSpace = 1`, which would force an sRGB
-  reading of the Display P3 base; `baseline_carries_no_exif_colorspace_claim`
-  guards that.
+- ~~**Blocked — C.4.3's CIPA DC-007 baseline requirement.**~~ **Unblocked and
+  split out (2026-08-06):** the text was read and the two gaps it exposes are now
+  `output/mp-container-conformance`. C.4.3 requires a DC-007-compliant baseline
+  and its NOTE explains that means Exif-compliant; nc writes JFIF and no Exif.
+  ISO 21496-1 alone does settle that our *colour space* signalling is unambiguous
+  (C.4.4 branch two: no Exif + ICC present ⇒ the ICC governs), but not DC-007's
+  own requirements. **DC-007 and DC-008 are free** from CIPA
+  (`cipa.jp/e/std/std-sec.html`) behind a JavaScript/POST disclaimer gate — which
+  the 2026-08-04 note called "resistant to scripting" and is not: `std/js/dll.js`
+  just copies the query string into a hidden `dlltarget` field posted to
+  `std/documents/dll.cgi`, so one `curl -X POST` fetches the PDF. Neither PDF is
+  committed. Still: do **not** synthesise an Exif block with `ColorSpace = 1`,
+  which would force an sRGB reading of the Display P3 base;
+  `baseline_carries_no_exif_colorspace_claim` guards that.
 - **External by nature — the decoder oracle.** An ISO-aware decoder reconstructing
   the HDR rendition, plus observing which dialect a dual-aware decoder prefers.
-  `io::ultra_hdr::tests::iso_sample_for_external_decoder` (`#[ignore]`, honours
-  `NC_ISO_SAMPLE_DIR`) writes the file that gate needs, since there is no CLI path.
-  The in-repo `conflicting_dialect_fixture_really_disagrees` proves the fixture
-  genuinely conflicts; it must never be extended to assert ISO precedence as a
-  conformance property, because the standard is silent on coexistence.
+  **Apple half done (2026-08-06)**, and it earned its keep — it found the `SOF0`
+  placement defect above. The harness is `scripts/iso-decoder-oracle/` (Apple
+  ImageIO, macOS-only, not in CI);
+  `io::ultra_hdr::tests::iso_oracle_samples` (`#[ignore]`, honours
+  `NC_ISO_SAMPLE_DIR` and optionally a real scan) writes the three files it
+  compares — legacy-only, dual, conflicting — from one render through one
+  container path, since there is no CLI path. Results in
+  `docs/progress/output.md`: the ISO metadata flipped from ABSENT to **PRESENT**,
+  every field read back as nc wrote it, and ISO won on the conflicting file. The
+  decoder's reported 4.926 headroom is *not* part of that evidence — it is nc's
+  own declared `AlternateHeadroom` echoed back, identical on a flat gain map. The
+  discriminating number is `GainMapMax` (1.095 log2 at `+3 EV`).
+  **Android 15+ remains open.** The in-repo
+  `conflicting_dialect_fixture_really_disagrees` proves an *analogous* fixture
+  genuinely conflicts — it packages the probe metadata's `4.0` against ISO `8.0`,
+  the same one-stop disagreement the oracle's `gain_max * 2.0` produces on a real
+  render, through the same `assemble` path. Neither it nor the ImageIO
+  observation may be stated as ISO precedence — the standard is silent on
+  coexistence, so what the oracle recorded is *observed Apple decoder
+  behaviour*.
 
 ## How to Verify
 

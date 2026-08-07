@@ -1883,3 +1883,228 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   bounds. If MSVC cannot build the vendored libaom source unpatched, prefer
   documenting Windows as unsupported over carrying a local patch; the repo already
   has one regretted native snapshot.
+## iso-gain-map-metadata (decoder oracle — a real defect)
+
+**Status:** in progress
+**Updated:** 2026-08-06
+
+- 2026-08-06: **The external decoder oracle ran, and it found a shipping bug the
+  entire in-repo suite could not.** The oracle is Apple ImageIO on macOS 26.5
+  (`kCGImageAuxiliaryDataTypeISOGainMap`, available since macOS 15.0) — an
+  independent ISO 21496-1 implementation, so no device was needed after all.
+  Harness: `scripts/`-free, a ~100-line Swift program in the scratchpad plus the
+  new `iso_oracle_samples` ignored test.
+- 2026-08-06: **The finding: nc's baseline ISO segment was placed where no JPEG
+  reader looks.** `insert_baseline_iso_segment` inserted the C.4.3 version-only
+  segment "immediately before the MPF segment" — which satisfies every MPF
+  invariant and is exactly what the 2026-08-04 entry above reasoned out. But
+  libultrahdr emits MPF **after `SOF0` and the tables**, and an `APPn` scan stops
+  at the frame header. The bytes were well-formed, correctly sized, MPF-safe —
+  and never parsed. ImageIO reported *no gain map at all* and decoded plain SDR.
+  The marker order it was written into:
+  `SOI · APP0 JFIF · APP1 XMP · APP2 ICC · **SOF0** · APP2 ISO · APP2 MPF · SOS`.
+- 2026-08-06: **Isolated by bisection on the bytes, not by reading source.** Three
+  hypotheses were tested by patching a produced file and re-running the oracle:
+  clearing `use_base_colour_space`, collapsing 3 metadata channels to 1 (with the
+  MPF second-image size repaired), and both — **all three still ABSENT**. Moving
+  the *unmodified* segment into the header block made it PRESENT immediately. Four
+  positions then all worked (after SOI, after JFIF, after XMP, after ICC), which
+  pins the boundary as `SOF0` and nothing else.
+- 2026-08-06: **`is_multichannel = true` is vindicated, and that was the surprise.**
+  The 2026-08-04 decision to always write 3 metadata channels over an achromatic
+  map (C.2.3 permits the counts to differ) was the leading suspect. ImageIO parses
+  all three and reports them individually. Do not "fix" it.
+- 2026-08-06: Fix is `leading_app_segment_end(packaged)?.min(mpf_start)` — the end
+  of the leading `APPn` run, clamped to the MPF start in case a future libultrahdr
+  emits MPF earlier. That satisfies **both** constraints at once and keeps JFIF
+  first. Pinned by `baseline_iso_segment_precedes_the_frame_header`, which was
+  confirmed falsifiable (restoring the old insertion point fails it with the marker
+  sequence printed). `marker_sequence` gained an `SOF` arm, since ordering against
+  MPF alone provably cannot catch this — both markers sat on the wrong side of
+  `SOF0` together.
+- 2026-08-06: **Verification results on a real 4715x3297 Ektar frame** (dual-dialect
+  file, post-fix). ImageIO's independent parse against what nc wrote:
+
+  | field | nc wrote | ImageIO read |
+  |---|---|---|
+  | GainMapMax (log2) | 9187889/8388608 = 1.09528 | 1.095282 |
+  | GainMapMin (log2) | -15127609/268435456 = -0.0563547 | -0.056355 |
+  | Gamma | 1/1 | 1.000000 |
+  | Base/AlternateOffset | 1/64 | 0.015625 |
+  | AlternateHeadroom | log2(1000/203) | 2.300448 |
+  | channels | 3 | 3, reported separately |
+
+  HDR reconstruction headroom **4.9261084** = 1000/203, from both
+  `CGImageSourceCreateImageAtIndex(kCGImageSourceDecodeToHDR)` and
+  `CIImage(.expandToHDR)`. The gain map resolves at 2358x1649 — the ceil-halved
+  2x downsample. This closes the "both dialects express the same semantics"
+  bullet with an *external* reader rather than by construction.
+- 2026-08-06: **Dual-aware precedence is now observed, not assumed: ISO wins.** On
+  the conflicting file (legacy XMP `GainMapMax` 1.09528, ISO 2.095282 — one stop
+  apart by construction) ImageIO reports **2.095282**. Recorded as *observed Apple
+  decoder behaviour*; ISO 21496-1 is silent on coexistence, so this still must
+  never be stated as a conformance property.
+- 2026-08-06: **Product finding, and it raises the stakes on `output/presets`: the
+  shipped `ultra-hdr-v1` preset is not HDR on Apple platforms.** The legacy-only
+  file is ABSENT for *both* `kCGImageAuxiliaryDataTypeISOGainMap` and
+  `kCGImageAuxiliaryDataTypeHDRGainMap`, and decodes at headroom 1.0. Apple
+  ignores Google's Ultra HDR v1 XMP entirely; only the ISO dialect makes the file
+  HDR there. The ISO work is therefore not a conformance nicety — it is the only
+  thing that makes nc's gain-map output function on macOS/iOS.
+- 2026-08-06: Oracle validated against a **known-good control** before any
+  conclusion was drawn — `ultrahdr_app` v1.4.0 (homebrew) encoding a synthetic
+  rgba1010102 gradient. ImageIO reads that file's ISO metadata and reconstructs at
+  4.926 headroom, so ABSENT on nc's files was nc's problem, not the harness's.
+  Conversely libultrahdr **accepts all three nc files** (exit 0) where a plain JPEG
+  control fails with "does not contain gainmap image" — the legacy dialect and the
+  container were always fine. Note the control's payload is 61 bytes (1 channel)
+  against nc's 141 (3 channels); both decode to the same layout formula
+  `4 + 1 + 16 + 40·channels`, which is independent evidence nc's C.2.2 field order
+  is right.
+- 2026-08-06: `iso_oracle_samples` (ignored) emits the three-file set the gate
+  needs — legacy-only, dual, and conflicting — from one render, so any difference
+  is attributable to metadata alone. It renders a **real scan** when
+  `NC_ISO_SAMPLE_INPUT`/`_BASE`/`_DMAX`/`_EV` are set. That is not optional
+  polish: the toy fixture *and* the default exponential render both produce a flat
+  gain map (`GainMapMax` 0.0039 log2 = 1.003x), which cannot discriminate an HDR
+  reconstruction. See the separate finding below.
+- 2026-08-06: **Separate, larger finding — nc's default render produces no HDR.**
+  On a real Ektar frame at defaults the gain map is inert: `GainMapMax` 0.00392
+  log2 = **1.0027x**, while the metadata advertises `HDRCapacityMax` 2.30045. The
+  file claims 2.3 stops and delivers 0.004. `--highlight-compress` does not move it
+  (identical to 6 significant figures at 0, 1 and 4 — the flag *does* resolve, so
+  this is content, not plumbing): the exponential curve anchors display white at
+  `Dmax` and real content lands far below the SDR shoulder knee, `clipped_high: 0`
+  with mean 0.258. Only `--print-exposure +3` pushes content over the knee
+  (`GainMapMax` 1.095 log2 = 2.14x), which is what the oracle files use. This is
+  the same non-discriminating condition `lossless-hdr-tiff`'s 2026-08-06 viewer
+  gate hit and attributed to "diffuse-highlight scene, exponential default curve" —
+  it is now measured, and it is the *default*, not the scene. **Belongs to
+  `output/presets` / the sigmoid default work, not here**; filed as a note rather
+  than fixed, because changing what the default render puts in the gain map is a
+  pixel decision this task has no mandate to make.
+- 2026-08-06: Shipped `ultra-hdr-v1` output is **byte-identical** across the fix
+  (sha256 `67911f22…5540` before and after on the real Ektar frame) — the changed
+  path runs only when ISO fields are present. All four gates green: 620 unit + 137
+  integration.
+- 2026-08-06: **Still open**, unchanged by this pass: C.4.3's CIPA DC-007 baseline
+  requirement (the document is still unfetched), and CLI activation, which
+  `output/presets` owns. The Android half of the "Android 15+ and target Apple
+  software" bullet is also still unrun — Apple is now covered.
+
+## iso-gain-map-metadata (CIPA DC-007 read — verdict)
+
+**Status:** in progress
+**Updated:** 2026-08-06
+
+- 2026-08-06: **The CIPA documents are no longer blocked.** The "JavaScript/POST
+  disclaimer gate that resisted scripted download" is just an undocumented POST
+  contract: `std/js/dll.js` copies the page's query string into a hidden
+  `dlltarget` field and posts it to `std/documents/dll.cgi`. So
+  `curl -X POST .../dll.cgi --data-urlencode dlltarget=CIPA_DC-007-2025_E` returns
+  the PDF directly; no browser needed. Same for `CIPA_DC-008-2026-E`. Both are
+  free downloads gated only on accepting a no-warranty disclaimer. **Do not commit
+  either PDF** — they were read from the scratchpad and only restated here.
+- 2026-08-06: **First correction: DC-007 is Multi-Picture Format, not Exif.**
+  DC-008 is Exif. Earlier entries here said "DC-007 ⇒ Exif-compliant", which is
+  right only transitively — DC-007 §4.2.1 says a Baseline MP File *uses the
+  compressed image file format of the Exif standard*, and §5.1 places the MP
+  Extensions APP2 "immediately after the Exif Attributes in the APP1 marker
+  segment". So the Exif requirement reaches us through MPF, and both documents are
+  in scope.
+- 2026-08-06: **DC-007-2025 explicitly anticipates us.** §4.2.1 names "gain map
+  images specified by ISO 21496-1" as a recordable Dependent Image, and Table 4
+  assigns them **MP Type Code `050000`**, with details to "follow the provisions of
+  Annex C of ISO 21496-1". This is the interop contract nc is actually writing
+  against, and it is far more on-point than the C.4.3 NOTE suggested.
+- 2026-08-06: **Concrete non-conformance found, and it is small: nc's gain map is
+  typed `Undefined`.** Measured on the dual-dialect file — MPImage1 is `030000`
+  (Baseline MP Primary Image, correct) but MPImage2 is `000000`, which Table 4
+  marks **× = "shall not be used"** in a Baseline MP file (.JPG). The correct value
+  is `050000`. **This comes from libultrahdr, not from nc's code** — its own
+  reference output (`ultrahdr_app` v1.4.0) writes `000000` too, unsurprisingly,
+  since the gain-map type code postdates it. nc ships the file, so it is nc's gap.
+  The repair is a 4-byte field in the MPEntry array, in the same post-packaging
+  patch that already fixes the first image's recorded size. Note it would change
+  the shipped `ultra-hdr-v1` bytes, which is why it is **not** being folded into
+  the oracle fix.
+- 2026-08-06: **Second gap, larger: the baseline is JFIF with no Exif APP1.** nc's
+  header is `APP0 JFIF · APP1 XMP · APP2 ICC · APP2 ISO · APP2 MPF`, so the MP
+  Extensions do not follow Exif Attributes as §5.1 specifies. Weighing how hard
+  this binds: §7's tag-level requirement is "**should** be followed" for
+  non-thumbnail Individual Images, and its tables are pinned to Exif 2.32 / DCF 2.0
+  — so the *tag* obligations are recommendations. The structural statements in
+  §4.2.1/§5.1 are the stronger ones. Adding Exif also changes the baseline's marker
+  layout, which is precisely the class of change that just cost this task a
+  silently inert feature, so it must be re-run against the ImageIO oracle rather
+  than trusted to `cargo test`. Whether libultrahdr's `package()` preserves,
+  rewrites or drops an APP1 Exif is **unknown and must be established by probe**
+  (it has an `-x` Exif-insertion flag, so the native API may be the right route);
+  the 2026-08-04 asymmetry lesson applies — do not reason it out from source.
+- 2026-08-06: **Verdict: both items move to a follow-up task**
+  (`output/mp-container-conformance`). Neither is required for the ISO metadata to
+  function — Apple ImageIO reconstructs HDR from nc's file today with the type code
+  `Undefined` and no Exif present — so they are conformance-claim work, not
+  functional work, and they change shipped container bytes. Keeping them here would
+  hold `output/presets` behind a container change that has nothing to do with the
+  metadata this task owns. `baseline_carries_no_exif_colorspace_claim` stays as the
+  tripwire; whoever adds Exif must still choose `Uncalibrated`, never `1`.
+
+## mp-container-conformance
+
+**Status:** not started
+**Updated:** 2026-08-06
+
+- Goal: make the gain-map JPEG a conformant CIPA DC-007 Baseline MP File — type
+  the gain map `050000` instead of `Undefined`, and settle the Exif-baseline
+  requirement (or narrow the claim, with the reason cited).
+- Filed 2026-08-06 out of `iso-gain-map-metadata`'s DC-007 read; the findings and
+  the reasoning behind the split are in that task's
+  `## iso-gain-map-metadata (CIPA DC-007 read — verdict)` section above, and the
+  approach is in [the task file](../tasks/output/mp-container-conformance.md).
+- The one thing to carry forward before touching anything: a marker-layout change
+  is exactly what silently disabled the ISO metadata (see the oracle section
+  above), so **re-run the ImageIO decoder oracle** — the Rust suite provably
+  cannot catch a placement regression on its own.
+- 2026-08-06 (review pass on the oracle branch): that instruction is now
+  followable — the Swift harness moved out of the scratchpad into
+  `scripts/iso-decoder-oracle/` (macOS-only, not in CI, with a README covering
+  build, sample generation, why `_EV` is required, and how to read `PRESENT` +
+  headroom). Two supporting changes: `io::ultra_hdr` gained a container seam
+  (`compress_images` + `package_images`) so the oracle's three files and the
+  product go through **one** assembly path — a future Exif/MPEntry change cannot
+  leave the oracle measuring a container nc no longer ships — and the three files
+  now come from one render rather than three (`encode_with`'s output is
+  byte-identical across the refactor, checked by sha256). Also recorded here
+  because review surfaced it: in the **gain-map** image libultrahdr prepends its
+  XMP, so `APP1` precedes `APP0 JFIF` — JFIF is not first in the dependent image.
+  Pre-existing, harmless so far, filed as a third item on
+  `output/mp-container-conformance`.
+- 2026-08-06 (second review round): the seam went one level deeper —
+  `io::ultra_hdr::assemble` now returns the container bytes and `package_images`
+  is a thin `stage_bytes` wrapper, because the `dual_dialect_package` **test
+  fixture** was still a second assembly path, and it is the fixture behind all
+  four marker-order tests. Left as it was, an Exif APP1 added to the product
+  would have moved the shipped layout while those tests stayed green — the same
+  shape of hole this branch exists to close. The fixture now calls `assemble`;
+  its bytes are unchanged (checked by a temporary equality test against the old
+  inline construction), and
+  `baseline_iso_segment_precedes_the_frame_header` was re-confirmed falsifiable
+  through the new path by restoring the defective insertion point. Also retired
+  `iso_sample_for_external_decoder`: `iso_oracle_samples` produces the same
+  dual-dialect file (sha256 `8039f2ad…9216`, identical) plus the other two.
+  Shipped `ultra-hdr-v1` still `67911f22…5540` on the Ektar frame.
+- 2026-08-06 (third review round): **correction to how the oracle's result was
+  reported above — the 4.926 headroom figure is not evidence of reconstruction.**
+  ImageIO's `HDR decode: headroom 4.9261084` is `2^AlternateHeadroom`, i.e. nc's
+  own declared `1000/203` policy constant parsed back out of the metadata.
+  Measured both ways on 2026-08-06: the toy fixture with no `_EV`, whose gain map
+  is flat (`GainMapMax = 0.000000` on all three channels), reports the *same*
+  4.9261084 as the real frame at `+3 EV` (`GainMapMax = 1.095282`). So a pass
+  condition of "PRESENT + headroom above 1.0" cannot fail on any file nc
+  produces. What the oracle did establish is unchanged and still load-bearing:
+  the **ABSENT → PRESENT flip** when the segment moved before `SOF0`, and
+  ImageIO's field-by-field parse agreeing with what nc wrote. The discriminating
+  number is `GainMapMax`; the harness README now states the criterion that way
+  and names the echo explicitly, as do the task file, `TASKS.md`, and
+  `insert_baseline_iso_segment`'s rustdoc.

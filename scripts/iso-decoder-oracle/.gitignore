@@ -1,0 +1,6 @@
+# Build product of `swiftc -O oracle.swift -o oracle`, the sample files the
+# oracle is pointed at, and any known-good control (`ultrahdr_app` writes
+# `out.jpeg`). None of them belong in the repo.
+oracle
+*.jpg
+*.jpeg
