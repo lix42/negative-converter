@@ -267,18 +267,34 @@ fn package(
 }
 
 /// Insert the ISO 21496-1 C.4.3 `GainMapVersion` segment into the packaged
-/// baseline image, immediately before its MPF segment.
+/// baseline image's leading application-segment block.
 ///
 /// libultrahdr rewrites the baseline image's marker segments during packaging
 /// and drops unknown APP2 segments, so the baseline's segment cannot be added
 /// before packaging the way the gain map's can — it has to go in afterwards.
 ///
-/// Placement is load-bearing, not cosmetic. MPF individual-image offsets are
-/// measured from the byte after the `MPF\0` label, so inserting *before* that
-/// label moves the reference point and the appended gain map by the same amount
-/// and leaves every stored offset correct. Only the first image's recorded size
-/// grows, which this function patches. Inserting *after* the MPF segment would
-/// instead invalidate every offset.
+/// Placement is load-bearing, not cosmetic, and **two** constraints bind it.
+///
+/// 1. **Before `SOF0`.** A JPEG reader scans for `APPn` markers only in the
+///    header block; once it reaches the frame header it stops looking. An
+///    earlier version of this function inserted immediately before the MPF
+///    segment, which libultrahdr emits *after* `SOF0` and the tables — so the
+///    segment was well-formed, correctly sized, and simply never parsed. Apple
+///    ImageIO reported no gain map at all and decoded the file as plain SDR;
+///    moving the same bytes into the header block made it reconstruct HDR at
+///    4.93 headroom. Verified 2026-08-06 against ImageIO on macOS 26.5 — see
+///    `docs/progress/output.md`.
+/// 2. **Before the `MPF\0` label.** MPF individual-image offsets are measured
+///    from the byte after that label, so inserting before it moves the reference
+///    point and the appended gain map by the same amount and leaves every stored
+///    offset correct. Only the first image's recorded size grows, which this
+///    function patches. Inserting *after* the MPF segment would invalidate every
+///    offset.
+///
+/// The insertion point is therefore the end of the leading `APPn` run, clamped
+/// to the MPF segment start in case a future libultrahdr emits MPF earlier. That
+/// also keeps the JFIF `APP0` first, which
+/// `dual_dialect_baseline_keeps_jfif_first_and_iso_before_mpf` pins.
 fn insert_baseline_iso_segment(packaged: &[u8], segment: &[u8]) -> Result<Vec<u8>> {
     let malformed = |what: &str| NcError::Write(format!("ISO gain-map MPF repair: {what}"));
 
@@ -287,12 +303,13 @@ fn insert_baseline_iso_segment(packaged: &[u8], segment: &[u8]) -> Result<Vec<u8
         .position(|window| window == b"MPF\0")
         .ok_or_else(|| malformed("the packaged baseline image has no MPF segment"))?;
     // The APP2 segment header (marker + length) precedes the label.
-    let segment_start = label_at
+    let mpf_start = label_at
         .checked_sub(4)
         .ok_or_else(|| malformed("the MPF label is not preceded by an APP2 header"))?;
-    if packaged[segment_start..segment_start + 2] != iso::APP2_MARKER {
+    if packaged[mpf_start..mpf_start + 2] != iso::APP2_MARKER {
         return Err(malformed("the MPF label is not inside an APP2 segment"));
     }
+    let segment_start = leading_app_segment_end(packaged)?.min(mpf_start);
 
     // MPF stores a TIFF structure whose offsets are relative to its own start.
     let tiff = label_at + 4;
@@ -374,6 +391,44 @@ fn insert_baseline_iso_segment(packaged: &[u8], segment: &[u8]) -> Result<Vec<u8
         .copy_from_slice(&bytes);
 
     Ok(output)
+}
+
+/// Offset just past the last `APPn` segment of the leading header block.
+///
+/// Walks from the `SOI`, following each segment's own length. Stops at the first
+/// marker that is not `APP0..APP15` — in a libultrahdr package that is `SOF0`,
+/// which is exactly the boundary a decoder stops scanning at.
+fn leading_app_segment_end(packaged: &[u8]) -> Result<usize> {
+    let malformed = |what: &str| NcError::Write(format!("ISO gain-map MPF repair: {what}"));
+
+    if packaged.get(..2) != Some(&[0xFF, 0xD8][..]) {
+        return Err(malformed(
+            "the packaged baseline image does not start with SOI",
+        ));
+    }
+    let mut at = 2;
+    loop {
+        let marker = packaged
+            .get(at..at + 2)
+            .ok_or_else(|| malformed("ran off the end looking for the frame header"))?;
+        if marker[0] != 0xFF {
+            return Err(malformed("expected a marker in the header block"));
+        }
+        // APP0..APP15 are 0xE0..=0xEF; anything else ends the header block.
+        if !(0xE0..=0xEF).contains(&marker[1]) {
+            return Ok(at);
+        }
+        let length = packaged
+            .get(at + 2..at + 4)
+            .ok_or_else(|| malformed("truncated application-segment length"))?;
+        let length = usize::from(u16::from_be_bytes([length[0], length[1]]));
+        if length < 2 {
+            return Err(malformed(
+                "application segment declares an impossible length",
+            ));
+        }
+        at += 2 + length;
+    }
 }
 
 fn compressed(bytes: &[u8], gamut: uhdr::uhdr_color_gamut_t) -> uhdr::uhdr_compressed_image_t {
@@ -460,6 +515,18 @@ mod tests {
                         .take_while(|c| c.is_ascii_graphic())
                         .collect::<String>();
                     markers.push(format!("APP{} ({label})", marker - 0xE0));
+                    position += 2 + length;
+                }
+                // Frame headers: 0xC0..=0xCF except DHT (0xC4), JPG (0xC8) and
+                // DAC (0xCC). This is the boundary a reader stops scanning for
+                // APPn at, so `baseline_iso_segment_precedes_the_frame_header`
+                // needs it in the sequence.
+                0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
+                    markers.push(format!("SOF{}", marker - 0xC0));
+                    let Some(raw) = bytes.get(position + 2..position + 4) else {
+                        break;
+                    };
+                    let length = u16::from_be_bytes([raw[0], raw[1]]) as usize;
                     position += 2 + length;
                 }
                 _ => position += 2,
@@ -659,6 +726,34 @@ mod tests {
             "{markers:?}"
         );
         assert!(position("JFIF") < position("urn:iso"), "{markers:?}");
+    }
+
+    #[test]
+    fn baseline_iso_segment_precedes_the_frame_header() {
+        // The defect the 2026-08-06 ImageIO oracle caught. Placing the segment
+        // "immediately before MPF" satisfied every MPF invariant, but libultrahdr
+        // emits MPF *after* SOF0 — and a JPEG reader stops scanning for APPn at
+        // the frame header. The segment was well-formed and simply never parsed:
+        // ImageIO reported no gain map and decoded plain SDR. Ordering against
+        // MPF alone cannot catch this, because both markers were on the wrong
+        // side of SOF0 together; only the frame header is the real boundary.
+        let (bytes, _) = dual_dialect_package();
+        let markers = marker_sequence(&bytes);
+        let position = |needle: &str| {
+            markers
+                .iter()
+                .position(|marker| marker.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from {markers:?}"))
+        };
+        let frame = markers
+            .iter()
+            .position(|marker| marker.starts_with("SOF"))
+            .unwrap_or_else(|| panic!("no frame header in {markers:?}"));
+        assert!(
+            position("urn:iso:std:iso:ts:21496:-1") < frame,
+            "the ISO segment must sit in the header block, before the frame \
+             header, or no decoder will parse it: {markers:?}"
+        );
     }
 
     #[test]
@@ -881,6 +976,133 @@ mod tests {
         println!("wrote dual-dialect sample: {}", path.display());
         println!("verify with: exiftool -a -G1 '{}'", path.display());
         println!("and with:    sips -g all '{}'", path.display());
+    }
+
+    /// The render behind [`iso_oracle_samples`]: the toy fixture by default, or
+    /// a real scan when `NC_ISO_SAMPLE_INPUT` names one. Reads only derived
+    /// numbers out — it writes JPEGs and prints statistics, never pixels.
+    fn oracle_render() -> gain_map::GainMapRender {
+        use crate::pipeline::stages;
+        use crate::types::{FilmBase, PrintParams, Reconstruction};
+
+        let Ok(input) = std::env::var("NC_ISO_SAMPLE_INPUT") else {
+            return real_render();
+        };
+
+        let base: Vec<f32> = std::env::var("NC_ISO_SAMPLE_BASE")
+            .expect("NC_ISO_SAMPLE_BASE=r,g,b is required with NC_ISO_SAMPLE_INPUT")
+            .split(',')
+            .map(|part| part.trim().parse().expect("film base component"))
+            .collect();
+        let film_base = FilmBase::from([base[0], base[1], base[2]]);
+        let dmax: f32 = std::env::var("NC_ISO_SAMPLE_DMAX")
+            .expect("NC_ISO_SAMPLE_DMAX is required with NC_ISO_SAMPLE_INPUT")
+            .parse()
+            .expect("dmax");
+        let ev: f32 = std::env::var("NC_ISO_SAMPLE_EV")
+            .map(|value| value.parse().expect("ev"))
+            .unwrap_or(0.0);
+
+        let (image, _) =
+            crate::io::decode::decode_within(std::path::Path::new(&input), u64::MAX).unwrap();
+        let reconstruction = serde_json::from_value(serde_json::json!({
+            "type": "density",
+            "curve": { "type": "exponential", "dmax": { "explicit": dmax } },
+        }))
+        .expect("reconstruction recipe");
+        let reconstruction: Reconstruction = reconstruction;
+        let print = PrintParams {
+            print_exposure: ev,
+            ..PrintParams::default()
+        };
+        let source = stages::render_display_source(&image, &film_base, &reconstruction, &print)
+            .expect("display source");
+        println!("oracle render: {input} at {ev:+} EV, dmax {dmax}");
+        gain_map::render(
+            &source.shared,
+            gain_map::GainMapConfig::ultra_hdr_v1(print.highlight_compress),
+        )
+        .unwrap()
+    }
+
+    /// Emit the full three-file set the decoder-oracle gate compares:
+    /// legacy-only, dual-dialect, and a dual file whose two dialects
+    /// deliberately disagree. All three share one render, so any difference an
+    /// external decoder reports is attributable to the metadata alone.
+    ///
+    /// `NC_ISO_SAMPLE_DIR=/some/dir cargo test --bin nc -- --ignored iso_oracle_samples`
+    ///
+    /// Set `NC_ISO_SAMPLE_INPUT` to a real scan to render *that* instead of the
+    /// toy fixture, with `NC_ISO_SAMPLE_BASE` (`r,g,b`), `NC_ISO_SAMPLE_DMAX`,
+    /// and `NC_ISO_SAMPLE_EV`. The toy fixture and the default exponential
+    /// render both produce a **flat** gain map (measured `GainMapMax` 0.0039
+    /// log2 = 1.003x), which cannot discriminate an HDR reconstruction — the
+    /// oracle needs content driven above the SDR shoulder knee, hence the EV.
+    #[test]
+    #[ignore = "writes sample files for external decoder verification"]
+    fn iso_oracle_samples() {
+        let dir = std::env::var("NC_ISO_SAMPLE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+
+        for (name, dialects) in [
+            ("oracle-legacy-only.jpg", Dialects::LegacyUltraHdrV1),
+            ("oracle-dual-dialect.jpg", Dialects::LegacyPlusIso),
+        ] {
+            let path = dir.join(name);
+            let (staged, _) = encode_with(oracle_render(), &path, dialects).unwrap();
+            staged.commit().unwrap();
+            println!("wrote {}", path.display());
+        }
+
+        // The conflicting file: package with the true legacy metadata, but write
+        // ISO fields projected from a divergent copy. Legacy says log2(gain_max)
+        // over 4.0; ISO says over 8.0 — one stop apart, which any decoder that
+        // actually reads its chosen dialect must report differently.
+        let render = oracle_render();
+        let gain = gain_map::encode_legacy_gain_map(&render).unwrap();
+        let (base, icc, _) = color::encode_rendered_sdr(render.into_sdr()).unwrap();
+        let (base_rgb, _, _) = quantize_base(&base.rgb);
+
+        let mut divergent = gain.metadata;
+        divergent.gain_max = gain.metadata.gain_max.map(|max| max * 2.0);
+        let fields = iso::project(&divergent).unwrap();
+
+        let base_jpeg = encode_jpeg(
+            &base_rgb,
+            base.width,
+            base.height,
+            Some(&icc),
+            "SDR base",
+            ColorType::Rgb,
+            None,
+        )
+        .unwrap();
+        let payload = iso::serialize_metadata(&fields).unwrap();
+        let gain_jpeg = encode_jpeg(
+            &gain.samples,
+            gain.width,
+            gain.height,
+            None,
+            "gain map",
+            ColorType::Luma,
+            Some(iso::segment_content(&payload)),
+        )
+        .unwrap();
+        let packaged = package(&base_jpeg, &gain_jpeg, &gain.metadata).unwrap();
+        let version = iso::app2_segment(&iso::serialize_version(&fields)).unwrap();
+        let packaged = insert_baseline_iso_segment(&packaged, &version).unwrap();
+
+        let path = dir.join("oracle-conflicting.jpg");
+        staged::stage_bytes(&path, &packaged)
+            .unwrap()
+            .commit()
+            .unwrap();
+        println!("wrote {}", path.display());
+        println!(
+            "conflicting: legacy gain_max {:?} vs ISO gain_max {:?}",
+            gain.metadata.gain_max, divergent.gain_max
+        );
     }
 
     fn probe_metadata() -> gain_map::GainMapMetadata {
