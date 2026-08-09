@@ -1045,7 +1045,7 @@ changed output pixel.
     "nc_version": "0.1.0",
     "git_commit": "0d05c800c092",
     "git_dirty": true,
-    "pipeline_version": 1,
+    "pipeline_version": 2,
     "target": "aarch64-apple-darwin",
     "params_hash": "3575c9feb5d42b2b"
   }
@@ -2448,8 +2448,11 @@ the NLP feature comparison, Phase 6).
     `estimate --d-max-region` is frozen as `{ "explicit": <d> }`. `--auto-d-max`
     (per-frame exposure normalization) is demoted to opt-in. This changes the
     default render, which is a `pipeline_version` bump — **discharged** by
-    `conversion-versioning` (item 16): this default is labeled
-    `pipeline_version 1`, the v0→v1 boundary for the density default. In the
+    `conversion-versioning` (item 16). Two boundaries, not one: making the density
+    conversion the default was the v0→v1 bump and `pipeline_version 1` records it
+    with the nominal at **2.0**; moving the nominal to **1.3** (with the sigmoid as
+    the default curve) is the v1→v2 bump, so an archived recipe's render is only
+    recoverable from the version its sidecar records. In the
     replacement pipeline, Dmax belongs to the selected density curve: scalar
     placement for exponential and curve shaping for sigmoid. SDR/HDR rendering
     owns display reference white.
