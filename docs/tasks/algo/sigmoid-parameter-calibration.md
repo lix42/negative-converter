@@ -21,8 +21,10 @@ numbers once assets exist that can actually support it.
   values, which `algo/film-stock-profiles` records as *not* true Status M densities. Residuals
   against user preference were **systematic per stock** (Ektar ≈ +0.6 EV, Portra 160 ≈ 0,
   Gold 200 ≈ −1.0), which is exactly the signature of constants each off by a fixed amount.
-- **the no-roll-Dmax fallback** — `NOMINAL_DMAX = 2.0` is badly wrong against measured rolls
-  (0.90–1.74, median ≈1.34); ~1.35 is provisional pending more rolls.
+- **the no-roll-Dmax fallback** — `NOMINAL_DMAX` was `2.0`, badly wrong against measured rolls
+  (0.90–1.74, median ≈1.34). Lowered to `1.3` on 2026-08-08 (`pipeline_version` 2), which is
+  the median rounded to one decimal and still explicitly a nominal rather than a calibrated
+  value; `film-base/dmax-anchor-reliability` owns the calibration.
 
 **What the calibration needs, and why more frames alone will not do it.** Per-frame exposure
 preference cannot select a parameter: asking which EV looks best *is* frame optimisation, and

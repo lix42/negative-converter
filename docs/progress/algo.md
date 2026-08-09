@@ -17,7 +17,8 @@ What other epics need to know about `algo`:
   ReconstructionReport)` plus `finish_print`** — the old `Converter` trait and
   `AlgoParams` are gone. The recipe is one **tagged `reconstruction` object**
   (`schema_version: 1`) selecting `simple` or `density`, with density carrying a
-  tagged `exponential` (default) or `sigmoid` curve. The legacy `algorithm` +
+  tagged `sigmoid` (the default since `pipeline_version` 2, 2026-08-08) or
+  `exponential` curve. The legacy `algorithm` +
   top-level `density`/`sigmoid`/`simple` keys are **rejected with migration
   errors** — never re-add them as aliases.
 - **`FilmRgbImage` is the typed boundary out of this epic.** Private fields,
@@ -45,8 +46,13 @@ What other epics need to know about `algo`:
   floor is `10^(−contrast·A)` and the reduce-to-exponential identity holds only
   there; a per-stock rule is a **third variant**, not a new field; and the default
   sigmoid contrast/shoulder are now `≈2.0687`/`0.6`, derived from manufacturer aim
-  densities rather than chosen. Drift fingerprints did **not** move — the default
-  recipe still selects `exponential`, so `output/presets` still owns that bump.
+  densities rather than chosen. The drift fingerprints did not move *for that*
+  change — the default recipe still selected `exponential` at the time. **That bump
+  has since been taken here, not by `output/presets`:** on 2026-08-08 the default
+  curve became the sigmoid, `NOMINAL_DMAX` became `1.3` and the exponential's own
+  `gamma` became `2.0`, recorded as `pipeline_version` 2 with its own
+  `PIPELINE_FINGERPRINTS` row. `output/presets` owns the default *preset*
+  migration; it no longer owes the curve bump.
 - **Mutually exclusive knobs are one enum, never parallel fields** — `WbSource`,
   `BalanceRange`, `DmaxSource`, the tagged `Reconstruction`/`DensityCurve`. This
   is what makes the flags-win merge sound and provenance representable.
@@ -1718,6 +1724,7 @@ What other epics need to know about `algo`:
   so nothing currently owns "a non-default path changed and archived recipes for it are
   reinterpreted". The warning covers this instance; the policy question is open.
 
+
 ## curve-endpoint-validation
 
 **Status:** not started
@@ -1820,3 +1827,194 @@ What other epics need to know about `algo`:
     applies WB and exposure, subtracts `black_point`, then soft-clips, so a curve
     black of 0.053 is not the displayed black.
   - `algo/regional-color-balance` added as a dependency.
+## negative-reconstruction-density-curves (sigmoid becomes the default)
+
+**Status:** done
+**Updated:** 2026-08-08
+
+- 2026-08-08: **Three render defaults moved together** (`pipeline_version` 1 → 2):
+  `NOMINAL_DMAX` 2.0 → 1.3, the default curve exponential → sigmoid, and the
+  exponential's own `gamma` 1.0 → 2.0. Measured baseline in
+  [reports/render-defaults-v2.md](../reports/render-defaults-v2.md).
+- 2026-08-08: **The headline is clipping, not brightness.** On four real frames the
+  old defaults clipped 0.00% / 3.38% / 4.86% / 1.98% of samples; the new ones clip
+  **0.00% on all four**. Real, and modest — a few percent of clipped highlights is a
+  defect worth removing, not a rescue. Do not read the per-frame means as a quality
+  score: they conflate scene content with rendering.
+- 2026-08-08: **My first version of that table was wrong, and the mechanism is worth
+  remembering.** I measured it through a zsh helper that interpolated an unquoted
+  `$extra` parameter. zsh does **not** word-split unquoted parameters, so
+  `--d-max 2.0` arrived as one argument and the flag was silently dropped — the "v1"
+  column was measured with a v2 anchor, and I published clipping figures up to 72%.
+  Two lessons. (a) A comparison run must assert that the thing it varied actually
+  changed: the report prints `dmax`, and reading it would have caught this
+  immediately. (b) A headline number a reviewer cannot re-run is not evidence, so the
+  measurement now lives in `scripts/render-defaults-v2/measure.py` (explicit argv
+  list to `subprocess`, which cannot reproduce the bug) rather than in a shell
+  session I described afterwards.
+- 2026-08-08: **The sigmoid's 0.00% clipped is partly an accounting artifact, and
+  the report says so.** `io::encode` counts a clip as `v > 1.0` strictly, and the
+  sigmoid's asymptotic approach to white saturates to exactly `1.0f32` from just
+  above `D′ ≈ 3.1` at the shipped defaults — so densities that used to be counted as
+  clipped now quantize to the same 65535 uncounted, with `--strict` green. Narrow
+  (near-opaque negative) but it means the clip counter is not a sufficient measure of
+  highlight preservation under this curve.
+- 2026-08-08: `NOMINAL_DMAX` 2.0 sat above **every** roll measured in this repo
+  (0.90–1.74, median ≈1.34). Because the exponential renders
+  `10^(γ·(D′ − Dmax))`, that darkened Ektar 963 by 5.09x in linear terms versus its
+  own measured anchor. 1.3 is the median rounded to one decimal, still explicitly
+  *nominal* — `film-base/dmax-anchor-reliability` is open on the anchor's level and
+  still owns the calibrated number. This **supersedes** that task's 2026-08-03 "do
+  not settle the fallback yet" decision (user, 2026-08-08): waiting was not neutral,
+  because leaving 2.0 in place meant shipping an anchor above every measured roll and
+  darkening every default conversion. Harman Phoenix (0.8976) is counted in as the
+  **worst case showing where the population's floor is**, not held out as an
+  exclusion example — that framing was corrected in the task file.
+- 2026-08-08: **The user asked for exponential gamma 2.0 as well, and was right to
+  push back on my objection.** I had claimed contrast ≈2 needs a mid-grey anchor
+  first, citing an 8.4x drop in mean. The mean conflated two effects:
+  `reports/sigmoid-reference-baseline.md` measures that contrast 2.0 *does* fix the
+  black floor immediately (72 → 12/255 on user-confirmed shadow patches) and costs
+  2.75 EV of midtone placement. It is a real, partial win; the residual is filed as
+  `algo/exponential-mid-grey-anchor`. Lesson: a frame mean cannot separate "floor
+  fixed" from "midtones moved" — read the report's percentile metrics.
+- 2026-08-08: **Two consequences that cost test-fixing time, worth knowing before
+  touching a fixture.** (a) The sigmoid never exceeds 1.0, so `film-master` and
+  `hdr-linear-tiff`'s integration tests no longer exercised their subject (unclamped
+  float / samples above reference white) and now select the exponential explicitly —
+  their subject is the *container*, not the default curve. (b) Auto-WB is a weaker
+  corrector for a **wrong** base under the sigmoid: a wrong base leaves a constant
+  per-channel density offset, which the exponential turns into a constant factor a
+  stage-4 gain cancels exactly, while the sigmoid is nonlinear in the same domain.
+  The estimator is unchanged and the effect vanishes with a correct base.
+- 2026-08-08: **HDR headroom is unchanged and still absent** — the `ultra-hdr-v1`
+  gain map measures `GainMapMax` ≈ 1.0027x under *both* curves, because content sits
+  below the shared display stage's shoulder knee either way. Not this change's to
+  fix; it belongs with `output/presets` and the display stage.
+- 2026-08-08: **The sigmoid default must not degrade HDR silently, so it now says so.**
+  Measured on the IR-free fixture, the default render peaks at **201 nits** against
+  the 203-nit SDR reference white (the exponential exceeds it), while the report
+  still advertises `target_peak_nits: 1000` — an HDR container around an SDR-range
+  signal. Every single-rendition HDR preset (`hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
+  `hdr-pq-tiff`, `hdr-hlg-tiff`) now emits a `--strict`-promotable warning for it,
+  built on `hdr::sdr_range_warning` over the **existing** `clli` measurement
+  (`ContentLightLevel`) rather than a second scan — so the warning and the file's own
+  `clli` box can never disagree. `ultra-hdr-v1` is deliberately excluded: it is
+  dual-rendition, so low headroom shows up as an inert gain map, which is a different
+  diagnosis about a different artifact and belongs with the gain-map stage.
+- 2026-08-08: Golden vectors were **not** rebased. The reference-derived captures
+  now name their configuration explicitly (`frozen_reference_curve`,
+  `sigmoid_at_reference_anchor_2_0`) so they keep pinning what they were captured
+  for, and the new default got its own freshly-captured golden — which honestly
+  pins "the default has not drifted since it was set", not "matches the reference
+  implementation". A golden that silently follows the default stops pinning
+  anything the moment the default moves.
+
+
+## exponential-mid-grey-anchor
+
+**Status:** not started
+**Updated:** 2026-08-08
+
+- 2026-08-08: Filed. The exponential curve pins display white at `Dmax` and has no
+  `AnchorPlacement`, so its contrast knob pivots the line *around white* — measured
+  in `reports/sigmoid-reference-baseline.md` as: `gamma = 2.0` takes the black floor
+  72 → 12/255 **and** costs 2.75 EV of midtone placement, from the same pivot. Giving
+  it the sigmoid's mid-grey anchor removes the conflict rather than re-picking a
+  point on the trade.
+- 2026-08-08: Filed *after* three sources had already cited it as existing
+  (`types::ExponentialParams::default`, `reports/render-defaults-v2.md`, and the
+  entry above). It did not exist. Worth remembering: naming a follow-up task in a
+  docstring is a promise that the task file, the `TASKS.md` checklist entry, the
+  dependency-list entry and the graph node all exist — a task id that resolves to
+  nothing is worse than an unexplained residual, because it reads as tracked.
+- 2026-08-08: Deliberately **not** blocking anything. Since `pipeline_version` 2 the
+  exponential is the explicit diagnostic straight line, not the default, so this
+  improves a non-default path. Depends on
+  `algo/negative-reconstruction-density-curves` (the tagged curve schema it would add
+  an `anchor` field to).
+## negative-reconstruction-density-curves (review follow-up)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The migration warning was scoped too narrowly and missed the most
+  deceptive case.** It fired for a recipe with *no* `curve` section, but returned
+  `None` for one that pins only the type — and
+  `{"curve":{"type":"exponential"}}` used to mean gamma 1.0 at anchor 2.0 and now
+  means gamma 2.0 at anchor 1.3. That file *looks* pinned, which is exactly why it
+  is worse than the bare case: nothing in it shows the render moved, and a bare
+  recipe carries no `meta.pipeline_version` for the other warning to catch. New
+  `UnpinnedCurve::MovedDefaults` covers it, plus a sigmoid that pins `anchor` but
+  omits `dmax` (the nominal moved for *both* curves). Pinning both moved scalars
+  silences it — the falsifiable half.
+- 2026-08-09: `sigmoid_rejects_no_d_max` was passing on clap's **duplicate-flag**
+  rejection: a sweep had added a second `--density-curve`, so it exited 2 during
+  parsing and never reached the merge/validation path it exists to pin. Removed,
+  and it now asserts the message names the sigmoid — exit 2 alone cannot say which
+  rule fired. That is the fourth test this session found passing for the wrong
+  reason; the pattern is always the same, an assertion on an exit code that more
+  than one rule can produce.
+- 2026-08-09: `scripts/analysis/benchmark.json` lost exponential coverage entirely
+  when the default flipped — all four remaining fixture cases resolved to the
+  sigmoid while the manifest's own note still claimed it covered "the default
+  exponential path". Added an explicit `hdri-exponential` case. The asset-free set
+  is the one used for determinism and zero-diff checks, so a still-supported path
+  being invisible there is a real gap rather than a tidiness point.
+
+## negative-reconstruction-density-curves (second review round)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The `MovedDefaults` warning had a hole in exactly the recipes people
+  archive.** It treated any present `dmax` key as pinned — but `"dmax":"fixed"`
+  names a *policy*, not a value, and resolves through `NOMINAL_DMAX`, which moved
+  2.0 → 1.3. That is the spelling `--dump-params` writes, so the fix excused the
+  single most likely archived recipe while catching the rarer omitted-key case.
+  `dmax` now counts as floating when absent **or** `"fixed"`; `"auto"` is per-frame
+  (a different thing) and `"none"`/`{"explicit":…}` are genuinely pinned. Lesson
+  that generalises: "is the key present" is not the same question as "is the value
+  pinned" whenever a key can name a policy.
+- 2026-08-09: Two shipped examples exited 2 after the default flip — `README.md`'s
+  HDR example and design-spec's transitional float example, both passing
+  `--density-gamma` (exponential-only) with the sigmoid now default. Both now
+  select the curve explicitly, and both were **run** to confirm exit 0 rather than
+  eyeballed. Worth noting the first doc pass on this PR missed them: I grepped for
+  statements *about* the defaults and not for commands that *depend* on them.
+
+## negative-reconstruction-density-curves (third review round)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The `dmax:"fixed"` fix over-corrected and broke the documented
+  reproducibility path.** Treating `"fixed"` as floating is right *across* versions
+  — but the resolved default sigmoid this build writes also spells `"dmax":"fixed"`,
+  so a sidecar `--dump-params` had just produced failed its own `--strict` replay
+  (exit 1, claiming a render moved that demonstrably had not). The warning now
+  returns `None` when the recipe records **this** build's `pipeline_version`:
+  nothing moved underneath a recipe produced by these defaults, and
+  `pipeline_version_warning` already owns the cross-version case. An **absent**
+  version still warns — there is no evidence which defaults it was written
+  against, which is exactly the uncertainty worth surfacing.
+- 2026-08-09: The pattern across all three rounds on this warning is worth naming:
+  under-warned (omitted key), then over-warned (any present key), then over-warned
+  again (any `"fixed"`). Each fix was correct about the mechanism and wrong about
+  the population it applied to. The question that resolves it is not "did a default
+  move?" but "did it move *for this recipe*", and `meta.pipeline_version` is the
+  only witness to that. Both directions are pinned now.
+- 2026-08-09 (fourth round, and the one that ends it): the version-based
+  exemption fixed the *sidecar* but not `--dump-params`, which writes a **bare**
+  recipe with no `meta.pipeline_version` — so a file the tool had just produced
+  still failed its own `--strict` replay while the output was byte-identical.
+  Root cause of all four rounds: the predicate kept being tuned against
+  hand-written JSON while **nothing tested the one file nc itself writes**. The
+  rule is now structural — *warn only on shapes this build cannot produce*
+  (absent `curve` / `anchor` / `gamma` / `dmax`) — and
+  `recipe_dumped_by_this_build_replays_clean_under_strict` gates dump → replay
+  end to end, byte-comparing the two outputs so a future false positive fails
+  loudly. `"dmax":"fixed"` is therefore treated as pinned; that residual gap and
+  the override-provenance one are written down in the task doc rather than
+  patched over, and both belong to `core/conversion-versioning`'s per-version
+  default table.

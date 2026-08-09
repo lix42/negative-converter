@@ -16,6 +16,16 @@ What other epics need to know about `film-base`:
 - **`Dmin` and `Dmax` are different quantities that share this code.** `Dmin` is
   a per-channel **transmission** (the film base). `Dmax` is a **scalar** anchor in
   **density** units. Never conflate them (design-spec §4).
+- **`film_base.source` has NO default — `convert` and `roll` refuse an unstated
+  source (exit 2).** `Dmin` is the divisor of the density conversion, so it sets
+  black point and colour balance together; it must be a decision, not an omission.
+  `--auto-base` is still one flag and still means what it used to. `roll` accepts
+  none of the film-base flags, so its diagnosis points at `film_base.source` in
+  the shared `--params` recipe — a roll recipe must carry it. `estimate` resolves
+  an unstated source to `auto` and `inspect` always runs the detector, since both
+  exist to *produce* a base. Any orchestrator added later must call
+  `cli::validate` (or `validate_with_remedy`) rather than reaching for a default
+  that no longer exists.
 - **`estimate` returns `BaseEstimate { base, warnings }`** and **guards the
   resolved base finite-and-positive on every channel at birth** — a region on the
   dark holder errors loudly here, not silently downstream. The per-algo guards in
@@ -54,7 +64,7 @@ What other epics need to know about `film-base`:
 
 ## estimation
 **Status:** done
-**Updated:** 2026-06-30
+**Updated:** 2026-08-08
 
 - Goal: estimate `Dmin` `FilmBase` from border/region with full CLI override.
 - **Done.** `pipeline/film_base.rs` implements `estimate(&LinearImage,
@@ -149,6 +159,70 @@ What other epics need to know about `film-base`:
   - **White holder support:** some film holders are white, not black — auto/border
     logic assumes a dark surround. Add a CLI flag (e.g. `--holder white|black`) to
     tell the detector which. Follow-up.
+
+### 2026-08-08 — the film base becomes a stated choice
+
+- **`film_base.source` no longer has a default.** `convert`/`roll` reject an
+  unstated source with exit 2. Requested by the user after a defaults review:
+  `Dmin` is the divisor of the density conversion — it sets black point and colour
+  balance together — and auto detection is best-effort on real scans, so arriving
+  at it by omission decided the most consequential parameter of a conversion for
+  the user. `--auto-base` is still one flag; what is gone is reaching it by
+  silence.
+- **The diagnosis is command-aware, and that was a real bug, not a nicety.**
+  `RollArgs` flattens only `MemoryArgs`/`ReportArgs`, so `roll` accepts *none* of
+  the three film-base flags — the first version of the message told roll users to
+  pass `--auto-base`, which itself exits 2. `cli::missing_film_base_message` now
+  has two spellings behind a `FilmBaseRemedy`: `convert` is told about the flags,
+  `roll` about `film_base.source` in the shared `--params` recipe (measuring once
+  per roll being the intended workflow). Both call sites — the gate and
+  `convert_frame`'s totality guard — share that one function so they cannot drift.
+- **The rule is the *last* check in `validate`, deliberately.** Placed first (its
+  original position) the least-specific diagnosis pre-empted every contradiction
+  rule and `reject_roll_unsupported*`, so a config that both contradicted itself
+  and stated no base reported the vaguer problem. `validate`'s documented
+  principle is flag-shape first.
+- **`estimate` still resolves an unstated source to `auto`; `inspect` never
+  consults `FilmBaseParams` at all** — it calls `rebate_candidates` +
+  `select_auto_base` directly, so it always runs the detector. Both exist to
+  *produce* a base, so requiring one first would make the documented "measure once
+  from an unexposed reference, reuse across the roll" workflow circular. Neither
+  calls `cli::validate`, so the split is structural rather than a special case;
+  `convert_requires_a_stated_film_base_but_estimate_does_not` and
+  `roll_requires_a_stated_film_base_and_says_so_in_roll_terms` pin the halves.
+- `roll` was **already** stricter in a different sense — it warns unless the
+  source is `explicit`, because a roll's headline guarantee is one frozen base.
+- `film_base::estimate` now takes a resolved `&FilmBaseSource` rather than
+  `&FilmBaseParams`. "Unset" is an orchestration state, and a pure stage should
+  only ever receive a decision.
+- **No pixel moved.** Verified two ways: the drift gate's `render` and `base`
+  fingerprints are byte-identical to what v1 has always carried, and a real Ektar
+  frame converted with an explicit base reproduces the recorded means exactly
+  (`[0.2586, 0.2576, 0.2595]`). Only the `recipe` fingerprint changed, because the
+  default document now carries `"source": null`.
+- **`PIPELINE_VERSION` stays 1, and bumping it was tried first and reverted.**
+  The bump was actively harmful: `pipeline_version_warning` fires on *any*
+  mismatch with the text "the output will not match the original", and `--strict`
+  promotes it — so replaying an archived v1 sidecar that states a base, and
+  therefore renders bit-identically, exited 1 with a claim that was false. The v1
+  row's `recipe` hash was refreshed in place instead (the one field the table
+  sanctions editing: a new value in the default document, no default pixel
+  change), and `PIPELINE_BEHAVIOR` was **amended** to drop its opening "auto
+  rebate film base" clause. Amending a shipped version's description is normally
+  forbidden; it is permitted here only because `render`/`base` did not move — the
+  render v1 labels is unchanged, and the removed clause described how the base was
+  *obtained* by default, which is no longer part of the default render because
+  there is no default. `render`/`base` remain never-edit.
+- Gotcha for the next default change: the stage-2 `base` fingerprint now pins
+  `FilmBaseSource::Auto` **explicitly** instead of `FilmBaseParams::default()`.
+  Tying the *detector's* fingerprint to the default meant it moved for a reason
+  unrelated to the detector. The hash is unchanged (`auto` was that default), so
+  this was free — do not re-couple them.
+- Gotcha the drift gate does **not** cover: `run_estimate`'s
+  `unwrap_or(FilmBaseSource::Auto)` is now the only surviving default film-base
+  choice in the crate, and no fingerprint watches it (`base` names `Auto`
+  explicitly, `recipe` sees `null`). Changing it would move every `nc estimate`
+  result with the whole gate green. A rustdoc line on `run_estimate` says so.
 
 
 ## auto-base-redesign

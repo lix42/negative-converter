@@ -507,13 +507,34 @@ const AUTO_DMAX_PERCENTILE: f32 = 0.995;
 /// units** (where the base is `0`), *not* a base transmission plus a range (mixing
 /// transmission and density is a unit error). It is the last tier of the fixed
 /// resolution ladder (measured reference → per-stock constant → this nominal): the
-/// value used when no reference / per-stock `Dmax` has been calibrated. `2.0`
-/// places display white a couple of density decades above the base — a reasonable
-/// default print density for a normally-exposed frame — so the default u16 encode
-/// fills the display range while keeping relative exposure faithful (darker frames
-/// stay darker). Calibrate a stock-specific value with `estimate --d-max-region`
-/// (see [`reference_dmax`]) and pass it via `--d-max` for accurate placement.
-pub(crate) const NOMINAL_DMAX: f32 = 2.0;
+/// value used when no reference / per-stock `Dmax` has been calibrated, so the
+/// default u16 encode fills the display range while keeping relative exposure
+/// faithful (darker frames stay darker).
+///
+/// **`1.3`, a rounded nominal chosen against measurement (2026-08-08).** The seven
+/// rolls measured in this repo span **0.90 to 1.74**, median ≈1.34: Harman Phoenix
+/// 0.8976 at the bottom and Portra 400 1.7383 at the top, with Gold 200 1.2758,
+/// Ektar 1.2933 and Portra 160 1.3816 clustered in between. `1.3` is that median
+/// rounded to one decimal — deliberately **not** presented as calibrated, and
+/// deliberately not restated to more precision than n=7 rolls supports.
+///
+/// The previous `2.0` sat above *every* one of those rolls, and because the
+/// exponential curve renders `10^(γ·(D′ − Dmax))`, an anchor 0.7 too high darkens
+/// the whole frame by that many decades: on the Ektar reference frame it rendered
+/// 5.09x darker in linear terms than the roll's own measured anchor (encoded means
+/// 0.104 vs 0.259). A default no real roll reaches is not a conservative default,
+/// it is a wrong one. Measured in `docs/reports/render-defaults-v2.md`.
+///
+/// Phoenix's 0.8976 is counted in that spread on purpose: it is the **worst case,
+/// showing what the floor of the population looks like**, not an outlier excluded
+/// to flatter the number. Whether a calibrated constant should exclude such stocks
+/// is `film-base/dmax-anchor-reliability`'s call — that task still owns the number,
+/// and it is open precisely because the leader-measured anchor's *level* is
+/// uncontrolled (two rolls of one stock 0.295 apart while their bases agree to
+/// 0.0005). Measure a stock-specific value with `estimate --d-max-region` (see
+/// [`reference_dmax`]) and pass it via `--d-max` whenever accuracy matters;
+/// per-stock constants belong to `algo/film-stock-profiles`.
+pub(crate) const NOMINAL_DMAX: f32 = 1.3;
 
 /// Resolve the display-white anchor density for a corrected-density buffer.
 /// `Fixed` returns the roll-fixed nominal [`NOMINAL_DMAX`] (scene-independent, so
@@ -2324,7 +2345,23 @@ mod tests {
                 &img,
                 &base,
                 DensityParams::default(),
-                DensityCurve::default(),
+                // The **exponential** curve, named explicitly rather than taken
+                // from the default (which is now the sigmoid). This is not
+                // bookkeeping: the property under test only holds for a power law.
+                // A wrong base leaves a *constant per-channel density offset*, and
+                // `10^(gamma*(D' - Dmax))` turns that into a constant per-channel
+                // *factor* — so a stage-4 gain, applied after the curve, cancels it
+                // exactly. The sigmoid is nonlinear in the same log domain, so the
+                // cast does not survive as a single factor and no post-curve gain
+                // can fully neutralize it (measured: channels land 0.0595 / 0.0616
+                // / 0.0685 instead of equal).
+                //
+                // Consequence worth knowing rather than hiding: under the default
+                // sigmoid, auto-WB is a weaker corrector for a *wrong base* than it
+                // was under the exponential. It is not a regression in auto-WB —
+                // the estimator is unchanged — and it does not arise when the base
+                // is right, since then there is no constant cast to cancel.
+                DensityCurve::Exponential(ExponentialParams::default()),
                 PrintParams {
                     white_balance: mode,
                     ..PrintParams::default()

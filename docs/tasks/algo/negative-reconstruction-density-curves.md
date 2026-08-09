@@ -137,6 +137,42 @@ forms fail loudly rather than silently changing meaning.
   prove this task causes no behavioral `pipeline_version` bump; preset
   activation tests own the later prospective boundary.
 
+## Known residual gaps (moved-default curve warning)
+
+`curve_default_warning` warns that an archived recipe will not reproduce its
+original render because a curve default moved underneath it. Its predicate is
+now **"warn only on shapes this build cannot produce"** — an absent `curve`,
+`anchor`, `gamma` or `dmax`, none of which `--dump-params` ever writes. That
+rule is structurally free of false positives on the reproducibility path, which
+three successive predicate tunings were not, and
+`recipe_dumped_by_this_build_replays_clean_under_strict` gates it end to end.
+
+Two cases it deliberately does **not** cover, both needing more than a recipe's
+bytes to decide:
+
+1. **An archived bare recipe spelling `"dmax": "fixed"` does not warn**, even
+   though `"fixed"` resolves through `NOMINAL_DMAX`, which moved 2.0 → 1.3 on
+   2026-08-08. `"fixed"` is also exactly what this build writes, and identical
+   bytes carry no evidence of *when* they were written — so the choice is
+   between a false positive on the documented `--dump-params` → replay workflow
+   and a false negative on a migration aid. The workflow wins. An enveloped
+   sidecar is unaffected: `meta.pipeline_version` witnesses the drift and
+   `pipeline_version_warning` reports it.
+2. **CLI overrides that explicitly pin the floating values still warn.** The
+   witness is captured from the raw recipe JSON before `merge`, so
+   `--params archived.json --density-curve exponential --density-gamma 1.0
+   --d-max 2.0` warns about values the flags just pinned. Milder than case 1 —
+   the render is exactly what was asked for and the advice is merely redundant —
+   but it is a false positive, and fixing it means deciding eligibility from the
+   *effective* configuration plus override provenance rather than the loaded
+   file alone.
+
+Both are subsumed by a per-version default table, which is
+[`core/conversion-versioning`](../core/conversion-versioning.md)'s to own —
+`contrast` and `shoulder` moved in the same commit and have the identical
+property, so the general mechanism is the right home rather than more special
+cases here.
+
 ## Dependencies
 
 - [Input data semantics and validation](../io/input-data-semantics.md)

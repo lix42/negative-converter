@@ -54,7 +54,8 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// | version | default render |
 /// |---|---|
 /// | 0 | the Step-1 MVP baseline recorded in `docs/reports/v0-baseline.md`: per-frame `auto` `Dmax` (99.5th-percentile density), exponential curve, no auto WB |
-/// | 1 | **current** — every default change since that baseline, collapsed into one label: `film-base/dmax-reference` replaced the per-frame anchor with the roll-fixed nominal `Dmax = 2.0` **density**, `film-base/auto-base-redesign` replaced the auto film-base detector with the inward-scan rebate detector, and `core/input-semantics` added the stage-1b transfer/meaning resolution. The tagged-`reconstruction` split was proven bit-identical and is *not* part of the change. |
+/// | 1 | every default change since that baseline, collapsed into one label: `film-base/dmax-reference` replaced the per-frame anchor with the roll-fixed nominal `Dmax = 2.0` **density**, `film-base/auto-base-redesign` replaced the auto film-base detector with the inward-scan rebate detector, and `core/input-semantics` added the stage-1b transfer/meaning resolution. The tagged-`reconstruction` split was proven bit-identical and is *not* part of the change. |
+/// | 2 | **current** — three render defaults moved together (2026-08-08, `algo/negative-reconstruction-density-curves`): the nominal `Fixed` anchor `Dmax = 2.0` → **1.3**, the default density curve exponential → **sigmoid** (mid-grey anchored), and `ExponentialParams::gamma` 1.0 → **2.0** for anyone still selecting that curve explicitly. Measured in `docs/reports/render-defaults-v2.md`. Film-base estimation is untouched, which is why the row's `base` fingerprint is unchanged. |
 ///
 /// **The v1 row is a collapse, not a single step.** `docs/reports/v0-baseline.md`
 /// measured its numbers with an **explicit** `--film-base`, so those numbers stay
@@ -63,6 +64,17 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// them. That is a known limitation of retrofitting the constant, not a claim that
 /// nothing else moved.
 ///
+/// **v1 stayed v1 when `film_base.source` lost its default**, because no default
+/// pixel moved: a recipe that states a base renders bit-identically, and the v1
+/// row's `render`/`base` fingerprints are unchanged. What changed is that a recipe
+/// stating *nothing* is now refused (exit 2) instead of quietly detecting — a
+/// contract change, not a render change. Bumping for it would have been actively
+/// harmful: `pipeline_version_warning` fires on any mismatch, telling a user
+/// re-running an archived v1 sidecar that "the output will not match the original"
+/// when it matches exactly. The row's `recipe` hash was refreshed in place (the one
+/// field this table sanctions editing) and `PIPELINE_BEHAVIOR` was amended to drop
+/// its film-base clause — see both for why that amendment is permitted here.
+///
 /// Version 0 predates this constant, so no fingerprint of it can be computed from
 /// the current tree; `docs/reports/v0-baseline.md` is its record. From 1 onward the
 /// pairing is machine-enforced by the drift gate below (`PIPELINE_FINGERPRINTS` +
@@ -70,7 +82,7 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// test fails until the fingerprints **and** this constant are updated together.
 /// Read `PipelineFingerprint` for exactly which stages those are — the gate is not
 /// whole-pipeline coverage and must not be described as if it were.
-pub const PIPELINE_VERSION: u32 = 1;
+pub const PIPELINE_VERSION: u32 = 2;
 
 /// The recorded ⟨`pipeline_version`, fingerprints, behavior⟩ rows — the
 /// machine-enforced half of "the behavioral version cannot silently drift" (see
@@ -96,13 +108,48 @@ pub const PIPELINE_VERSION: u32 = 1;
 /// Test-only: nothing at runtime reads it, and gating it on `cfg(test)` keeps it
 /// out of the shipped binary without needing a `dead_code` allow.
 #[cfg(test)]
-pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[PipelineFingerprint {
-    pipeline_version: 1,
-    render: "1fce7367c4bfec58",
-    base: "01c5acccc36a3388",
-    recipe: "8a5b874faa30d391",
-    behavior: PIPELINE_BEHAVIOR,
-}];
+pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
+    PipelineFingerprint {
+        pipeline_version: 1,
+        render: "1fce7367c4bfec58",
+        base: "01c5acccc36a3388",
+        // Refreshed in place when `film_base.source` lost its default: the default
+        // document now carries `"source": null`, so the recipe hash moved. `render`
+        // and `base` are byte-identical to what this row has always carried — no
+        // pixel moved, and a recipe that states a base renders exactly as it did —
+        // which is precisely the "new value in the default document, no default
+        // pixel change" case this field sanctions editing for.
+        recipe: "5bd3e903db3a02b5",
+        // `behavior` is a **string literal** here, not `PIPELINE_BEHAVIOR`. It used to
+        // be the constant, back when v1 was current; the v2 bump below took the
+        // constant over, so v1's description had to be frozen as the text it carried
+        // — that is the whole point of recording the description per row. The literal
+        // is v1's final text: it had been *amended* once (dropping an opening "auto
+        // rebate film base" clause when `film_base.source` lost its default), which
+        // was permitted only because v1's `render`/`base` did not move, so the render
+        // v1 labels was unchanged and the removed clause described a resolution step
+        // no longer part of any default render. `render` and `base` remain never-edit.
+        behavior: "roll-fixed nominal Dmax 2.0 density, exponential density \
+     curve, no auto white balance",
+    },
+    // v2 — the default *render* changed, which is what this table exists for.
+    // Three defaults moved together (2026-08-08):
+    //   * `NOMINAL_DMAX` 2.0 → 1.3, because every roll measured in this repo
+    //     lands 0.90–1.74 and an anchor above all of them darkened the frame by
+    //     the difference (5.09x linear on the Ektar reference);
+    //   * the default curve exponential → sigmoid, which pins mid-grey instead of
+    //     white and so can place the black floor and the midtones at once;
+    //   * the exponential's own `gamma` 1.0 → 2.0, taking its black floor
+    //     72 → 12/255 for anyone who still selects it explicitly.
+    // `base` is unchanged: none of these touch film-base estimation.
+    PipelineFingerprint {
+        pipeline_version: 2,
+        render: "9beca8b24eb785b0",
+        base: "01c5acccc36a3388",
+        recipe: "3d37b13ecb7a5095",
+        behavior: PIPELINE_BEHAVIOR,
+    },
+];
 
 /// One recorded row of [`PIPELINE_FINGERPRINTS`]: a `pipeline_version`, the
 /// fingerprints of the default conversion behavior it labels, and the
@@ -117,18 +164,19 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[PipelineFingerprint 
 ///   output pixel's `f32` bit pattern plus the resolved `Dmax` / white-balance /
 ///   balance-range diagnostics. This is the *arithmetic* of stages 3–4.
 /// - `base` — [`stable_hash`] over `film_base::estimate`'s result (the resolved
-///   base's `f32` bit patterns plus its warnings) for `FilmBaseParams::default()`
+///   base's `f32` bit patterns plus its warnings) for [`FilmBaseSource::Auto`]
 ///   over the frozen synthetic scan in `pipeline::film_base::golden`. This is
 ///   **stage 2**, which `render` structurally cannot see: `render` is handed a
-///   hardcoded base, while the default `film_base.source` is `auto` and estimates
-///   one from pixels on every real run. Retuning the rebate detector or its
+///   hardcoded base, while `auto` estimates one from pixels on every run that
+///   selects it. Retuning the rebate detector or its
 ///   percentile changes every default conversion and nothing else here would move.
 /// - `recipe` — [`stable_hash`] over the canonical JSON of
 ///   `cli::ResolvedConfig::default()`. This is the default *configuration*: it
 ///   covers default **values** the other two cannot see (`output.hdr`,
 ///   `output.output_profile`, `film_base.source`, the `input` defaults). Note it
 ///   covers the *values*, never the code implementing them — `film_base.source`
-///   appears in it only as the string `"auto"`, which is why `base` exists.
+///   appears in it only as `null` (it has no default and must be chosen), which
+///   is why `base` exists.
 ///
 /// **What the gate does NOT cover.** Being explicit matters more than sounding
 /// comprehensive; a claim of whole-pipeline coverage would be worse than no claim,
@@ -162,11 +210,27 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[PipelineFingerprint 
 /// **Why hashing these particular values is safe on both macOS/aarch64 and x86_64
 /// Linux** (CLAUDE.md's cross-platform determinism rule, design-spec §8):
 ///
-/// - `render` hashes **exactly** the per-pixel values that
-///   `golden_density_exponential_default_is_bit_identical` already pins as literal
-///   bit patterns — vectors chosen because they agree across libm implementations,
-///   and proven so by that test being green on both targets today. Hashing them
-///   adds a version label; it does not widen the numeric surface by one value.
+/// - `render` hashes **exactly** the per-pixel values a `stages::golden` test
+///   already pins as literal bit patterns, so hashing adds a version label without
+///   widening the numeric surface by one value. Which test depends on the row: the
+///   **v2** (current) render is the mid-grey-anchored sigmoid at `NOMINAL_DMAX =
+///   1.3`, pinned by `golden_new_default_is_bit_identical`; the **v1** render is
+///   the exponential straight line at gamma 1.0 / anchor 2.0, which is no longer a
+///   default but is still pinned by
+///   `golden_density_exponential_reference_is_bit_identical`.
+///
+///   **The two rows' cross-platform claims are not equally strong, and saying so
+///   matters more than sounding confident.** The exponential vectors have been
+///   green on macOS/aarch64 *and* CI's x86_64 Linux runner for as long as this gate
+///   has existed — observed agreement, not an argument. The v2 vector has no such
+///   history: it was captured on this host on 2026-08-08, and the sigmoid evaluates
+///   `10f32.powf` and `log10` several times per sample (`algo::sigmoid`) where the
+///   exponential evaluated one `10^`, so there is more libm surface for a ~1-ULP
+///   divergence to land on. Its cross-target agreement is therefore a **prediction
+///   that CI's Linux runner validates**, not prior agreement being restated. If
+///   that runner ever reds on `golden_new_default_is_bit_identical`, the failure is
+///   the vector's — pick sample values that do agree, per CLAUDE.md's rule — not
+///   the gate's, and not a real behavior change.
 /// - It stops at `reconstruct_and_print`, i.e. **before** the lcms2 output color
 ///   transform. No post-lcms2 pixel and no embedded ICC byte — both of which differ
 ///   by target — enters any of the hashes.
@@ -208,8 +272,22 @@ pub struct PipelineFingerprint {
 /// enforced instead by two assertions in `mod drift_gate` — the current version's
 /// row must carry *this* string, and no two rows may share a behavior — which fails
 /// for both ways of forgetting to update it.
-pub const PIPELINE_BEHAVIOR: &str = "auto rebate film base, roll-fixed nominal Dmax 2.0 density, \
-     exponential density curve, no auto white balance";
+///
+/// **Rewritten for v2, not amended.** This text describes whatever
+/// [`PIPELINE_VERSION`] currently is, so a version bump replaces it outright: the
+/// v2 string below was written fresh for the 2026-08-08 default render, and v1's
+/// final text moved into its row in [`PIPELINE_FINGERPRINTS`] as a frozen literal.
+/// That is the normal path.
+///
+/// The *abnormal* path is amending a string while its version stays put, and it has
+/// happened exactly once — v1's text used to open with "auto rebate film base", and
+/// that clause was dropped when `film_base.source` lost its default. It was allowed
+/// only because the v1 row's `render` and `base` fingerprints did not move (the
+/// render v1 labels was unchanged, and the removed clause described a resolution
+/// step that is no longer part of any *default* render, there being no default).
+/// The v1 row records the outcome; read it before amending anything here.
+pub const PIPELINE_BEHAVIOR: &str = "roll-fixed nominal Dmax 1.3 density, mid-grey-anchored \
+     sigmoid curve, no auto white balance";
 
 /// The short git commit hash, or `None` when the build could not determine it
 /// (source tarball / no `git` / not this package's repository). `None` is reported
@@ -357,7 +435,7 @@ mod drift_gate {
     use crate::pipeline::film_base;
     use crate::pipeline::stages::{golden, reconstruct_and_print};
     use crate::types::{
-        DensityCurve, DensityParams, ExponentialParams, FilmBaseParams, FilmType, PrintParams,
+        DensityCurve, DensityParams, ExponentialParams, FilmBaseSource, FilmType, PrintParams,
         Reconstruction,
     };
 
@@ -404,13 +482,19 @@ mod drift_gate {
         )
     }
 
-    /// The default **stage 2** fingerprint input: what `film_base::estimate`
-    /// resolves for `FilmBaseParams::default()` (i.e. `source = "auto"`, the default
-    /// every real `nc convert` takes) over the frozen synthetic scan, plus any
-    /// warnings it raised. Parameterized for the same reason as the render text.
-    fn base_fingerprint_text(params: &FilmBaseParams) -> String {
-        let est = film_base::estimate(&film_base::golden::scan(), params, FilmType::default())
-            .expect("the default film-base estimate must succeed on the frozen scan");
+    /// The **stage 2** fingerprint input: what `film_base::estimate` resolves for
+    /// [`FilmBaseSource::Auto`] over the frozen synthetic scan, plus any warnings
+    /// it raised. Parameterized for the same reason as the render text.
+    ///
+    /// It pins `Auto` **explicitly** rather than "whatever the default is",
+    /// because this fingerprint exists to catch drift in the *detector*. Since
+    /// `film_base.source` lost its default, tying the gate to the default would
+    /// have meant the estimator's fingerprint moving for a reason that has
+    /// nothing to do with the estimator. (`Auto` was that default, so the
+    /// recorded hash is unchanged by the switch.)
+    fn base_fingerprint_text(source: &FilmBaseSource) -> String {
+        let est = film_base::estimate(&film_base::golden::scan(), source, FilmType::default())
+            .expect("the `auto` film-base estimate must succeed on the frozen scan");
         let rgb: Vec<String> = <[f32; 3]>::from(est.base)
             .iter()
             .copied()
@@ -438,7 +522,7 @@ mod drift_gate {
             &Reconstruction::default(),
             &PrintParams::default(),
         ));
-        let base = stable_hash(&base_fingerprint_text(&FilmBaseParams::default()));
+        let base = stable_hash(&base_fingerprint_text(&FilmBaseSource::Auto));
         let recipe = stable_hash(&recipe_fingerprint_text());
         PIPELINE_FINGERPRINTS
             .iter()
@@ -483,20 +567,21 @@ mod drift_gate {
             render_fingerprint_text(&Reconstruction::default(), &PrintParams::default())
         );
 
-        let base = stable_hash(&base_fingerprint_text(&FilmBaseParams::default()));
+        let base = stable_hash(&base_fingerprint_text(&FilmBaseSource::Auto));
         assert_eq!(
             base,
             row.base,
             "the DEFAULT FILM-BASE ESTIMATE changed but PIPELINE_VERSION is still \
              {PIPELINE_VERSION}.\n\n\
-             `film_base.source` defaults to `auto`, so this stage runs on every default \
-             conversion and a change here moves every default output: raise PIPELINE_VERSION, \
-             update PIPELINE_BEHAVIOR, add a history-table row, and ADD a new row with base: \
+             `film_base.source` has NO default, so this stage runs only on runs that asked for \
+             `auto` — but for those it resolves the divisor of the density conversion, and a \
+             detector change moves every one of their outputs: raise PIPELINE_VERSION, update \
+             PIPELINE_BEHAVIOR, add a history-table row, and ADD a new row with base: \
              \"{base}\" (never edit an existing row's `base`).\n\n\
              If you changed `film_base::golden::scan` instead of the detector, revert it — that \
              fixture is frozen precisely so this hash means \"the algorithm moved\".\n\n\
              fingerprint input was:\n{}",
-            base_fingerprint_text(&FilmBaseParams::default())
+            base_fingerprint_text(&FilmBaseSource::Auto)
         );
 
         let recipe = stable_hash(&recipe_fingerprint_text());
@@ -565,9 +650,7 @@ mod drift_gate {
 
         // (c) the film-base side: a different source resolves a different base, so
         // the stage-2 fingerprint must move too.
-        let perturbed_base = FilmBaseParams {
-            source: crate::types::FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
-        };
+        let perturbed_base = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
         assert_ne!(
             stable_hash(&base_fingerprint_text(&perturbed_base)),
             row.base,
@@ -584,7 +667,7 @@ mod drift_gate {
             row.render
         );
         assert_eq!(
-            stable_hash(&base_fingerprint_text(&FilmBaseParams::default())),
+            stable_hash(&base_fingerprint_text(&FilmBaseSource::Auto)),
             row.base
         );
     }

@@ -64,9 +64,7 @@
 
 use serde::Serialize;
 
-use crate::types::{
-    FilmBase, FilmBaseParams, FilmBaseSource, FilmType, LinearImage, NcError, Result,
-};
+use crate::types::{FilmBase, FilmBaseSource, FilmType, LinearImage, NcError, Result};
 
 /// Percentile used to summarize a region per channel. A high percentile (rather
 /// than the raw max) resists hot pixels / dust sparkles while still landing on
@@ -233,12 +231,16 @@ pub struct RebateCandidate {
 /// the user bakes into a recipe). This is the "reject degenerate bases at birth"
 /// guard the film-base gotcha in `CLAUDE.md` called for; the per-algo guards in
 /// `algo/*` remain as defense-in-depth.
+/// Takes an already-**resolved** [`FilmBaseSource`], not the params object: since
+/// `film_base.source` has no default, "unset" is an orchestration state the CLI
+/// resolves (reject for `convert`/`roll`, `Auto` for the measurement commands),
+/// and a pure stage should only ever receive a decision.
 pub fn estimate(
     image: &LinearImage,
-    params: &FilmBaseParams,
+    source: &FilmBaseSource,
     film_type: FilmType,
 ) -> Result<BaseEstimate> {
-    let est = match params.source {
+    let est = match *source {
         FilmBaseSource::Explicit(rgb) => BaseEstimate::clean(FilmBase::from(rgb)),
         FilmBaseSource::Region(rect) => sample_region(image, rect)?,
         FilmBaseSource::Auto => {
@@ -246,7 +248,7 @@ pub fn estimate(
             select_auto_base(image, &candidates)?
         }
     };
-    guard_base(&est.base, &params.source)?;
+    guard_base(&est.base, source)?;
     Ok(est)
 }
 
@@ -1203,11 +1205,6 @@ mod tests {
         }
     }
 
-    /// A `FilmBaseParams` selecting the given source.
-    fn params(source: FilmBaseSource) -> FilmBaseParams {
-        FilmBaseParams { source }
-    }
-
     /// The measured rebate transmission of the user's real film stock
     /// (`48bit-full/1` bottom edge ≈ `48bit-full/2` left edge) — the value the
     /// synthetic layouts below are built around.
@@ -1261,7 +1258,7 @@ mod tests {
         let img = solid(4, 4, [0.1, 0.1, 0.1]);
         let est = estimate(
             &img,
-            &params(FilmBaseSource::Explicit([0.9, 0.55, 0.42])),
+            &FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
             FilmType::Unknown,
         )
         .unwrap();
@@ -1277,7 +1274,7 @@ mod tests {
         fill_rect(&mut img, [4, 4, 2, 2], [0.8, 0.6, 0.5]);
         let est = estimate(
             &img,
-            &params(FilmBaseSource::Region([4, 4, 2, 2])),
+            &FilmBaseSource::Region([4, 4, 2, 2]),
             FilmType::Unknown,
         )
         .unwrap();
@@ -1295,7 +1292,7 @@ mod tests {
         fill_rect(&mut img, [0, 0, 20, 6], REBATE); // top: fake rebate
         let mixed = estimate(
             &img,
-            &params(FilmBaseSource::Region([0, 0, 20, 12])),
+            &FilmBaseSource::Region([0, 0, 20, 12]),
             FilmType::Unknown,
         )
         .unwrap();
@@ -1308,7 +1305,7 @@ mod tests {
         // The clean sub-rectangle does not warn.
         let clean = estimate(
             &img,
-            &params(FilmBaseSource::Region([0, 0, 20, 6])),
+            &FilmBaseSource::Region([0, 0, 20, 6]),
             FilmType::Unknown,
         )
         .unwrap();
@@ -1319,7 +1316,7 @@ mod tests {
     fn auto_detects_rebate_behind_holder_on_one_edge() {
         // The real layout: holder → thin rebate (bottom edge only) → picture.
         let img = scan_with_rebate(&[Edge::Bottom]);
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
     }
@@ -1333,7 +1330,7 @@ mod tests {
 
         // (1) auto resolves it cleanly — a fixture that errored, or that warned,
         //     would fingerprint the failure path instead of the detector.
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
 
         // (2) the rebate band is textured, so the CHOSEN percentile is observable.
@@ -1354,7 +1351,7 @@ mod tests {
     #[test]
     fn auto_detects_agreeing_rebate_on_two_edges() {
         let img = scan_with_rebate(&[Edge::Bottom, Edge::Left]);
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
         // Same stock on both edges → no cross-edge disagreement warning.
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
@@ -1371,7 +1368,7 @@ mod tests {
         fill_rect(&mut img, [0, 94, 100, 6], [0.92, 0.55, 0.42]);
         fill_rect(&mut img, [0, 0, 6, 100], [0.92, 0.55, 0.42]);
         fill_rect(&mut img, [94, 0, 6, 100], [0.92, 0.55, 0.42]);
-        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
+        let err = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap_err();
         assert!(matches!(err, NcError::Other(_)));
         let msg = err.to_string();
         for flag in ["--film-base", "--base-region", "--base-content"] {
@@ -1409,7 +1406,7 @@ mod tests {
         // region) must not out-rank the genuine, brighter rebate on another.
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         fill_rect(&mut img, [0, 3, 100, 4], [0.20, 0.10, 0.05]); // top: flat dark band
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02);
     }
 
@@ -1419,7 +1416,7 @@ mod tests {
         // actionable message naming the recovery flags, never return a silent
         // wrong base.
         let img = scan_with_rebate(&[]);
-        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
+        let err = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap_err();
         assert!(matches!(err, NcError::Other(_)));
         let msg = err.to_string();
         for flag in ["--film-base", "--base-region", "--base-content"] {
@@ -1432,7 +1429,7 @@ mod tests {
         // A flat image has no holder run, hence no candidate.
         let img = solid(100, 100, [0.5, 0.5, 0.5]);
         assert!(matches!(
-            estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err(),
+            estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap_err(),
             NcError::Other(_)
         ));
     }
@@ -1445,7 +1442,7 @@ mod tests {
         let mut img = solid(100, 100, [0.6, 0.6, 0.6]);
         fill_rect(&mut img, [0, 0, 100, 3], HOLDER);
         fill_rect(&mut img, [0, 3, 100, 4], [0.30, 0.30, 0.30]); // dark band
-        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
+        let err = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap_err();
         assert!(
             err.to_string().contains("higher transmission"),
             "should fail the transmission gate: {err}"
@@ -1459,7 +1456,7 @@ mod tests {
         // surfaced as a warning (--strict can then refuse it).
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         fill_rect(&mut img, [0, 3, 100, 4], [0.30, 0.20, 0.12]); // top: bright but different
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
         assert_close(est.base, REBATE, 0.02); // highest-transmission (the rebate) still wins
         assert!(
             est.warnings.iter().any(|w| w.contains("disagree")),
@@ -1476,7 +1473,7 @@ mod tests {
         let mut img = scan_with_rebate(&[Edge::Bottom]);
         // Top band ~8% brighter than REBATE per channel — inside the 15% tol.
         fill_rect(&mut img, [0, 3, 100, 4], [0.573, 0.281, 0.173]);
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
         assert!(
             est.warnings.is_empty(),
             "edges within tolerance must not warn: {:?}",
@@ -1488,7 +1485,7 @@ mod tests {
     fn auto_is_too_small_error_on_sliver_images() {
         // 6x6 with the minimum scan depth of 3 leaves no interior at all.
         let img = solid(6, 6, [0.5, 0.5, 0.5]);
-        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap_err();
+        let err = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap_err();
         assert!(err.to_string().contains("too small"), "{err}");
     }
 
@@ -1542,12 +1539,7 @@ mod tests {
             assert!((got - want).abs() < 0.02, "candidate base {:?}", c.base);
         }
         // The reported region re-samples to the same base it proposed.
-        let est = estimate(
-            &img,
-            &params(FilmBaseSource::Region(c.region)),
-            FilmType::Unknown,
-        )
-        .unwrap();
+        let est = estimate(&img, &FilmBaseSource::Region(c.region), FilmType::Unknown).unwrap();
         assert_close(est.base, c.base, 1e-6);
         assert!(est.warnings.is_empty(), "{:?}", est.warnings);
 
@@ -1558,12 +1550,7 @@ mod tests {
         let cands = rebate_candidates(&img, FilmType::Unknown).unwrap();
         let c = cands.iter().find(|c| c.edge == Edge::Bottom).unwrap();
         assert_eq!(c.region, [10, 93, 80, 4]);
-        let est = estimate(
-            &img,
-            &params(FilmBaseSource::Region(c.region)),
-            FilmType::Unknown,
-        )
-        .unwrap();
+        let est = estimate(&img, &FilmBaseSource::Region(c.region), FilmType::Unknown).unwrap();
         assert_close(est.base, c.base, 1e-6);
     }
 
@@ -1585,7 +1572,7 @@ mod tests {
         let img = solid(8, 8, [0.5, 0.5, 0.5]);
         let err = estimate(
             &img,
-            &params(FilmBaseSource::Region([4, 4, 8, 8])),
+            &FilmBaseSource::Region([4, 4, 8, 8]),
             FilmType::Unknown,
         )
         .unwrap_err();
@@ -1594,7 +1581,7 @@ mod tests {
         assert!(matches!(
             estimate(
                 &img,
-                &params(FilmBaseSource::Region([0, 0, 0, 4])),
+                &FilmBaseSource::Region([0, 0, 0, 4]),
                 FilmType::Unknown
             )
             .unwrap_err(),
@@ -1768,7 +1755,7 @@ mod tests {
         set_px(&mut img, 0, 0, [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
         let est = estimate(
             &img,
-            &params(FilmBaseSource::Region([0, 0, 10, 10])),
+            &FilmBaseSource::Region([0, 0, 10, 10]),
             FilmType::Unknown,
         )
         .unwrap();
@@ -1854,7 +1841,7 @@ mod tests {
         fill_rect(&mut img, [0, 0, 10, 10], [0.0, 0.0, 0.0]);
         let err = estimate(
             &img,
-            &params(FilmBaseSource::Region([0, 0, 10, 10])),
+            &FilmBaseSource::Region([0, 0, 10, 10]),
             FilmType::Unknown,
         )
         .unwrap_err();
@@ -2049,9 +2036,9 @@ mod tests {
         }
         // And the full estimate resolves to that rebate under the chromogenic path,
         // while the RGB-only path fails loudly (no candidate anywhere).
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Chromogenic).unwrap();
         assert_close(est.base, REBATE, 0.03);
-        assert!(estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).is_err());
+        assert!(estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).is_err());
     }
 
     #[test]
@@ -2059,8 +2046,8 @@ mod tests {
         // An HDR 48-bit scan (no IR plane) declared chromogenic must behave exactly
         // like the RGB-only path — the mask never applies, so the base is identical.
         let img = scan_with_rebate(&[Edge::Bottom, Edge::Left]);
-        let rgb = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Unknown).unwrap();
-        let chromo = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
+        let rgb = estimate(&img, &FilmBaseSource::Auto, FilmType::Unknown).unwrap();
+        let chromo = estimate(&img, &FilmBaseSource::Auto, FilmType::Chromogenic).unwrap();
         assert_eq!(rgb.base, chromo.base);
     }
 
@@ -2183,7 +2170,7 @@ mod tests {
             }
         }
         // And the estimate resolves to the rebate under the chromogenic path.
-        let est = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap();
+        let est = estimate(&img, &FilmBaseSource::Auto, FilmType::Chromogenic).unwrap();
         assert_close(est.base, REBATE, 0.02);
     }
 
@@ -2223,7 +2210,7 @@ mod tests {
             err.to_string().contains("no uniform unexposed rebate band"),
             "empty-candidates error must be the loud no-band message: {err}"
         );
-        let err = estimate(&img, &params(FilmBaseSource::Auto), FilmType::Chromogenic).unwrap_err();
+        let err = estimate(&img, &FilmBaseSource::Auto, FilmType::Chromogenic).unwrap_err();
         assert!(matches!(err, NcError::Other(_)), "got {err:?}");
     }
 

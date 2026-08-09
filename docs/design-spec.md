@@ -43,8 +43,8 @@ The deterministic core owns the image science. Any future ML assistance (see
 - **Tagged reconstruction** architecture (shipped): `simple` (channel
   inversion — baseline / debug / B&W) or `density` (density-domain
   reconstruction, Kodak Cineon / darktable `negadoctor` style — the default),
-  where density owns a tagged **exponential** (default) or **sigmoid**
-  (H&D-style S-curve) density curve.
+  where density owns a tagged **sigmoid** (H&D-style S-curve, the default since
+  `pipeline_version` 2) or **exponential** (the straight line) density curve.
 - All conversion parameters controllable via CLI flags and/or a JSON recipe file.
 - Write **TIFF** output, selectable as **16-bit integer** or transitional
   **32-bit rendered float** via a flag.
@@ -491,7 +491,7 @@ See the "Architecture" section of `CLAUDE.md` for the current-vs-target framing.
 Stage 1's semantic resolution is **implemented** (`pipeline::input_semantics`,
 task `input-data-semantics`; see §4 and §9). The replacement stage 3 adopts a
 tagged reconstruction schema: `simple`, or `density` containing density
-parameters and a tagged `exponential` (default) or `sigmoid` curve. It preserves
+parameters and a tagged `sigmoid` (default) or `exponential` curve. It preserves
 the current exponential pixels and exact sigmoid equation. Dmax belongs to the
 curve stage—scalar placement for exponential, curve shaping for sigmoid. Every
 path returns private-field `FilmRgbImage`.
@@ -699,7 +699,7 @@ default `reconstruction.curve.dmax = "fixed"` therefore resolves a **fixed** anc
 **measured reference → per-stock constant → nominal**: a value measured once from
 a fully-exposed reference frame (§8, `estimate --d-max-region`) or a known
 per-stock constant is carried as `{ "explicit": <d> }`; with no calibration a
-**nominal** corrected-density anchor (`Dmax ≈ 2.0`, a scene-independent placement
+**nominal** corrected-density anchor (`Dmax = 1.3`, a scene-independent placement
 *in density units* — not a base transmission plus a range) applies. The brightest
 pixel then maps to *wherever it falls* (below white for a dim frame, clipping above
 for a specular), the faithful behavior. `auto` (`--auto-d-max`) — the demoted
@@ -782,9 +782,20 @@ white. **The knee order is deliberate:** the shoulder (soft-min with the
 log-output-`0` ceiling) is applied *last*, so nothing lifts the result back above
 white — for `shoulder > 0`, this **stage-3 output** is `≤ 1.0` for every finite
 density, for any valid params (including a small `Dmax` or low-contrast auto
-anchor), so under neutral print params the default u16 encode **cannot clip
+anchor), so under neutral print params the default u16 encode **reports no clipped
 highlights** (the later print/display render — exposure/gains — can still lift samples
-above `1.0`). With `shoulder = 0` there is no roll-off and
+above `1.0`).
+
+That is a statement in ℝ, and it must not be read as "no highlight information is
+lost". The approach to white is asymptotic, so in `f32` the gap closes at a finite
+density — at the shipped defaults with the nominal 1.3 anchor, the rendered value is
+exactly `1.0f32` from just above `D′ ≈ 3.1` onward. The encoder counts a clip as
+`v > 1.0` **strictly**, so those densities all encode to 65535 with
+`loss.clipped_high = 0` and `--strict` green. The region is narrow (near-opaque
+negative), but part of "0% clipped" is loss that moved from a counted category into
+an uncounted one; `docs/reports/render-defaults-v2.md` records the measurement.
+
+With `shoulder = 0` there is no roll-off and
 highlights follow the (toe-shaped) line, which can exceed `1.0` like `density`.
 The toe holds shadows to the paper-black floor `≈ 10^(−contrast·A)` (exact
 when `shoulder = 0`; the shoulder nudges it imperceptibly lower otherwise).
@@ -918,7 +929,7 @@ no interactive prompts.
 | `nc roll` | Convert a batch of frames from one shared, frozen recipe (the batch-**apply** scaffold). Per-frame outputs into `--out-dir` + a roll-level JSON report. Single-frame `convert` is unchanged; roll is additive. |
 | `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
 | `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. `--d-max-region` additionally measures the roll-fixed display-white anchor `Dmax` from a fully-exposed reference frame, emitting reuse-ready `--d-max` / `reconstruction.curve.dmax` forms. |
-| `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). |
+| `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). The scaffold is a **template to edit, not a runnable recipe**: `film_base.source` has no default, so it prints as `null` and `convert`/`roll` reject it until you state a base. |
 
 ### Recipes (JSON in/out)
 
@@ -956,13 +967,21 @@ shapes (other stage objects are omitted here):
       "balance_range": "auto"
     },
     "curve": {
-      "type": "exponential",
-      "gamma": 1.0,
-      "dmax": "fixed"
+      "type": "sigmoid",
+      "contrast": 2.0686874,
+      "toe": 0.2,
+      "shoulder": 0.6,
+      "dmax": "fixed",
+      "anchor": {"mid-at-dmax-fraction": 0.5}
     }
   }
 }
 ```
+
+That first density example is the **resolved default document** as of
+`pipeline_version` 2 — copying it reproduces the shipped render. The exponential
+curve is still a first-class variant, selected explicitly (here with a custom
+density block and a calibrated anchor, to show the other fields too):
 
 ```json
 {
@@ -977,12 +996,9 @@ shapes (other stage objects are omitted here):
       "balance_range": {"explicit": [0.1, 1.9]}
     },
     "curve": {
-      "type": "sigmoid",
-      "contrast": 2.0686874,
-      "toe": 0.2,
-      "shoulder": 0.6,
-      "dmax": {"explicit": 2.0},
-      "anchor": {"mid-at-dmax-fraction": 0.5}
+      "type": "exponential",
+      "gamma": 2.0,
+      "dmax": {"explicit": 1.29}
     }
   }
 }
@@ -995,7 +1011,7 @@ defaults to 1; resolved recipes always emit it. `curve.dmax` accepts
 (sigmoid only) accepts `"white-at-dmax"` or `{"mid-at-dmax-fraction": <f>}` with
 `f` in `(0, 1]`, defaulting to `{"mid-at-dmax-fraction": 0.5}` (§7.3). Omitted
 density fields take the displayed defaults. Partial input may omit
-`reconstruction.curve`, which selects exponential with its defaults; every
+`reconstruction.curve`, which selects the default curve (sigmoid) with its defaults; every
 resolved recipe/report emits exactly one tagged curve. Partial objects are
 otherwise permitted. Unknown fields are rejected at every level.
 
@@ -1029,7 +1045,7 @@ changed output pixel.
     "nc_version": "0.1.0",
     "git_commit": "0d05c800c092",
     "git_dirty": true,
-    "pipeline_version": 1,
+    "pipeline_version": 2,
     "target": "aarch64-apple-darwin",
     "params_hash": "3575c9feb5d42b2b"
   }
@@ -1043,22 +1059,27 @@ changed output pixel.
   `git_dirty: true` means the commit alone does not identify the source.
 - `pipeline_version` — the **behavioral** version, an integer **independent of
   semver** that bumps *only* when **default** conversion behavior changes. `0` is
-  the Step-1 baseline in `docs/reports/v0-baseline.md`; `1` is current and
+  the Step-1 baseline in `docs/reports/v0-baseline.md`; `1`
   **collapses every default change since that baseline into one label**:
   `dmax-reference` replaced the per-frame anchor with the roll-fixed nominal
   `Dmax = 2.0` **density**, `auto-base-redesign` replaced the auto film-base
   detector, and `input-semantics` added stage-1b transfer/meaning resolution. (The
   v0 baseline report measured its numbers with an *explicit* `--film-base`, so those
   numbers stay comparable; the *default* render crossed three boundaries with only
-  one label available to record them.) This is the axis a version comparison is
-  keyed on.
+  one label available to record them.) `2` is current: the nominal anchor moved to
+  `1.3`, the default curve to the mid-grey-anchored sigmoid, and the exponential's
+  own gamma to `2.0` — measured in `docs/reports/render-defaults-v2.md`, where v1
+  clipped between 0% and 4.9% of a real frame's samples and v2 clips none of any of
+  the four measured. That report also records why the clip counter alone overstates
+  the win. This is the axis a version comparison is keyed on.
 - **What the drift gate does and does not cover.** A golden drift test
   (`version::PIPELINE_FINGERPRINTS`) pairs each version with three fingerprints —
   the default **render** (the curated per-pixel vectors in
   `pipeline::stages::golden`), the default **film-base estimate** (stage 2, `auto`
   over the frozen scan in `pipeline::film_base::golden`, because the render
-  fingerprint is handed a hardcoded base and the recipe fingerprint sees only the
-  string `"auto"`), and the default **recipe values**. Change a default in those
+  fingerprint is handed a hardcoded base and the recipe fingerprint sees only
+  `null` — `film_base.source` has no default, so the base fingerprint names `auto`
+  explicitly), and the default **recipe values**. Change a default in those
   stages and the test fails until the version and the fingerprints are updated
   together. It does **not** cover decode, stage-1b input semantics, the lcms2 output
   transform or embedded ICC bytes (excluded deliberately — both differ by target, so
@@ -1124,18 +1145,27 @@ task):
         "highlight_balance": [0.0, 0.0, 0.0],
         "balance_range": "auto"
       },
-      "curve": {"type": "exponential", "gamma": 1.0, "dmax": "fixed"}
+      "curve": {
+        "type": "sigmoid",
+        "contrast": 2.0686874,
+        "toe": 0.2,
+        "shoulder": 0.6,
+        "dmax": "fixed",
+        "anchor": {"mid-at-dmax-fraction": 0.5}
+      }
     }
   },
   "reconstruction_result": {
     "type": "density",
     "curve": {
-      "type": "exponential",
+      "type": "sigmoid",
       "dmax": {
         "policy": "fixed",
-        "value": 2.0,
+        "value": 1.3,
         "provenance": "default"
-      }
+      },
+      "anchor": {"mid-at-dmax-fraction": 0.5},
+      "anchor_value": 1.01
     }
   },
   "working_mapping": "nc-film-rgb-v1",
@@ -1180,7 +1210,8 @@ behavioral `pipeline_version` is a **separate** field owned by
 `conversion-versioning`; this build stamps none, so it is absent rather than
 guessed.
 
-For sigmoid, `curve.type` is `"sigmoid"` with the same resolved `dmax` object plus two
+The block above is the **default** (sigmoid) shape: `curve.type` is `"sigmoid"` with
+the resolved `dmax` object plus two
 placement fields: `anchor` (the resolved placement *rule*, omitted entirely for the
 exponential curve, which has none) and `anchor_value` (the **derived** anchor — the
 corrected density this render mapped to `1.0`, hence the black floor at
@@ -1246,17 +1277,19 @@ failed for another reason, whose entry carries both its `memory` block and its
 ### Example invocations
 
 ```bash
-# Default density conversion: auto Dmin, fixed/roll nominal Dmax, 16-bit TIFF,
-# JSON report. The two selector flags are optional (both are the defaults).
+# Default density conversion: fixed/roll nominal Dmax, 16-bit TIFF, JSON report.
+# The two selector flags are optional (both are the defaults); the film-base flag
+# is **not** — `film_base.source` has no default, so every `convert` must state
+# one of `--film-base` / `--base-region` / `--auto-base`.
 nc convert in.tiff -o out.tiff --reconstruction density \
-  --density-curve exponential --report json
+  --density-curve exponential --auto-base --report json
 
 # Transitional rendered float TIFF: --no-d-max selects the exponential curve's
 # unity placement (base → 1.0, detail above), then the current print controls
 # still run and the depth-aware default profile (acescg for HDR) applies. This
 # is NOT film-master.
 nc convert in.tiff -o out.tiff \
-  --output-hdr --no-d-max \
+  --output-hdr --density-curve exponential --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
   --highlight-compress 0.3
@@ -1375,9 +1408,11 @@ nc estimate blank.tiff --grid --report json
 # Auto-Neutral; gray-world ≈ Auto-AVG), read the resolved gains back from the
 # report, and freeze them into --white-balance / the roll recipe
 # (print.white_balance = {"explicit": [...]}) — the reuse run is bit-identical.
-nc convert frame01.tiff -o frame01_pos.tiff --auto-wb percentile --report json
+nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.92,0.55,0.42 \
+  --auto-wb percentile --report json
 # → { "white_balance": [1.083, 1.0, 0.941], ... }
-nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941
+nc convert frame02.tiff -o frame02_pos.tiff --film-base 0.92,0.55,0.42 \
+  --white-balance 1.083,1.0,0.941
 ```
 
 ## 9. Parameter reference (grouped by stage)
@@ -1499,7 +1534,21 @@ object (§8). Names are binding and unknown keys are rejected
 
 ### Film base / Dmin (stage 2)
 The base source is a single mutually-exclusive choice, recipe key
-`film_base.source` (default `"auto"`). The three flags conflict (passing more
+`film_base.source` — **required, with no default**. `convert` and `roll` reject a
+config that does not state one (exit 2, naming the three ways to supply it —
+`roll` accepts none of the flags, so its message points at the shared `--params`
+recipe instead). The measurement commands exist to *produce* a base, so requiring
+one first would be circular: `estimate` resolves an unstated source to `"auto"`,
+and `inspect` takes no film-base flags at all — it always runs the detector.
+
+Why it is required: `Dmin` is the divisor of the density conversion, so it sets
+the black point and the colour balance together, and auto-detection is
+best-effort on real scans (the rebate is a thin inset band behind the holder, not
+the outer margin). Defaulting silently meant the single most consequential
+parameter of a conversion was one nobody had decided. `--auto-base` is still one
+flag — the requirement is that the choice be *stated*, not that it be explicit.
+
+The three flags conflict (passing more
 than one is a usage error); whichever is given replaces a recipe's source:
 - `--film-base R,G,B` ⇒ `{ "explicit": [r, g, b] }` — explicit base transmission.
 - `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this rectangle.
@@ -1507,7 +1556,7 @@ than one is a usage error); whichever is given replaces a recipe's source:
   sampled value but raises a **uniformity warning** in the report (`--strict`
   promotes it) — a mixed rectangle otherwise yields a plausible-looking bad base
   with no signal.
-- `--auto-base` (default) ⇒ `"auto"` — detect the unexposed rebate band behind
+- `--auto-base` ⇒ `"auto"` — detect the unexposed rebate band behind
   the film holder (the inward-scan detector; see the ladder below). On no
   confident band it **fails loudly** and *suggests* `--base-content` — the opt-in
   content source owned by the separate `film-base/content-fallback` task (ladder
@@ -1535,7 +1584,7 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    `--base-region` at a visible rebate patch manually — `nc inspect` reports the
    detector's candidate rectangles (edge, coordinates, value, spread) so you can
    confirm one instead of measuring it in an image viewer (UI-assisted picking
-   is a roadmap item, §12). Convenience form: `--auto-base` (the default) — real
+   is a roadmap item, §12). Convenience form: `--auto-base` — real
    scans are laid out as
    `dark film holder → thin unexposed rebate → exposed picture`, the rebate being
    a narrow, uniform, bright band *inset behind the holder*, possibly on only
@@ -1595,7 +1644,7 @@ crossover.
 
 ### Reconstruction and density-curve select
 - CLI: `--reconstruction simple|density` (default `density`).
-- With density: `--density-curve exponential|sigmoid` (default `exponential`).
+- With density: `--density-curve exponential|sigmoid` (default `sigmoid`).
   `--density-curve` with `simple` is a usage error (no curve stage).
 - Recipe: `reconstruction.type`, then for density
   `reconstruction.density` and tagged `reconstruction.curve`, exactly as shown
@@ -1635,7 +1684,7 @@ crossover.
   calibration** like `Dmin`. The four flags conflict (passing more than one is a
   usage error); whichever is given replaces a recipe's `dmax`:
   - `--fixed-d-max` (default) ⇒ `"fixed"` — the roll-fixed **nominal** anchor: a
-    scene-independent corrected-density placement (`Dmax ≈ 2.0`, in density units),
+    scene-independent corrected-density placement (`Dmax = 1.3`, in density units),
     reused across the roll. The default when no reference / per-stock value has
     been calibrated.
   - `--d-max <d>` ⇒ `{ "explicit": <d> }` — the roll-fixed **calibrated** anchor: a
@@ -2063,6 +2112,14 @@ positional `inputs` (files and directories — a directory is expanded to its
 `.tif`/`.tiff` files, sorted; shell globs are expanded by the shell, not by nc)
 **or** `--frames <manifest.json>` (explicit per-frame `input`/`output`/partial-recipe
 `params` overrides, deep-merged onto the shared recipe for that frame only).
+**A `--params` recipe is effectively mandatory for `roll`**, because `roll`
+converts and `film_base.source` has no default while `RollArgs` accepts none of
+the three film-base flags — the recipe is the only place a roll can state its
+base, and a roll with no recipe (or one omitting `film_base.source`) exits 2 with
+a message that says so. That is the intended workflow rather than a limitation:
+`Dmin` is measured once for the roll (`nc estimate`) and frozen into the shared
+recipe as `film_base.source.explicit`, which is also the only source that keeps
+every frame on one base — see the roll-fixed invariant warnings below.
 The shipped schema stores roll-fixed Dmax at `density.dmax`; the target schema
 stores it at `reconstruction.curve.dmax`. The shared recipe configuration
 appears once at the top of the roll report; each frame additionally reports
@@ -2385,14 +2442,17 @@ the NLP feature comparison, Phase 6).
     `dmax-reference`.)* Supersedes the frame-local `auto` default: `Dmax` is a
     film+scanner calibration reused per roll like `Dmin`. The default
     `density.dmax = fixed` resolves reference → per-stock constant → a nominal
-    corrected-density anchor (`Dmax ≈ 2.0`, in density units — *not* base
+    corrected-density anchor (`Dmax = 1.3`, in density units — *not* base
     transmission plus a range); a value measured once from the light-struck leader
     (near-opaque in RGB, the max-density endpoint — always available) via
     `estimate --d-max-region` is frozen as `{ "explicit": <d> }`. `--auto-d-max`
     (per-frame exposure normalization) is demoted to opt-in. This changes the
     default render, which is a `pipeline_version` bump — **discharged** by
-    `conversion-versioning` (item 16): this default is labeled
-    `pipeline_version 1`, the v0→v1 boundary for the density default. In the
+    `conversion-versioning` (item 16). Two boundaries, not one: making the density
+    conversion the default was the v0→v1 bump and `pipeline_version 1` records it
+    with the nominal at **2.0**; moving the nominal to **1.3** (with the sigmoid as
+    the default curve) is the v1→v2 bump, so an archived recipe's render is only
+    recoverable from the version its sidecar records. In the
     replacement pipeline, Dmax belongs to the selected density curve: scalar
     placement for exponential and curve shaping for sigmoid. SDR/HDR rendering
     owns display reference white.

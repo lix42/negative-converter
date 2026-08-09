@@ -32,21 +32,43 @@ task's contract, which is why it is a new task rather than an edit.
    insensitive grains keep responding well past where the curve looks flat, so reaching true
    Dmax can take many stops more than a leader receives.
 
-**And the fallback is separately wrong.** `NOMINAL_DMAX = 2.0` is the shipped default when no
-roll reference exists, while measured rolls span 0.90–1.74 (median ≈1.34, ≈1.36 excluding the
-poor-quality Harman Phoenix). Worst-case error against 2.0 is 1.10 density — several stops —
-and it makes switching between `Fixed` and `Explicit` a large unexplained rendering change.
-~1.35 is a better provisional value, but n=7 rolls is too small to fix a shipped constant, and
+**And the fallback is separately wrong.** `NOMINAL_DMAX` was `2.0` when this task was written,
+while measured rolls span 0.90–1.74 (median ≈1.34, ≈1.36 excluding the poor-quality Harman
+Phoenix). Worst-case error against 2.0 is 1.10 density — several stops — and it makes switching
+between `Fixed` and `Explicit` a large unexplained rendering change. ~1.35 is a better
+provisional value, but n=7 rolls is too small to *calibrate* a shipped constant, and
 Portra400's own 1.7383 is one of the suspect measurements.
 
 **Do not settle the fallback number yet** (user, 2026-08-03) — more rolls are coming, and they
-will also show whether Portra400's 1.7383 is a mistake or real. What *is* settled is the
-**method**: when the constant is finally computed, **exclude extreme cases** rather than taking a
-plain median over everything. Harman Phoenix (0.8976) is the worked example — a poor-quality
-stock with a dense, non-orange base, already known to false-alarm the plausibility floor
-(`film-base/dense-base-dmax-plausibility`). A fallback dragged down by an outlier stock is worse
-than one computed from the mainstream population it will actually be applied to. Record the
-exclusion criterion explicitly, so the choice is auditable rather than a silent judgement.
+will also show whether Portra400's 1.7383 is a mistake or real. What *was* proposed alongside
+that was a **method**: when the constant is finally computed, exclude extreme cases rather than
+taking a plain median over everything, with Harman Phoenix (0.8976) as the worked example — a
+poor-quality stock with a dense, non-orange base, already known to false-alarm the plausibility
+floor (`film-base/dense-base-dmax-plausibility`).
+
+### Superseded 2026-08-08: the shipped nominal is now `1.3`
+
+The 2026-08-03 "do not settle it yet" decision was **superseded by the user on 2026-08-08**, and
+`algo/negative-reconstruction-density-curves` shipped `NOMINAL_DMAX = 1.3` with
+`pipeline_version` 2. The reason is that leaving 2.0 in place was not a neutral act of waiting:
+2.0 sat above *every* measured roll, and the render is `10^(γ·(D′ − Dmax))`, so an anchor 0.7
+too high darkened **every default conversion** by that many decades — measured at 5.09× darker
+in linear terms on the Ektar reference frame
+(`docs/reports/render-defaults-v2.md`). Deferring the number meant continuing to ship a wrong
+one; 1.3 is the measured median rounded to one decimal, which is at worst a differently-wrong
+number and at best a defensible one.
+
+Two things this does **not** settle, and which this task still owns:
+
+- **1.3 is a nominal, not a calibration.** It is not the answer to "what is the right anchor",
+  and the docstring on `NOMINAL_DMAX` says so. Everything above about the anchor's level being
+  uncontrolled still stands, and the calibrated value — whenever more rolls justify one — is
+  still this task's to compute and to defend.
+- **Harman Phoenix is a worst case, not an exclusion example.** The user's framing (2026-08-08):
+  0.8976 *demonstrates what the floor of the population looks like*, which is exactly the thing
+  a fallback has to survive. It is counted in the 0.90–1.74 spread and in the median behind 1.3.
+  Whether a future calibrated constant should exclude stocks like it is still open — but it is a
+  question to answer with evidence here, not a settled method inherited from 2026-08-03.
 
 **Directions to weigh, not a predetermined fix:**
 
