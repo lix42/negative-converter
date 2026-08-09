@@ -2175,10 +2175,21 @@ fn convert_rejects_report_file_colliding_with_artifacts() {
         fix.to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
+        // A base must be stated (no default); without it all three of these
+        // conversions exit 2 on the missing-base gate and never reach the
+        // collision check they exist to pin.
+        "--film-base",
+        "0.9,0.6,0.5",
         "--report-file",
         out.to_str().unwrap(),
     ]);
     assert_eq!(code, 2, "report over output must be a usage error: {err}");
+    // Exit 2 alone cannot say *which* rule fired — that is how this test came to
+    // pass on the missing-base gate instead. Pin the reason.
+    assert!(
+        !err.contains("no film base selected"),
+        "must reach the collision check, not the film-base gate: {err}"
+    );
     // --report-file == the automatic sidecar.
     let sidecar = dir.path("out.tiff.json");
     let (code, _, err) = run(&[
@@ -2186,10 +2197,19 @@ fn convert_rejects_report_file_colliding_with_artifacts() {
         fix.to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
+        // A base must be stated (no default); without it all three of these
+        // conversions exit 2 on the missing-base gate and never reach the
+        // collision check they exist to pin.
+        "--film-base",
+        "0.9,0.6,0.5",
         "--report-file",
         sidecar.to_str().unwrap(),
     ]);
     assert_eq!(code, 2, "report over sidecar must be a usage error: {err}");
+    assert!(
+        !err.contains("no film base selected"),
+        "must reach the collision check, not the film-base gate: {err}"
+    );
     // --report-file reaching the output through a `..` traversal (the target
     // doesn't exist yet, so canonicalizing the full path alone can't catch it).
     std::fs::create_dir_all(dir.path("sub")).unwrap();
@@ -2199,6 +2219,11 @@ fn convert_rejects_report_file_colliding_with_artifacts() {
         fix.to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
+        // A base must be stated (no default); without it all three of these
+        // conversions exit 2 on the missing-base gate and never reach the
+        // collision check they exist to pin.
+        "--film-base",
+        "0.9,0.6,0.5",
         "--report-file",
         dotted.to_str().unwrap(),
     ]);
@@ -6976,4 +7001,31 @@ fn roll_requires_a_stated_film_base_and_says_so_in_roll_terms() {
     ]);
     assert_eq!(code, 0, "a stated base must convert:\n{stdout}\n{err}");
     assert!(out_dir.join("hdr-48bit_positive.tiff").exists());
+}
+
+#[test]
+fn roll_reports_the_specific_problem_before_the_missing_base() {
+    // Ordering, not just correctness: `validate`'s own policy is
+    // least-specific-diagnosis-last, and "no film base selected" is the least
+    // specific diagnosis there is. A recipe that is *both* baseless and
+    // roll-invalid must name the roll-invalid setting, or the user adds a base
+    // only to be told about a second, unrelated problem.
+    let tmp = TempDir::new("roll-order");
+    let out_dir = tmp.path("out");
+    let recipe = tmp.path("recipe.json");
+    // Baseless AND colorimetric — two independent reasons to refuse.
+    std::fs::write(&recipe, r#"{"input":{"meaning":"colorimetric"}}"#).unwrap();
+    let (code, _stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 4, "the colorimetric rejection must win: {err}");
+    assert!(
+        !err.contains("no film base selected"),
+        "the least-specific diagnosis must not pre-empt the specific one: {err}"
+    );
 }
