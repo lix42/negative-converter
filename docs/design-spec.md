@@ -918,7 +918,7 @@ no interactive prompts.
 | `nc roll` | Convert a batch of frames from one shared, frozen recipe (the batch-**apply** scaffold). Per-frame outputs into `--out-dir` + a roll-level JSON report. Single-frame `convert` is unchanged; roll is additive. |
 | `nc inspect` | Read a scan and emit a JSON report of format, channels, bit depth, candidate rebate regions (coordinates + spread, ready for `--base-region`), suggested `Dmin`. No output image. |
 | `nc estimate` | Run only film-base/`Dmin` estimation; emit JSON with reuse-ready `--film-base` / recipe-fragment forms. `--grid` adds 5-cell agreement-checked sampling for blank reference frames. `--d-max-region` additionally measures the roll-fixed display-white anchor `Dmax` from a fully-exposed reference frame, emitting reuse-ready `--d-max` / `reconstruction.curve.dmax` forms. |
-| `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). |
+| `nc params`  | Print the full default/effective parameter set as JSON (for discovery and recipe scaffolding). The scaffold is a **template to edit, not a runnable recipe**: `film_base.source` has no default, so it prints as `null` and `convert`/`roll` reject it until you state a base. |
 
 ### Recipes (JSON in/out)
 
@@ -1057,8 +1057,9 @@ changed output pixel.
   the default **render** (the curated per-pixel vectors in
   `pipeline::stages::golden`), the default **film-base estimate** (stage 2, `auto`
   over the frozen scan in `pipeline::film_base::golden`, because the render
-  fingerprint is handed a hardcoded base and the recipe fingerprint sees only the
-  string `"auto"`), and the default **recipe values**. Change a default in those
+  fingerprint is handed a hardcoded base and the recipe fingerprint sees only
+  `null` — `film_base.source` has no default, so the base fingerprint names `auto`
+  explicitly), and the default **recipe values**. Change a default in those
   stages and the test fails until the version and the fingerprints are updated
   together. It does **not** cover decode, stage-1b input semantics, the lcms2 output
   transform or embedded ICC bytes (excluded deliberately — both differ by target, so
@@ -1246,10 +1247,12 @@ failed for another reason, whose entry carries both its `memory` block and its
 ### Example invocations
 
 ```bash
-# Default density conversion: auto Dmin, fixed/roll nominal Dmax, 16-bit TIFF,
-# JSON report. The two selector flags are optional (both are the defaults).
+# Default density conversion: fixed/roll nominal Dmax, 16-bit TIFF, JSON report.
+# The two selector flags are optional (both are the defaults); the film-base flag
+# is **not** — `film_base.source` has no default, so every `convert` must state
+# one of `--film-base` / `--base-region` / `--auto-base`.
 nc convert in.tiff -o out.tiff --reconstruction density \
-  --density-curve exponential --report json
+  --density-curve exponential --auto-base --report json
 
 # Transitional rendered float TIFF: --no-d-max selects the exponential curve's
 # unity placement (base → 1.0, detail above), then the current print controls
@@ -1375,9 +1378,11 @@ nc estimate blank.tiff --grid --report json
 # Auto-Neutral; gray-world ≈ Auto-AVG), read the resolved gains back from the
 # report, and freeze them into --white-balance / the roll recipe
 # (print.white_balance = {"explicit": [...]}) — the reuse run is bit-identical.
-nc convert frame01.tiff -o frame01_pos.tiff --auto-wb percentile --report json
+nc convert frame01.tiff -o frame01_pos.tiff --film-base 0.92,0.55,0.42 \
+  --auto-wb percentile --report json
 # → { "white_balance": [1.083, 1.0, 0.941], ... }
-nc convert frame02.tiff -o frame02_pos.tiff --white-balance 1.083,1.0,0.941
+nc convert frame02.tiff -o frame02_pos.tiff --film-base 0.92,0.55,0.42 \
+  --white-balance 1.083,1.0,0.941
 ```
 
 ## 9. Parameter reference (grouped by stage)
@@ -1499,7 +1504,21 @@ object (§8). Names are binding and unknown keys are rejected
 
 ### Film base / Dmin (stage 2)
 The base source is a single mutually-exclusive choice, recipe key
-`film_base.source` (default `"auto"`). The three flags conflict (passing more
+`film_base.source` — **required, with no default**. `convert` and `roll` reject a
+config that does not state one (exit 2, naming the three ways to supply it —
+`roll` accepts none of the flags, so its message points at the shared `--params`
+recipe instead). The measurement commands exist to *produce* a base, so requiring
+one first would be circular: `estimate` resolves an unstated source to `"auto"`,
+and `inspect` takes no film-base flags at all — it always runs the detector.
+
+Why it is required: `Dmin` is the divisor of the density conversion, so it sets
+the black point and the colour balance together, and auto-detection is
+best-effort on real scans (the rebate is a thin inset band behind the holder, not
+the outer margin). Defaulting silently meant the single most consequential
+parameter of a conversion was one nobody had decided. `--auto-base` is still one
+flag — the requirement is that the choice be *stated*, not that it be explicit.
+
+The three flags conflict (passing more
 than one is a usage error); whichever is given replaces a recipe's source:
 - `--film-base R,G,B` ⇒ `{ "explicit": [r, g, b] }` — explicit base transmission.
 - `--base-region x,y,w,h` ⇒ `{ "region": [x, y, w, h] }` — sample this rectangle.
@@ -1507,7 +1526,7 @@ than one is a usage error); whichever is given replaces a recipe's source:
   sampled value but raises a **uniformity warning** in the report (`--strict`
   promotes it) — a mixed rectangle otherwise yields a plausible-looking bad base
   with no signal.
-- `--auto-base` (default) ⇒ `"auto"` — detect the unexposed rebate band behind
+- `--auto-base` ⇒ `"auto"` — detect the unexposed rebate band behind
   the film holder (the inward-scan detector; see the ladder below). On no
   confident band it **fails loudly** and *suggests* `--base-content` — the opt-in
   content source owned by the separate `film-base/content-fallback` task (ladder
@@ -1535,7 +1554,7 @@ keeping the roll color-consistent. The sources, in decreasing reliability:
    `--base-region` at a visible rebate patch manually — `nc inspect` reports the
    detector's candidate rectangles (edge, coordinates, value, spread) so you can
    confirm one instead of measuring it in an image viewer (UI-assisted picking
-   is a roadmap item, §12). Convenience form: `--auto-base` (the default) — real
+   is a roadmap item, §12). Convenience form: `--auto-base` — real
    scans are laid out as
    `dark film holder → thin unexposed rebate → exposed picture`, the rebate being
    a narrow, uniform, bright band *inset behind the holder*, possibly on only
@@ -2063,6 +2082,14 @@ positional `inputs` (files and directories — a directory is expanded to its
 `.tif`/`.tiff` files, sorted; shell globs are expanded by the shell, not by nc)
 **or** `--frames <manifest.json>` (explicit per-frame `input`/`output`/partial-recipe
 `params` overrides, deep-merged onto the shared recipe for that frame only).
+**A `--params` recipe is effectively mandatory for `roll`**, because `roll`
+converts and `film_base.source` has no default while `RollArgs` accepts none of
+the three film-base flags — the recipe is the only place a roll can state its
+base, and a roll with no recipe (or one omitting `film_base.source`) exits 2 with
+a message that says so. That is the intended workflow rather than a limitation:
+`Dmin` is measured once for the roll (`nc estimate`) and frozen into the shared
+recipe as `film_base.source.explicit`, which is also the only source that keeps
+every frame on one base — see the roll-fixed invariant warnings below.
 The shipped schema stores roll-fixed Dmax at `density.dmax`; the target schema
 stores it at `reconstruction.curve.dmax`. The shared recipe configuration
 appears once at the top of the roll report; each frame additionally reports
