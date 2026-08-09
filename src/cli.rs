@@ -373,10 +373,12 @@ pub struct FilmBaseOverrides {
     /// Detect the unexposed rebate band behind the film holder. Best-effort and
     /// fails loudly when no confident band exists — real scans put a thin inset
     /// rebate *behind* the holder, not at the outer margin. **No longer the
-    /// default**: `convert`/`roll` require one of these three flags (or the
-    /// `film_base.source` recipe key), because `Dmin` is a per-roll calibration
+    /// default**: `convert` requires one of these three flags **or** the
+    /// `film_base.source` recipe key, because `Dmin` is a per-roll calibration
     /// that sets black point and colour balance together, and arriving at it by
-    /// omission decided that for you. The measurement commands are unaffected,
+    /// omission decided that for you. `roll` requires the same choice but takes
+    /// **none of these flags** — it accepts only the recipe key, in the shared
+    /// `--params` file. The measurement commands are unaffected,
     /// since they exist to produce a base: `estimate` resolves an unstated source
     /// to this, and `inspect` always runs the detector (it takes no film-base
     /// flags at all).
@@ -4815,9 +4817,11 @@ fn resolve_frames(
                                 mf.input.display()
                             ))
                         })?;
-                        validate_with_remedy(&cfg, FilmBaseRemedy::SharedRecipe)?;
+                        // Same ordering as the shared gate above: roll-specific
+                        // rejections first, the least-specific missing-base last.
                         reject_roll_unsupported(&cfg)?;
                         reject_roll_unsupported_input(&cfg)?;
+                        validate_with_remedy(&cfg, FilmBaseRemedy::SharedRecipe)?;
                         (cfg, Some(ov), setting)
                     }
                     None => (shared.clone(), None, shared_setting),
@@ -4949,11 +4953,17 @@ fn run_roll(args: RollArgs) -> Result<()> {
         meta_pipeline_version,
         sigmoid_anchor_absent,
     } = load_recipe(args.recipe_in.as_deref())?;
+    // Roll-specific rejections run **before** the shared `validate`, and the order
+    // is the same least-specific-diagnosis-last policy `validate` itself now
+    // follows: "this setting cannot work in roll mode" names the offending key,
+    // while "no film base selected" is the least specific diagnosis available. A
+    // recipe that is both baseless and roll-invalid should surface the roll problem
+    // first, or the user adds a base only to meet a second error.
+    reject_roll_unsupported(&shared)?;
+    reject_roll_unsupported_input(&shared)?;
     // `roll`'s remedy for an unstated film base is the shared recipe, never a flag:
     // `RollArgs` accepts none of the three film-base flags.
     validate_with_remedy(&shared, FilmBaseRemedy::SharedRecipe)?;
-    reject_roll_unsupported(&shared)?;
-    reject_roll_unsupported_input(&shared)?;
 
     // A roll's headline guarantee is one frozen, roll-fixed film base shared by
     // every frame. Only an *explicit* base delivers that: `auto`/`region`
