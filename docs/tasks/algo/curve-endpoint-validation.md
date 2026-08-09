@@ -43,32 +43,33 @@ Both come from the resolved curve params. **Evaluate them through the renderer's
 own curve function, not a re-derived closed form** — the closed forms below are for
 explaining the result in the message, not for gating.
 
-**Exponential** (`10^(γ·(D′ − Dmax))`):
+**Black — the same rule for both curves: evaluate the curve at the reachable film
+base**, `D′base`, *not* at an idealized floor. The base sits at `D = 0`, so
+`D′base = density.offset` (from `D′ = scale·D + offset`), and regional balance
+shifts it further. `density.offset` and the balance knobs are **RGB arrays**, so
+there are three base endpoints; define the aggregation (worst channel is the
+obvious choice — a single lifted channel is a coloured black).
 
-- *Black* — **there is no asymptotic floor**: the curve continues toward 0 as
-  `D′ → −∞`. The meaningful quantity is the **film base endpoint**, `D′base`, which
-  is `density.offset` — *not* 0 — because `D′ = scale·D + offset` and the base sits
-  at `D = 0`. Regional balance can shift it further. So the rule is
-  `10^(γ·(D′base − Dmax))`, and `10^(−γ·Dmax)` is only its `offset = 0` special
-  case. Using the special case as the rule would both falsely warn a config whose
-  corrected base reaches deep black and miss one whose base is lifted.
-- *White* — reached **exactly** at `D′ = Dmax` by construction; content above
-  `Dmax` exceeds 1.0 and clips. Real content is known to measure above a
-  leader-derived `Dmax` (`film-base/dmax-anchor-reliability`), so some clipping is
-  expected rather than a defect, and the encode loss counter already reports its
-  magnitude. The exponential half of this task is therefore the **black endpoint**.
+An idealized floor is the wrong metric for either curve. Exponential has none at
+all: `10^(γ·(D′−Dmax))` runs to 0 as `D′ → −∞`. Sigmoid has one, but the base can
+sit well above it — with the shipped parameters the asymptote is 0.0086 while an
+`offset` of `+0.5` renders the base at **0.0923**, a washed-out config the
+asymptote would call healthy.
 
-**Sigmoid** (`t = contrast·(D′ − A)` through toe then shoulder):
+**White — sigmoid only.** Evaluate `s_curve(R)`: what a pixel at the reference
+density renders to. Exponential reaches white exactly at `D′ = Dmax` by
+construction, and content above `Dmax` clips — expected, since real content
+measures above a leader-derived `Dmax` (`film-base/dmax-anchor-reliability`), and
+the encode loss counter already reports the magnitude.
 
-- *Black* — the true asymptote is `s_curve(D′ → −∞)`, which is the pre-shoulder
-  floor `10^(−contrast·A)` **passed through the shoulder soft-min**. The two agree
-  for the shipped `shoulder = 0.6` (0.008621 vs 0.008623) and are equal only at
-  `shoulder = 0`, but they diverge materially inside the valid range
-  (`SIGMOID_KNEE_MAX = 10`): the naive form over-states the floor by 1.75× at
-  `shoulder = 3` and 5× at `shoulder = 5`, which would warn on configs that in fact
-  render a *deeper* black. Take the value from the renderer.
-- *White* — evaluate `s_curve(R)`: what a pixel **at the reference density**
-  renders to.
+### Scope: this judges curve placement, not the displayed image
+
+The print stage runs *after* the curve — `render_print` applies white balance and
+`2^print_exposure`, subtracts `black_point`, then soft-clips — and a named display
+preset can also apply `linear_range`. So a curve black of 0.053 is **not** the
+rendered black: a `black_point` of 0.053 maps it to zero. The warning must say it
+is about curve placement, or it will fire on configurations the print controls
+have already fixed. Do not make display or paper-black claims from curve values.
 
 ### What the white check does and does not claim
 
@@ -107,10 +108,16 @@ Test `s_curve(R)` itself. The closed-form condition
 for the message ("this contrast is below the X your reference implies"), but it must
 not be the gate.
 
-### Where the check can run, per `Dmax` source
+### Where the check can run
 
-`cli::validate` sees only the resolved config, which is enough for `Fixed` and
-`Explicit` but **not** for `Auto`:
+Two resolved values are frame-measured, and **either one alone defers the check**:
+
+- **`DmaxSource::Auto`** — see the table below.
+- **`balance_range: Auto` with a non-zero `shadow_balance`/`highlight_balance`** —
+  the ramp anchors are measured from decoded densities, so `D′base` is not known
+  pre-decode either. The **default is neutral balance**, which skips the regional
+  pass entirely, so the common case stays pre-decode; an explicit
+  `balance_range` does too.
 
 | `DmaxSource` | Numeric `R` known pre-decode? | Where the check runs |
 |---|---|---|
@@ -178,13 +185,19 @@ pre-decode gate is a defensible first cut — but say so in the task's outcome.
   `--sigmoid-contrast`.
 - Exponential `γ = 1.0` with `--d-max 0.391` trips the black rule; with the nominal
   `Dmax = 2.0` it does not.
-- **A non-zero `density.offset` moves the exponential black endpoint** — a config
-  whose `10^(−γ·Dmax)` looks bad but whose actual `D′base` renders deep must *not*
-  warn, and vice versa. This is the test that pins the `offset = 0` special case as
-  a special case.
-- **Shoulder sensitivity:** a large-but-valid `--sigmoid-shoulder` (e.g. 3.0) whose
-  naive pre-shoulder floor would trip the threshold but whose true asymptote does
-  not must emit nothing.
+- **A non-zero `density.offset` moves the black endpoint on *both* curves** — the
+  sigmoid case is the sharp one: shipped parameters with `offset = +0.5` leave the
+  asymptote at 0.0086 but render the base at 0.0923, and must warn. The exponential
+  mirror (a config whose `10^(−γ·Dmax)` looks bad but whose actual `D′base` renders
+  deep must *not* warn) pins the idealized floor as the wrong metric in both
+  directions.
+- **Per-channel:** an `offset` lifting one channel only must warn, and the message
+  must name the channel.
+- **Print controls do not suppress the warning** — a `black_point` that would map
+  the curve black to zero leaves the curve-placement warning intact, and the message
+  says it is about curve placement. (Pins the scope decision above.)
+- **Deferred cases:** `balance_range: Auto` with non-zero balance, like `Auto`
+  `Dmax`, resolves to whatever deferral the task chooses — asserted, not incidental.
 - `--no-d-max` emits nothing on **exponential**; on **sigmoid** it remains a usage
   error (exit 2) with the existing message — assert both, so the exemption cannot
   silently swallow the hard failure.
