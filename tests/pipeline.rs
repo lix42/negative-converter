@@ -7271,3 +7271,134 @@ fn a_suffix_mismatch_outranks_the_missing_base() {
     );
     assert!(!bad.exists());
 }
+
+#[test]
+fn sdr_presets_write_lossless_16_bit_tiffs_through_the_modern_pipeline() {
+    // The two SDR presets: same render, different destination gamut, both 16-bit
+    // integer TIFF (lossless) and both `convert`-only.
+    let tmp = TempDir::new("sdr-presets");
+    let scan = fixture("hdr-48bit.tif");
+
+    for (preset, encoding) in [
+        ("compatibility", "srgb-u16-tiff"),
+        ("display-p3", "display-p3-u16-tiff"),
+    ] {
+        let out = tmp.path(&format!("{preset}.tiff"));
+        let (code, stdout, err) = run(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "0.9,0.6,0.5",
+        ]);
+        assert_eq!(code, 0, "{preset}: {err}");
+        assert!(is_tiff(&out), "{preset} must write a TIFF");
+
+        let report = json(&stdout);
+        assert_eq!(report["output_render"]["preset"], preset);
+        assert_eq!(report["output_render"]["encoding"], encoding);
+        // Both run the shared print controls *and* a display render — that is what
+        // separates them from the legacy TIFF path, which does neither.
+        assert_eq!(report["output_render"]["print_controls"], true);
+        assert_eq!(report["output_render"]["display_render"], true);
+        assert_eq!(report["output_render"]["working_mapping"], "nc-film-rgb-v1");
+
+        // A `.jpg` path is refused before anything is written.
+        let bad = tmp.path(&format!("{preset}.jpg"));
+        let (code, _stdout, err) = run(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            bad.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "0.9,0.6,0.5",
+        ]);
+        assert_eq!(code, 2, "{preset} must reject a .jpg path");
+        assert!(err.contains(".tif"), "{preset}: {err}");
+        assert!(!bad.exists());
+    }
+}
+
+#[test]
+fn the_two_sdr_presets_differ_only_in_gamut() {
+    // They share a render and differ in destination gamut, so the files must not
+    // be identical — the falsifiable half of "same render, different gamut". If
+    // they ever match byte-for-byte, one of them is not applying its own gamut.
+    let tmp = TempDir::new("sdr-gamut");
+    let scan = fixture("hdr-48bit.tif");
+    let mut bytes = Vec::new();
+    for preset in ["compatibility", "display-p3"] {
+        let out = tmp.path(&format!("{preset}.tiff"));
+        let (code, _stdout, err) = run(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "0.9,0.6,0.5",
+        ]);
+        assert_eq!(code, 0, "{preset}: {err}");
+        bytes.push(std::fs::read(&out).unwrap());
+    }
+    assert_ne!(
+        bytes[0], bytes[1],
+        "sRGB and Display P3 renditions must not be byte-identical"
+    );
+}
+
+#[test]
+fn every_tiff_preset_now_states_its_suffix_including_the_oldest_two() {
+    // Before the SDR presets landed, `legacy` and `film-master` pinned no suffix,
+    // so `nc convert -o out.jpg` wrote a TIFF named `.jpg` with exit 0 and no
+    // warning — the silently-misnamed-file mistake every newer preset guards.
+    // An **extensionless** path is refused too, deliberately (design-spec §5): a file
+    // called `positive` is as misleading about its contents as `positive.jpg`, and the
+    // diagnosis must be about the path rather than about `--output-preset legacy`,
+    // which the user need never have typed.
+    let tmp = TempDir::new("suffix-symmetry");
+    let scan = fixture("hdr-48bit.tif");
+    let convert = |out: &std::path::Path, argv: &[&str]| {
+        let mut full = vec![
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.6,0.5",
+        ];
+        full.extend_from_slice(argv);
+        run(&full)
+    };
+    for argv in [vec![], vec!["--output-preset", "film-master"]] {
+        for name in ["out.jpg", "out"] {
+            let bad = tmp.path(name);
+            let (code, _stdout, err) = convert(&bad, &argv);
+            assert_eq!(code, 2, "{argv:?} must reject `{name}`: {err}");
+            assert!(!bad.exists(), "{argv:?} must write nothing for `{name}`");
+        }
+        // The positive control: without it, a rule that rejected *every* path would
+        // pass the assertions above.
+        let good = tmp.path(if argv.is_empty() {
+            "legacy.tiff"
+        } else {
+            "master.tiff"
+        });
+        let (code, _stdout, err) = convert(&good, &argv);
+        assert_eq!(code, 0, "{argv:?} must accept a .tiff path: {err}");
+        assert!(good.exists(), "{argv:?} must write the file");
+    }
+    // The default path's diagnosis names the requirement, not a flag nobody passed.
+    let (_code, _stdout, err) = convert(&tmp.path("out"), &[]);
+    assert!(err.contains(".tif"), "{err}");
+    assert!(
+        !err.contains("--output-preset"),
+        "the default path must not blame an unpassed flag: {err}"
+    );
+}

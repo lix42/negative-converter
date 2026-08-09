@@ -39,7 +39,7 @@ use std::time::Instant;
 
 use crate::algo;
 use crate::pipeline::color::{self, OutputSpace};
-use crate::pipeline::{render_split, working_space};
+use crate::pipeline::{render_split, sdr, working_space};
 use crate::types::{
     FilmBase, LinearImage, OutputParams, OutputPreset, PrintParams, Reconstruction, Result,
 };
@@ -168,11 +168,46 @@ pub fn render(
         | OutputPreset::HdrHlg
         | OutputPreset::HdrLinearTiff
         | OutputPreset::HdrPqTiff
-        | OutputPreset::HdrHlgTiff => Err(crate::types::NcError::Other(format!(
+        | OutputPreset::HdrHlgTiff
+        | OutputPreset::DisplayP3
+        | OutputPreset::Compatibility => Err(crate::types::NcError::Other(format!(
             "`{}` must use stages::render_display_source",
             output_params.preset.name()
         ))),
     }
+}
+
+/// The `display-p3` / `compatibility` render: the shared display source, one SDR
+/// rendition in the requested gamut, and the output-encoded pixels plus their ICC.
+///
+/// Returns the same [`Rendered`] the legacy branch does, which is deliberate — an
+/// SDR preset's product *is* a rendered image and a profile, so it reuses the
+/// existing 16-bit TIFF encode path rather than introducing a container of its own.
+/// What differs from `legacy` is everything upstream: this crosses the ACEScg
+/// boundary and runs the shared print controls plus `pipeline::sdr`'s
+/// reference-white-preserving shoulder and gamut mapping, where `legacy` applies
+/// the print controls before a plain ICC transform.
+pub fn render_sdr_preset(
+    image: &LinearImage,
+    film_base: &FilmBase,
+    reconstruction: &Reconstruction,
+    print: &PrintParams,
+    gamut: sdr::SdrGamut,
+) -> Result<Rendered> {
+    let source = render_display_source(image, film_base, reconstruction, print)?;
+    let mut timings = source.timings;
+    let started = Instant::now();
+    let rendered = sdr::render(&source.shared, gamut, print.highlight_compress)?;
+    // The transform into the output space is colour work, like the gain-map and
+    // Rec.2100 branches; only the container write counts as encode.
+    let (image, icc, _metadata) = color::encode_rendered_sdr(rendered)?;
+    timings.color_ms += ms_since(started);
+    Ok(Rendered {
+        image,
+        icc,
+        convert: source.convert,
+        timings,
+    })
 }
 
 /// Reconstruct once, cross the NC film RGB v1 boundary, then resolve and apply

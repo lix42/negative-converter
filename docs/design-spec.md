@@ -215,8 +215,8 @@ detector proposes as possible rebate.
   offsets), gain-map JPEG for the explicit `ultra-hdr-v1` preset, and 10-bit 4:4:4
   AVIF for the explicit `hdr-pq` / `hdr-hlg` presets.
 - **Current implemented preset selection:**
-  `--output-preset <legacy|film-master|ultra-hdr-v1|hdr-pq|hdr-hlg|hdr-linear-tiff|hdr-pq-tiff|hdr-hlg-tiff>`
-  / recipe key `output.preset` (default `legacy`). Exactly **eight** names are
+  `--output-preset <legacy|film-master|ultra-hdr-v1|display-p3|compatibility|hdr-pq|hdr-hlg|hdr-linear-tiff|hdr-pq-tiff|hdr-hlg-tiff>`
+  / recipe key `output.preset` (default `legacy`). Exactly **ten** names are
   accepted today; every other planned name below is rejected with a
   "does not accept yet" message, and the pre-release `scene-master` is rejected as an
   unreleased-schema break (no alias). `legacy` **is** the no-preset state, so it
@@ -268,8 +268,8 @@ detector proposes as possible rebate.
     Rec.709→P3 primaries remap — Rec.709 ⊂ P3, no gamut compression — plus the sRGB
     TRC. The shipped `ultra-hdr-v1` path instead takes rendered-linear Display P3
     from the SDR stage and applies the matching transfer encoding without a second
-    gamut transform. The general `display-p3` preset adopts that same boundary when
-    `output/presets` activates it.)
+    gamut transform. The shipped `display-p3` *preset* now takes that same boundary,
+    which is what distinguishes it from this profile axis.)
   Either default can be overridden explicitly. Output is tagged with the embedded
   ICC profile for the chosen space.
 - **Working-space intent:** the current implementation treats reconstructed
@@ -292,8 +292,8 @@ detector proposes as possible rebate.
   - `ultra-hdr-v1` ⇧ — explicit legacy Display P3 gain-map JPEG (convert only;
     reads as plain SDR on Apple platforms, which ignore the legacy XMP dialect);
   - `gain-map-hdr` — future default, backward-compatible display HDR;
-  - `display-p3` — 16-bit losslessly stored wide-gamut SDR TIFF;
-  - `compatibility` — 16-bit losslessly stored sRGB SDR TIFF;
+  - `display-p3` ⇧ — 16-bit losslessly stored wide-gamut SDR TIFF (convert only);
+  - `compatibility` ⇧ — 16-bit losslessly stored sRGB SDR TIFF (convert only);
   - `hdr-pq` ⇧ — single-rendition BT.2020 / Rec.2100 PQ AVIF (convert only);
   - `hdr-hlg` ⇧ — explicit HLG/broadcast-oriented AVIF (convert only);
   - `hdr-linear-tiff` ⇧ — 32-bit float display-linear BT.2020 HDR interchange TIFF (convert only);
@@ -351,15 +351,30 @@ detector proposes as possible rebate.
   percentiles. An `auto` range with equal shadow and highlight balances — including the
   neutral default — consults no range and stays accepted.
   The resolved-branch record lands in the report as `output_render` (§8). The
-  *remaining* suffix table is still owned by `output/presets`; each shipped preset
-  contributes its own row to `cli::required_extensions` (`.jpg`/`.jpeg` for
-  `ultra-hdr-v1`, `.avif` for `hdr-pq`/`hdr-hlg`, and `.tif`/`.tiff` for all three of
-  `hdr-linear-tiff`, `hdr-pq-tiff` and `hdr-hlg-tiff`). `film-master` deliberately pins **no** row: it is a TIFF, the
-  existing `.tif`/`.tiff` convention already covers it, and leaving the row absent
-  is what keeps it usable from `nc roll` (whose automatic
-  `<stem>_positive.tiff` names it accepts). That coupling is deliberate — a
-  preset that pins a suffix is `convert`-only, because roll derives frame names
-  itself and nothing yet makes that derivation honour a required extension.
+  suffix table in `cli::required_extensions` is now **complete**: `.jpg`/`.jpeg`
+  for `ultra-hdr-v1`, `.avif` for `hdr-pq`/`hdr-hlg`, and `.tif`/`.tiff` for
+  `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`, `display-p3`,
+  `compatibility`, **`film-master` and `legacy`**. The last two previously pinned
+  no row, so `nc convert -o out.jpg` wrote a TIFF named `.jpg` with exit 0 and no
+  warning — the silently-misnamed-file mistake every newer preset was already
+  guarded against.
+
+  Since every preset now states a rule, an **extensionless** output path
+  (`-o positive`) is a usage error too — a decision, not a side effect: a file with
+  no extension misleads about its contents exactly as a wrongly-named one does, and
+  nc is unreleased, so the strict rule costs nothing now. `nc convert -o positive`
+  previously exited 0. The **diagnosis names the path, not a preset**, whenever the
+  resolved preset is `legacy`: that is the no-preset default, so blaming
+  `--output-preset legacy` would name a flag the user need never have typed. A
+  *named* preset is named in its own message.
+
+  **Roll capability is a separate axis**, not derived from that table. It used to
+  be ("pins a suffix" ⇒ `convert`-only), and that inference died when the table
+  was completed — deriving it would refuse every preset and leave `nc roll` with
+  nothing to run. `legacy` and `film-master` are the roll-capable presets; the
+  rest are `convert`-only because roll derives `<stem>_positive.tiff` for every
+  frame and its naming, manifests and collision handling are not container-aware
+  yet (`output/presets`).
 - **Metadata:** the effective parameter set (recipe) and key estimated values are
   written to a **sidecar JSON** next to the output (paired by name). The sidecar is
   the two-key envelope `{ "meta": {…identity…}, "params": {…recipe…} }`, where
@@ -432,9 +447,9 @@ curve) and owns the resulting `FilmRgbImage` boundary:
   `color::hdr_linear_bt2020_icc`. Its peak memory phase is the render rather
   than the encode — f32 needs no quantization buffer and the `tiff` writer streams
   strips instead of assembling a container in memory. It is not alone in that:
-  `hdr-pq-tiff`/`hdr-hlg-tiff` peak at render for the same reason, and
-  `ultra-hdr-v1` does because its four simultaneous display buffers outweigh its
-  encode set. Which phase peaks is per profile and pinned by
+  `hdr-pq-tiff`/`hdr-hlg-tiff` and the SDR presets `display-p3`/`compatibility`
+  peak at render for the same reason, and `ultra-hdr-v1` does because its four
+  simultaneous display buffers outweigh its encode set. Which phase peaks is per profile and pinned by
   `pipeline::memory`'s `which_phase_peaks_is_per_profile_and_measured_not_assumed`.
 - `hdr-pq-tiff` / `hdr-hlg-tiff` — the **same rendition** `hdr-pq` / `hdr-hlg`
   produce (identical `render_linear` + `encode_transfer`), quantized once to
@@ -1428,9 +1443,9 @@ object (§8). Names are binding and unknown keys are rejected
   (`OutputParams::depth()`), which is *not* the primary container's depth for the
   display presets. In full:
   - 16-bit — the legacy default; `--output-preset hdr-pq-tiff` / `hdr-hlg-tiff`
-    (whose primary is itself 16-bit); and the three presets whose primary is not a
-    TIFF at all: `ultra-hdr-v1` (fixed 8-bit JPEG) and `hdr-pq` / `hdr-hlg`
-    (10-bit AVIF).
+    and `display-p3` / `compatibility` (whose primaries are themselves 16-bit);
+    and the three presets whose primary is not a TIFF at all: `ultra-hdr-v1`
+    (fixed 8-bit JPEG) and `hdr-pq` / `hdr-hlg` (10-bit AVIF).
   - 32-bit float — legacy `--output-hdr`; `--output-preset film-master`; and
     `--output-preset hdr-linear-tiff`. The last two resolve f32 from the preset
     without consulting `output.hdr`.
@@ -1904,7 +1919,7 @@ covers a full disk, a permissions error, a crash and `SIGINT`, and the remaining
 would cost a Unix-only code path for output that is reproducible by re-running.
 
 - `-o, --output <path>` (required)
-- `--output-preset <legacy|film-master|ultra-hdr-v1|hdr-pq|hdr-hlg|hdr-linear-tiff|hdr-pq-tiff|hdr-hlg-tiff>`
+- `--output-preset <legacy|film-master|ultra-hdr-v1|display-p3|compatibility|hdr-pq|hdr-hlg|hdr-linear-tiff|hdr-pq-tiff|hdr-hlg-tiff>`
   — the atomic output **policy** choice;
   recipe key `output.preset` (default `legacy`). One mutually-exclusive enum field,
   never parallel bools: a preset resolves a whole coherent container/depth/profile
@@ -1949,6 +1964,20 @@ would cost a Unix-only code path for output that is reproducible by re-running.
     libultrahdr-based readers do consume the legacy dialect. This is why the
     future `gain-map-hdr` default is dual-dialect rather than legacy-only; see
     `scripts/iso-decoder-oracle/` for the harness that measures it.
+  - `display-p3` and `compatibility` are explicit single-rendition **SDR**
+    presets, accepted by `convert` only, each requiring a `.tif`/`.tiff` output.
+    They write 16-bit integer TIFF — lossless, no lossy codec — with a 203 cd/m²
+    reference white, through the modern display stage: NC film RGB v1 → linear
+    ACEScg → the shared print controls → `pipeline::sdr`, including its
+    reference-white-preserving shoulder and gamut mapping into the destination.
+    They differ **only** in that destination: Display P3 for the first, sRGB for
+    the second, which is the widest-support output nc writes.
+
+    The distinction from the `legacy` TIFF path is the *pipeline*, not the
+    profile: `legacy` applies the print controls **before** a plain
+    working→output ICC transform and never crosses the ACEScg boundary. Which of
+    these should replace `legacy` as the default is
+    `output/sdr-preset-followups`, because flipping it changes pixels.
   - `hdr-pq` and `hdr-hlg` are explicit single-rendition display-HDR presets,
     accepted by `convert` only, each requiring an `.avif` output path. They write
     10-bit, full-range, 4:4:4 AVIF (AV1 High Profile, level capped at 6.0 for the
@@ -2012,9 +2041,9 @@ would cost a Unix-only code path for output that is reproducible by re-running.
     the report's **`hdr_coded_tiff`** block instead — the coded counterpart of
     `hdr-linear-tiff`'s `hdr_linear_tiff` block, and mirrored into the sidecar's
     `meta` for the same `--report none` reason (§5).
-  - Every other planned name (`gain-map-hdr`, `display-p3`, `compatibility`,
-    `custom`) is rejected with a distinct "not accepted yet" message rather than
-    a generic unknown-value error, and the pre-release `scene-master` is rejected
+  - Every other planned name (`gain-map-hdr`, `custom`) is rejected with a
+    distinct "not accepted yet" message rather than a generic unknown-value
+    error, and the pre-release `scene-master` is rejected
     as an unreleased-schema break naming the rename — **not** an alias. The flag
     and the recipe key share one parser, so a name gets the same diagnosis
     wherever it appears.
@@ -2041,14 +2070,16 @@ would cost a Unix-only code path for output that is reproducible by re-running.
   compression) plus the sRGB TRC. Consuming already-rendered linear-P3 values as a
   pure transfer-encode — and the ACEScg→P3 render and SDR gamut policy that produce
   them — is the target state owned by `sdr-display-rendering`, not this axis. This
-  is the profile/encoding axis; the full `display-p3` *preset* (container,
-  tone/gamut policy) remains a planned `output/presets` name not yet accepted.
+  is the profile/encoding axis, and it stays distinct from the shipped `display-p3`
+  *preset*, which resolves container, depth and tone/gamut policy together and
+  reaches P3 through the modern display stage rather than through this transform.
 - `--bigtiff auto|on|off` (default `auto`)
 
 Planned `output/presets` replaces the depth-only default with `gain-map-hdr` and
-explicit `display-p3`, `compatibility`, and `custom` policies. Already accepted:
-`film-master`, `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, and — since
-`output/lossless-hdr-tiff` — `hdr-linear-tiff`, `hdr-pq-tiff` and `hdr-hlg-tiff`.
+the explicit `custom` policy. Already accepted: `film-master`, `ultra-hdr-v1`,
+`hdr-pq`, `hdr-hlg`, — since `output/lossless-hdr-tiff` — `hdr-linear-tiff`,
+`hdr-pq-tiff` and `hdr-hlg-tiff`, and — since the SDR half of `output/presets` —
+`display-p3` and `compatibility`.
 `display-p3` and `compatibility` are 16-bit losslessly stored TIFF; `hdr-pq` and
 `hdr-hlg` are AVIF, while the three shipped HDR TIFF policies provide
 linear-float or losslessly stored PQ/HLG interchange. `film-master` encodes NC
@@ -2067,9 +2098,9 @@ explicitly reset recipe values to defaults, and the resolved report records the
 effective values/provenance and that no display transfer ran. A selected
 `correction.profile` is not a downstream creative/print/display control:
 corrected output remains `film-master` and records mandatory profile
-identity/hash/scope provenance. Of the policies in this migration list, only the *convenient display* policies
-(`gain-map-hdr`, `display-p3`, `compatibility`, `custom`) and the default migration
-remain unaccepted; the eight explicit presets above are live.
+identity/hash/scope provenance. Of the policies in this migration list, only
+`gain-map-hdr`, `custom`, and the default migration remain unaccepted; the ten
+explicit presets above are live.
 `nc roll` migration is part of the preset task: automatic names use
 each resolved container suffix, manifest/per-frame overrides validate
 independently, and each sidecar derives from its final image path. The single roll
