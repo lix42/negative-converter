@@ -2124,27 +2124,39 @@ pub fn validate_convert(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> 
     // Flag-shape first: "these two requests contradict each other" is a clearer
     // diagnosis than whatever value rule the same config might also trip.
     reject_output_sdr_with_named_preset(cfg, args)?;
+    // The output path's suffix is likewise a property of *this invocation*, so it
+    // outranks `validate`'s value rules — and specifically outranks the
+    // missing-base rule, which `validate` deliberately reports last because an
+    // omission is the least specific diagnosis available. Without this ordering,
+    // `-o out.jpg --output-preset hdr-pq` with no base demands a base first and
+    // only then mentions the suffix, making the user fix two things in series.
+    reject_output_suffix_mismatch(cfg, args)?;
     validate(cfg)?;
-    if let Some(extensions) = required_extensions(cfg.output.preset)
-        && !extensions.iter().any(|want| {
-            args.output
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
-        })
-    {
-        // The path is never rewritten — a mismatch is a usage error that names the
-        // extensions the resolved container accepts (design-spec §5).
-        let list = extensions
-            .iter()
-            .map(|e| format!(".{e}"))
-            .collect::<Vec<_>>()
-            .join(" or ");
-        return Err(NcError::Usage(format!(
-            "--output-preset {} requires an output path ending in {list}",
-            cfg.output.preset.name()
-        )));
-    }
     Ok(())
+}
+
+/// The resolved container's suffix rule: the output path is never rewritten, so a
+/// mismatch is a usage error naming what the container accepts (design-spec §5).
+fn reject_output_suffix_mismatch(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
+    let Some(extensions) = required_extensions(cfg.output.preset) else {
+        return Ok(());
+    };
+    if extensions.iter().any(|want| {
+        args.output
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+    }) {
+        return Ok(());
+    }
+    let list = extensions
+        .iter()
+        .map(|e| format!(".{e}"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    Err(NcError::Usage(format!(
+        "--output-preset {} requires an output path ending in {list}",
+        cfg.output.preset.name()
+    )))
 }
 
 /// Output-path extensions a preset's resolved container accepts, or `None` when
