@@ -83,6 +83,29 @@ carries the rows.
   SDR contract as machine-readable fields (the `hdr_coded_tiff` block is the
   shape to follow), and `RenderedSdr::metadata()`'s `#[allow(dead_code)]` is gone.
 
+## Carried-over review findings (not fixed in the shipping PRs)
+
+Both are P2s raised during review of the defaults/preset PRs and deliberately
+left out of them — real, bounded, and not defaults questions.
+
+- **The SDR-range warning is luminance-only, so it can misfire on saturated
+  colour** (`pipeline/hdr.rs`, `sdr_range_warning`). MaxCLL is a luminance
+  measure, so a rendered BT.2020 blue near `[0, 0, 4]` sits around 48 nits of
+  luminance while its blue channel uses substantial per-channel headroom that no
+  SDR-range signal can carry without clipping or shifting the colour. The
+  warning would then claim the whole signal is SDR-range and `--strict` would
+  fail valid HDR colour-volume content. Fix by also checking the rendered
+  per-channel peak, or by narrowing the claim to "no *luminance* headroom" —
+  the latter is the smaller change and matches what MaxCLL actually witnesses.
+- **The output-suffix rule does not reach `roll` frames** (`cli.rs`,
+  `resolve_frames`). `validate_convert` composes the suffix check with
+  `validate`, but a `--frames` manifest carrying an explicit
+  `"output": "frame.jpg"` is resolved on the path that calls `validate` alone,
+  so a `legacy`/`film-master` frame can still be pointed at a container those
+  presets cannot write. Route the per-frame resolution through the same
+  composed gate rather than adding a second check — a parallel check is exactly
+  how the suffix rule and the convert-only refusal drifted apart before.
+
 ## Dependencies
 
 - [Output presets and guidance](presets.md)
