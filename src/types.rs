@@ -129,10 +129,12 @@ pub enum ReconstructionType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum DensityCurveType {
-    /// The straight-line `10^(gamma·(D′ − Dmax))` curve — the default.
-    #[default]
+    /// The straight-line `10^(gamma·(D′ − Dmax))` curve — the explicit diagnostic
+    /// option since 2026-08-08.
     Exponential,
-    /// The S-curve (photographic H&D / paper-response) with toe/shoulder knees.
+    /// The S-curve (photographic H&D / paper-response) with toe/shoulder knees —
+    /// **the default**, in step with [`DensityCurve::default`].
+    #[default]
     Sigmoid,
 }
 
@@ -676,7 +678,24 @@ pub struct ExponentialParams {
 impl Default for ExponentialParams {
     fn default() -> Self {
         Self {
-            gamma: 1.0,
+            // `2.0`, not the straight line's `1.0` (2026-08-08). Contrast 1.0 is
+            // the slope at which this curve confines the whole image to
+            // `Dmax` decades and leaves the black floor at 57–72/255 — the
+            // measured "pale, not dark" defect `algo/reference-anchored-sigmoid`
+            // was opened for. `reports/sigmoid-reference-baseline.md` measured the
+            // remedy on user-confirmed shadow patches: contrast 2.0 takes the
+            // floor 72 → 12/255.
+            //
+            // It is a partial fix and the report says so. Because this curve pins
+            // white at `Dmax` and has **no anchor placement** (unlike the sigmoid's
+            // `AnchorPlacement`), steepening pivots the line *around white* and
+            // drags everything below it down — costing 2.75 EV of midtone
+            // placement. The two knobs fight, which is exactly what an anchor other
+            // than white avoids, and why the sigmoid is now the default curve.
+            // Giving this curve a mid-grey anchor is filed as
+            // `algo/exponential-mid-grey-anchor`; until then this is the better of
+            // two imperfect slopes, not a calibrated value.
+            gamma: 2.0,
             dmax: DmaxSource::Fixed,
         }
     }
@@ -838,8 +857,21 @@ pub enum DensityCurve {
 }
 
 impl Default for DensityCurve {
+    /// **The sigmoid (2026-08-08).** The exponential straight line was the default
+    /// through Step 1 because it was the first curve implemented, not because it
+    /// renders film well: pinning white at `Dmax` with a photographic slope is
+    /// geometrically unable to place both the black floor and the midtones (see
+    /// [`ExponentialParams::default`] and `reports/sigmoid-reference-baseline.md`).
+    /// The sigmoid pins **mid-grey** instead, which removes that conflict, and its
+    /// contrast/shoulder defaults are *derived* from manufacturer reference
+    /// densities rather than chosen.
+    ///
+    /// `algo/sigmoid-parameter-calibration` remains open, so those values are
+    /// provisional — but provisional-and-derived beats a slope that was never a
+    /// rendering intent. The exponential stays available as the explicit
+    /// diagnostic straight line.
     fn default() -> Self {
-        DensityCurve::Exponential(ExponentialParams::default())
+        DensityCurve::Sigmoid(SigmoidParams::default())
     }
 }
 
@@ -1660,10 +1692,32 @@ mod tests {
             let json = serde_json::to_string(&curve).unwrap();
             assert_eq!(serde_json::from_str::<DensityCurve>(&json).unwrap(), curve);
         }
-        // The wire form is internally tagged with the documented key names.
+        // The wire form is internally tagged with the documented key names. The
+        // default is the sigmoid; the exponential's own wire shape is asserted
+        // separately so both variants stay pinned regardless of which is default.
+        assert_eq!(
+            serde_json::to_string(&DensityCurve::Exponential(ExponentialParams::default()))
+                .unwrap(),
+            r#"{"type":"exponential","gamma":2.0,"dmax":"fixed"}"#
+        );
         assert_eq!(
             serde_json::to_string(&DensityCurve::default()).unwrap(),
-            r#"{"type":"exponential","gamma":1.0,"dmax":"fixed"}"#
+            r#"{"type":"sigmoid","contrast":2.0686874,"toe":0.2,"shoulder":0.6,"dmax":"fixed","anchor":{"mid-at-dmax-fraction":0.5}}"#
+        );
+    }
+
+    #[test]
+    fn curve_selector_default_matches_the_default_curve() {
+        // `DensityCurveType`'s `#[default]` and `DensityCurve`'s `Default` impl are
+        // two spellings of one decision, and they drifted apart once: the selector
+        // still said `exponential` after the default curve became the sigmoid. That
+        // is invisible in practice only because nothing calls
+        // `DensityCurveType::default()` today — a latent trap, plus `--help` text
+        // derived from the wrong answer. Pin them to each other rather than waiting
+        // for the first caller to find it.
+        assert_eq!(
+            DensityCurveType::default(),
+            DensityCurve::default().curve_type()
         );
     }
 
@@ -1679,7 +1733,11 @@ mod tests {
             })
         );
         let c: DensityCurve = serde_json::from_str(r#"{"type":"exponential"}"#).unwrap();
-        assert_eq!(c, DensityCurve::default());
+        assert_eq!(
+            c,
+            DensityCurve::Exponential(ExponentialParams::default()),
+            "a tagged-but-empty exponential fills its OWN defaults, not the default curve's"
+        );
         // A present-but-untagged curve object must not guess a variant.
         assert!(serde_json::from_str::<DensityCurve>(r#"{"gamma":1.2}"#).is_err());
     }
@@ -1747,18 +1805,18 @@ mod tests {
         assert_eq!(json["schema_version"], 1);
         assert_eq!(json["type"], "density");
         assert_eq!(json["density"]["scale"], serde_json::json!([1.0, 1.0, 1.0]));
-        assert_eq!(json["curve"]["type"], "exponential");
+        assert_eq!(json["curve"]["type"], "sigmoid");
     }
 
     #[test]
     fn reconstruction_partial_input_normalizes() {
-        // Empty object = all defaults: density with exponential defaults.
+        // Empty object = all defaults: density with the default (sigmoid) curve.
         let r: Reconstruction = serde_json::from_str("{}").unwrap();
         assert_eq!(r, Reconstruction::default());
         // Omitted schema_version defaults to 1; an explicit 1 also parses.
         let r: Reconstruction = serde_json::from_str(r#"{"schema_version":1}"#).unwrap();
         assert_eq!(r, Reconstruction::default());
-        // Omitted curve under density normalizes to tagged exponential defaults.
+        // Omitted curve under density normalizes to the default tagged curve.
         let r: Reconstruction =
             serde_json::from_str(r#"{"type":"density","density":{"scale":[1.1,1.0,0.9]}}"#)
                 .unwrap();

@@ -54,7 +54,8 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// | version | default render |
 /// |---|---|
 /// | 0 | the Step-1 MVP baseline recorded in `docs/reports/v0-baseline.md`: per-frame `auto` `Dmax` (99.5th-percentile density), exponential curve, no auto WB |
-/// | 1 | **current** — every default change since that baseline, collapsed into one label: `film-base/dmax-reference` replaced the per-frame anchor with the roll-fixed nominal `Dmax = 2.0` **density**, `film-base/auto-base-redesign` replaced the auto film-base detector with the inward-scan rebate detector, and `core/input-semantics` added the stage-1b transfer/meaning resolution. The tagged-`reconstruction` split was proven bit-identical and is *not* part of the change. |
+/// | 1 | every default change since that baseline, collapsed into one label: `film-base/dmax-reference` replaced the per-frame anchor with the roll-fixed nominal `Dmax = 2.0` **density**, `film-base/auto-base-redesign` replaced the auto film-base detector with the inward-scan rebate detector, and `core/input-semantics` added the stage-1b transfer/meaning resolution. The tagged-`reconstruction` split was proven bit-identical and is *not* part of the change. |
+/// | 2 | **current** — three render defaults moved together (2026-08-08, `algo/negative-reconstruction-density-curves`): the nominal `Fixed` anchor `Dmax = 2.0` → **1.3**, the default density curve exponential → **sigmoid** (mid-grey anchored), and `ExponentialParams::gamma` 1.0 → **2.0** for anyone still selecting that curve explicitly. Measured in `docs/reports/render-defaults-v2.md`. Film-base estimation is untouched, which is why the row's `base` fingerprint is unchanged. |
 ///
 /// **The v1 row is a collapse, not a single step.** `docs/reports/v0-baseline.md`
 /// measured its numbers with an **explicit** `--film-base`, so those numbers stay
@@ -81,7 +82,7 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// test fails until the fingerprints **and** this constant are updated together.
 /// Read `PipelineFingerprint` for exactly which stages those are — the gate is not
 /// whole-pipeline coverage and must not be described as if it were.
-pub const PIPELINE_VERSION: u32 = 1;
+pub const PIPELINE_VERSION: u32 = 2;
 
 /// The recorded ⟨`pipeline_version`, fingerprints, behavior⟩ rows — the
 /// machine-enforced half of "the behavioral version cannot silently drift" (see
@@ -107,27 +108,48 @@ pub const PIPELINE_VERSION: u32 = 1;
 /// Test-only: nothing at runtime reads it, and gating it on `cfg(test)` keeps it
 /// out of the shipped binary without needing a `dead_code` allow.
 #[cfg(test)]
-pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[PipelineFingerprint {
-    pipeline_version: 1,
-    render: "1fce7367c4bfec58",
-    base: "01c5acccc36a3388",
-    // Refreshed in place when `film_base.source` lost its default: the default
-    // document now carries `"source": null`, so the recipe hash moved. `render`
-    // and `base` are byte-identical to what this row has always carried — no
-    // pixel moved, and a recipe that states a base renders exactly as it did —
-    // which is precisely the "new value in the default document, no default
-    // pixel change" case this field sanctions editing for.
-    recipe: "5bd3e903db3a02b5",
-    // `behavior` still references `PIPELINE_BEHAVIOR`, whose text was **amended**
-    // (not re-versioned) by the same change: its opening clause described how the
-    // base was *obtained* by default, and there is no default any more. Amending a
-    // shipped version's description is normally forbidden — it is permitted here
-    // only because `render`/`base` did not move, so the render v1 labels is
-    // unchanged and the amended clause described a resolution step that is no
-    // longer part of the default render at all. `render` and `base` remain
-    // never-edit.
-    behavior: PIPELINE_BEHAVIOR,
-}];
+pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
+    PipelineFingerprint {
+        pipeline_version: 1,
+        render: "1fce7367c4bfec58",
+        base: "01c5acccc36a3388",
+        // Refreshed in place when `film_base.source` lost its default: the default
+        // document now carries `"source": null`, so the recipe hash moved. `render`
+        // and `base` are byte-identical to what this row has always carried — no
+        // pixel moved, and a recipe that states a base renders exactly as it did —
+        // which is precisely the "new value in the default document, no default
+        // pixel change" case this field sanctions editing for.
+        recipe: "5bd3e903db3a02b5",
+        // `behavior` is a **string literal** here, not `PIPELINE_BEHAVIOR`. It used to
+        // be the constant, back when v1 was current; the v2 bump below took the
+        // constant over, so v1's description had to be frozen as the text it carried
+        // — that is the whole point of recording the description per row. The literal
+        // is v1's final text: it had been *amended* once (dropping an opening "auto
+        // rebate film base" clause when `film_base.source` lost its default), which
+        // was permitted only because v1's `render`/`base` did not move, so the render
+        // v1 labels was unchanged and the removed clause described a resolution step
+        // no longer part of any default render. `render` and `base` remain never-edit.
+        behavior: "roll-fixed nominal Dmax 2.0 density, exponential density \
+     curve, no auto white balance",
+    },
+    // v2 — the default *render* changed, which is what this table exists for.
+    // Three defaults moved together (2026-08-08):
+    //   * `NOMINAL_DMAX` 2.0 → 1.3, because every roll measured in this repo
+    //     lands 0.90–1.74 and an anchor above all of them darkened the frame by
+    //     the difference (5.09x linear on the Ektar reference);
+    //   * the default curve exponential → sigmoid, which pins mid-grey instead of
+    //     white and so can place the black floor and the midtones at once;
+    //   * the exponential's own `gamma` 1.0 → 2.0, taking its black floor
+    //     72 → 12/255 for anyone who still selects it explicitly.
+    // `base` is unchanged: none of these touch film-base estimation.
+    PipelineFingerprint {
+        pipeline_version: 2,
+        render: "9beca8b24eb785b0",
+        base: "01c5acccc36a3388",
+        recipe: "3d37b13ecb7a5095",
+        behavior: PIPELINE_BEHAVIOR,
+    },
+];
 
 /// One recorded row of [`PIPELINE_FINGERPRINTS`]: a `pipeline_version`, the
 /// fingerprints of the default conversion behavior it labels, and the
@@ -188,11 +210,27 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[PipelineFingerprint 
 /// **Why hashing these particular values is safe on both macOS/aarch64 and x86_64
 /// Linux** (CLAUDE.md's cross-platform determinism rule, design-spec §8):
 ///
-/// - `render` hashes **exactly** the per-pixel values that
-///   `golden_density_exponential_default_is_bit_identical` already pins as literal
-///   bit patterns — vectors chosen because they agree across libm implementations,
-///   and proven so by that test being green on both targets today. Hashing them
-///   adds a version label; it does not widen the numeric surface by one value.
+/// - `render` hashes **exactly** the per-pixel values a `stages::golden` test
+///   already pins as literal bit patterns, so hashing adds a version label without
+///   widening the numeric surface by one value. Which test depends on the row: the
+///   **v2** (current) render is the mid-grey-anchored sigmoid at `NOMINAL_DMAX =
+///   1.3`, pinned by `golden_new_default_is_bit_identical`; the **v1** render is
+///   the exponential straight line at gamma 1.0 / anchor 2.0, which is no longer a
+///   default but is still pinned by
+///   `golden_density_exponential_reference_is_bit_identical`.
+///
+///   **The two rows' cross-platform claims are not equally strong, and saying so
+///   matters more than sounding confident.** The exponential vectors have been
+///   green on macOS/aarch64 *and* CI's x86_64 Linux runner for as long as this gate
+///   has existed — observed agreement, not an argument. The v2 vector has no such
+///   history: it was captured on this host on 2026-08-08, and the sigmoid evaluates
+///   `10f32.powf` and `log10` several times per sample (`algo::sigmoid`) where the
+///   exponential evaluated one `10^`, so there is more libm surface for a ~1-ULP
+///   divergence to land on. Its cross-target agreement is therefore a **prediction
+///   that CI's Linux runner validates**, not prior agreement being restated. If
+///   that runner ever reds on `golden_new_default_is_bit_identical`, the failure is
+///   the vector's — pick sample values that do agree, per CLAUDE.md's rule — not
+///   the gate's, and not a real behavior change.
 /// - It stops at `reconstruct_and_print`, i.e. **before** the lcms2 output color
 ///   transform. No post-lcms2 pixel and no embedded ICC byte — both of which differ
 ///   by target — enters any of the hashes.
@@ -235,18 +273,21 @@ pub struct PipelineFingerprint {
 /// row must carry *this* string, and no two rows may share a behavior — which fails
 /// for both ways of forgetting to update it.
 ///
-/// **Amended once, deliberately.** It used to open with "auto rebate film base",
-/// describing how v1 obtained `Dmin` by default. `film_base.source` then lost its
-/// default, so that clause was dropped rather than re-versioned: `nc --version`
-/// prints this for the *running* build, and a build that refuses an unstated base
-/// must not claim to detect one. Amending a shipped version's description is
-/// normally forbidden; it was allowed here only because the v1 row's `render` and
-/// `base` fingerprints did not move — the render v1 labels is unchanged, and the
-/// removed clause described a resolution step that is no longer part of the
-/// *default* render because there is no default. See the row in
-/// [`PIPELINE_FINGERPRINTS`].
-pub const PIPELINE_BEHAVIOR: &str = "roll-fixed nominal Dmax 2.0 density, exponential density \
-     curve, no auto white balance";
+/// **Rewritten for v2, not amended.** This text describes whatever
+/// [`PIPELINE_VERSION`] currently is, so a version bump replaces it outright: the
+/// v2 string below was written fresh for the 2026-08-08 default render, and v1's
+/// final text moved into its row in [`PIPELINE_FINGERPRINTS`] as a frozen literal.
+/// That is the normal path.
+///
+/// The *abnormal* path is amending a string while its version stays put, and it has
+/// happened exactly once — v1's text used to open with "auto rebate film base", and
+/// that clause was dropped when `film_base.source` lost its default. It was allowed
+/// only because the v1 row's `render` and `base` fingerprints did not move (the
+/// render v1 labels was unchanged, and the removed clause described a resolution
+/// step that is no longer part of any *default* render, there being no default).
+/// The v1 row records the outcome; read it before amending anything here.
+pub const PIPELINE_BEHAVIOR: &str = "roll-fixed nominal Dmax 1.3 density, mid-grey-anchored \
+     sigmoid curve, no auto white balance";
 
 /// The short git commit hash, or `None` when the build could not determine it
 /// (source tarball / no `git` / not this package's repository). `None` is reported

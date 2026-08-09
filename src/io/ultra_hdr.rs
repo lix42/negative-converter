@@ -1102,10 +1102,12 @@ mod tests {
     ///
     /// Set `NC_ISO_SAMPLE_INPUT` to a real scan to render *that* instead of the
     /// toy fixture, with `NC_ISO_SAMPLE_BASE` (`r,g,b`), `NC_ISO_SAMPLE_DMAX`,
-    /// and `NC_ISO_SAMPLE_EV`. The toy fixture and the default exponential
-    /// render both produce a **flat** gain map (measured `GainMapMax` 0.0039
-    /// log2 = 1.003x), which cannot discriminate an HDR reconstruction — the
-    /// oracle needs content driven above the SDR shoulder knee, hence the EV.
+    /// and `NC_ISO_SAMPLE_EV`. The toy fixture and a default render both produce a
+    /// **flat** gain map (measured `GainMapMax` 0.0039 log2 = 1.003x — under the
+    /// exponential curve that was default when this was written, and re-measured at
+    /// ≈1.0027x under the sigmoid default that replaced it on 2026-08-08), which
+    /// cannot discriminate an HDR reconstruction — the oracle needs content driven
+    /// above the SDR shoulder knee, hence the EV.
     #[test]
     #[ignore = "writes sample files for external decoder verification"]
     fn iso_oracle_samples() {

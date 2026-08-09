@@ -376,6 +376,101 @@ fn avif_boxes(buf: &[u8]) -> Vec<(String, usize)> {
     out
 }
 
+/// An HDR container whose signal never rises above the 203-nit reference white is
+/// an HDR wrapper around an SDR picture: it costs bit depth and compatibility and
+/// buys nothing, while the report still advertises `target_peak_nits: 1000`. Every
+/// single-rendition HDR preset must say so, and must stop saying so as soon as the
+/// frame actually uses the headroom.
+#[test]
+fn single_rendition_hdr_presets_warn_when_the_signal_stays_below_reference_white() {
+    const MARKER: &str = "HDR output carries an SDR-range signal";
+    let tmp = TempDir::new("hdr-sdr-range");
+    let warnings = |stdout: &str| -> Vec<String> {
+        json(stdout)["warnings"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|w| w.as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let input = fixture("hdr-48bit.tif");
+    let convert = |preset: &str, out: &Path, extra: &[&str]| {
+        let mut argv = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+        ];
+        argv.extend_from_slice(extra);
+        run(&argv)
+    };
+
+    for (preset, ext) in [
+        ("hdr-pq", "avif"),
+        ("hdr-hlg", "avif"),
+        ("hdr-pq-tiff", "tif"),
+        ("hdr-hlg-tiff", "tif"),
+        ("hdr-linear-tiff", "tif"),
+    ] {
+        // At defaults the sigmoid asymptotes below display white, so this frame
+        // peaks at 201 nits — under reference white, in a container signalling HDR.
+        let low = tmp.path(&format!("{preset}-low.{ext}"));
+        let (code, stdout, err) = convert(preset, &low, &[]);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            warnings(&stdout).iter().any(|w| w.contains(MARKER)),
+            "{preset} must warn that its HDR signal is SDR-range: {:?}",
+            warnings(&stdout)
+        );
+
+        // The falsifiable control: the same frame through the exponential curve does
+        // reach past the shoulder, so the warning must disappear. Without this the
+        // assertion above would pass equally for a warning that always fires. The
+        // `--strict` here is a second assertion — `hdr-48bit.tif` is the IR-free
+        // fixture, so exit 0 proves the run raised *no* promotable warning at all.
+        let high = tmp.path(&format!("{preset}-high.{ext}"));
+        let (code, stdout, err) = convert(
+            preset,
+            &high,
+            &["--density-curve", "exponential", "--strict"],
+        );
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            !warnings(&stdout).iter().any(|w| w.contains(MARKER)),
+            "{preset} must not warn when content exceeds reference white: {:?}",
+            warnings(&stdout)
+        );
+    }
+
+    // `--strict` promotes it. One preset is enough: promotion is the shared
+    // `push_warning_buf` path, not anything per-preset.
+    let strict = tmp.path("strict.tif");
+    let (code, _stdout, err) = convert("hdr-pq-tiff", &strict, &["--strict"]);
+    assert_eq!(
+        code, 1,
+        "--strict must promote the SDR-range warning: {err}"
+    );
+    assert!(err.contains(MARKER), "{err}");
+
+    // `ultra-hdr-v1` is dual-rendition — an SDR base image plus a gain map, so a
+    // low-headroom render yields an inert gain map rather than a mislabelled HDR
+    // container. Different artifact, different diagnosis; this warning stays off it.
+    let ultra = tmp.path("ultra.jpg");
+    let (code, stdout, err) = convert("ultra-hdr-v1", &ultra, &[]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        !warnings(&stdout).iter().any(|w| w.contains(MARKER)),
+        "ultra-hdr-v1 must not carry the single-rendition HDR warning: {:?}",
+        warnings(&stdout)
+    );
+}
+
 #[test]
 fn hdr_linear_tiff_writes_a_bit_exact_display_linear_bt2020_master() {
     use tiff::decoder::{Decoder, DecodingResult};
@@ -398,6 +493,15 @@ fn hdr_linear_tiff_writes_a_bit_exact_display_linear_bt2020_master() {
             "hdr-linear-tiff",
             "--film-base",
             "1,1,1",
+            // The **exponential** curve, named explicitly. This test's subject is
+            // the container — that samples above the 203-nit reference white
+            // survive with no transfer or clamp applied — so the fixture has to
+            // produce some. The default sigmoid approaches display white `1.0`
+            // from strictly below and never reaches it for any finite density
+            // (`algo::sigmoid`, pinned by its own tests), which is correct for a
+            // print curve and useless for this assertion.
+            "--density-curve",
+            "exponential",
             "--strict",
         ]);
         assert_eq!(code, 0, "{err}");
@@ -502,6 +606,15 @@ fn coded_hdr_tiffs_store_exact_codes_and_signal_cicp_in_the_profile() {
             preset,
             "--film-base",
             "1,1,1",
+            // The **exponential** curve, named explicitly. This test's subject is the
+            // coded container, and it asserts exit 0 under `--strict` on the IR-free
+            // fixture — i.e. *no* promotable warning. At defaults the sigmoid keeps
+            // this frame's peak below the 203-nit reference white, which is a real
+            // condition with its own warning
+            // (`single_rendition_hdr_presets_warn_when_the_signal_stays_below_reference_white`)
+            // and nothing to do with PQ/HLG code storage.
+            "--density-curve",
+            "exponential",
             "--strict",
         ]);
         assert_eq!(code, 0, "{preset}: {err}");
@@ -1530,6 +1643,11 @@ fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips(
         out.to_str().unwrap(),
         "--film-base",
         "0.9,0.55,0.42",
+        // Both freezes must name the same curve, or the byte-identity assertion
+        // below compares two different renders. The recipe fragment written for
+        // Freeze B is tagged `exponential`, so pin it here too.
+        "--density-curve",
+        "exponential",
         "--d-max",
         value,
     ]);
@@ -1581,7 +1699,8 @@ fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips(
 #[test]
 fn convert_default_uses_the_fixed_roll_anchor_not_per_frame_auto() {
     // dmax-reference changed the default render: the anchor is the roll-fixed
-    // nominal `Fixed` (NOMINAL_DMAX = 2.0), not the demoted per-frame `Auto`. Pin
+    // nominal `Fixed` (NOMINAL_DMAX, 1.3 since 2026-08-08), not the demoted
+    // per-frame `Auto`. Pin
     // the default's reported anchor, and that `--auto-d-max` (opt-in) differs from
     // it — proving the default no longer normalizes exposure per frame.
     let tmp = TempDir::new("dmaxdefault");
@@ -1600,8 +1719,8 @@ fn convert_default_uses_the_fixed_roll_anchor_not_per_frame_auto() {
     assert_eq!(code, 0, "{err}");
     let default_dmax = json(&stdout)["dmax"].as_f64().expect("dmax reported");
     assert!(
-        (default_dmax - 2.0).abs() < 1e-6,
-        "default anchor must be the fixed nominal 2.0, got {default_dmax}"
+        (default_dmax - 1.3).abs() < 1e-6,
+        "default anchor must be the fixed nominal 1.3, got {default_dmax}"
     );
 
     let out2 = tmp.path("auto.tiff");
@@ -1876,6 +1995,8 @@ fn bad_params_are_usage_errors() {
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
+        "--density-curve",
+        "exponential",
         "--density-gamma",
         "0",
     ]);
@@ -1965,6 +2086,8 @@ fn sidecar_recipe_round_trips_through_recipe_in() {
         "--output-hdr",
         "--film-base",
         "0.9,0.55,0.42",
+        "--density-curve",
+        "exponential",
         "--density-gamma",
         "1.8",
         "--report",
@@ -2881,7 +3004,7 @@ fn telemetry_file_writes_full_record() {
     let conv = &record["conversion"];
     assert_eq!(conv["preset"], "legacy");
     assert_eq!(conv["reconstruction"], "density");
-    assert_eq!(conv["curve"], "exponential");
+    assert_eq!(conv["curve"], "sigmoid");
     assert!(conv["params_hash"].as_str().unwrap().len() == 16);
     assert_eq!(
         conv["film_base_source"]["explicit"],
@@ -3265,7 +3388,10 @@ fn telemetry_params_hash_matches_identical_conversions() {
     let c = tmp.path("c.tiff");
     let ra = convert(&a, &[]);
     let rb = convert(&b, &[]);
-    let rc = convert(&c, &["--density-gamma", "1.8"]);
+    let rc = convert(
+        &c,
+        &["--density-curve", "exponential", "--density-gamma", "1.8"],
+    );
 
     let ha = ra["conversion"]["params_hash"].as_str().unwrap();
     let hb = rb["conversion"]["params_hash"].as_str().unwrap();
@@ -3599,8 +3725,13 @@ fn sigmoid_rejects_density_gamma_as_a_usage_error() {
     );
     assert_eq!(code, 2, "flag presence is the trigger, not the value");
 
-    // The exponential (default) curve consumes gamma normally.
-    let (code, err) = gamma_run(&["--density-gamma", "1.5"], &tmp.path("c.tiff"));
+    // The exponential curve consumes gamma normally. Selected explicitly: the
+    // default curve is the sigmoid, so a bare `--density-gamma` is now the
+    // contradiction asserted above, not the accepted case.
+    let (code, err) = gamma_run(
+        &["--density-curve", "exponential", "--density-gamma", "1.5"],
+        &tmp.path("c.tiff"),
+    );
     assert_eq!(code, 0, "exponential consumes gamma: {err}");
 }
 
@@ -3618,6 +3749,8 @@ fn sigmoid_rejects_no_d_max() {
         "sigmoid",
         "--film-base",
         "0.9,0.55,0.42",
+        "--density-curve",
+        "exponential",
         "--no-d-max",
     ]);
     assert_eq!(code, 2, "sigmoid + --no-d-max must exit 2: {err}");
@@ -3654,6 +3787,10 @@ fn density_report_carries_resolved_dmax() {
         out2.to_str().unwrap(),
         "--film-base",
         "0.9,0.55,0.42",
+        // `--no-d-max` is exponential-only (the sigmoid is anchored on [0, Dmax]
+        // and cannot run without one), and the sigmoid is now the default curve.
+        "--density-curve",
+        "exponential",
         "--no-d-max",
     ]);
     assert_eq!(code, 0, "{err}");
@@ -4686,6 +4823,12 @@ fn film_master_writes_unclamped_float_acescg_and_reports_the_branch() {
         "film-master",
         "--film-base",
         "0.9,0.55,0.42",
+        // Exponential for the same reason as the hdr-linear-tiff test: this
+        // asserts the master is *unclamped*, which needs samples above 1.0, and
+        // the default sigmoid asymptotes below 1.0 by construction. The low
+        // `--d-max` then pushes plenty of content past the anchor.
+        "--density-curve",
+        "exponential",
         "--d-max",
         "0.2",
     ]);
@@ -5233,7 +5376,10 @@ fn film_master_without_a_dmax_anchor_does_not_claim_one() {
     };
 
     for (name, extra) in [
-        ("no-dmax.tiff", vec!["--no-d-max"]),
+        (
+            "no-dmax.tiff",
+            vec!["--density-curve", "exponential", "--no-d-max"],
+        ),
         ("simple.tiff", vec!["--reconstruction", "simple"]),
     ] {
         let report = convert(name, &extra);
@@ -5638,6 +5784,8 @@ fn params_hash_is_the_hash_of_the_dump_params_bytes() {
         &[
             "--dump-params",
             dump.to_str().unwrap(),
+            "--density-curve",
+            "exponential",
             "--density-gamma",
             "1.7",
         ],
@@ -5672,7 +5820,7 @@ fn params_hash_is_the_hash_of_the_dump_params_bytes() {
     let (c2, s2, _) = convert_default(
         &fixture("hdri-64bit.tif"),
         &out2,
-        &["--density-gamma", "1.8"],
+        &["--density-curve", "exponential", "--density-gamma", "1.8"],
     );
     assert_eq!(c2, 0);
     assert_ne!(
@@ -5711,6 +5859,8 @@ fn enveloped_sidecar_and_bare_legacy_recipe_both_reload_identically() {
         &[
             "--dump-params",
             dump.to_str().unwrap(),
+            "--density-curve",
+            "exponential",
             "--density-gamma",
             "1.6",
             "--report",

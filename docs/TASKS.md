@@ -66,9 +66,10 @@ under, and the parenthesized paths are the modules it owns.
   transform/render it for the selected output; optional correction is explicit.
 - **algo** (`src/algo/`) — `algo::reconstruct` resolves the tagged
   `reconstruction` recipe object into simple or density reconstruction. The
-  reference-anchored sigmoid is the candidate product default and owns
-  floor/toe, midtone, and shoulder placement; exponential/simple remain explicit
-  advanced references. `algo::finish_print` is the stage-4 print bridge.
+  reference-anchored sigmoid **is** the product default as of `pipeline_version` 2
+  (2026-08-08) and owns floor/toe, midtone, and shoulder placement;
+  exponential/simple remain explicit advanced references. `algo::finish_print` is
+  the stage-4 print bridge.
 - **output** (the encoders downstream of `color`) — the display renditions:
   Display P3 / SDR, BT.2020 PQ/HLG, explicit legacy Ultra HDR v1 gain-map JPEG
   (with final ISO metadata planned), AVIF, and the presets that resolve them
@@ -174,6 +175,7 @@ graph TD
     algo/sigmoid
     algo/negative-reconstruction-density-curves
     algo/reference-anchored-sigmoid
+    algo/exponential-mid-grey-anchor
     algo/content-aware-sigmoid-toe
     algo/dmax-white-anchor
     algo/density-safety-bounds
@@ -295,6 +297,7 @@ graph TD
   film-base/dmax-reference --> algo/negative-reconstruction-density-curves
   algo/sigmoid --> algo/negative-reconstruction-density-curves
   algo/negative-reconstruction-density-curves --> algo/reference-anchored-sigmoid
+  algo/negative-reconstruction-density-curves --> algo/exponential-mid-grey-anchor
   film-base/dmax-reference --> algo/reference-anchored-sigmoid
   algo/reference-anchored-sigmoid --> algo/film-stock-profiles
   algo/reference-anchored-sigmoid --> algo/auto-anchor-interior-measurement
@@ -409,8 +412,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `film-base/dmax-anchor-reliability` (post-MVP): `film-base/dmax-reference`, `algo/reference-anchored-sigmoid`
   — follow-up on a **completed** task's contract, so a new task rather than an edit: the
   leader-measured anchor is uncontrolled (same stock 0.295 apart while the base agrees to
-  0.0005), is exceeded by real content, and `NOMINAL_DMAX = 2.0` is a poor fallback against
-  measured rolls (0.90–1.74). `algo` candidates 2 and 3 are contingent on this
+  0.0005), is exceeded by real content, and the no-reference `NOMINAL_DMAX` fallback still
+  wants calibrating against measured rolls (0.90–1.74; the shipped nominal moved 2.0 → 1.3 on
+  2026-08-08, which is a rounded median, not a calibration). `algo` candidates 2 and 3 are
+  contingent on this
 - `film-base/dmax-per-channel-reduction` (post-MVP): `film-base/dmax-reference`, `algo/reference-anchored-sigmoid`
   — sibling of `film-base/dmax-anchor-reliability` on a different axis: that one questions the
   anchor's *level*, this one the per-channel *ratio* the gray-mean reduction discards
@@ -425,6 +430,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
 - `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
+- `algo/exponential-mid-grey-anchor` (post-MVP): `algo/negative-reconstruction-density-curves`
+  — the exponential pins white at `Dmax` with no placement rule, so contrast pivots around
+  white; measured at 2.75 EV of midtone offset for the floor fix `gamma = 2.0` buys. Give it
+  the sigmoid's `AnchorPlacement`. Blocks nothing (non-default path since v2)
 - `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`, `algo/auto-anchor-interior-measurement`; no downstream blockers
   — the last is a hard prerequisite, not a nicety: content-driven anchoring is currently
   unusable because `DmaxSource::Auto` measures the whole frame and the opaque holder owns the
@@ -620,9 +629,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Dmax anchor reliability](tasks/film-base/dmax-anchor-reliability.md) — follow-up on a
   **completed** contract: the leader-measured anchor is *uncontrolled* (two rolls of one stock
   0.295 density apart while their red base agrees to 0.0005), real content measures *above* it,
-  and leaders are uniform so it is not a fogging gradient. `NOMINAL_DMAX = 2.0` is also a poor
-  no-reference fallback against measured rolls (0.90–1.74, median ≈1.35). `algo` candidates 2
-  and 3 are contingent on this.
+  and leaders are uniform so it is not a fogging gradient. The no-reference `NOMINAL_DMAX`
+  fallback also still wants calibrating against measured rolls (0.90–1.74, median ≈1.34); the
+  shipped nominal moved 2.0 → 1.3 on 2026-08-08, a rounded median rather than a calibrated
+  value, so this task still owns the number. `algo` candidates 2 and 3 are contingent on this.
 - [ ] [Per-channel Dmax and the gray-mean reduction](tasks/film-base/dmax-per-channel-reduction.md) —
   `reference_dmax` measures `D_c` per channel then reduces by `(r+g+b)/3`, asserting the highlight
   end shares the base's colour cast. Committed leader data says otherwise: spread 0.05–0.14 density
@@ -644,6 +654,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo/sigmoid.md)
 - [x] [Negative reconstruction and density curves](tasks/algo/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
 - [x] [Reference-anchored sigmoid calibration and redesign](tasks/algo/reference-anchored-sigmoid.md) — reproduce and quantify the shipped sigmoid's raised, narrow real-roll shadow spread, then choose the least invasive defaults/semantics/equation remedy against frozen film-master/SDR/HDR metrics
+- [ ] [Mid-grey anchor for the exponential curve](tasks/algo/exponential-mid-grey-anchor.md) — the
+  exponential pins display white at `Dmax` and has no `AnchorPlacement`, so raising contrast
+  pivots the line *around white*: `gamma = 2.0` fixes the black floor (72 → 12/255) but costs
+  **2.75 EV of midtone placement**. Give it the sigmoid's anchor rule so the two knobs stop
+  fighting. Non-default path since v2, so it blocks nothing
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [ ] [Curve endpoint validation](tasks/algo/curve-endpoint-validation.md) — warn **before decode**
   when a resolved curve places its tonal endpoints so badly the render cannot approach white or
