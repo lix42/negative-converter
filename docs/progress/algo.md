@@ -1805,3 +1805,18 @@ What other epics need to know about `algo`:
      `cli::validate`, warning accumulation, roll handling and `--strict`;
      `density-safety-bounds`, `auto-neutral-wb` and `bw-support` all declare it.
      Still `[x]`, so the task stays immediately executable.
+- **Spec corrected again 2026-08-08, review rounds 2–4** (appended rather than
+  editing the entry above, which records what was believed at the time):
+  - **The black endpoint is the reachable film base, not any idealized floor** —
+    superseding item 2 above. Exponential has no floor; the sigmoid has one, but the
+    base can sit far above it (shipped parameters: asymptote 0.0086, but
+    `offset = +0.5` renders the base at 0.0923). Evaluate the curve at `D′base`,
+    which is `density.offset` plus balance, **per channel**.
+  - Deferral is **per endpoint**, and only when the balance range is genuinely
+    consulted (`consults_balance_range` = `shadow_balance != highlight_balance`).
+    Equal non-zero balances are pre-decode; `s_curve(R)` is pre-decode whenever
+    `Dmax` is `Fixed`/`Explicit`.
+  - The check judges **curve placement**, not the rendered image: `render_print`
+    applies WB and exposure, subtracts `black_point`, then soft-clips, so a curve
+    black of 0.053 is not the displayed black.
+  - `algo/regional-color-balance` added as a dependency.

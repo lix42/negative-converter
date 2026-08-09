@@ -200,8 +200,11 @@ pre-decode gate is a defensible first cut — but say so in the task's outcome.
 - **Print controls do not suppress the warning** — a `black_point` that would map
   the curve black to zero leaves the curve-placement warning intact, and the message
   says it is about curve placement. (Pins the scope decision above.)
-- **Deferred cases:** `balance_range: Auto` with non-zero balance, like `Auto`
-  `Dmax`, resolves to whatever deferral the task chooses — asserted, not incidental.
+- **Deferred cases:** `balance_range: Auto` with **differing** shadow/highlight
+  balances (i.e. `consults_balance_range`), like `Auto` `Dmax`, resolves to whatever
+  deferral the task chooses — asserted, not incidental. The companion case is the
+  one that must *not* defer: **equal non-zero** balances are pre-decode, and a test
+  using them has to prove the warning still fires.
 - `--no-d-max` emits nothing on **exponential**; on **sigmoid** it remains a usage
   error (exit 2) with the existing message — assert both, so the exemption cannot
   silently swallow the hard failure.
