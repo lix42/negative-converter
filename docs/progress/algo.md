@@ -2004,3 +2004,17 @@ What other epics need to know about `algo`:
   the population it applied to. The question that resolves it is not "did a default
   move?" but "did it move *for this recipe*", and `meta.pipeline_version` is the
   only witness to that. Both directions are pinned now.
+- 2026-08-09 (fourth round, and the one that ends it): the version-based
+  exemption fixed the *sidecar* but not `--dump-params`, which writes a **bare**
+  recipe with no `meta.pipeline_version` — so a file the tool had just produced
+  still failed its own `--strict` replay while the output was byte-identical.
+  Root cause of all four rounds: the predicate kept being tuned against
+  hand-written JSON while **nothing tested the one file nc itself writes**. The
+  rule is now structural — *warn only on shapes this build cannot produce*
+  (absent `curve` / `anchor` / `gamma` / `dmax`) — and
+  `recipe_dumped_by_this_build_replays_clean_under_strict` gates dump → replay
+  end to end, byte-comparing the two outputs so a future false positive fails
+  loudly. `"dmax":"fixed"` is therefore treated as pinned; that residual gap and
+  the override-provenance one are written down in the task doc rather than
+  patched over, and both belong to `core/conversion-versioning`'s per-version
+  default table.

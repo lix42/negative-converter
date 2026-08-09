@@ -1703,17 +1703,29 @@ fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
     let Some(curve) = reconstruction.get("curve") else {
         return Some(UnpinnedCurve::WholeCurve);
     };
-    // `dmax`'s nominal moved for *both* curves, so it is checked once here — and
-    // an **absent** key is not the only way it floats. `"dmax":"fixed"` names the
-    // *policy*, not a value: it resolves through `NOMINAL_DMAX`, which moved
-    // 2.0 → 1.3. That is the spelling `--dump-params` writes, so treating a present
-    // key as pinned would have excused exactly the archived recipes people keep.
-    // `"auto"` is per-frame (a different thing, not a moved default), and `"none"`
-    // and `{"explicit":…}` are genuinely pinned.
-    let dmax_floats = match curve.get("dmax") {
-        None => true,
-        Some(d) => d.as_str() == Some("fixed"),
-    };
+    // `dmax`'s nominal moved for *both* curves, so it is checked once here.
+    //
+    // **Only an absent key counts.** `"dmax":"fixed"` does name the *policy* rather
+    // than a value — it resolves through `NOMINAL_DMAX`, which moved 2.0 → 1.3 — so
+    // an archived recipe spelling it really would render differently. But `"fixed"`
+    // is also exactly what `--dump-params` writes, and identical bytes carry no
+    // evidence of when they were written, so warning on it made a file this build
+    // had *just* produced fail its own `--strict` replay while the output was
+    // byte-identical. Given a choice between a false positive on the documented
+    // reproducibility path and a false negative on a migration aid, the workflow
+    // wins. `"auto"` is per-frame (a different thing, not a moved default), and
+    // `"none"` / `{"explicit":…}` are genuinely pinned.
+    //
+    // The rule this settles on, and the one worth keeping: **warn only on shapes
+    // this build cannot produce.** An absent `dmax`, `gamma`, `anchor` or `curve`
+    // is never written by `--dump-params`, so a recipe carrying one was written by
+    // some other build — which is the whole population the warning is for, and it
+    // makes the predicate structurally free of false positives instead of tuned.
+    // `recipe_dumped_by_this_build_replays_clean_under_strict` is the gate; the
+    // residual gap (an archived bare recipe spelling `"fixed"`) is recorded in
+    // `docs/tasks/algo/negative-reconstruction-density-curves.md` and belongs to
+    // `core/conversion-versioning`'s per-version default table.
+    let dmax_floats = curve.get("dmax").is_none();
     match curve.get("type").and_then(|t| t.as_str()) {
         Some("sigmoid") => {
             if curve.get("anchor").is_none() {
@@ -6662,6 +6674,24 @@ mod tests {
         assert_eq!(
             probe(r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax"}}}"#),
             Some(UnpinnedCurve::MovedDefaults)
+        );
+        // `"dmax":"fixed"` counts as PINNED, though it does resolve through the
+        // nominal that moved. It is the spelling `--dump-params` writes, so treating
+        // it as floating made a freshly dumped recipe fail its own `--strict` replay
+        // with a byte-identical output. Warn only on shapes this build cannot
+        // produce; `recipe_dumped_by_this_build_replays_clean_under_strict` is the
+        // end-to-end gate on that.
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5},"dmax":"fixed"}}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":2.0,"dmax":"fixed"}}}"#
+            ),
+            None
         );
         // A recipe with no `curve` section used to resolve to the exponential, and this
         // probe used to stay silent for it. Since 2026-08-08 it resolves to the sigmoid

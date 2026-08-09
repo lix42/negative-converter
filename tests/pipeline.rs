@@ -5775,6 +5775,67 @@ fn inspect_and_estimate_carry_build_identity_without_a_params_hash() {
 }
 
 #[test]
+fn recipe_dumped_by_this_build_replays_clean_under_strict() {
+    // The documented reproducibility path is `--dump-params` → replay, and it must
+    // survive `--strict`. This gate exists because the moved-default curve warning
+    // broke it three separate times: the predicate was tuned against hand-written
+    // JSON each round while nothing checked the one file the tool itself writes.
+    // The output being byte-identical is what makes the failure unambiguous — a
+    // warning claiming the render moved, on a render that provably did not.
+    //
+    // The IR-free fixture is required: `hdri-64bit.tif` emits the "IR preserved but
+    // not used" warning on every frame, which would fail `--strict` here no matter
+    // what the curve warning did.
+    let tmp = TempDir::new("dumpreplay");
+    let first = tmp.path("first.tiff");
+    let dump = tmp.path("params.json");
+    let (code, _, err) = convert_default(
+        &fixture("hdr-48bit.tif"),
+        &first,
+        &["--dump-params", dump.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "{err}");
+
+    let replay = tmp.path("replay.tiff");
+    let (code, _, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        replay.to_str().unwrap(),
+        "--params",
+        dump.to_str().unwrap(),
+        "--strict",
+    ]);
+    assert_eq!(
+        code, 0,
+        "a recipe this build just dumped must replay clean under --strict; stderr:\n{err}"
+    );
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&replay).unwrap(),
+        "the replay must be byte-identical, or the warning had a point"
+    );
+
+    // Falsifiable: the same replay of a recipe that genuinely leaves the curve
+    // unpinned — a shape this build never writes — still fails.
+    let bare = tmp.path("bare.json");
+    std::fs::write(&bare, r#"{"reconstruction":{"type":"density"}}"#).unwrap();
+    let (code, _, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("bare.tiff").to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--params",
+        bare.to_str().unwrap(),
+        "--strict",
+    ]);
+    assert_ne!(code, 0, "a curve-less recipe must still warn");
+    assert!(err.contains("reconstruction.curve"), "{err}");
+}
+
+#[test]
 fn params_hash_is_the_hash_of_the_dump_params_bytes() {
     // The advertised hash must be reproducible by an agent: hash the exact bytes
     // `--dump-params` writes and you get `identity.params_hash`. That equality is
