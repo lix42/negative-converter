@@ -7029,3 +7029,29 @@ fn roll_reports_the_specific_problem_before_the_missing_base() {
         "the least-specific diagnosis must not pre-empt the specific one: {err}"
     );
 }
+
+#[test]
+fn a_suffix_mismatch_outranks_the_missing_base() {
+    // Same least-specific-diagnosis-last policy as the roll gate: the output
+    // path's suffix is a property of *this invocation*, while "no film base
+    // selected" is the least specific diagnosis available. A run that is wrong
+    // both ways must name the suffix, or the user supplies a base only to be
+    // told the path was never going to work.
+    let tmp = TempDir::new("suffix-order");
+    let bad = tmp.path("out.jpg");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        bad.to_str().unwrap(),
+        "--output-preset",
+        "hdr-pq",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(".avif"), "the suffix rule must win: {err}");
+    assert!(
+        !err.contains("no film base selected"),
+        "the least-specific diagnosis must not pre-empt it: {err}"
+    );
+    assert!(!bad.exists());
+}
