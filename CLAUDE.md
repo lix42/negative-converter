@@ -71,15 +71,18 @@ decode → film-base → tagged reconstruction → FilmRgbImage
   ├ film-master → NC film RGB v1 → linear ACEScg → encode (unclamped f32, no transform)
   └ display presets → NC film RGB v1 → linear ACEScg → shared print controls
       ├ ultra-hdr-v1            → SDR + HDR + gain map → JPEG
+      ├ display-p3 / compatibility → SDR → P3/sRGB → 16-bit TIFF
       ├ hdr-pq / hdr-hlg        → HDR → Rec.2100 PQ/HLG → 10-bit 4:4:4 AVIF
       ├ hdr-pq-tiff / hdr-hlg-tiff → the same signal → full-range 16-bit TIFF
       └ hdr-linear-tiff         → HDR, no transfer → 32-bit float BT.2020 TIFF
 ```
 
-Eight preset names are accepted today (`legacy`, `film-master`, `ultra-hdr-v1`,
-`hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff`, `hdr-hlg-tiff`); the
-remaining planned names (`gain-map-hdr`, `display-p3`, `compatibility`, `custom`)
-and the default migration are `output/presets`. Keep this list, `OutputPreset::parse`,
+Ten preset names are accepted today (`legacy`, `film-master`, `ultra-hdr-v1`,
+`display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
+`hdr-pq-tiff`, `hdr-hlg-tiff`); the remaining planned names (`gain-map-hdr`,
+`custom`) and the default migration are `output/presets`. Keep this list,
+`OutputPreset::ALL` (which the parse diagnostics are generated from),
+`OutputPreset::parse`,
 `OutputPreset`'s rustdoc, and `OutputOverrides::output_preset`'s **help text** in
 step — those three have gone stale twice, and the help text is what `--help` prints.
 
@@ -135,18 +138,22 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   contract. `output/presets` still owns the remaining presets, roll integration,
   and future default activation — the boundary is recorded in
   `docs/tasks/output/hdr-avif-output.md`: whichever task ships an explicit
-  `convert`-only preset also calibrates that preset's `memory::RunProfile`. One
-  `cli::required_extensions` table drives *both* the output-suffix rule and the
-  convert-only refusal, so extend that table rather than adding a parallel check —
-  otherwise a new container gets one rule and silently misses the other;
+  `convert`-only preset also calibrates that preset's `memory::RunProfile`. `cli::required_extensions` is now **complete** (every preset states a
+  suffix, including `legacy` and `film-master`, which previously let
+  `nc convert -o out.jpg` write a TIFF named `.jpg`). It no longer drives the
+  roll refusal: that is a separate explicit list (`legacy` + `film-master`),
+  because deriving "convert-only" from "pins a suffix" refused *every* preset
+  once the table was completed and broke `nc roll` outright — the two concepts
+  had merely coincided;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
   ACEScg mapper; `render_split` is the named-output split out of that boundary —
   `film_master` (a pure unwrap: the bypass *is* the master) plus the shared print
   controls `WB → exposure → black point → linear_range`, resolved once and
-  *borrowed* by both display branches. The `film-master` half and all six explicit
-  display consumers (`ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
+  *borrowed* by both display branches. The `film-master` half and all eight explicit
+  display consumers (`ultra-hdr-v1`, `display-p3`, `compatibility`, `hdr-pq`,
+  `hdr-hlg`, `hdr-linear-tiff`,
   `hdr-pq-tiff`, `hdr-hlg-tiff`) are wired; a non-default `print.linear_range` is
   accepted only by those display presets (legacy ignores it — so it is rejected
   there rather than silently dropped — and film-master rejects it);
@@ -302,7 +309,9 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   allocates; `RunProfile::HdrLinearTiff` and `HdrCodedTiff` count that same
   rendition with **no container staging at all** (the `tiff` writer streams strips
   under `Predictor::None`), the coded one adding only its 6 B/px u16 quantize
-  buffer. Those two therefore peak at the **render** phase, not encode — as does
+  buffer, and `SdrTiff` (the two SDR presets) shares the coded arm's arithmetic
+  exactly — measured, not merely inherited. Those three therefore peak at the
+  **render** phase, not encode — as does
   `UltraHdrV1`, for the different reason that it holds four display buffers at once.
   Which phase peaks is **per profile**; a sentence claiming otherwise has been wrong
   twice, so read it off

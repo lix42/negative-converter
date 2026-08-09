@@ -107,8 +107,10 @@ What other epics need to know about `output`:
   untouched and every audit ulp at 0*, and nothing automated catches it. The
   definitions module note used to say `BT2020` had no runtime consumer; that is
   fixed.
-- **`hdr-pq-tiff` and `hdr-hlg-tiff` are live**, so **eight** preset names are now
-  accepted. They store the *same rendition* the AVIF presets code, as full-range
+- **`hdr-pq-tiff` and `hdr-hlg-tiff` are live**; with the SDR pair
+  (`display-p3` / `compatibility`, 2026-08-09) **ten** preset names are accepted
+  today, enumerated once in `OutputPreset::ALL`, which the parse diagnostics are
+  generated from. The coded TIFFs store the *same rendition* the AVIF presets code, as full-range
   16-bit TIFF codes. Five things downstream tasks inherit:
   **(a)** for an **RGB** data space ICC.1:2022 §10.3 *requires*
   `MatrixCoefficients = 0`, so the `9` in
@@ -2172,3 +2174,84 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   map is inert and the test discriminates nothing; and whichever of this task and
   `output/presets` ships a CLI surface first owns the `gain-map-hdr` name — the
   shipped `ultra-hdr-v1` is contractually ISO-free and must not be re-pointed.
+
+## sdr-preset-followups
+
+**Status:** not started
+**Updated:** 2026-08-09
+
+- Goal: hold the three open questions from the SDR presets — the default flip,
+  Adobe RGB, and confirming the inherited memory profile — so the space stays
+  visible rather than remembered. See
+  [the task file](../tasks/output/sdr-preset-followups.md).
+- Filed 2026-08-09 alongside `display-p3` / `compatibility`. Deliberately *not*
+  answered: the user's steer was to track the work rather than lock the details.
+
+## presets (SDR half: display-p3 + compatibility)
+
+**Status:** in progress
+**Updated:** 2026-08-09
+
+- 2026-08-09: **`display-p3` and `compatibility` are live**, `convert`-only,
+  `.tif`/`.tiff`. Both are 16-bit integer TIFF (lossless) through the modern
+  display stage — NC film RGB v1 → linear ACEScg → shared print controls →
+  `pipeline::sdr` with its shoulder and gamut mapping — differing **only** in
+  destination gamut. This is the SDR half of `output/presets`; the default flip,
+  roll integration and `gain-map-hdr` remain that task's.
+- 2026-08-09: They reuse `FrameRender::Tiff` and the existing 16-bit encode path
+  rather than introducing a container. `stages::render_sdr_preset` is the pure
+  addition: display source → one `sdr::render` → `color::encode_rendered_sdr`,
+  returning the same `Rendered` the legacy branch does. An SDR preset's product
+  *is* a rendered image plus a profile, so there was nothing new to encode.
+- 2026-08-09: **The suffix table is now complete, and completing it broke `nc
+  roll` until I fixed the coupling — worth knowing before touching either.**
+  `legacy` and `film-master` previously pinned no suffix, so
+  `nc convert -o out.jpg` wrote a TIFF named `.jpg`, exit 0, no warning. Giving
+  them `.tif`/`.tiff` was right, but `reject_roll_unsupported` *derived*
+  "convert-only" from "pins a suffix" — so every preset became roll-refused and
+  `nc roll` had nothing to run. Roll capability is now an **explicit list**
+  (`legacy` + `film-master`). The two concepts had merely coincided; CLAUDE.md's
+  "one table drives both" note was true when written and is not any more.
+- 2026-08-09: `RunProfile::SdrTiff` **inherits** `HdrCodedTiff`'s arithmetic
+  rather than being calibrated: the buffers genuinely match (one f32 rendition +
+  a 3x2 B quantize buffer, streamed strips, the output transform mutating in
+  place). That is a structural argument, not a measurement, and it is flagged as
+  such on the variant and filed in `output/sdr-preset-followups`.
+- 2026-08-09: Three questions deliberately left open rather than guessed —
+  which preset becomes the default (a pixel change needing its own version bump
+  and report, and what finally lets `legacy` be deleted), Adobe RGB as a
+  first-class gamut (a real addition: the modern renderer gamut-*maps* rather
+  than tagging, so it needs a colorimetry definition with provenance), and
+  confirming the memory profile. All in `output/sdr-preset-followups`.
+
+- 2026-08-09 (review-fix round): **the memory profile is measured, superseding
+  the "inherits" entry above.** Peak RSS 0.850 GB at 15.55 MP and 3.594 GB at
+  74.65 MP against estimates of 0.921 / 3.911 GB (1.08x / 1.09x over), with the
+  enumerated buffers alone at 0.80x / 0.91x of measured. Two frame sizes, as the
+  calibration rule requires. `RunProfile::SdrTiff` is calibrated in its own right
+  now; the follow-up item asking for it is closed.
+- 2026-08-09 (review-fix round): **extensionless output paths are now rejected,
+  as a decision rather than a side effect.** Completing the suffix table made
+  `nc convert -o positive` exit 2, which previously exited 0 — the code comment
+  and the spec edit had justified only the *mismatched*-suffix case. Keeping the
+  strictness was the user's call (a file with no extension misleads exactly as a
+  wrongly-named one does, and nc is unreleased); it is written into design-spec §5
+  and pinned by tests at both the CLI and integration level. The diagnostic no
+  longer blames `--output-preset legacy` when no preset was passed — under the
+  default path the message is about the output path, and only a *named* preset is
+  named.
+- 2026-08-09 (review-fix round): `--output-sdr`'s refusal is now reason-specific.
+  The presence-based rejection stays (the documented asymmetry), but for
+  `display-p3`/`compatibility` it says the flag is **redundant** — those presets
+  resolve exactly 16-bit integer TIFF, so calling it a contradiction told the user
+  something false about what they were getting.
+- 2026-08-09 (review-fix round): the two "accepted: …" lists in
+  `OutputPreset::parse` are **generated from `OutputPreset::ALL`**. Both had gone
+  stale the moment a preset shipped, so `--output-preset displayp3` listed eight
+  names and hid the one the user wanted; a test loops over `ALL` and asserts every
+  name appears in both messages, which closes the class rather than the instance.
+- 2026-08-09 (review-fix round): `output/sdr-preset-followups` now holds **the SDR
+  report block** in place of the closed memory item — `stages::render_sdr_preset`
+  drops `SdrRenderMetadata` as `_metadata` while the HDR TIFF presets surface
+  their equivalent blocks, so the SDR contract reaches the report only as prose.
+  `RenderedSdr::metadata()`'s `#[allow(dead_code)]` is the marker for it.

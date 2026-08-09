@@ -108,8 +108,10 @@ profile for `hdr-pq`/`hdr-hlg` comes with `output/hdr-avif-output`, which also
 owns accepting those two names, their `.avif` suffix rule, and their atomicity.
 What remains here is *selection*: proving a resolved preset picks its calibrated
 profile, and adding profiles for the presets this task activates first
-(`gain-map-hdr` as default, `display-p3`, `compatibility`, `custom`). Do not
-re-derive an already-calibrated model.
+(`gain-map-hdr` as default, `custom`). `display-p3` and `compatibility` left that
+list when the SDR presets shipped — they arrived with their own calibrated
+`RunProfile::SdrTiff`, per the same rule. Do not re-derive an already-calibrated
+model.
 
 To preserve exposure across frames, `film-master` rejects frame-local automatic
 Dmax. The exponential density curve accepts supported `none` or fixed/

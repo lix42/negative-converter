@@ -1221,16 +1221,19 @@ impl EncodeReport {
 /// a preset resolves a whole coherent policy, so it can never be a bag of
 /// independent bools. Serializes kebab-case (`"legacy"` / `"film-master"`).
 ///
-/// **Eight variants are accepted today** — `legacy`, `film-master`,
-/// `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff` and
-/// `hdr-hlg-tiff`. The remaining planned names (`gain-map-hdr`, `display-p3`,
-/// `compatibility`, `custom`) need the default-activation and guidance work owned by
-/// `output/presets`; [`parse`](Self::parse) rejects them with a pinned "does not
-/// accept yet" message rather than a generic unknown-value error, and rejects the
-/// pre-release name `scene-master` as an unreleased-schema break.
+/// **Ten variants are accepted today** — `legacy`, `film-master`, `ultra-hdr-v1`,
+/// `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
+/// `hdr-pq-tiff` and `hdr-hlg-tiff`, enumerated once in [`ALL`](Self::ALL). The
+/// remaining planned names (`gain-map-hdr`, `custom`) need the default-activation
+/// and guidance work owned by `output/presets`; [`parse`](Self::parse) rejects them
+/// with a pinned "does not accept yet" message rather than a generic unknown-value
+/// error, and rejects the pre-release name `scene-master` as an unreleased-schema
+/// break.
 ///
-/// Keep this list in step with `parse` and with `OutputOverrides::output_preset`'s
-/// help text — it has gone stale twice, and the help text is what `--help` shows.
+/// Keep this list in step with `parse`, [`ALL`](Self::ALL), and
+/// `OutputOverrides::output_preset`'s help text — it has gone stale twice, and the
+/// help text is what `--help` shows. The diagnostics no longer restate it: they are
+/// generated from `ALL`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutputPreset {
@@ -1312,6 +1315,20 @@ pub enum OutputPreset {
     /// (HLG's OOTF is not per-channel separable, so no 1D curve set can express
     /// it); the display-referred contract lives in the report.
     HdrHlgTiff,
+    /// **`display-p3`** — a 16-bit integer SDR TIFF in Display P3, rendered through
+    /// the modern display stage (NC film RGB v1 → linear ACEScg → the shared print
+    /// controls → `pipeline::sdr`, including its reference-white-preserving
+    /// shoulder and gamut mapping). Requires `.tif`/`.tiff`.
+    ///
+    /// Differs from `legacy` in **pipeline**, not merely in profile: `legacy` runs
+    /// the print controls *before* the working→output ICC transform and never
+    /// crosses the ACEScg boundary at all.
+    DisplayP3,
+    /// **`compatibility`** — the same modern SDR render as
+    /// [`DisplayP3`](Self::DisplayP3), in **sRGB**: the widest-support output nc
+    /// writes, and lossless (16-bit integer, no lossy codec). Requires
+    /// `.tif`/`.tiff`.
+    Compatibility,
 }
 
 impl OutputPreset {
@@ -1329,6 +1346,8 @@ impl OutputPreset {
             "hdr-linear-tiff" => Ok(OutputPreset::HdrLinearTiff),
             "hdr-pq-tiff" => Ok(OutputPreset::HdrPqTiff),
             "hdr-hlg-tiff" => Ok(OutputPreset::HdrHlgTiff),
+            "display-p3" => Ok(OutputPreset::DisplayP3),
+            "compatibility" => Ok(OutputPreset::Compatibility),
             // The pre-release name for the same branch. It was renamed *before*
             // release because "scene" wrongly implied physical scene-linear
             // recovery; nc is unreleased, so this is a schema break, not an alias.
@@ -1339,24 +1358,45 @@ impl OutputPreset {
                  scene-linear recovery). Use `film-master`; there is no alias."
                     .into(),
             )),
-            planned @ ("gain-map-hdr" | "display-p3" | "compatibility" | "custom") => {
-                Err(NcError::Usage(format!(
-                    "output preset `{planned}` is a planned name that this build does not \
+            planned @ ("gain-map-hdr" | "custom") => Err(NcError::Usage(format!(
+                "output preset `{planned}` is a planned name that this build does not \
                  accept yet (it needs the remaining container work owned by \
-                 `output/presets`). Accepted today: `legacy` (the transitional TIFF \
-                 path, the default), `film-master` (unclamped linear ACEScg float \
-                 TIFF), `ultra-hdr-v1` (legacy XMP gain-map JPEG), `hdr-pq` / \
-                 `hdr-hlg` (10-bit 4:4:4 Rec.2100 AVIF), `hdr-linear-tiff` \
-                 (display-linear BT.2020 float TIFF), and `hdr-pq-tiff` / \
-                 `hdr-hlg-tiff` (16-bit Rec.2100 code values in a TIFF)."
-                )))
-            }
+                 `output/presets`). Accepted today: {} (`--help` says what each one \
+                 writes).",
+                Self::accepted_list()
+            ))),
             other => Err(NcError::Usage(format!(
-                "unknown output preset `{other}` — accepted: `legacy`, `film-master`, \
-                 `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, \
-                 `hdr-pq-tiff`, `hdr-hlg-tiff`"
+                "unknown output preset `{other}` — accepted: {}",
+                Self::accepted_list()
             ))),
         }
+    }
+
+    /// Every preset this build accepts, in help order.
+    ///
+    /// Diagnostics are generated from this list rather than restating it, because
+    /// two hand-written "accepted: …" lists both went stale the moment a preset
+    /// shipped — and a stale list hides exactly the name the user was reaching for.
+    pub const ALL: [OutputPreset; 10] = [
+        OutputPreset::Legacy,
+        OutputPreset::FilmMaster,
+        OutputPreset::UltraHdrV1,
+        OutputPreset::DisplayP3,
+        OutputPreset::Compatibility,
+        OutputPreset::HdrPq,
+        OutputPreset::HdrHlg,
+        OutputPreset::HdrLinearTiff,
+        OutputPreset::HdrPqTiff,
+        OutputPreset::HdrHlgTiff,
+    ];
+
+    /// The accepted names as a comma-separated backticked list, for diagnostics.
+    fn accepted_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|p| format!("`{}`", p.name()))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     /// Whether this preset is a *named* output (i.e. not the legacy no-preset
@@ -1380,6 +1420,8 @@ impl OutputPreset {
             OutputPreset::HdrLinearTiff => "hdr-linear-tiff",
             OutputPreset::HdrPqTiff => "hdr-pq-tiff",
             OutputPreset::HdrHlgTiff => "hdr-hlg-tiff",
+            OutputPreset::DisplayP3 => "display-p3",
+            OutputPreset::Compatibility => "compatibility",
         }
     }
 }
@@ -1494,7 +1536,12 @@ impl OutputParams {
             | OutputPreset::HdrPq
             | OutputPreset::HdrHlg
             | OutputPreset::HdrPqTiff
-            | OutputPreset::HdrHlgTiff => OutDepth::U16,
+            | OutputPreset::HdrHlgTiff
+            // 16-bit integer for the primary image and any IR plane: "losslessly
+            // stored SDR" is the point, and a float SDR TIFF is precision nothing
+            // can display.
+            | OutputPreset::DisplayP3
+            | OutputPreset::Compatibility => OutDepth::U16,
             OutputPreset::Legacy => {
                 if self.hdr {
                     OutDepth::F32
@@ -2069,7 +2116,7 @@ mod tests {
 
         // A planned-but-unimplemented name gets its own diagnosis rather than a bare
         // "unknown", so an agent can tell "not yet" from "typo".
-        for planned in ["gain-map-hdr", "display-p3", "compatibility", "custom"] {
+        for planned in ["gain-map-hdr", "custom"] {
             let msg = OutputPreset::parse(planned).unwrap_err().to_string();
             assert!(msg.contains("does not accept yet"), "{planned}: {msg}");
             assert!(msg.contains("film-master"), "{planned}: {msg}");
@@ -2079,6 +2126,15 @@ mod tests {
         // `hdr-pq-tiff` and `hdr-hlg-tiff` when `output/lossless-hdr-tiff` did — all
         // six are accepted now. They are asserted here name by name so the AVIF, the
         // linear-TIFF, and the coded-TIFF families cannot be confused back together.
+        // `display-p3` and `compatibility` graduated when the SDR presets landed.
+        assert_eq!(
+            OutputPreset::parse("display-p3").unwrap(),
+            OutputPreset::DisplayP3
+        );
+        assert_eq!(
+            OutputPreset::parse("compatibility").unwrap(),
+            OutputPreset::Compatibility
+        );
         assert_eq!(OutputPreset::parse("hdr-pq").unwrap(), OutputPreset::HdrPq);
         assert_eq!(
             OutputPreset::parse("hdr-hlg").unwrap(),
@@ -2127,6 +2183,45 @@ mod tests {
         }
         let msg = OutputPreset::parse("filmmaster").unwrap_err().to_string();
         assert!(msg.contains("unknown output preset"), "{msg}");
+    }
+
+    #[test]
+    fn every_accepted_preset_is_listed_in_the_parse_diagnostics() {
+        // Both "accepted: …" lists used to be hand-written, and both went stale the
+        // moment a preset shipped — so `--output-preset displayp3` listed eight names
+        // and hid the one the user wanted. They are generated from `ALL` now, and this
+        // is the test that keeps `ALL` itself honest.
+        let unknown = OutputPreset::parse("displayp3").unwrap_err().to_string();
+        let planned = OutputPreset::parse("gain-map-hdr").unwrap_err().to_string();
+        for preset in OutputPreset::ALL {
+            let name = preset.name();
+            assert!(
+                unknown.contains(name),
+                "unknown-preset message omits {name}"
+            );
+            assert!(planned.contains(name), "planned-name message omits {name}");
+            // Every entry is a name `parse` actually accepts (a typo in `ALL` would
+            // otherwise advertise a name that then fails).
+            assert_eq!(OutputPreset::parse(name).unwrap(), preset, "{name}");
+        }
+        // Completeness guard: adding a variant breaks this match, and the arm the
+        // author has to write sits next to the reminder to extend `ALL`.
+        for preset in OutputPreset::ALL {
+            match preset {
+                OutputPreset::Legacy
+                | OutputPreset::FilmMaster
+                | OutputPreset::UltraHdrV1
+                | OutputPreset::DisplayP3
+                | OutputPreset::Compatibility
+                | OutputPreset::HdrPq
+                | OutputPreset::HdrHlg
+                | OutputPreset::HdrLinearTiff
+                | OutputPreset::HdrPqTiff
+                | OutputPreset::HdrHlgTiff => {
+                    assert!(OutputPreset::ALL.contains(&preset));
+                }
+            }
+        }
     }
 
     #[test]

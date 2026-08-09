@@ -57,6 +57,8 @@ pub fn transfer_for(preset: OutputPreset) -> Option<HdrTransfer> {
         // below, which are not HDR renditions in the first place; both answers are
         // "no transfer", for opposite reasons.
         OutputPreset::HdrLinearTiff
+        | OutputPreset::DisplayP3
+        | OutputPreset::Compatibility
         | OutputPreset::Legacy
         | OutputPreset::FilmMaster
         | OutputPreset::UltraHdrV1 => None,

@@ -53,8 +53,19 @@
 //! encode     decoded + rendition                             28 + 12·s B/px
 //! ```
 //!
+//! `display-p3` / `compatibility` ([`RunProfile::SdrTiff`]) hold the same set as the
+//! coded HDR TIFFs and therefore share their arithmetic exactly — one SDR rendition
+//! instead of a Rec.2100 one, the output-space transform applied in place, and the
+//! same 6 B/px u16 quantize buffer at encode:
+//!
+//! ```text
+//! render     decoded + shared ACEScg + SDR rendition           2·decoded + 12 + 12·s B/px
+//! encode     decoded + rendition + u16 codes                   34 + 12·s B/px
+//! ```
+//!
 //! Its peak is therefore the **render** phase rather than encode, as it is for
-//! `hdr-pq-tiff`/`hdr-hlg-tiff` (no container is assembled in memory) and — for a
+//! `hdr-pq-tiff`/`hdr-hlg-tiff` and the two SDR presets (no container is assembled
+//! in memory) and — for a
 //! different reason — for `ultra-hdr-v1`, whose four simultaneous display buffers
 //! outweigh its encode set. Which phase peaks is **per profile**, not a property of
 //! any category: `which_phase_peaks_is_per_profile_and_measured_not_assumed` pins
@@ -160,6 +171,8 @@
 //! | `hdr-pq-tiff` 18.66 MP (explicit base, no IR export) | 1.078 GB | 0.906 GB | +19.0% |
 //! | `hdr-hlg-tiff` 18.66 MP (explicit base, no IR export) | 1.078 GB | 0.906 GB | +19.0% |
 //! | `hdr-pq-tiff` 74.65 MP (explicit base, no IR export) | 3.911 GB | (not measured) | — |
+//! | SDR preset 15.55 MP (explicit base, no IR export) | 0.921 GB | 0.850 GB | +8.4% |
+//! | SDR preset 74.65 MP (explicit base, no IR export) | 3.911 GB | 3.594 GB | +8.8% |
 //!
 //! Two sources of slack are visible and deliberate. Small frames run looser
 //! (+39.4% for the u16 18.66 MP run) because [`ALLOWANCE_FIXED_BYTES`] stops being negligible —
@@ -185,6 +198,14 @@
 //! a phase built only from enumerated buffers, so the residual is unmodelled
 //! allocator and writer overhead. Every one of these estimates stays **above**
 //! measured, which is the direction the gate requires.
+//!
+//! The two SDR rows are that same render peak — which is why the 74.65 MP estimate
+//! is again 3.911 GB — but they are **measured**, not inherited from the structural
+//! argument: 0.850 GB and 3.594 GB against 0.921 GB and 3.911 GB (1.08x / 1.09x), with
+//! the enumerated buffers alone at 0.80x / 0.91x of measured, so the allowance is
+//! covering real unmodelled overhead rather than padding. `display-p3` and
+//! `compatibility` share one profile — same buffers, different destination gamut —
+//! so the pair of frame sizes covers both.
 //!
 //! The two `hdr-pq` rows are the *pair* that solved
 //! [`AVIF_STAGING_BYTES_PER_PX`] — they are a fit, not two independent
@@ -365,6 +386,26 @@ pub enum RunProfile {
     /// it pays for a quantization buffer the linear TIFF does not need, but not for
     /// a native codec's working set.
     HdrCodedTiff {
+        /// Whether a u16 IR TIFF is staged before the primary TIFF.
+        export_ir: bool,
+    },
+    /// `display-p3` / `compatibility`: one SDR rendition plus the u16 buffer it is
+    /// quantized into.
+    ///
+    /// **Shares [`HdrCodedTiff`](Self::HdrCodedTiff)'s arithmetic exactly**, because
+    /// it holds the same buffers: the shared display source, one full-frame f32
+    /// rendition, and a 3x2 B quantize buffer, with `tiff` streaming strips so
+    /// nothing stages a container. The output-space transform is
+    /// `lcms2::transform_in_place`, which mutates the rendition rather than
+    /// allocating beside it.
+    ///
+    /// It is a **separate variant rather than a reuse** so the report and any future
+    /// divergence have a name to hang on. The shared arithmetic began as a structural
+    /// argument and has since been **measured** on two frame sizes (see the module
+    /// doc's calibration table: 1.08x / 1.09x over peak RSS), so it is calibrated in
+    /// its own right. Structural equivalence is still not self-enforcing: if a future
+    /// SDR change adds a buffer, this arm must move, and nothing here will notice.
+    SdrTiff {
         /// Whether a u16 IR TIFF is staged before the primary TIFF.
         export_ir: bool,
     },
@@ -831,7 +872,8 @@ pub fn estimate_peak(
                 sum(sum(sum(retained, avif_staging)?, ir_export)?, sampled)?,
             )
         }
-        RunProfile::HdrCodedTiff { export_ir } => {
+        // One arm for both: see `RunProfile::SdrTiff`'s note on why they share it.
+        RunProfile::HdrCodedTiff { export_ir } | RunProfile::SdrTiff { export_ir } => {
             // Render: identical to `HdrAvif` and `HdrLinearTiff` — they share
             // `render_linear`, and `encode_transfer` mutates the rendition in place.
             let rendition = mul(pixels, WORKING_CHANNELS * F32_BYTES)?;
@@ -1447,6 +1489,9 @@ mod tests {
         for (profile, expected) in [
             (RunProfile::HdrLinearTiff { export_ir: false }, "render"),
             (RunProfile::HdrCodedTiff { export_ir: false }, "render"),
+            // Provably "render" — it shares the coded arm — but the module doc claims
+            // this test pins *each* profile, so an unlisted one makes that false.
+            (RunProfile::SdrTiff { export_ir: false }, "render"),
             (RunProfile::UltraHdrV1 { export_ir: false }, "render"),
             (RunProfile::HdrAvif { export_ir: false }, "encode"),
             (
