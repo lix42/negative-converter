@@ -78,6 +78,43 @@ pub struct ContentLightLevel {
     pub max_fall_nits: u16,
 }
 
+/// Warn when a single-rendition HDR container would carry a signal that never rises
+/// above SDR reference white.
+///
+/// Every HDR preset advertises `target_peak_nits: 1000` in its report, and the
+/// container's own signalling (CICP transfer 16/18, the PQ `clli` box) says "HDR".
+/// If the rendered frame's brightest pixel measures at or below the 203-nit
+/// reference white, all of that is true of the *file* and none of it is true of the
+/// *picture*: the result is an HDR wrapper around an SDR-range signal, which costs
+/// bit depth and compatibility and buys nothing. CLAUDE.md's fail-loudly rule puts
+/// that in the report rather than leaving it to be discovered with `exiftool`.
+///
+/// The measurement is [`ContentLightLevel::max_cll_nits`], reused exactly as
+/// measured for the `clli` box — the same number the artifact advertises, so the
+/// warning and the file can never disagree, and no second pass over the frame is
+/// needed. It is whole nits by the time it reaches here, which is why the
+/// comparison is `<=` against a rounded 203 rather than a float epsilon dance: a
+/// frame peaking at 203.4 nits is not meaningfully HDR either.
+///
+/// `None` for a frame with real highlights — that is the falsifiable half, and the
+/// reason this takes the measurement rather than the preset.
+pub fn sdr_range_warning(content_light: ContentLightLevel) -> Option<String> {
+    let reference_white = REFERENCE_WHITE_NITS.round() as u16;
+    (content_light.max_cll_nits <= reference_white).then(|| {
+        format!(
+            "HDR output carries an SDR-range signal: the brightest pixel measures {} nits, \
+             at or below the {reference_white}-nit reference white, so nothing in this frame \
+             uses the {:.0}-nit headroom the container and report advertise. Two common \
+             causes: the resolved Dmax anchor is too high for this roll, which darkens the \
+             whole render — measure the roll's own anchor with `nc estimate --d-max-region` \
+             and pass it as `--d-max` — or the frame's content genuinely never reaches the \
+             display shoulder, in which case an SDR preset delivers the same picture in a \
+             more compatible container.",
+            content_light.max_cll_nits, TARGET_PEAK_NITS,
+        )
+    })
+}
+
 /// Policy metadata that describes the pre-transfer linear BT.2020 rendition.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct LinearHdrMetadata {
@@ -134,6 +171,16 @@ impl LinearBt2020Hdr {
     /// Borrow the fully resolved linear rendering policy.
     pub fn metadata(&self) -> &LinearHdrMetadata {
         &self.metadata
+    }
+
+    /// The measured content-light levels of these pixels.
+    ///
+    /// Read before the encode boundary so the orchestrator can check the rendition
+    /// against reference white ([`sdr_range_warning`]) without keeping the buffer
+    /// alive past [`into_parts`](Self::into_parts) — `hdr-linear-tiff` hands the
+    /// image straight to the encoder, so there is no later moment to ask.
+    pub fn content_light(&self) -> ContentLightLevel {
+        self.content_light
     }
 
     /// Consume the typed value at the linear-TIFF encoding boundary.
@@ -841,6 +888,52 @@ mod tests {
             let rendered = render(&shared_from_film_rgb(&[0.05; 3]), transfer, 0.0).unwrap();
             assert_eq!(rendered.metadata().content_light, dark);
             assert_eq!(dark.max_fall_nits, dark.max_cll_nits);
+        }
+    }
+
+    #[test]
+    fn sdr_range_warning_fires_on_the_measurement_not_on_the_preset() {
+        // A frame rendered exactly at reference white uses none of the headroom: the
+        // container says 1000 nits, the picture says 203. `<=` is deliberate — a
+        // signal that only *reaches* reference white has no HDR content either.
+        let at_white = render_linear(&shared_from_film_rgb(&[1.0; 3]), 0.0)
+            .unwrap()
+            .content_light();
+        assert_eq!(at_white.max_cll_nits, REFERENCE_WHITE_NITS as u16);
+        let message = sdr_range_warning(at_white).expect("a 203-nit peak must warn");
+        assert!(message.contains("203"), "{message}");
+        assert!(message.contains("--d-max-region"), "{message}");
+
+        // Darker still, obviously.
+        let dark = render_linear(&shared_from_film_rgb(&[0.05; 3]), 0.0)
+            .unwrap()
+            .content_light();
+        assert!(sdr_range_warning(dark).is_some());
+
+        // The falsifiable half: one pixel above reference white silences it, so the
+        // warning tracks the frame rather than the preset. `shoulder_start` for
+        // `highlight_compress = 0` sits below the peak, so this renders above 1.0.
+        let bright = render_linear(
+            &shared_from_film_rgb(&[
+                0.0,
+                0.0,
+                0.0,
+                LINEAR_HEADROOM,
+                LINEAR_HEADROOM,
+                LINEAR_HEADROOM,
+            ]),
+            0.0,
+        )
+        .unwrap()
+        .content_light();
+        assert!(bright.max_cll_nits > REFERENCE_WHITE_NITS as u16);
+        assert_eq!(sdr_range_warning(bright), None);
+
+        // The transfer encode carries the same measurement, so PQ and HLG renditions
+        // reach the identical verdict from the identical number.
+        for transfer in [HdrTransfer::Pq, HdrTransfer::Hlg] {
+            let rendered = render(&shared_from_film_rgb(&[0.05; 3]), transfer, 0.0).unwrap();
+            assert!(sdr_range_warning(rendered.metadata().content_light).is_some());
         }
     }
 

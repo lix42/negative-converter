@@ -44,9 +44,12 @@ nc estimate reference.tiff --base-region 0,0,120,40
 nc convert in.tiff -o out.tiff --reconstruction density \
   --film-base 0.92,0.55,0.42
 
-# Full HDR float output with explicit controls.
+# Full HDR float output with explicit controls. `--density-gamma` is the
+# exponential curve's knob, so that curve is selected explicitly — the default
+# is the sigmoid, whose slope is `--sigmoid-contrast`.
 nc convert in.tiff -o out.tiff --reconstruction density --output-hdr \
-  --film-base 0.92,0.55,0.42 --density-gamma 1.8 --print-exposure 0.0
+  --film-base 0.92,0.55,0.42 \
+  --density-curve exponential --density-gamma 1.8 --print-exposure 0.0
 
 # Inspect a scan and emit machine-readable JSON.
 nc inspect in.tiff --report json

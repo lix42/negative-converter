@@ -74,7 +74,10 @@ machinery.
   `nc estimate --d-max-region X,Y,W,H`, which mirrors `--base-region` and emits
   reuse-ready `--d-max` / explicit recipe forms.
 - **Default becomes a fixed `Dmax`**, resolved in order: measured reference →
-  per-stock constant → a nominal **corrected-density** anchor (e.g. `Dmax ≈ 2.0`,
+  per-stock constant → a nominal **corrected-density** anchor (shipped as
+  `NOMINAL_DMAX`; `2.0` when this task shipped, lowered to `1.3` on 2026-08-08 by
+  `algo/negative-reconstruction-density-curves` — see
+  `film-base/dmax-anchor-reliability`, which owns the number — and in either case
   a scene-independent placement expressed *in density units*). Note `Dmax` lives
   in the post-base `D′` space where the base is `0`, so the fallback is a density
   value — **not** the base transmission plus a range (mixing transmission and

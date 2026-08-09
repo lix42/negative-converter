@@ -302,7 +302,9 @@ fn ms_since(started: Instant) -> f64 {
 mod tests {
     use super::*;
     use crate::pipeline::film_base;
-    use crate::types::{DensityCurve, DensityParams, FilmBaseSource, SigmoidParams};
+    use crate::types::{
+        DensityCurve, DensityParams, DmaxSource, ExponentialParams, FilmBaseSource, SigmoidParams,
+    };
 
     /// A small synthetic negative with the real scan layout — a near-black
     /// holder ring, then a bright, uniform orange rebate band (the film base),
@@ -331,6 +333,24 @@ mod tests {
 
     fn density_default() -> Reconstruction {
         Reconstruction::default()
+    }
+
+    /// A reconstruction that lands this module's synthetic pixels in the **middle**
+    /// of the range, where a transfer function visibly changes a value.
+    ///
+    /// The default (sigmoid at the nominal 1.3 anchor) renders these vectors to
+    /// ~0.999, and near white the sRGB transfer and the linear value converge — so
+    /// a test asking "was the transfer applied?" stops being able to tell. That is
+    /// a property of the fixture, not of the branch under test, so the fixture is
+    /// pinned rather than the assertion loosened.
+    fn midtone_reconstruction() -> Reconstruction {
+        Reconstruction::Density {
+            density: DensityParams::default(),
+            curve: DensityCurve::Exponential(ExponentialParams {
+                gamma: 1.0,
+                dmax: DmaxSource::Explicit(2.0),
+            }),
+        }
     }
 
     fn sigmoid_default() -> Reconstruction {
@@ -507,7 +527,7 @@ mod tests {
             preset: OutputPreset::FilmMaster,
             ..OutputParams::default()
         };
-        let (film, _) = algo::reconstruct(&img, &base, &density_default()).unwrap();
+        let (film, _) = algo::reconstruct(&img, &base, &midtone_reconstruction()).unwrap();
         let mapped = working_space::map_nc_film_rgb_v1(film).into_linear();
 
         // (a) A print control the legacy branch honours (2^1 exposure doubles every
@@ -518,7 +538,7 @@ mod tests {
             print_exposure: 1.0,
             ..PrintParams::default()
         };
-        let master = render(&img, &base, &density_default(), &hot, &master_params).unwrap();
+        let master = render(&img, &base, &midtone_reconstruction(), &hot, &master_params).unwrap();
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
         assert_eq!(
             bits(&master.image.rgb),
@@ -528,7 +548,7 @@ mod tests {
         let legacy_hot = render(
             &img,
             &base,
-            &density_default(),
+            &midtone_reconstruction(),
             &hot,
             &OutputParams {
                 hdr: true,
@@ -560,7 +580,7 @@ mod tests {
         let legacy_srgb = render(
             &img,
             &base,
-            &density_default(),
+            &midtone_reconstruction(),
             &PrintParams::default(),
             &OutputParams {
                 output_profile: Some("srgb".into()),
@@ -571,7 +591,7 @@ mod tests {
         let master_plain = render(
             &img,
             &base,
-            &density_default(),
+            &midtone_reconstruction(),
             &PrintParams::default(),
             &master_params,
         )
@@ -671,14 +691,25 @@ mod tests {
     }
 }
 
-/// Golden fixtures pinning the refactor bit-for-bit against the **pre-split
-/// monolithic converters** (`Algorithm::{Simple,Density,Sigmoid}`). Every
-/// expected value below was captured by running the pre-refactor code on these
-/// exact inputs and printing `f32::to_bits` / hashing the encoded TIFF bytes —
-/// so any arithmetic drift in the reconstruction split (a reordered multiply, a
-/// changed intermediate, a lost anchor) fails these tests immediately, not in a
-/// downstream image diff. This is the task's acceptance gate: the split is a
-/// structural refactor, the default pixels are the contract.
+/// Golden fixtures pinning the reconstruction split bit-for-bit against the
+/// **pre-split monolithic converters** (`Algorithm::{Simple,Density,Sigmoid}`).
+/// Most expected values below were captured by running the pre-refactor code on
+/// these exact inputs and printing `f32::to_bits` — so any arithmetic drift in the
+/// split (a reordered multiply, a changed intermediate, a lost anchor) fails these
+/// tests immediately, not in a downstream image diff. That was the split task's
+/// acceptance gate: the split is a structural refactor, the default pixels are the
+/// contract.
+///
+/// **Two of the twelve are not reference captures**, and the claim has to be scoped
+/// or it stops being true. `golden_sigmoid_default_is_numerically_exact` was
+/// recaptured on 2026-08-03 when the sigmoid's own defaults deliberately moved, and
+/// `golden_new_default_is_bit_identical` was captured fresh from this build on
+/// 2026-08-08 for the new default render. Both honestly pin "this has not drifted
+/// since it was set", which is strictly weaker than "matches the reference
+/// implementation" — no golden can claim the stronger thing about a value that was
+/// deliberately changed. Each says so at its own call site; read it before treating
+/// a failure there as proof of a regression. Nothing here hashes an encoded TIFF:
+/// see the note at the end of the module for why that could never be checked in.
 ///
 /// The module is (test-only) `pub(crate)` so the `pipeline_version` drift gate in
 /// [`crate::version`] fingerprints **these exact** curated vectors instead of a
@@ -787,19 +818,75 @@ pub(crate) mod golden {
 
     const UNIT_WB: [u32; 3] = [0x3f800000; 3]; // [1.0, 1.0, 1.0]
 
+    /// The configuration the vectors below were captured under: the exponential
+    /// straight line at gamma **1.0** with the anchor pinned at the old
+    /// `NOMINAL_DMAX` of **2.0**.
+    ///
+    /// Pinned **explicitly** rather than through `DensityCurve::default()`, because
+    /// on 2026-08-08 the default became the sigmoid, `NOMINAL_DMAX` became 1.3, and
+    /// this curve's gamma became 2.0. A golden vector that silently follows the
+    /// default stops pinning anything the moment the default moves — it just
+    /// re-describes whatever the build now does. Naming the configuration keeps
+    /// every bit below exactly as captured from the reference code, and the *new*
+    /// default gets its own golden (`golden_new_default_...`).
+    ///
+    /// `Explicit(2.0)` is arithmetically identical to the old `Fixed`: both resolve
+    /// to the same anchor value, so these are the original captures, not a rebase.
+    fn frozen_reference_curve() -> DensityCurve {
+        DensityCurve::Exponential(ExponentialParams {
+            gamma: 1.0,
+            dmax: DmaxSource::Explicit(2.0),
+        })
+    }
+
+    /// `Reconstruction::default()`'s density knobs with [`frozen_reference_curve`].
+    fn frozen_reference_config() -> Reconstruction {
+        Reconstruction::Density {
+            density: DensityParams::default(),
+            curve: frozen_reference_curve(),
+        }
+    }
+
     #[test]
-    fn golden_density_exponential_default_is_bit_identical() {
-        // THE default path (density reconstruction, exponential curve, fixed
-        // nominal anchor, neutral print) — the task's headline guarantee.
+    fn golden_new_default_is_bit_identical() {
+        // THE default path as of 2026-08-08: density reconstruction, **sigmoid**
+        // curve with its derived contrast/shoulder, the nominal anchor at the new
+        // NOMINAL_DMAX = 1.3, neutral print.
+        //
+        // Captured from THIS build, not from the reference implementation — so it
+        // pins "the default has not drifted since it was set", which is what a
+        // default golden can honestly claim after the default deliberately moved.
+        // The reference-derived captures live in the `frozen_reference_*` goldens
+        // above and are untouched.
         assert_golden(
             Reconstruction::default(),
+            PrintParams::default(),
+            &[
+                0x3c23e35f, 0x3c2d03d9, 0x3c2e457f, 0x3da066cb, 0x3da68379, 0x3ddb53b4, 0x3f7f12f0,
+                0x3f7f2169, 0x3f7f2ec2, 0x3c05798b, 0x3f800000, 0x3f800000, 0x3c1928cc, 0x3c1928cc,
+                0x3c1928cc,
+            ],
+            Some(0x3fa66666), // NOMINAL_DMAX = 1.3
+            Some(UNIT_WB),
+            None,
+        );
+    }
+
+    #[test]
+    fn golden_density_exponential_reference_is_bit_identical() {
+        // The exponential straight line at gamma 1.0 / anchor 2.0 — what used to be
+        // THE default path, and still the reference capture these bits came from.
+        // No longer reached by `Reconstruction::default()` (see
+        // `frozen_reference_curve`), so it is named here instead.
+        assert_golden(
+            frozen_reference_config(),
             PrintParams::default(),
             &[
                 0x3c2d7a46, 0x3c343958, 0x3c35161a, 0x3cf5c28f, 0x3cfa4fa3, 0x3d0f5c2a, 0x3ee66668,
                 0x3eeaaaab, 0x3eeeeef1, 0x3bc49ba7, 0x45abdfff, 0x45833ffb, 0x3c23d70a, 0x3c23d70a,
                 0x3c23d70a,
             ],
-            Some(0x40000000), // NOMINAL_DMAX = 2.0
+            Some(0x40000000), // the anchor these bits were captured at
             Some(UNIT_WB),
             None,
         );
@@ -876,15 +963,21 @@ pub(crate) mod golden {
         );
     }
 
-    fn sigmoid_default_config() -> Reconstruction {
+    /// The sigmoid with its shipped parameters but the anchor pinned at the **old**
+    /// `NOMINAL_DMAX` of 2.0, so the 2026-08-03 recapture below stays the captured
+    /// bits rather than silently following `NOMINAL_DMAX` to 1.3.
+    fn sigmoid_at_reference_anchor_2_0() -> Reconstruction {
         Reconstruction::Density {
             density: DensityParams::default(),
-            curve: DensityCurve::Sigmoid(SigmoidParams::default()),
+            curve: DensityCurve::Sigmoid(SigmoidParams {
+                dmax: DmaxSource::Explicit(2.0),
+                ..SigmoidParams::default()
+            }),
         }
     }
 
     #[test]
-    fn golden_sigmoid_default_is_numerically_exact() {
+    fn golden_sigmoid_at_the_reference_anchor_is_numerically_exact() {
         // RECAPTURED 2026-08-03 (`algo/reference-anchored-sigmoid`, Phase 4). The sigmoid
         // defaults changed deliberately: contrast 1.0 → REFERENCE_CONTRAST (≈2.07), shoulder
         // 0.2 → 0.6, and the anchor is now mid-grey at half the reference rather than white
@@ -892,17 +985,22 @@ pub(crate) mod golden {
         // (≈28/255 → ≈6/255, i.e. an actual black — the defect this task was opened for) and
         // the dense highlight 0.448 → 0.946.
         //
-        // NOTE these values still use the `Fixed` fallback reference of NOMINAL_DMAX = 2.0,
-        // which places mid-grey at D′ 1.0. On a *measured* roll (reference ≈1.35) it lands at
-        // ≈0.67, matching real mid-tones. The fallback constant is `film-base`'s to fix
-        // (`film-base/dmax-anchor-reliability`); this vector is not evidence about it.
+        // NOTE this is **no longer the sigmoid default**, which is why the name says
+        // "at the reference anchor" instead. It runs the shipped sigmoid parameters at
+        // `Explicit(2.0)` — the anchor `NOMINAL_DMAX` carried when these bits were
+        // captured — so the capture keeps pinning what it was captured for. The live
+        // default is the same curve at `NOMINAL_DMAX = 1.3`, pinned separately by
+        // `golden_new_default_is_bit_identical`. On a *measured* roll (reference ≈1.35)
+        // mid-grey lands at ≈0.67, matching real mid-tones; the fallback constant is
+        // `film-base/dmax-anchor-reliability`'s to settle and this vector is not
+        // evidence about it.
         //
-        // The drift-gate fingerprints are deliberately NOT touched: the default recipe still
-        // selects the exponential curve, so `version::PIPELINE_FINGERPRINTS` does not move and
-        // no `pipeline_version` bump is owed here. `output/presets` owns that bump when it
-        // flips the default curve to sigmoid.
+        // The drift-gate fingerprints do not move for *this* vector: it is not a default
+        // path, so `version::PIPELINE_FINGERPRINTS` never hashed it. The bump that flipped
+        // the default curve to the sigmoid is v2, recorded on 2026-08-08 by this same
+        // change — not, as this note used to predict, deferred to `output/presets`.
         assert_golden(
-            sigmoid_default_config(),
+            sigmoid_at_reference_anchor_2_0(),
             PrintParams::default(),
             &[
                 0x3af793c5, 0x3b02af7d, 0x3b03a290, 0x3c7438ec, 0x3c7da965, 0x3ca7e975, 0x3f72198a,
@@ -966,7 +1064,7 @@ pub(crate) mod golden {
         // the film positive" — bit-identical because a per-sample map commutes
         // with striding. Pin both estimators' gains AND output pixels.
         assert_golden(
-            Reconstruction::default(),
+            frozen_reference_config(),
             PrintParams {
                 white_balance: WbSource::Percentile,
                 ..PrintParams::default()
@@ -981,7 +1079,7 @@ pub(crate) mod golden {
             None,
         );
         assert_golden(
-            Reconstruction::default(),
+            frozen_reference_config(),
             PrintParams {
                 white_balance: WbSource::GrayWorld,
                 ..PrintParams::default()
@@ -1005,7 +1103,7 @@ pub(crate) mod golden {
         assert_golden(
             Reconstruction::Density {
                 density: balanced_density(),
-                curve: DensityCurve::default(),
+                curve: frozen_reference_curve(),
             },
             PrintParams {
                 white_balance: WbSource::Percentile,
@@ -1028,7 +1126,7 @@ pub(crate) mod golden {
         // film positive (not the exponential one), and the gains apply through
         // the same stage-4 slot.
         assert_golden(
-            sigmoid_default_config(),
+            sigmoid_at_reference_anchor_2_0(),
             PrintParams {
                 white_balance: WbSource::Percentile,
                 ..PrintParams::default()
@@ -1061,7 +1159,7 @@ pub(crate) mod golden {
                     balance_range: BalanceRange::Auto,
                     ..balanced_density()
                 },
-                curve: DensityCurve::default(),
+                curve: frozen_reference_curve(),
             },
             PrintParams::default(),
             &[

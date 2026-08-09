@@ -98,7 +98,8 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   color-fidelity rule. Don't collapse them.
 - Algorithms are pluggable behind the tagged `reconstruction` recipe object:
   `algo::reconstruct` resolves it into `simple` or `density` reconstruction
-  (density selecting an `exponential` (default) or `sigmoid` curve);
+  (density selecting a `sigmoid` (default since `pipeline_version` 2) or
+  `exponential` curve);
   `algo::finish_print` is the stage-4 print bridge. The old `Converter` trait and
   `AlgoParams` are gone.
 - The **IR channel** (HDRi 64-bit input) is decoded and, by default, **preserved

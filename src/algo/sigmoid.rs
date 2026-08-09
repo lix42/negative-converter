@@ -45,10 +45,22 @@
 //! Properties (pinned by tests):
 //! - **White (highlights):** with `shoulder > 0`, `lin` approaches display white
 //!   `1.0` from strictly below as `D' → ∞` and never reaches or exceeds it for any
-//!   finite density — so the default u16 encode cannot clip highlights, for *any*
-//!   valid params (including a small `Dmax` or a low-contrast auto anchor). With
-//!   `shoulder = 0` there is no roll-off and highlights follow the (toe-shaped)
+//!   finite density — so the default u16 encode reports no clipped highlights, for
+//!   *any* valid params (including a small `Dmax` or a low-contrast auto anchor).
+//!   With `shoulder = 0` there is no roll-off and highlights follow the (toe-shaped)
 //!   line, which *can* exceed `1.0` (like the exponential curve).
+//!
+//!   **That is a statement in ℝ, and `f32` is not ℝ — do not read it as "no
+//!   highlight detail is lost".** The approach is asymptotic, so the gap to `1.0`
+//!   falls below an `f32` ulp at a finite density: at the shipped defaults with the
+//!   nominal anchor 1.3, `lin` is exactly `1.0f32` from just above `D' ≈ 3.1`
+//!   onward. `io::encode` counts a clip as `v > 1.0` *strictly*
+//!   (`quantize_u16`), so every one of those densities encodes to the same 65535
+//!   with `clipped_high = 0` and `--strict` green. The loss is real and it is
+//!   narrow — it needs near-opaque negative, i.e. deep highlights — but it moved
+//!   from a **counted** category to an **uncounted** one, which is the opposite of
+//!   what the clip counter is for. Anyone quoting "0.00% clipped" as evidence of
+//!   preserved highlights has to say this too.
 //! - **Black (shadows):** with `toe > 0`, `lin` approaches the paper-black floor
 //!   `10^(−contrast·A)` as `D' → −∞` (the shoulder's effect on the floor is
 //!   negligible for realistic params; the floor is exactly `10^(−contrast·A)`

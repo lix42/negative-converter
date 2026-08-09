@@ -209,7 +209,7 @@ pub struct ConvertArgs {
     #[arg(long, value_enum)]
     pub reconstruction: Option<ReconstructionType>,
     /// Density-to-positive curve (with `--reconstruction density`; default
-    /// `exponential`).
+    /// `sigmoid`).
     #[arg(long = "density-curve", value_enum)]
     pub density_curve: Option<DensityCurveType>,
     /// Removed: the pre-reconstruction algorithm selector. Kept hidden only to
@@ -1389,10 +1389,10 @@ struct LoadedRecipe {
     /// carried one. Provenance only — never applied, only compared (see
     /// [`pipeline_version_warning`]).
     meta_pipeline_version: Option<u32>,
-    /// Whether the recipe explicitly selects the sigmoid curve but omits
-    /// `reconstruction.curve.anchor` — the witness behind
-    /// [`sigmoid_anchor_default_warning`].
-    sigmoid_anchor_absent: bool,
+    /// How far the recipe left the density curve unpinned (an omitted `curve`, or a
+    /// sigmoid without `reconstruction.curve.anchor`) — the witness behind
+    /// [`curve_default_warning`].
+    unpinned_curve: Option<UnpinnedCurve>,
 }
 
 /// The sidecar document written beside every converted frame:
@@ -1473,7 +1473,11 @@ fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
             cfg: ResolvedConfig::default(),
             curve_dmax_present: false,
             meta_pipeline_version: None,
-            sigmoid_anchor_absent: false,
+            // No recipe file means nothing was archived and nothing is being
+            // reinterpreted — the run simply *is* this build's defaults. Only a
+            // loaded document can carry the "written when the defaults were
+            // different" problem the warning describes.
+            unpinned_curve: None,
         }),
         Some(p) => {
             let txt = std::fs::read_to_string(p)
@@ -1520,7 +1524,7 @@ fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
                 cfg,
                 curve_dmax_present,
                 meta_pipeline_version,
-                sigmoid_anchor_absent: body.is_some_and(selects_sigmoid_without_anchor),
+                unpinned_curve: body.and_then(unpinned_curve),
             })
         }
     }
@@ -1635,48 +1639,186 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// The warning for replaying a recipe captured under a **different** behavioral
-/// `pipeline_version` than this build implements: the recipe still applies, but the
-/// default render it was captured under has changed, so the pixels will not match
-/// the original output. Loud (and `--strict`-promotable) rather than silent — that
-/// mismatch is exactly what `pipeline_version` exists to make visible.
-fn selects_sigmoid_without_anchor(v: &serde_json::Value) -> bool {
-    let Some(curve) = v.get("reconstruction").and_then(|r| r.get("curve")) else {
-        return false;
-    };
-    curve.get("type").and_then(|t| t.as_str()) == Some("sigmoid") && curve.get("anchor").is_none()
+/// How far a loaded recipe left the density curve unpinned. The two shapes need
+/// different warnings, because a different amount moved underneath each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnpinnedCurve {
+    /// The recipe tags `curve.type = "sigmoid"` but omits `anchor`: the curve
+    /// itself is pinned and only its **placement rule** floats.
+    AnchorOnly,
+    /// The recipe omits `reconstruction.curve` entirely, so the **curve itself**
+    /// floats — and it moved on 2026-08-08.
+    WholeCurve,
+    /// The recipe pins the curve *type* but omits a scalar whose default moved in
+    /// `pipeline_version` 2: the exponential's `gamma` (1.0 → 2.0) or either
+    /// curve's `dmax` (nominal 2.0 → 1.3).
+    ///
+    /// Narrower than [`WholeCurve`](Self::WholeCurve) — the curve is the one the
+    /// author chose — and easy to miss for exactly that reason: the recipe *looks*
+    /// pinned. A recipe reading `{"curve":{"type":"exponential"}}` used to mean
+    /// gamma 1.0 at anchor 2.0 and now means gamma 2.0 at anchor 1.3, which is a
+    /// substantially different render with nothing in the file to show it.
+    MovedDefaults,
 }
 
-/// Warn that an archived sigmoid recipe will not reproduce its original render.
+/// Whether a loaded recipe resolves to a sigmoid curve it never fully pinned — the
+/// witness behind [`curve_default_warning`].
+///
+/// Probed on the raw JSON because that is the only witness: once serde has filled
+/// defaults, a recipe that omitted the curve is indistinguishable from one that
+/// wrote today's default out in full.
+///
+/// **An omitted `curve` counts, since 2026-08-08.** The default curve is now the
+/// sigmoid, so a `reconstruction` block with no `curve` resolves to a sigmoid at
+/// this build's default anchor — a different curve, a different placement rule *and*
+/// a different `Dmax` than the same file got before that date. That is exactly the
+/// silent reinterpretation design-spec §7.3 promises not to do, and nothing else
+/// catches it: a bare `--params` recipe carries no `meta.pipeline_version`, so
+/// [`pipeline_version_warning`] never sees it. Answering "no warning" for a
+/// curve-less `reconstruction` block was right while the curve-less resolution was
+/// the anchorless exponential; it stopped being right when the default moved.
+///
+/// **The boundary is the presence of a `reconstruction` object, and that is a
+/// judgement call worth stating.** A recipe carrying no `reconstruction` key at all
+/// resolves to exactly the same render as `{"reconstruction": {"type": "density"}}`,
+/// so warning about one and not the other is a seam. It is drawn there anyway,
+/// because the two say different things: a recipe with a `reconstruction` block is
+/// stating a reconstruction configuration, and the curve is a **hole in that
+/// statement** that used to be filled differently. A recipe silent on the stage is
+/// stating nothing about it — the same position as passing no recipe, where nc
+/// warns nothing at all. Erasing the seam the other way would fire on essentially
+/// every partial recipe and make `--strict` fail for all of them, permanently, in
+/// exchange for a one-time migration aid.
+///
+/// Otherwise `None` only where the recipe rules the case out: `simple`
+/// reconstruction (no curve stage exists), a tagged non-sigmoid curve, or an
+/// explicit `anchor`.
+fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
+    let reconstruction = v.get("reconstruction")?;
+    // `simple` runs no curve stage, so no curve default can reach it. An absent
+    // `type` is `density` (the serde default), which does.
+    if reconstruction.get("type").and_then(|t| t.as_str()) == Some("simple") {
+        return None;
+    }
+    let Some(curve) = reconstruction.get("curve") else {
+        return Some(UnpinnedCurve::WholeCurve);
+    };
+    // `dmax`'s nominal moved for *both* curves, so it is checked once here.
+    //
+    // **Only an absent key counts.** `"dmax":"fixed"` does name the *policy* rather
+    // than a value — it resolves through `NOMINAL_DMAX`, which moved 2.0 → 1.3 — so
+    // an archived recipe spelling it really would render differently. But `"fixed"`
+    // is also exactly what `--dump-params` writes, and identical bytes carry no
+    // evidence of when they were written, so warning on it made a file this build
+    // had *just* produced fail its own `--strict` replay while the output was
+    // byte-identical. Given a choice between a false positive on the documented
+    // reproducibility path and a false negative on a migration aid, the workflow
+    // wins. `"auto"` is per-frame (a different thing, not a moved default), and
+    // `"none"` / `{"explicit":…}` are genuinely pinned.
+    //
+    // The rule this settles on, and the one worth keeping: **warn only on shapes
+    // this build cannot produce.** An absent `dmax`, `gamma`, `anchor` or `curve`
+    // is never written by `--dump-params`, so a recipe carrying one was written by
+    // some other build — which is the whole population the warning is for, and it
+    // makes the predicate structurally free of false positives instead of tuned.
+    // `recipe_dumped_by_this_build_replays_clean_under_strict` is the gate; the
+    // residual gap (an archived bare recipe spelling `"fixed"`) is recorded in
+    // `docs/tasks/algo/negative-reconstruction-density-curves.md` and belongs to
+    // `core/conversion-versioning`'s per-version default table.
+    let dmax_floats = curve.get("dmax").is_none();
+    match curve.get("type").and_then(|t| t.as_str()) {
+        Some("sigmoid") => {
+            if curve.get("anchor").is_none() {
+                // The bigger of the two: report the placement move, which subsumes
+                // a floating `dmax` in the explanation.
+                Some(UnpinnedCurve::AnchorOnly)
+            } else {
+                dmax_floats.then_some(UnpinnedCurve::MovedDefaults)
+            }
+        }
+        Some("exponential") => {
+            (curve.get("gamma").is_none() || dmax_floats).then_some(UnpinnedCurve::MovedDefaults)
+        }
+        // An untagged or unknown curve object never parses, so it cannot reach a
+        // render to be warned about.
+        _ => None,
+    }
+}
+
+/// Warn that an archived recipe will not reproduce its original render, because a
+/// curve default moved underneath it.
 ///
 /// The same situation as [`pipeline_version_warning`], one level down: the parameters
-/// still apply, but a **default changed underneath them**. `reconstruction.curve.anchor`
-/// was introduced by `algo/reference-anchored-sigmoid` (2026-08-03) with a default of
-/// mid-grey placement, replacing the previous white-at-Dmax behavior, so a recipe frozen
-/// before that date renders differently even with `contrast`, `toe`, `shoulder` and `dmax`
-/// all pinned.
+/// still apply, but a **default changed underneath them**. Two such moves are covered,
+/// and they are reported separately because the remedy differs:
+///
+/// - [`UnpinnedCurve::AnchorOnly`] — `reconstruction.curve.anchor` was introduced by
+///   `algo/reference-anchored-sigmoid` (2026-08-03) with a default of mid-grey
+///   placement, replacing the previous white-at-Dmax behavior, so a recipe frozen
+///   before that date renders differently even with `contrast`, `toe`, `shoulder`
+///   and `dmax` all pinned.
+/// - [`UnpinnedCurve::WholeCurve`] — `algo/negative-reconstruction-density-curves`
+///   (2026-08-08, `pipeline_version` 2) made the sigmoid the default curve and moved
+///   the nominal `Dmax` to 1.3, so a curve-less recipe that used to mean "the
+///   exponential straight line at gamma 1.0, anchor 2.0" now means something else
+///   entirely. Bigger than the anchor case, and previously unwarned.
 ///
 /// Why a warning and not a `reconstruction.schema_version` bump: that constant versions the
 /// **schema shape** and is checked for *exact* equality, so bumping it would reject every
-/// archived recipe outright — including the overwhelming majority that select the
-/// exponential curve and are wholly unaffected by this change. Preserving the old semantics
+/// archived recipe outright — including the many that pin a curve explicitly and are wholly
+/// unaffected. Preserving the old semantics
 /// per schema version is the other option, and it is a real design (a per-version default
 /// table), but it would have to cover `contrast` and `shoulder` too — they moved in the same
 /// commit and have the identical property — and that policy belongs with
 /// `core/conversion-versioning`, not improvised here. What is not acceptable is silence, so
 /// this says so loudly and `--strict` promotes it.
-fn sigmoid_anchor_default_warning(anchor_absent: bool) -> Option<String> {
-    anchor_absent.then(|| {
-        "the loaded recipe selects the sigmoid curve without \
+fn curve_default_warning(
+    unpinned: Option<UnpinnedCurve>,
+    loaded_version: Option<u32>,
+) -> Option<String> {
+    // A recipe that records **this** build's `pipeline_version` was produced by a
+    // build whose defaults are these defaults: nothing moved underneath it, and
+    // saying otherwise breaks the documented reproducibility path — a sidecar
+    // `--dump-params` just wrote would fail its own `--strict` replay. The warning
+    // is about drift *between* versions, and `pipeline_version_warning` already
+    // covers the case where they differ.
+    //
+    // An absent version (a hand-written or pre-envelope recipe) still warns: there
+    // is no evidence about which defaults it was written against, which is exactly
+    // the uncertainty worth surfacing.
+    if loaded_version == Some(version::PIPELINE_VERSION) {
+        return None;
+    }
+    Some(match unpinned? {
+        UnpinnedCurve::AnchorOnly => "the loaded recipe selects the sigmoid curve without \
          `reconstruction.curve.anchor`, so it takes this build's default placement \
          (mid-grey at half the reference density). Recipes frozen before 2026-08-03 were \
          produced when the anchor pinned display *white* at the reference, so this render \
          will not match the original even with contrast/toe/shoulder/dmax pinned. Add an \
          explicit `anchor` (`\"white-at-dmax\"` to reproduce the old placement) to pin it."
-            .to_string()
+            .to_string(),
+        UnpinnedCurve::WholeCurve => "the loaded recipe omits `reconstruction.curve`, so the \
+         curve is whichever one this build defaults to — since 2026-08-08 that is the \
+         mid-grey-anchored sigmoid at the nominal Dmax of 1.3. The same file written before \
+         that date resolved to the exponential straight line at gamma 1.0 and Dmax 2.0, so \
+         this render will not match the original. Write an explicit tagged \
+         `reconstruction.curve` to pin the curve, its anchor and its Dmax."
+            .to_string(),
+        UnpinnedCurve::MovedDefaults => "the loaded recipe pins `reconstruction.curve.type` \
+         but leaves a value to this build's default that moved on 2026-08-08 \
+         (`pipeline_version` 2): the exponential's `gamma` went 1.0 → 2.0 and the nominal \
+         `dmax` went 2.0 → 1.3. A recipe that pins only the curve type therefore looks \
+         pinned and is not — the same file renders differently than it did. Write the \
+         curve's `gamma` (exponential) and its `dmax` explicitly to pin them."
+            .to_string(),
     })
 }
 
+/// The warning for replaying a recipe captured under a **different** behavioral
+/// `pipeline_version` than this build implements: the recipe still applies, but the
+/// default render it was captured under has changed, so the pixels will not match
+/// the original output. Loud (and `--strict`-promotable) rather than silent — that
+/// mismatch is exactly what `pipeline_version` exists to make visible.
 fn pipeline_version_warning(loaded_version: Option<u32>) -> Option<String> {
     let recorded = loaded_version?;
     (recorded != version::PIPELINE_VERSION).then(|| {
@@ -3346,6 +3488,26 @@ impl FrameRender {
             | Self::HdrCodedTiff { timings, .. } => *timings,
         }
     }
+
+    /// The measured content light of a **single-rendition HDR** render, for the
+    /// SDR-range check ([`hdr::sdr_range_warning`]).
+    ///
+    /// `None` for the two branches the check does not apply to, for different
+    /// reasons: `Tiff` renders no HDR signal at all, and `UltraHdr` is dual-rendition
+    /// — its deliverable is an SDR base image plus a gain map, so an HDR rendition
+    /// that stays near reference white produces an inert gain map rather than a
+    /// mislabelled container. That is a real observation (`GainMapMax` measures
+    /// ≈1.0027x today) but a different warning about a different artifact, and it
+    /// belongs with the gain-map stage that can measure it.
+    fn hdr_content_light(&self) -> Option<hdr::ContentLightLevel> {
+        match self {
+            Self::HdrAvif { render, .. } | Self::HdrCodedTiff { render, .. } => {
+                Some(render.metadata().content_light)
+            }
+            Self::HdrLinearTiff { render, .. } => Some(render.content_light()),
+            Self::Tiff(_) | Self::UltraHdr { .. } => None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3734,6 +3896,17 @@ fn convert_frame(
         pending.push(encode::export_ir(&image, cfg.output.depth(), path)?);
         ir_export_ms = Some(elapsed_ms(stage_started));
         report.ir_exported = Some(path.clone());
+    }
+
+    // An HDR container whose signal never rises above SDR reference white is a
+    // wrapper around an SDR picture — reported loudly (and `--strict`-promotable)
+    // rather than left to be discovered by inspecting the file's `clli` box. Checked
+    // here, before the encode consumes the render, because the measurement rides on
+    // the rendition and only two of the four HDR arms surface it in their summary.
+    if let Some(content_light) = rendered.hdr_content_light()
+        && let Some(message) = hdr::sdr_range_warning(content_light)
+    {
+        push_warning_buf(warnings, log, message);
     }
 
     // Stage 5 — encode + effective-recipe sidecar.
@@ -4180,7 +4353,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     if let Some(msg) = pipeline_version_warning(loaded.meta_pipeline_version) {
         push_warning_buf(&mut warnings, &log, msg);
     }
-    if let Some(msg) = sigmoid_anchor_default_warning(loaded.sigmoid_anchor_absent) {
+    if let Some(msg) = curve_default_warning(loaded.unpinned_curve, loaded.meta_pipeline_version) {
         push_warning_buf(&mut warnings, &log, msg);
     }
     let frame = convert_frame(
@@ -4963,7 +5136,7 @@ fn run_roll(args: RollArgs) -> Result<()> {
         cfg: shared,
         curve_dmax_present: shared_dmax_present,
         meta_pipeline_version,
-        sigmoid_anchor_absent,
+        unpinned_curve: shared_unpinned_curve,
     } = load_recipe(args.recipe_in.as_deref())?;
     // Roll-specific rejections run **before** the shared `validate`, and the order
     // is the same least-specific-diagnosis-last policy `validate` itself now
@@ -4991,9 +5164,9 @@ fn run_roll(args: RollArgs) -> Result<()> {
         log.warn(&msg);
         roll_warnings.push(msg);
     }
-    // Same reasoning for the anchor-placement default: one shared recipe, N frames, so
-    // it is a roll-level fact rather than any single frame's.
-    if let Some(msg) = sigmoid_anchor_default_warning(sigmoid_anchor_absent) {
+    // Same reasoning for an unpinned curve / anchor default: one shared recipe, N frames,
+    // so it is a roll-level fact rather than any single frame's.
+    if let Some(msg) = curve_default_warning(shared_unpinned_curve, meta_pipeline_version) {
         log.warn(&msg);
         roll_warnings.push(msg);
     }
@@ -5919,9 +6092,15 @@ mod tests {
         let cfg = merge(recipe, &parse_convert(&["--density-gamma", "1.5"])).unwrap();
         assert_eq!(gamma_of(&cfg), 1.5);
 
-        // unspecified everywhere → default
-        let cfg = merge(base_cfg(), &parse_convert(&[])).unwrap();
-        assert_eq!(gamma_of(&cfg), 1.0);
+        // unspecified everywhere → that curve's own default. Selected explicitly
+        // because the *default* curve is the sigmoid, and this test's subject is
+        // the exponential's gamma-merge precedence, not which curve is default.
+        let cfg = merge(
+            base_cfg(),
+            &parse_convert(&["--density-curve", "exponential"]),
+        )
+        .unwrap();
+        assert_eq!(gamma_of(&cfg), 2.0);
     }
 
     #[test]
@@ -5984,7 +6163,7 @@ mod tests {
         assert_eq!(
             *curve_of(&cfg),
             DensityCurve::Exponential(ExponentialParams {
-                gamma: 1.0,
+                gamma: 2.0,
                 dmax: DmaxSource::Auto,
             })
         );
@@ -6031,9 +6210,18 @@ mod tests {
             );
         }
 
-        // A sigmoid flag with a resolved exponential curve (the default) is
-        // invalid, not inert.
-        let err = merge(base_cfg(), &parse_convert(&["--sigmoid-contrast", "1.2"])).unwrap_err();
+        // A sigmoid flag with a resolved exponential curve is invalid, not inert.
+        // The curve is named explicitly since the sigmoid is now the default.
+        let err = merge(
+            base_cfg(),
+            &parse_convert(&[
+                "--density-curve",
+                "exponential",
+                "--sigmoid-contrast",
+                "1.2",
+            ]),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("--sigmoid-contrast"), "{err}");
         assert!(err.to_string().contains("exponential"), "{err}");
 
@@ -6373,7 +6561,11 @@ mod tests {
             ["--sigmoid-mid-fraction", "0.6"].as_slice(),
             ["--sigmoid-white-at-d-max"].as_slice(),
         ] {
-            let err = merge(base_cfg(), &parse_convert(flag)).unwrap_err();
+            // The exponential curve is selected explicitly: it is no longer the
+            // default, so without this the flags would resolve against a sigmoid
+            // and be perfectly valid — the rejection under test would vanish.
+            let argv = [&["--density-curve", "exponential"][..], flag].concat();
+            let err = merge(base_cfg(), &parse_convert(&argv)).unwrap_err();
             assert!(err.to_string().contains(flag[0]), "{err}");
         }
         // And they are mutually exclusive at the clap layer.
@@ -6435,36 +6627,116 @@ mod tests {
     }
 
     #[test]
-    fn sigmoid_anchor_default_warning_fires_only_for_an_anchorless_sigmoid_recipe() {
+    fn curve_default_warning_fires_for_every_recipe_that_leaves_the_curve_unpinned() {
         // The witness is a raw-JSON probe, so test it that way.
-        let probe = |json: &str| {
-            selects_sigmoid_without_anchor(
-                &serde_json::from_str::<serde_json::Value>(json).unwrap(),
-            )
-        };
+        let probe =
+            |json: &str| unpinned_curve(&serde_json::from_str::<serde_json::Value>(json).unwrap());
         // An archived sigmoid recipe with no `anchor` — the case that silently changed
-        // meaning on 2026-08-03.
-        assert!(probe(
-            r#"{"reconstruction":{"curve":{"type":"sigmoid","contrast":1.0}}}"#
-        ));
+        // meaning on 2026-08-03. The curve itself is pinned, so only the placement moved.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"curve":{"type":"sigmoid","contrast":1.0}}}"#),
+            Some(UnpinnedCurve::AnchorOnly)
+        );
         // Pinned explicitly either way ⇒ nothing changed underneath it, no noise.
-        assert!(!probe(
-            r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax"}}}"#
-        ));
-        assert!(!probe(
-            r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5}}}}"#
-        ));
-        // The exponential curve has no placement rule, and a recipe with no curve section
-        // resolves to exponential — neither is affected, so neither warns.
-        assert!(!probe(
-            r#"{"reconstruction":{"curve":{"type":"exponential"}}}"#
-        ));
-        assert!(!probe(r#"{"reconstruction":{"type":"density"}}"#));
-        assert!(!probe(r#"{"film_base":{"source":"auto"}}"#));
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax","dmax":{"explicit":2.0}}}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5},"dmax":{"explicit":1.3}}}}"#
+            ),
+            None
+        );
+        // A curve pinned by *type only* looks pinned and is not: on 2026-08-08 the
+        // exponential's gamma moved 1.0 → 2.0 and the nominal dmax 2.0 → 1.3, so this
+        // file renders differently than it did with nothing in it to show that.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"curve":{"type":"exponential"}}}"#),
+            Some(UnpinnedCurve::MovedDefaults)
+        );
+        // Pinning both moved scalars silences it — the falsifiable half.
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0,"dmax":{"explicit":2.0}}}}"#
+            ),
+            None
+        );
+        // Either one alone still floats the other.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0}}}"#),
+            Some(UnpinnedCurve::MovedDefaults)
+        );
+        // A sigmoid that pins its placement but not its dmax: the anchor rule is
+        // settled, the reference density it is measured against is not.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax"}}}"#),
+            Some(UnpinnedCurve::MovedDefaults)
+        );
+        // `"dmax":"fixed"` counts as PINNED, though it does resolve through the
+        // nominal that moved. It is the spelling `--dump-params` writes, so treating
+        // it as floating made a freshly dumped recipe fail its own `--strict` replay
+        // with a byte-identical output. Warn only on shapes this build cannot
+        // produce; `recipe_dumped_by_this_build_replays_clean_under_strict` is the
+        // end-to-end gate on that.
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5},"dmax":"fixed"}}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":2.0,"dmax":"fixed"}}}"#
+            ),
+            None
+        );
+        // A recipe with no `curve` section used to resolve to the exponential, and this
+        // probe used to stay silent for it. Since 2026-08-08 it resolves to the sigmoid
+        // at a different anchor rule and a different Dmax, so silence would be exactly
+        // the "archived recipe silently reinterpreted" case design-spec §7.3 forbids —
+        // and no `meta.pipeline_version` rides a bare recipe to catch it instead.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"type":"density"}}"#),
+            Some(UnpinnedCurve::WholeCurve)
+        );
+        // A recipe silent on `reconstruction` resolves identically to the line above, yet
+        // deliberately does *not* warn: it states no reconstruction configuration to
+        // reinterpret, which is the same position as passing no recipe at all. Warning
+        // here would fire on nearly every partial recipe and make `--strict` fail for all
+        // of them permanently — see `unpinned_curve` for the full argument.
+        assert_eq!(probe(r#"{"film_base":{"source":"auto"}}"#), None);
+        // `simple` runs no curve stage, so no curve default can reach it.
+        assert_eq!(probe(r#"{"reconstruction":{"type":"simple"}}"#), None);
 
-        assert_eq!(sigmoid_anchor_default_warning(false), None);
-        let msg = sigmoid_anchor_default_warning(true).expect("must warn");
+        assert_eq!(curve_default_warning(None, None), None);
+        // A recipe recording THIS build's version was produced by these defaults,
+        // so nothing moved underneath it. Without this, a sidecar `--dump-params`
+        // just wrote fails its own `--strict` replay: the resolved default sigmoid
+        // spells `"dmax":"fixed"`, which is precisely what `MovedDefaults` flags.
+        assert_eq!(
+            curve_default_warning(
+                Some(UnpinnedCurve::MovedDefaults),
+                Some(version::PIPELINE_VERSION)
+            ),
+            None
+        );
+        // A different version, or none recorded at all, still warns.
+        assert!(
+            curve_default_warning(
+                Some(UnpinnedCurve::MovedDefaults),
+                Some(version::PIPELINE_VERSION - 1)
+            )
+            .is_some()
+        );
+        assert!(curve_default_warning(Some(UnpinnedCurve::MovedDefaults), None).is_some());
+        let msg = curve_default_warning(Some(UnpinnedCurve::AnchorOnly), None).expect("must warn");
         assert!(msg.contains("white-at-dmax"), "{msg}");
+        let msg = curve_default_warning(Some(UnpinnedCurve::WholeCurve), None).expect("must warn");
+        assert!(msg.contains("reconstruction.curve"), "{msg}");
+        assert!(msg.contains("exponential"), "{msg}");
     }
 
     #[test]
@@ -6861,7 +7133,16 @@ mod tests {
     fn dump_params_round_trips_through_params() {
         let cfg = merge(
             base_cfg(),
-            &parse_convert(&["--density-gamma", "1.8", "--output-hdr"]),
+            // `--density-gamma` is the exponential curve's knob, and the default
+            // curve is the sigmoid, so the curve must be selected explicitly —
+            // otherwise `validate` correctly rejects the pair as a contradiction.
+            &parse_convert(&[
+                "--density-curve",
+                "exponential",
+                "--density-gamma",
+                "1.8",
+                "--output-hdr",
+            ]),
         )
         .unwrap();
         let json = serde_json::to_string(&cfg).unwrap();
@@ -6889,20 +7170,20 @@ mod tests {
         let v = serde_json::to_value(base_cfg()).unwrap();
         assert_eq!(v["reconstruction"]["schema_version"], 1);
         assert_eq!(v["reconstruction"]["type"], "density");
-        assert_eq!(v["reconstruction"]["curve"]["type"], "exponential");
+        assert_eq!(v["reconstruction"]["curve"]["type"], "sigmoid");
         assert_eq!(v["reconstruction"]["curve"]["dmax"], "fixed");
         assert_eq!(
             v["reconstruction"]["density"]["scale"],
             serde_json::json!([1.0, 1.0, 1.0])
         );
 
-        // Partial input: omitted curve normalizes to tagged exponential defaults.
+        // Partial input: omitted curve normalizes to the tagged default curve.
         let cfg: ResolvedConfig =
             serde_json::from_str(r#"{"reconstruction":{"schema_version":1,"type":"density"}}"#)
                 .unwrap();
         assert_eq!(*curve_of(&cfg), DensityCurve::default());
         let v = serde_json::to_value(&cfg).unwrap();
-        assert_eq!(v["reconstruction"]["curve"]["type"], "exponential");
+        assert_eq!(v["reconstruction"]["curve"]["type"], "sigmoid");
 
         // Simple emits schema_version + type and nothing else.
         let v = serde_json::to_value(simple_cfg()).unwrap();
@@ -6932,8 +7213,12 @@ mod tests {
         .unwrap();
         assert_eq!(v, serde_json::json!({"type": "simple"}));
 
+        // The exponential curve, named explicitly since it is no longer the
+        // default: no placement rule exists for it, so `anchor` is omitted
+        // entirely rather than reported as a null rule; the reference *is* the
+        // anchor, so `anchor_value` mirrors it.
         let v = serde_json::to_value(reconstruction_result(
-            &Reconstruction::default(),
+            &exponential_cfg(ExponentialParams::default()).reconstruction,
             Some(2.0),
             Some(2.0),
             DmaxSetting::Default,
@@ -6946,12 +7231,24 @@ mod tests {
                 "curve": {
                     "type": "exponential",
                     "dmax": {"policy": "fixed", "value": 2.0, "provenance": "default"},
-                    // No placement rule exists for the exponential curve, so `anchor` is
-                    // omitted entirely rather than reported as a null rule; the reference
-                    // *is* the anchor, so `anchor_value` mirrors it.
                     "anchor_value": 2.0
                 }
             })
+        );
+
+        // The default curve (sigmoid) additionally reports its placement rule,
+        // because it *has* one — that is the shape a default report now carries.
+        let v = serde_json::to_value(reconstruction_result(
+            &Reconstruction::default(),
+            Some(2.0),
+            Some(2.0),
+            DmaxSetting::Default,
+        ))
+        .unwrap();
+        assert_eq!(v["curve"]["type"], "sigmoid");
+        assert_eq!(
+            v["curve"]["anchor"],
+            serde_json::json!({"mid-at-dmax-fraction": 0.5})
         );
 
         // `none` reports a null value; the recipe provenance rides through.
