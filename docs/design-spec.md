@@ -1289,7 +1289,7 @@ nc convert in.tiff -o out.tiff --reconstruction density \
 # still run and the depth-aware default profile (acescg for HDR) applies. This
 # is NOT film-master.
 nc convert in.tiff -o out.tiff \
-  --output-hdr --no-d-max \
+  --output-hdr --density-curve exponential --no-d-max \
   --film-base 0.92,0.55,0.42 \
   --density-gamma 1.8 --print-exposure 0.0 --black-point 0.002 \
   --highlight-compress 0.3

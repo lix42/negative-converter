@@ -1961,3 +1961,24 @@ What other epics need to know about `algo`:
   exponential path". Added an explicit `hdri-exponential` case. The asset-free set
   is the one used for determinism and zero-diff checks, so a still-supported path
   being invisible there is a real gap rather than a tidiness point.
+
+## negative-reconstruction-density-curves (second review round)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The `MovedDefaults` warning had a hole in exactly the recipes people
+  archive.** It treated any present `dmax` key as pinned — but `"dmax":"fixed"`
+  names a *policy*, not a value, and resolves through `NOMINAL_DMAX`, which moved
+  2.0 → 1.3. That is the spelling `--dump-params` writes, so the fix excused the
+  single most likely archived recipe while catching the rarer omitted-key case.
+  `dmax` now counts as floating when absent **or** `"fixed"`; `"auto"` is per-frame
+  (a different thing) and `"none"`/`{"explicit":…}` are genuinely pinned. Lesson
+  that generalises: "is the key present" is not the same question as "is the value
+  pinned" whenever a key can name a policy.
+- 2026-08-09: Two shipped examples exited 2 after the default flip — `README.md`'s
+  HDR example and design-spec's transitional float example, both passing
+  `--density-gamma` (exponential-only) with the sigmoid now default. Both now
+  select the curve explicitly, and both were **run** to confirm exit 0 rather than
+  eyeballed. Worth noting the first doc pass on this PR missed them: I grepped for
+  statements *about* the defaults and not for commands that *depend* on them.

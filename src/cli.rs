@@ -1703,8 +1703,17 @@ fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
     let Some(curve) = reconstruction.get("curve") else {
         return Some(UnpinnedCurve::WholeCurve);
     };
-    // `dmax`'s nominal moved for *both* curves, so it is checked once here.
-    let dmax_floats = curve.get("dmax").is_none();
+    // `dmax`'s nominal moved for *both* curves, so it is checked once here — and
+    // an **absent** key is not the only way it floats. `"dmax":"fixed"` names the
+    // *policy*, not a value: it resolves through `NOMINAL_DMAX`, which moved
+    // 2.0 → 1.3. That is the spelling `--dump-params` writes, so treating a present
+    // key as pinned would have excused exactly the archived recipes people keep.
+    // `"auto"` is per-frame (a different thing, not a moved default), and `"none"`
+    // and `{"explicit":…}` are genuinely pinned.
+    let dmax_floats = match curve.get("dmax") {
+        None => true,
+        Some(d) => d.as_str() == Some("fixed"),
+    };
     match curve.get("type").and_then(|t| t.as_str()) {
         Some("sigmoid") => {
             if curve.get("anchor").is_none() {
