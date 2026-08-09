@@ -647,10 +647,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [ ] [Curve endpoint validation](tasks/algo/curve-endpoint-validation.md) — warn **before decode**
   when a resolved curve places its tonal endpoints so badly the render cannot approach white or
-  black. Read both endpoints off the renderer's own curve: exponential's black end is the film
-  base, `10^(gamma*(D'base - Dmax))` (and `D'base` is `density.offset`, not 0), sigmoid's is the
-  post-shoulder asymptote, with the white side read off `s_curve(R)` as a **reference-placement**
-  check, not a reachability one. The shipped sigmoid defect (0.053 → 72/255) was computable from
+  black. Read both endpoints off the renderer's own curve at the **reachable film base** — the
+  same rule for both curves: `D'base` is `density.offset` plus any balance, per channel, not 0.
+  An idealized floor is the wrong metric either way (exponential has none; the sigmoid's
+  asymptote can sit far below its reachable base). The white side is `s_curve(R)`, a
+  **reference-placement** check, not a reachability one. The shipped sigmoid defect (0.053 → 72/255) was computable from
   config all along and took a visual review to find; the same hole is open on the **default**
   exponential curve, where a measured `--d-max 0.391` at default gamma renders the base at 0.406
   and only the encode-side clip counter says anything. Warning tier (`--strict` promotes);

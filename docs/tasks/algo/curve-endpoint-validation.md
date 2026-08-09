@@ -110,7 +110,9 @@ not be the gate.
 
 ### Where the check can run
 
-Two resolved values are frame-measured, and **either one alone defers the check**:
+Two resolved values are frame-measured. **Defer per endpoint, not wholesale**: the
+white check needs only the curve and `R`, so with a `Fixed`/`Explicit` `Dmax` it
+stays pre-decode even when the black one has to wait.
 
 - **`DmaxSource::Auto`** — see the table below.
 - **`balance_range: Auto` — but only when the range is actually consulted.** Use
@@ -163,7 +165,7 @@ pre-decode gate is a defensible first cut — but say so in the task's outcome.
   validator and the renderer cannot drift apart — a hand-rolled duplicate is exactly
   how these checks go stale, and it is what makes the shoulder mistake above easy.
 - **The thresholds need calibrating, and the report already supplies the labels.**
-  `reports/sigmoid-reference-baseline.md`'s candidate table is a ready-made
+  `docs/reports/sigmoid-reference-baseline.md`'s candidate table is a ready-made
   fixture: the rejected candidate 1 (0.053) must trip, the shipped default (0.009)
   must not. Pick the boundary from those, and state it in the message rather than
   only the verdict.
