@@ -308,6 +308,7 @@ graph TD
   film-base/dmax-reference --> film-base/dmax-per-channel-reduction
   algo/reference-anchored-sigmoid --> film-base/dmax-per-channel-reduction
   algo/density --> algo/curve-endpoint-validation
+  core/pipeline-orchestration --> algo/curve-endpoint-validation
   algo/reference-anchored-sigmoid --> algo/curve-endpoint-validation
   algo/reference-anchored-sigmoid --> analysis/comparison-review-tooling
   algo/film-stock-profiles --> io/scanner-density-calibration
@@ -427,12 +428,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   — the last is a hard prerequisite, not a nicety: content-driven anchoring is currently
   unusable because `DmaxSource::Auto` measures the whole frame and the opaque holder owns the
   top percentile
-- `algo/curve-endpoint-validation` (post-MVP): `algo/density`, `algo/reference-anchored-sigmoid`
-  — closed-form, pre-decode check that a resolved curve can reach black and white. The shipped
-  sigmoid defect (floor 0.053 → 72/255) was computable from config the whole time; the same hole
-  is open on the default exponential curve, whose floor is `10^(-gamma*Dmax)` (a measured
-  `--d-max 0.391` at default gamma puts it at 0.407 and nothing warns). Warning tier, not a hard
-  error — `--sigmoid-white-at-d-max` is a retained diagnostic. Ships no pixel change
+- `algo/curve-endpoint-validation` (post-MVP): `algo/density`, `algo/reference-anchored-sigmoid`, `core/pipeline-orchestration`
+  — pre-decode check that a resolved curve places its tonal endpoints usefully. The shipped sigmoid
+  defect (black asymptote 0.053 → 72/255) was computable from config the whole time; the same hole
+  is open on the default exponential curve, where the film base renders to
+  `10^(gamma*(D'base - Dmax))` (a measured `--d-max 0.391` at default gamma puts it at 0.406 and
+  nothing warns). Both endpoints must be read off the renderer's own curve, not a re-derived closed
+  form, and `DmaxSource::Auto` has no pre-decode value. Warning tier, not a hard error —
+  `--sigmoid-white-at-d-max` is a retained diagnostic. Ships no pixel change
 - `algo/film-stock-profiles` (post-MVP): `algo/reference-anchored-sigmoid`
 - `algo/auto-anchor-interior-measurement` (post-MVP): `algo/reference-anchored-sigmoid`, `film-base/auto-base-redesign`
   — `DmaxSource::Auto` measures the whole frame, so the opaque holder owns the 99.5th
@@ -642,13 +645,16 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Reference-anchored sigmoid calibration and redesign](tasks/algo/reference-anchored-sigmoid.md) — reproduce and quantify the shipped sigmoid's raised, narrow real-roll shadow spread, then choose the least invasive defaults/semantics/equation remedy against frozen film-master/SDR/HDR metrics
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [ ] [Curve endpoint validation](tasks/algo/curve-endpoint-validation.md) — warn **before decode**
-  when a resolved curve cannot reach display white or paper black. Both endpoints are closed-form
-  in the curve params: exponential's floor is `10^(-gamma*Dmax)`, sigmoid's is `10^(-contrast*A)`
-  with white read off `s_curve(R)`. The shipped sigmoid defect (floor 0.053 → 72/255) was
-  computable from config all along and took a visual review to find; the same hole is open on the
-  **default** exponential curve, where a measured `--d-max 0.391` at default gamma leaves the floor
-  at 0.407 and only the encode-side clip counter says anything. Warning tier (`--strict` promotes),
-  with `--no-d-max` and `simple` exempt; ships no pixel change
+  when a resolved curve places its tonal endpoints so badly the render cannot approach white or
+  black. Read both endpoints off the renderer's own curve: exponential's black end is the film
+  base, `10^(gamma*(D'base - Dmax))` (and `D'base` is `density.offset`, not 0), sigmoid's is the
+  post-shoulder asymptote, with the white side read off `s_curve(R)` as a **reference-placement**
+  check, not a reachability one. The shipped sigmoid defect (0.053 → 72/255) was computable from
+  config all along and took a visual review to find; the same hole is open on the **default**
+  exponential curve, where a measured `--d-max 0.391` at default gamma renders the base at 0.406
+  and only the encode-side clip counter says anything. Warning tier (`--strict` promotes);
+  `--no-d-max` is exempt on **exponential only** (sigmoid already hard-errors) and `simple` is out
+  of scope; ships no pixel change
 - [x] [Auto neutral white balance](tasks/algo/auto-neutral-wb.md)
 - [x] [Regional (shadow/highlight) color balance](tasks/algo/regional-color-balance.md)
 - [ ] [Film-stock profiles](tasks/algo/film-stock-profiles.md) — a selectable registry of

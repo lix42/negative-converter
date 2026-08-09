@@ -1777,3 +1777,31 @@ What other epics need to know about `algo`:
   post-render histogram check; this is a closed-form pre-decode check on the *joint*
   endpoint behaviour. `contrast = 1.0` and `shoulder = 0.6` each pass any
   per-parameter bound — only their combination with the resolved `R` is broken.
+- **Spec refined 2026-08-08 after Codex review of PR #83** (six P2 findings, all
+  verified against the code and all real — the task file over-claimed in six ways):
+  1. **Exponential has no black floor.** `10^(gamma*(D'-Dmax))` runs to 0 as
+     `D' → -inf`. The meaningful quantity is the **film base endpoint**, and
+     `D'base = density.offset`, *not* 0 (`D' = scale*D + offset`, base at `D = 0`);
+     regional balance shifts it further. `10^(-gamma*Dmax)` is only the
+     `offset = 0` special case.
+  2. **The sigmoid floor must go through the shoulder.** `10^(-contrast*A)` is the
+     pre-shoulder value. Equal at `shoulder = 0` and indistinguishable at the
+     shipped 0.6 (0.008621 vs 0.008623), but `SIGMOID_KNEE_MAX` is **10**, and the
+     naive form over-states the floor 1.75x at shoulder 3 and 5x at shoulder 5 —
+     warning on configs that actually render deeper black.
+  3. **The white check is reference *placement*, not reachability.** The sigmoid is
+     monotonic and asymptotic to 1.0, so denser content always renders nearer white;
+     no config makes white unattainable. `s_curve(R)` says the *reference tone*
+     renders dim. Phrasing it as "white unreachable" would be false.
+  4. **`--no-d-max` is an exponential-only exemption.** On sigmoid it is already a
+     hard usage error ("the sigmoid curve needs a display-white anchor … only
+     supported by the exponential curve") — verified against the binary. The old
+     verification bullet ("emits nothing on either curve") was impossible.
+  5. **`DmaxSource::Auto` has no pre-decode value.** `resolve_dmax` computes it
+     inside `density::reconstruct` from post-balance densities, so `cli::validate`
+     would evaluate a placeholder. Added a per-source table; Auto must be decided
+     explicitly (skip or evaluate later), not by omission.
+  6. **`core/pipeline-orchestration` added as a dependency** — it owns
+     `cli::validate`, warning accumulation, roll handling and `--strict`;
+     `density-safety-bounds`, `auto-neutral-wb` and `bw-support` all declare it.
+     Still `[x]`, so the task stays immediately executable.
