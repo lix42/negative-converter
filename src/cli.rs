@@ -1649,6 +1649,16 @@ enum UnpinnedCurve {
     /// The recipe omits `reconstruction.curve` entirely, so the **curve itself**
     /// floats — and it moved on 2026-08-08.
     WholeCurve,
+    /// The recipe pins the curve *type* but omits a scalar whose default moved in
+    /// `pipeline_version` 2: the exponential's `gamma` (1.0 → 2.0) or either
+    /// curve's `dmax` (nominal 2.0 → 1.3).
+    ///
+    /// Narrower than [`WholeCurve`](Self::WholeCurve) — the curve is the one the
+    /// author chose — and easy to miss for exactly that reason: the recipe *looks*
+    /// pinned. A recipe reading `{"curve":{"type":"exponential"}}` used to mean
+    /// gamma 1.0 at anchor 2.0 and now means gamma 2.0 at anchor 1.3, which is a
+    /// substantially different render with nothing in the file to show it.
+    MovedDefaults,
 }
 
 /// Whether a loaded recipe resolves to a sigmoid curve it never fully pinned — the
@@ -1690,11 +1700,27 @@ fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
     if reconstruction.get("type").and_then(|t| t.as_str()) == Some("simple") {
         return None;
     }
-    match reconstruction.get("curve") {
-        None => Some(UnpinnedCurve::WholeCurve),
-        Some(curve) => (curve.get("type").and_then(|t| t.as_str()) == Some("sigmoid")
-            && curve.get("anchor").is_none())
-        .then_some(UnpinnedCurve::AnchorOnly),
+    let Some(curve) = reconstruction.get("curve") else {
+        return Some(UnpinnedCurve::WholeCurve);
+    };
+    // `dmax`'s nominal moved for *both* curves, so it is checked once here.
+    let dmax_floats = curve.get("dmax").is_none();
+    match curve.get("type").and_then(|t| t.as_str()) {
+        Some("sigmoid") => {
+            if curve.get("anchor").is_none() {
+                // The bigger of the two: report the placement move, which subsumes
+                // a floating `dmax` in the explanation.
+                Some(UnpinnedCurve::AnchorOnly)
+            } else {
+                dmax_floats.then_some(UnpinnedCurve::MovedDefaults)
+            }
+        }
+        Some("exponential") => {
+            (curve.get("gamma").is_none() || dmax_floats).then_some(UnpinnedCurve::MovedDefaults)
+        }
+        // An untagged or unknown curve object never parses, so it cannot reach a
+        // render to be warned about.
+        _ => None,
     }
 }
 
@@ -1740,6 +1766,13 @@ fn curve_default_warning(unpinned: Option<UnpinnedCurve>) -> Option<String> {
          that date resolved to the exponential straight line at gamma 1.0 and Dmax 2.0, so \
          this render will not match the original. Write an explicit tagged \
          `reconstruction.curve` to pin the curve, its anchor and its Dmax."
+            .to_string(),
+        UnpinnedCurve::MovedDefaults => "the loaded recipe pins `reconstruction.curve.type` \
+         but leaves a value to this build's default that moved on 2026-08-08 \
+         (`pipeline_version` 2): the exponential's `gamma` went 1.0 → 2.0 and the nominal \
+         `dmax` went 2.0 → 1.3. A recipe that pins only the curve type therefore looks \
+         pinned and is not — the same file renders differently than it did. Write the \
+         curve's `gamma` (exponential) and its `dmax` explicitly to pin them."
             .to_string(),
     })
 }
@@ -6569,19 +6602,41 @@ mod tests {
         );
         // Pinned explicitly either way ⇒ nothing changed underneath it, no noise.
         assert_eq!(
-            probe(r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax"}}}"#),
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax","dmax":{"explicit":2.0}}}}"#
+            ),
             None
         );
         assert_eq!(
             probe(
-                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5}}}}"#
+                r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":{"mid-at-dmax-fraction":0.5},"dmax":{"explicit":1.3}}}}"#
             ),
             None
         );
-        // A pinned exponential has no placement rule and did not move: no warning.
+        // A curve pinned by *type only* looks pinned and is not: on 2026-08-08 the
+        // exponential's gamma moved 1.0 → 2.0 and the nominal dmax 2.0 → 1.3, so this
+        // file renders differently than it did with nothing in it to show that.
         assert_eq!(
             probe(r#"{"reconstruction":{"curve":{"type":"exponential"}}}"#),
+            Some(UnpinnedCurve::MovedDefaults)
+        );
+        // Pinning both moved scalars silences it — the falsifiable half.
+        assert_eq!(
+            probe(
+                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0,"dmax":{"explicit":2.0}}}}"#
+            ),
             None
+        );
+        // Either one alone still floats the other.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0}}}"#),
+            Some(UnpinnedCurve::MovedDefaults)
+        );
+        // A sigmoid that pins its placement but not its dmax: the anchor rule is
+        // settled, the reference density it is measured against is not.
+        assert_eq!(
+            probe(r#"{"reconstruction":{"curve":{"type":"sigmoid","anchor":"white-at-dmax"}}}"#),
+            Some(UnpinnedCurve::MovedDefaults)
         );
         // A recipe with no `curve` section used to resolve to the exponential, and this
         // probe used to stay silent for it. Since 2026-08-08 it resolves to the sigmoid

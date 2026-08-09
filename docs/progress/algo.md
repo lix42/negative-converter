@@ -1933,3 +1933,31 @@ What other epics need to know about `algo`:
   improves a non-default path. Depends on
   `algo/negative-reconstruction-density-curves` (the tagged curve schema it would add
   an `anchor` field to).
+## negative-reconstruction-density-curves (review follow-up)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The migration warning was scoped too narrowly and missed the most
+  deceptive case.** It fired for a recipe with *no* `curve` section, but returned
+  `None` for one that pins only the type — and
+  `{"curve":{"type":"exponential"}}` used to mean gamma 1.0 at anchor 2.0 and now
+  means gamma 2.0 at anchor 1.3. That file *looks* pinned, which is exactly why it
+  is worse than the bare case: nothing in it shows the render moved, and a bare
+  recipe carries no `meta.pipeline_version` for the other warning to catch. New
+  `UnpinnedCurve::MovedDefaults` covers it, plus a sigmoid that pins `anchor` but
+  omits `dmax` (the nominal moved for *both* curves). Pinning both moved scalars
+  silences it — the falsifiable half.
+- 2026-08-09: `sigmoid_rejects_no_d_max` was passing on clap's **duplicate-flag**
+  rejection: a sweep had added a second `--density-curve`, so it exited 2 during
+  parsing and never reached the merge/validation path it exists to pin. Removed,
+  and it now asserts the message names the sigmoid — exit 2 alone cannot say which
+  rule fired. That is the fourth test this session found passing for the wrong
+  reason; the pattern is always the same, an assertion on an exit code that more
+  than one rule can produce.
+- 2026-08-09: `scripts/analysis/benchmark.json` lost exponential coverage entirely
+  when the default flipped — all four remaining fixture cases resolved to the
+  sigmoid while the manifest's own note still claimed it covered "the default
+  exponential path". Added an explicit `hdri-exponential` case. The asset-free set
+  is the one used for determinism and zero-diff checks, so a still-supported path
+  being invisible there is a real gap rather than a tidiness point.

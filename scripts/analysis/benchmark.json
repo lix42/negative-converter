@@ -4,32 +4,62 @@
   "sets": {
     "fixtures": {
       "root": "repo",
-      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default exponential path, the sigmoid curve, `simple` reconstruction, and f32 (HDR) output. This is the set to use for a determinism / zero-diff check.",
+      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default sigmoid curve, the exponential curve (explicitly, since it is no longer the default), `simple` reconstruction, and f32 (HDR) output. This is the set to use for a determinism / zero-diff check.",
       "cases": [
         {
           "name": "hdri-default",
           "input": "tests/fixtures/hdri-64bit.tif",
-          "args": ["--film-base", "0.9,0.55,0.42"]
+          "args": [
+            "--film-base",
+            "0.9,0.55,0.42"
+          ]
         },
         {
           "name": "hdr-default",
           "input": "tests/fixtures/hdr-48bit.tif",
-          "args": ["--film-base", "0.9,0.55,0.42"]
+          "args": [
+            "--film-base",
+            "0.9,0.55,0.42"
+          ]
         },
         {
           "name": "hdri-f32",
           "input": "tests/fixtures/hdri-64bit.tif",
-          "args": ["--film-base", "0.9,0.55,0.42", "--output-hdr"]
+          "args": [
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--output-hdr"
+          ]
         },
         {
           "name": "hdri-sigmoid",
           "input": "tests/fixtures/hdri-64bit.tif",
-          "args": ["--film-base", "0.9,0.55,0.42", "--density-curve", "sigmoid"]
+          "args": [
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--density-curve",
+            "sigmoid"
+          ]
+        },
+        {
+          "name": "hdri-exponential",
+          "input": "tests/fixtures/hdri-64bit.tif",
+          "args": [
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--density-curve",
+            "exponential"
+          ]
         },
         {
           "name": "hdri-simple",
           "input": "tests/fixtures/hdri-64bit.tif",
-          "args": ["--film-base", "0.9,0.55,0.42", "--reconstruction", "simple"]
+          "args": [
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--reconstruction",
+            "simple"
+          ]
         }
       ]
     },

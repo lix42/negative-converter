@@ -3749,11 +3749,16 @@ fn sigmoid_rejects_no_d_max() {
         "sigmoid",
         "--film-base",
         "0.9,0.55,0.42",
-        "--density-curve",
-        "exponential",
         "--no-d-max",
     ]);
     assert_eq!(code, 2, "sigmoid + --no-d-max must exit 2: {err}");
+    // Exit 2 alone is not enough: a second `--density-curve` was briefly added here
+    // by a sweep, and clap's duplicate-flag rejection made this pass without ever
+    // reaching the merge/validation path it exists to pin.
+    assert!(
+        err.contains("sigmoid"),
+        "must be the sigmoid anchor rejection, not a parse error: {err}"
+    );
     assert!(!out.exists(), "no output on a usage error");
 }
 
