@@ -1760,7 +1760,23 @@ fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
 /// commit and have the identical property — and that policy belongs with
 /// `core/conversion-versioning`, not improvised here. What is not acceptable is silence, so
 /// this says so loudly and `--strict` promotes it.
-fn curve_default_warning(unpinned: Option<UnpinnedCurve>) -> Option<String> {
+fn curve_default_warning(
+    unpinned: Option<UnpinnedCurve>,
+    loaded_version: Option<u32>,
+) -> Option<String> {
+    // A recipe that records **this** build's `pipeline_version` was produced by a
+    // build whose defaults are these defaults: nothing moved underneath it, and
+    // saying otherwise breaks the documented reproducibility path — a sidecar
+    // `--dump-params` just wrote would fail its own `--strict` replay. The warning
+    // is about drift *between* versions, and `pipeline_version_warning` already
+    // covers the case where they differ.
+    //
+    // An absent version (a hand-written or pre-envelope recipe) still warns: there
+    // is no evidence about which defaults it was written against, which is exactly
+    // the uncertainty worth surfacing.
+    if loaded_version == Some(version::PIPELINE_VERSION) {
+        return None;
+    }
     Some(match unpinned? {
         UnpinnedCurve::AnchorOnly => "the loaded recipe selects the sigmoid curve without \
          `reconstruction.curve.anchor`, so it takes this build's default placement \
@@ -4325,7 +4341,7 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     if let Some(msg) = pipeline_version_warning(loaded.meta_pipeline_version) {
         push_warning_buf(&mut warnings, &log, msg);
     }
-    if let Some(msg) = curve_default_warning(loaded.unpinned_curve) {
+    if let Some(msg) = curve_default_warning(loaded.unpinned_curve, loaded.meta_pipeline_version) {
         push_warning_buf(&mut warnings, &log, msg);
     }
     let frame = convert_frame(
@@ -5138,7 +5154,7 @@ fn run_roll(args: RollArgs) -> Result<()> {
     }
     // Same reasoning for an unpinned curve / anchor default: one shared recipe, N frames,
     // so it is a roll-level fact rather than any single frame's.
-    if let Some(msg) = curve_default_warning(shared_unpinned_curve) {
+    if let Some(msg) = curve_default_warning(shared_unpinned_curve, meta_pipeline_version) {
         log.warn(&msg);
         roll_warnings.push(msg);
     }
@@ -6665,10 +6681,30 @@ mod tests {
         // `simple` runs no curve stage, so no curve default can reach it.
         assert_eq!(probe(r#"{"reconstruction":{"type":"simple"}}"#), None);
 
-        assert_eq!(curve_default_warning(None), None);
-        let msg = curve_default_warning(Some(UnpinnedCurve::AnchorOnly)).expect("must warn");
+        assert_eq!(curve_default_warning(None, None), None);
+        // A recipe recording THIS build's version was produced by these defaults,
+        // so nothing moved underneath it. Without this, a sidecar `--dump-params`
+        // just wrote fails its own `--strict` replay: the resolved default sigmoid
+        // spells `"dmax":"fixed"`, which is precisely what `MovedDefaults` flags.
+        assert_eq!(
+            curve_default_warning(
+                Some(UnpinnedCurve::MovedDefaults),
+                Some(version::PIPELINE_VERSION)
+            ),
+            None
+        );
+        // A different version, or none recorded at all, still warns.
+        assert!(
+            curve_default_warning(
+                Some(UnpinnedCurve::MovedDefaults),
+                Some(version::PIPELINE_VERSION - 1)
+            )
+            .is_some()
+        );
+        assert!(curve_default_warning(Some(UnpinnedCurve::MovedDefaults), None).is_some());
+        let msg = curve_default_warning(Some(UnpinnedCurve::AnchorOnly), None).expect("must warn");
         assert!(msg.contains("white-at-dmax"), "{msg}");
-        let msg = curve_default_warning(Some(UnpinnedCurve::WholeCurve)).expect("must warn");
+        let msg = curve_default_warning(Some(UnpinnedCurve::WholeCurve), None).expect("must warn");
         assert!(msg.contains("reconstruction.curve"), "{msg}");
         assert!(msg.contains("exponential"), "{msg}");
     }

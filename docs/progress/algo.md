@@ -1982,3 +1982,25 @@ What other epics need to know about `algo`:
   select the curve explicitly, and both were **run** to confirm exit 0 rather than
   eyeballed. Worth noting the first doc pass on this PR missed them: I grepped for
   statements *about* the defaults and not for commands that *depend* on them.
+
+## negative-reconstruction-density-curves (third review round)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The `dmax:"fixed"` fix over-corrected and broke the documented
+  reproducibility path.** Treating `"fixed"` as floating is right *across* versions
+  — but the resolved default sigmoid this build writes also spells `"dmax":"fixed"`,
+  so a sidecar `--dump-params` had just produced failed its own `--strict` replay
+  (exit 1, claiming a render moved that demonstrably had not). The warning now
+  returns `None` when the recipe records **this** build's `pipeline_version`:
+  nothing moved underneath a recipe produced by these defaults, and
+  `pipeline_version_warning` already owns the cross-version case. An **absent**
+  version still warns — there is no evidence which defaults it was written
+  against, which is exactly the uncertainty worth surfacing.
+- 2026-08-09: The pattern across all three rounds on this warning is worth naming:
+  under-warned (omitted key), then over-warned (any present key), then over-warned
+  again (any `"fixed"`). Each fix was correct about the mechanism and wrong about
+  the population it applied to. The question that resolves it is not "did a default
+  move?" but "did it move *for this recipe*", and `meta.pipeline_version` is the
+  only witness to that. Both directions are pinned now.
