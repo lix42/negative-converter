@@ -5,8 +5,9 @@ images.
 
 It reads high-bit-depth scanner files (SilverFast HDR/HDRi first), runs a
 deterministic negative→positive pipeline in a 32-bit float linear working space,
-and writes TIFF (16-bit or 32-bit float) or an explicitly selected legacy
-Ultra HDR v1 gain-map JPEG.
+and writes TIFF (16-bit or 32-bit float) or, via an explicitly selected output
+preset, an SDR TIFF in Display P3 or sRGB, a legacy Ultra HDR v1 gain-map JPEG,
+a 10-bit HDR AVIF (PQ or HLG), or an HDR TIFF.
 
 ## Design goal: built for agents
 
@@ -25,6 +26,8 @@ around the edges.
 The Step-1 TIFF converter is implemented, with post-MVP pipeline, display-output,
 and hardening work tracked in the task roadmap.
 
+- [`docs/using-nc.md`](docs/using-nc.md) — **how to use `nc`**: the
+  measure → freeze a recipe → apply workflow, recipes, presets, exit codes.
 - [`docs/design-spec.md`](docs/design-spec.md) — full design (architecture,
   pipeline, CLI surface, parameters).
 - [`docs/TASKS.md`](docs/TASKS.md) — the build plan and dependency graph.
