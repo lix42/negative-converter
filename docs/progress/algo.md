@@ -1717,3 +1717,63 @@ What other epics need to know about `algo`:
   is scoped to *default* behaviour ("bumps only when default conversion behaviour changes"),
   so nothing currently owns "a non-default path changed and archived recipes for it are
   reinterpreted". The warning covers this instance; the policy question is open.
+
+## curve-endpoint-validation
+
+**Status:** not started
+**Updated:** 2026-08-08
+
+- Goal: a closed-form, pre-decode warning when a resolved density curve cannot
+  reach display white or paper black. Covers **both** curves. Ships no pixel change.
+- Origin: raised 2026-08-08 by the user while reviewing the sigmoid anchoring
+  section of the usage guide. The framing is theirs and it is the useful part:
+  *this is a property of the configuration, and a configuration can be good or
+  bad* — so it should be checkable, not discovered by eye.
+- The argument, and the correction it survived. The initial claim was that the
+  default sigmoid lets display white land *above* `Dmax`, which would mean
+  fully-exposed film could never render white. **That was wrong** — a misreading of
+  "lets white land above it" in `sigmoid.rs`, where "it" is the mid-grey
+  placement, not the reference. Computed from the shipped formula
+  `A = f·R + 0.745/contrast`, white sits **below** `Dmax` under the defaults:
+
+  | R (Dmax) | A (white pt) | A − R | render @ Dmax |
+  |---|---|---|---|
+  | 1.2758 Gold 200 | 0.9979 | −0.278 | 0.939 |
+  | 1.2933 Ektar | 1.0067 | −0.287 | 0.943 |
+  | 1.3816 Portra 160 | 1.0508 | −0.331 | 0.959 |
+  | 2.0 nominal | 1.3600 | −0.640 | 0.996 |
+
+  But the *principle* held: `A ≤ R` is not guaranteed, it is a consequence.
+  `A ≤ R ⟺ contrast ≥ 0.745/((1−f)·R)`, so at `f = 0.5, R = 1.3` any contrast
+  below ~1.15 makes white unreachable. Good and bad configs both exist.
+- Both shipped failure modes are the same two formulas at opposite ends:
+
+  | config | A | s_curve(R) | floor | verdict |
+  |---|---|---|---|---|
+  | shipped mid@0.5, c=2.069 | 0.998 | 0.939 | 0.009 | ok |
+  | mid@0.5, c=1.0 | 1.383 | 0.576 | 0.041 | white unreachable |
+  | **old defect** white@Dmax, c=1.0 | 1.276 | 0.660 | **0.053** | floor too high |
+  | white@Dmax, c=2.0 | 1.276 | 0.660 | 0.003 | ok |
+
+  The 0.053 row reproduces the measured 72/255 shadow patch from
+  `reference-anchored-sigmoid` — i.e. this check would have caught that defect from
+  config alone, before the blind visual review did.
+- **The default exponential curve has the same hole**, which is what widened the
+  scope. Its floor is `10^(-gamma*Dmax)`: nominal `Dmax = 2.0` gives 0.010, but a
+  leader-measured 1.2758 gives 0.053 and `--d-max 0.391` gives **0.407**. That last
+  is a real invocation made while writing the usage guide — nc reported 18.15%
+  clipping (an encode-side symptom) and said nothing about the floor.
+- Two traps recorded so the implementer does not re-derive them: with
+  `shoulder > 0` the sigmoid approaches 1.0 **asymptotically and never reaches it**
+  (deliberate — it is what makes u16 highlight clipping impossible), so "must reach
+  white" would fail every valid config; and `A ≤ R` is only a proxy, since the
+  `white@Dmax` rows have `A = R` exactly yet render `Dmax` to 0.660 because the
+  shoulder is already compressing. Test `s_curve(R)`.
+- Warning tier, not a hard error: `--sigmoid-white-at-d-max` is retained precisely
+  to reproduce the defect on demand, so refusing to render it would be
+  self-defeating. `--no-d-max` (anchor 0.0 → floor formula yields 1.0) is the
+  intended scene-referred mode and is exempt; `simple` has no curve and is out of scope.
+- Boundary vs `algo/density-safety-bounds`: that task is per-parameter bounds plus a
+  post-render histogram check; this is a closed-form pre-decode check on the *joint*
+  endpoint behaviour. `contrast = 1.0` and `shoulder = 0.6` each pass any
+  per-parameter bound — only their combination with the resolved `R` is broken.
