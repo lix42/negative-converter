@@ -1855,6 +1855,7 @@ fn export_ir_writes_plane_for_hdri_and_errors_for_hdr() {
         "simple",
         "--export-ir",
         ir_hdr.to_str().unwrap(),
+        "--auto-base",
     ]);
     assert_eq!(code, 4, "export-ir on an HDR scan is Unsupported (exit 4)");
     assert!(
@@ -2150,6 +2151,9 @@ fn convert_rejects_in_place_output() {
         fix.to_str().unwrap(),
         "-o",
         fix.to_str().unwrap(),
+        // A base must be stated since `film_base.source` has no default; the
+        // rule under test is the in-place-output guard, not that one.
+        "--auto-base",
     ]);
     assert_eq!(code, 2, "in-place output must be a usage error: {err}");
     assert!(err.contains("overwrite the input"), "stderr: {err}");
@@ -2567,7 +2571,13 @@ fn roll_rejects_colorimetric_shared_recipe_before_decode() {
     let tmp = TempDir::new("roll-colorimetric");
     let out_dir = tmp.path("out");
     let recipe = tmp.path("recipe.json");
-    std::fs::write(&recipe, r#"{"input":{"meaning":"colorimetric"}}"#).unwrap();
+    // The shared recipe states a base (no default) so the rejection under test
+    // is the colorimetric one, not the missing-base usage error.
+    std::fs::write(
+        &recipe,
+        r#"{"input":{"meaning":"colorimetric"},"film_base":{"source":{"explicit":[0.9,0.6,0.5]}}}"#,
+    )
+    .unwrap();
     let (code, _stdout, err) = run(&[
         "roll",
         fixture("hdr-48bit.tif").to_str().unwrap(),
@@ -6858,4 +6868,112 @@ fn malformed_max_memory_is_a_usage_error() {
         );
         assert!(!out.exists());
     }
+}
+
+#[test]
+fn convert_requires_a_stated_film_base_but_estimate_does_not() {
+    // The contract this PR introduces, end to end at the binary boundary.
+    let tmp = TempDir::new("stated-base");
+    let out = tmp.path("out.tif");
+    let scan = fixture("hdr-48bit.tif");
+
+    // convert with no base: usage error (exit 2), before anything is written.
+    let (code, _stdout, err) = run(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 2,
+        "an unstated film base must be a usage error: {err}"
+    );
+    assert!(err.contains("no film base selected"), "stderr: {err}");
+    assert!(
+        !out.exists(),
+        "nothing may be written on the fast-fail path"
+    );
+
+    // The same run with a stated base gets past the gate. (This fixture is
+    // synthetic and has no rebate band, so `--auto-base` would legitimately fail
+    // in the *detector*; an explicit base isolates the gate under test.)
+    let (code, _stdout, err) = run(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.6,0.5",
+    ]);
+    assert_eq!(code, 0, "a stated base must convert: {err}");
+    assert!(out.exists());
+
+    // `estimate` exists to *produce* a base, so it must not require one —
+    // otherwise the documented "measure once, reuse" workflow is circular. It
+    // resolves the unstated source to `auto` and reaches the detector, which on
+    // this rebate-less fixture fails on its own merits (exit 1, not exit 2).
+    let (code, _stdout, err) = run(&["estimate", scan.to_str().unwrap()]);
+    assert_ne!(
+        code, 2,
+        "estimate must not demand a base it is being asked to measure: {err}"
+    );
+    assert!(
+        !err.contains("no film base selected"),
+        "estimate must not emit the convert-only requirement: {err}"
+    );
+}
+
+#[test]
+fn roll_requires_a_stated_film_base_and_says_so_in_roll_terms() {
+    // `roll` converts, so it must state a base too — but `RollArgs` accepts none
+    // of the three film-base flags, so the diagnosis has to point at the shared
+    // `--params` recipe. A message naming `--auto-base` here would be advice the
+    // user cannot follow (that flag exits 2 on `roll`).
+    let tmp = TempDir::new("roll-stated-base");
+    let out_dir = tmp.path("out");
+    let scan = fixture("hdr-48bit.tif");
+
+    let (code, _stdout, err) = run(&[
+        "roll",
+        scan.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 2,
+        "roll with no stated film base must be a usage error: {err}"
+    );
+    assert!(err.contains("no film base selected"), "stderr: {err}");
+    assert!(
+        err.contains("--params") && err.contains("film_base.source"),
+        "roll's message must send the user to the shared recipe: {err}"
+    );
+    // The flags it does not have must not be offered as the way out. (`--base-region`
+    // does appear, but only inside the recommended `nc estimate` invocation — a
+    // different command, which accepts it.)
+    assert!(
+        !err.contains("--auto-base") && !err.contains("--film-base"),
+        "roll must not advise flags it rejects: {err}"
+    );
+    assert!(
+        !out_dir.exists(),
+        "nothing may be written on the fast-fail path"
+    );
+
+    // Falsifiable control: the same invocation with a recipe carrying
+    // `film_base.source` gets past the gate and converts.
+    let recipe = write_file(
+        &tmp.path("roll.json"),
+        r#"{"film_base": {"source": {"explicit": [0.9, 0.6, 0.5]}}}"#,
+    );
+    let (code, stdout, err) = run(&[
+        "roll",
+        scan.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "a stated base must convert:\n{stdout}\n{err}");
+    assert!(out_dir.join("hdr-48bit_positive.tiff").exists());
 }

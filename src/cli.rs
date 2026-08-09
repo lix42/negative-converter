@@ -370,8 +370,16 @@ pub struct FilmBaseOverrides {
     #[arg(long, value_name = "X,Y,W,H", value_parser = parse_region,
           conflicts_with = "auto_base")]
     pub base_region: Option<[u32; 4]>,
-    /// Detect the unexposed rebate band behind the film holder (the default
-    /// behavior; fails loudly when no confident band exists).
+    /// Detect the unexposed rebate band behind the film holder. Best-effort and
+    /// fails loudly when no confident band exists — real scans put a thin inset
+    /// rebate *behind* the holder, not at the outer margin. **No longer the
+    /// default**: `convert`/`roll` require one of these three flags (or the
+    /// `film_base.source` recipe key), because `Dmin` is a per-roll calibration
+    /// that sets black point and colour balance together, and arriving at it by
+    /// omission decided that for you. The measurement commands are unaffected,
+    /// since they exist to produce a base: `estimate` resolves an unstated source
+    /// to this, and `inspect` always runs the detector (it takes no film-base
+    /// flags at all).
     #[arg(long)]
     pub auto_base: bool,
 }
@@ -1892,10 +1900,10 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
         cfg.input.export_ir = Some(p.clone());
     }
 
-    // film base: the four source flags are mutually exclusive (clap-enforced);
+    // film base: the three source flags are mutually exclusive (clap-enforced);
     // whichever is given replaces the recipe's source entirely.
     if let Some(src) = film_base_source_override(&args.film_base) {
-        cfg.film_base.source = src;
+        cfg.film_base.source = Some(src);
     }
 
     // Density-reconstruction, curve, and Dmax flags — all live inside the tagged
@@ -2160,6 +2168,59 @@ fn required_extensions(preset: OutputPreset) -> Option<&'static [&'static str]> 
     }
 }
 
+/// How the calling command can state a film base — the one thing the
+/// missing-base diagnosis must vary on, because the remedies are disjoint.
+///
+/// `convert` has all three film-base flags; `roll` has **none** of them
+/// (`RollArgs` flattens only `MemoryArgs`/`ReportArgs`), so telling a `roll` user
+/// to "pass `--auto-base`" is advice they cannot follow — the flag exits 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilmBaseRemedy {
+    /// `convert` — `--film-base` / `--base-region` / `--auto-base`, or the recipe.
+    Flags,
+    /// `roll` — the shared `--params` recipe only.
+    SharedRecipe,
+}
+
+impl FilmBaseRemedy {
+    /// The remedy available to the command named in a report's `command` field.
+    fn for_command(command: &str) -> Self {
+        match command {
+            "roll" => Self::SharedRecipe,
+            _ => Self::Flags,
+        }
+    }
+}
+
+/// The **one** spelling of "no film base was stated", so the two places that can
+/// report it ([`validate`] and [`convert_frame`]'s totality guard) cannot drift
+/// into two differently-worded diagnoses of the same condition.
+///
+/// Command-aware by [`FilmBaseRemedy`]: the requirement is identical, but what the
+/// user can do about it is not.
+pub fn missing_film_base_message(remedy: FilmBaseRemedy) -> String {
+    match remedy {
+        FilmBaseRemedy::Flags => "no film base selected: pass --film-base R,G,B (a Dmin measured \
+             once per roll, e.g. with `nc estimate`), --base-region X,Y,W,H to sample an \
+             unexposed border, or --auto-base to detect the rebate band (best-effort: real scans \
+             put a thin inset rebate behind the holder, so it can fail). Recipe key: \
+             `film_base.source`."
+            .to_string(),
+        // `roll` deliberately does not repeat the flag names as an option: it has
+        // none of them, and the first version of this message sent users to flags
+        // that exit 2.
+        FilmBaseRemedy::SharedRecipe => "no film base selected: `roll` takes no film-base flags, \
+             so set `film_base.source` in the shared --params recipe. Measuring once per roll is \
+             the intended workflow: run `nc estimate --base-region X,Y,W,H <reference-scan>` on \
+             one frame and paste the reported `film_base` fragment \
+             (`\"film_base\": {\"source\": {\"explicit\": [R, G, B]}}`) into the recipe — that is \
+             also the only source that keeps every frame on one frozen Dmin. \
+             `{\"source\": \"auto\"}` and `{\"source\": {\"region\": [X, Y, W, H]}}` are accepted \
+             too, but re-estimate per frame, so the roll is not colour-consistent."
+            .to_string(),
+    }
+}
+
 /// Validate a resolved config at the CLI boundary so the pure stages can trust
 /// their inputs. Every failure is a [`NcError::Usage`] (exit 2) — bad recipes and
 /// impossible parameters fail loudly, never producing a quietly wrong image.
@@ -2169,7 +2230,18 @@ fn required_extensions(preset: OutputPreset) -> Option<&'static [&'static str]> 
 /// override). `convert` has one additional rule that inspects flag *presence* and
 /// therefore cannot live here; [`validate_convert`] composes the two and is what a
 /// `convert` orchestrator must call.
+///
+/// This spelling reports the missing film base with [`FilmBaseRemedy::Flags`];
+/// `roll` calls [`validate_with_remedy`] so its users are pointed at the shared
+/// recipe instead of flags `RollArgs` does not accept.
 pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
+    validate_with_remedy(cfg, FilmBaseRemedy::Flags)
+}
+
+/// [`validate`], with the caller stating which remedy its users actually have for
+/// an unstated film base. Only the wording of that one diagnosis differs; every
+/// rule is identical, which is what keeps `roll` and `convert` on one gate.
+pub fn validate_with_remedy(cfg: &ResolvedConfig, remedy: FilmBaseRemedy) -> Result<()> {
     let usage = |m: String| NcError::Usage(m);
 
     let finite = |label: &str, vals: &[f32]| -> Result<()> {
@@ -2193,12 +2265,17 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     // decoded scan is [0, 1]-normalized, so a value above 1 (e.g. a "90" typo for
     // "0.90") would silently render every real sample denser than the base; a
     // sampled region must have non-zero extent; auto needs nothing.
+    // The *unstated* case is deliberately not handled here — it is the last rule in
+    // this function. "You have not chosen a film base" is the least specific
+    // diagnosis there is, so letting it run first would pre-empt every
+    // contradiction rule below (and `reject_roll_unsupported*`) on a config that
+    // has both problems, reporting the vaguer one. Flag-shape first.
     match cfg.film_base.source {
-        FilmBaseSource::Explicit(b) => validate_explicit_film_base(&b)?,
-        FilmBaseSource::Region([_, _, w, h]) if w == 0 || h == 0 => {
+        Some(FilmBaseSource::Explicit(b)) => validate_explicit_film_base(&b)?,
+        Some(FilmBaseSource::Region([_, _, w, h])) if w == 0 || h == 0 => {
             return Err(usage("--base-region width and height must be > 0".into()));
         }
-        FilmBaseSource::Region(_) | FilmBaseSource::Auto => {}
+        Some(FilmBaseSource::Region(_)) | Some(FilmBaseSource::Auto) | None => {}
     }
 
     // Reconstruction: the tagged config's value checks, per variant. `simple`
@@ -2394,6 +2471,20 @@ pub fn validate(cfg: &ResolvedConfig) -> Result<()> {
     }
 
     validate_output_preset(cfg)?;
+
+    // Last, deliberately: `film_base.source` has no default, and `Dmin` is the
+    // divisor of the density conversion, so falling into auto-detection by
+    // omission decided the most consequential parameter for the user. `--auto-base`
+    // is still one flag away — the requirement is that the choice be *stated*, not
+    // that it be explicit.
+    //
+    // It runs after every value and shape rule because it is the least specific
+    // diagnosis in the function: a config that both contradicts itself and states
+    // no base should be told about the contradiction, which names the two things
+    // the user actually typed.
+    if cfg.film_base.source.is_none() {
+        return Err(usage(missing_film_base_message(remedy)));
+    }
 
     Ok(())
 }
@@ -3262,6 +3353,18 @@ fn convert_frame(
     let recipe_json = canonical_params_json(cfg)?;
     let identity = Identity::with_params_hash(version::stable_hash(&recipe_json));
 
+    // `film_base.source` has no default, and the gate rejects `None` before any
+    // frame runs (`validate_convert` for `convert`, `validate_with_remedy` directly
+    // for each `roll` frame). Restating it here keeps this function total rather
+    // than relying on an `unwrap` whose safety lives in another module — sharing
+    // `missing_film_base_message` so this unreachable spelling cannot drift into a
+    // second, thinner diagnosis of the same condition.
+    let base_source = cfg.film_base.source.clone().ok_or_else(|| {
+        NcError::Usage(missing_film_base_message(FilmBaseRemedy::for_command(
+            command,
+        )))
+    })?;
+
     let mut report = Report {
         command: Some(command),
         identity: Some(identity.clone()),
@@ -3270,7 +3373,7 @@ fn convert_frame(
         // The effective recipe (the sidecar's exact object), so
         // `recipe.reconstruction` is the tagged reconstruction schema.
         recipe: Some(cfg.clone()),
-        film_base_source: Some(cfg.film_base.source.clone()),
+        film_base_source: Some(base_source.clone()),
         ..Report::default()
     };
 
@@ -3312,7 +3415,7 @@ fn convert_frame(
                 export_ir: export_ir_planned,
             },
         },
-        sample_plan(&cfg.film_base.source),
+        sample_plan(&base_source),
         budget,
         memory::detect_total_ram(),
         log,
@@ -3379,7 +3482,7 @@ fn convert_frame(
     // shape-only IR plane (unverified provenance) is not trusted, so it degrades to
     // RGB-only. Governs the "IR carried but unused" note (false when we consume it)
     // and the chromogenic-without-IR note below.
-    let auto_base = matches!(cfg.film_base.source, FilmBaseSource::Auto);
+    let auto_base = matches!(base_source, FilmBaseSource::Auto);
     let chromogenic = cfg.input.film_type.ir_transparent();
     let ir_shape_only = info.ir_present && !image.ir_verified;
     let ir_used_for_holder = chromogenic && info.ir_present && image.ir_verified && auto_base;
@@ -3439,7 +3542,7 @@ fn convert_frame(
     }
 
     let stage_started = Instant::now();
-    let base = film_base::estimate(&image, &cfg.film_base, cfg.input.film_type)?;
+    let base = film_base::estimate(&image, &base_source, cfg.input.film_type)?;
     let film_base_ms = elapsed_ms(stage_started);
     report.film_base = Some(base.base);
     for w in base.warnings {
@@ -4712,7 +4815,7 @@ fn resolve_frames(
                                 mf.input.display()
                             ))
                         })?;
-                        validate(&cfg)?;
+                        validate_with_remedy(&cfg, FilmBaseRemedy::SharedRecipe)?;
                         reject_roll_unsupported(&cfg)?;
                         reject_roll_unsupported_input(&cfg)?;
                         (cfg, Some(ov), setting)
@@ -4846,16 +4949,18 @@ fn run_roll(args: RollArgs) -> Result<()> {
         meta_pipeline_version,
         sigmoid_anchor_absent,
     } = load_recipe(args.recipe_in.as_deref())?;
-    validate(&shared)?;
+    // `roll`'s remedy for an unstated film base is the shared recipe, never a flag:
+    // `RollArgs` accepts none of the three film-base flags.
+    validate_with_remedy(&shared, FilmBaseRemedy::SharedRecipe)?;
     reject_roll_unsupported(&shared)?;
     reject_roll_unsupported_input(&shared)?;
 
     // A roll's headline guarantee is one frozen, roll-fixed film base shared by
-    // every frame. Only an *explicit* base delivers that: `auto`/`region` (and the
-    // default, `auto`) re-estimate `Dmin` from each frame's own pixels, so the roll
-    // is neither frozen nor color-consistent even though the report still prints
-    // "one shared recipe". Warn loudly (report + stderr, `--strict`-promotable)
-    // rather than hard-failing, so a best-effort batch stays usable.
+    // every frame. Only an *explicit* base delivers that: `auto`/`region`
+    // re-estimate `Dmin` from each frame's own pixels, so the roll is neither
+    // frozen nor color-consistent even though the report still prints "one shared
+    // recipe". Warn loudly (report + stderr, `--strict`-promotable) rather than
+    // hard-failing, so a best-effort batch stays usable.
     let mut roll_warnings: Vec<String> = Vec::new();
     // A frozen recipe replayed under a different behavioral `pipeline_version` than
     // it was captured under is a roll-level fact (one shared recipe, N frames), so
@@ -4870,11 +4975,13 @@ fn run_roll(args: RollArgs) -> Result<()> {
         log.warn(&msg);
         roll_warnings.push(msg);
     }
-    if !matches!(shared.film_base.source, FilmBaseSource::Explicit(_)) {
+    if !matches!(shared.film_base.source, Some(FilmBaseSource::Explicit(_))) {
+        // `validate` above already rejected `None`, so only the two estimating
+        // sources reach here.
         let kind = match shared.film_base.source {
-            FilmBaseSource::Auto => "auto",
-            FilmBaseSource::Region(_) => "region",
-            FilmBaseSource::Explicit(_) => unreachable!(),
+            Some(FilmBaseSource::Auto) => "auto",
+            Some(FilmBaseSource::Region(_)) => "region",
+            Some(FilmBaseSource::Explicit(_)) | None => unreachable!("validate rejects both"),
         };
         let msg = format!(
             "roll film base is NOT frozen: film_base.source is `{kind}`, so every frame \
@@ -5225,7 +5332,7 @@ fn reuse_ready(rgb: [f32; 3]) -> Option<(String, FilmBaseParams)> {
     Some((
         format!("--film-base {},{},{}", rgb[0], rgb[1], rgb[2]),
         FilmBaseParams {
-            source: FilmBaseSource::Explicit(rgb),
+            source: Some(FilmBaseSource::Explicit(rgb)),
         },
     ))
 }
@@ -5241,6 +5348,15 @@ fn reuse_ready(rgb: [f32; 3]) -> Option<(String, FilmBaseParams)> {
 /// detection may fail loudly on real scans; that propagates as an error (the
 /// user asked for an estimate we can't give). `--strict` promotes warnings
 /// (e.g. grid disagreement) to a failing exit after the report is emitted.
+///
+/// **The `unwrap_or(FilmBaseSource::Auto)` below is the only surviving default
+/// film-base choice in the crate, and no fingerprint watches it.** Since
+/// `film_base.source` lost its default, `version::PIPELINE_FINGERPRINTS` no
+/// longer covers this decision from either side: `base` pins the detector by
+/// naming `Auto` explicitly, and `recipe` sees the resolved config's `null`.
+/// Changing what an unstated `estimate` resolves to would therefore move every
+/// `nc estimate` result with the whole drift gate green — verify such a change by
+/// hand, and do not assume the gate is watching.
 fn run_estimate(args: EstimateArgs) -> Result<()> {
     let started = Instant::now();
     let log = Log::new(&args.report);
@@ -5248,7 +5364,9 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     if let Some(rf) = args.report.report_file.as_deref() {
         ensure_write_targets_distinct(&args.input, &[("--report-file", rf)])?;
     }
-    let source = film_base_source_override(&args.film_base).unwrap_or_default();
+    // `estimate` exists to *produce* a base, so requiring one first would be
+    // circular: here — and only here — an unstated source still means `auto`.
+    let source = film_base_source_override(&args.film_base).unwrap_or(FilmBaseSource::Auto);
     // Guard an explicit base with the same check `convert` applies (a recipe
     // never reaches estimate, but a bad `--film-base` must fail loudly rather
     // than be echoed back). Region bounds are checked by `film_base::estimate`.
@@ -5377,13 +5495,7 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
         // quality warnings (non-uniform region, cross-edge disagreement). The
         // declared film type lets the `auto` source use the IR holder mask when
         // the scan is chromogenic and carries an IR plane.
-        let est = film_base::estimate(
-            &image,
-            &FilmBaseParams {
-                source: source.clone(),
-            },
-            args.film_type.unwrap_or_default(),
-        )?;
+        let est = film_base::estimate(&image, &source, args.film_type.unwrap_or_default())?;
         report.film_base_source = Some(source);
         for w in est.warnings {
             push_warning(&mut report, &log, w);
@@ -5550,6 +5662,16 @@ fn emit_telemetry(
     log: &Log,
     telemetry_log: Option<&Path>,
 ) {
+    // Falsifiable in a debug build: the `unwrap_or` below is unreachable, and if it
+    // ever *were* reached it would silently record a plausible-but-wrong `auto` for
+    // a run that resolved something else — the one failure mode a telemetry field
+    // cannot recover from after the fact. A schema bump to make the field optional
+    // is not worth it for an arm `validate` already forecloses; this assertion is.
+    debug_assert!(
+        report.film_base_source.is_some(),
+        "telemetry runs only after a successful conversion, which means `validate` \
+         accepted a stated film base"
+    );
     let record = telemetry::build_record(telemetry::RecordInputs {
         info,
         // The ambient reads live here in the orchestrator; `build_record` stays a
@@ -5563,7 +5685,15 @@ fn emit_telemetry(
         reconstruction: cfg.reconstruction.reconstruction_type(),
         curve: cfg.reconstruction.curve_type(),
         params_hash: telemetry::params_hash(recipe_json),
-        film_base_source: cfg.film_base.source.clone(),
+        // The report's copy is the source `convert_frame` actually resolved and
+        // ran, so it cannot disagree with the conversion. It is always `Some`
+        // here — telemetry is emitted only after a conversion succeeded, which
+        // means `validate` accepted the source — and telemetry must never fail a
+        // run, so the unreachable arm degrades instead of panicking.
+        film_base_source: report
+            .film_base_source
+            .clone()
+            .unwrap_or(FilmBaseSource::Auto),
         dmax: report.dmax,
         preset: cfg.output.preset,
         // Via `depth()` — the single place a recipe value becomes a depth — so the
@@ -5649,6 +5779,22 @@ fn elapsed_ms(started: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resolved config whose film base is **stated**.
+    ///
+    /// `film_base.source` has no default (see `types::FilmBaseParams::source`),
+    /// so `validate` rejects an unstated one. Tests that are not *about* the film
+    /// base use this, otherwise every unrelated assertion would trip that rule
+    /// instead of the one under test. `Auto` is the value this used to default to,
+    /// so these tests exercise exactly what they did before.
+    fn base_cfg() -> ResolvedConfig {
+        ResolvedConfig {
+            film_base: FilmBaseParams {
+                source: Some(FilmBaseSource::Auto),
+            },
+            ..ResolvedConfig::default()
+        }
+    }
     use crate::types::{ExponentialParams, SigmoidParams};
 
     /// Parse a `convert` invocation (with the required input/output already set)
@@ -5667,7 +5813,7 @@ mod tests {
     fn density_cfg(density: DensityParams, curve: DensityCurve) -> ResolvedConfig {
         ResolvedConfig {
             reconstruction: Reconstruction::Density { density, curve },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         }
     }
 
@@ -5682,7 +5828,7 @@ mod tests {
     fn simple_cfg() -> ResolvedConfig {
         ResolvedConfig {
             reconstruction: Reconstruction::Simple,
-            ..ResolvedConfig::default()
+            ..base_cfg()
         }
     }
 
@@ -5752,14 +5898,14 @@ mod tests {
         assert_eq!(gamma_of(&cfg), 1.5);
 
         // unspecified everywhere → default
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&[])).unwrap();
         assert_eq!(gamma_of(&cfg), 1.0);
     }
 
     #[test]
     fn merge_handles_reconstruction_and_array_flags() {
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&[
                 "--reconstruction",
                 "simple",
@@ -5856,7 +6002,7 @@ mod tests {
             ]
             .as_slice(),
         ] {
-            let err = merge(ResolvedConfig::default(), &parse_convert(flags)).unwrap_err();
+            let err = merge(base_cfg(), &parse_convert(flags)).unwrap_err();
             assert!(
                 matches!(err, NcError::Usage(_)),
                 "{flags:?} must be a usage error, got {err}"
@@ -5865,18 +6011,14 @@ mod tests {
 
         // A sigmoid flag with a resolved exponential curve (the default) is
         // invalid, not inert.
-        let err = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--sigmoid-contrast", "1.2"]),
-        )
-        .unwrap_err();
+        let err = merge(base_cfg(), &parse_convert(&["--sigmoid-contrast", "1.2"])).unwrap_err();
         assert!(err.to_string().contains("--sigmoid-contrast"), "{err}");
         assert!(err.to_string().contains("exponential"), "{err}");
 
         // A customized gamma with a resolved sigmoid curve is a loud usage
         // error, never ignored or downgraded to a warning.
         let err = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--density-curve", "sigmoid", "--density-gamma", "1.4"]),
         )
         .unwrap_err();
@@ -5943,21 +6085,13 @@ mod tests {
     fn merge_wb_flags_map_to_the_source_enum() {
         // Each flag maps to its variant; a forgotten merge arm would leave the
         // default and silently make the flag a no-op (the four-spot-wiring trap).
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--auto-wb", "gray-world"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--auto-wb", "gray-world"])).unwrap();
         assert_eq!(cfg.print.white_balance, WbSource::GrayWorld);
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--auto-wb", "percentile"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--auto-wb", "percentile"])).unwrap();
         assert_eq!(cfg.print.white_balance, WbSource::Percentile);
 
         // No flag keeps the recipe's auto mode; a flag replaces it (flags win).
-        let mut recipe = ResolvedConfig::default();
+        let mut recipe = base_cfg();
         recipe.print.white_balance = WbSource::GrayWorld;
         assert_eq!(
             merge(recipe.clone(), &parse_convert(&[]))
@@ -6021,7 +6155,7 @@ mod tests {
         // The auto modes validate under density reconstruction (no value to
         // range-check).
         for mode in [WbSource::GrayWorld, WbSource::Percentile] {
-            let mut cfg = ResolvedConfig::default();
+            let mut cfg = base_cfg();
             cfg.print.white_balance = mode;
             validate(&cfg).unwrap();
         }
@@ -6086,21 +6220,13 @@ mod tests {
         // Each flag maps to its variant on the resolved curve; a forgotten merge
         // arm would leave the default and silently make the flag a no-op (the
         // four-spot-wiring trap).
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--d-max", "1.75"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--d-max", "1.75"])).unwrap();
         assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.75));
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--no-d-max"])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--no-d-max"])).unwrap();
         assert_eq!(curve_of(&cfg).dmax(), DmaxSource::None);
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--auto-d-max"])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--auto-d-max"])).unwrap();
         assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Auto);
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--fixed-d-max"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--fixed-d-max"])).unwrap();
         assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Fixed);
 
         // The same flags land on a resolved *sigmoid* curve too — the anchor is
@@ -6139,7 +6265,7 @@ mod tests {
         // Each flag maps to its field; a forgotten merge arm would leave the
         // default and silently make the flag a no-op (the four-spot-wiring trap).
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&[
                 "--density-curve",
                 "sigmoid",
@@ -6176,7 +6302,7 @@ mod tests {
         // already `MidAtDmaxFraction(0.5)`, so `--sigmoid-mid-fraction 0.5` would
         // "work" by accident — hence asserting a *different* fraction.
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&[
                 "--density-curve",
                 "sigmoid",
@@ -6191,7 +6317,7 @@ mod tests {
         );
 
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--density-curve", "sigmoid", "--sigmoid-white-at-d-max"]),
         )
         .unwrap();
@@ -6225,7 +6351,7 @@ mod tests {
             ["--sigmoid-mid-fraction", "0.6"].as_slice(),
             ["--sigmoid-white-at-d-max"].as_slice(),
         ] {
-            let err = merge(ResolvedConfig::default(), &parse_convert(flag)).unwrap_err();
+            let err = merge(base_cfg(), &parse_convert(flag)).unwrap_err();
             assert!(err.to_string().contains(flag[0]), "{err}");
         }
         // And they are mutually exclusive at the clap layer.
@@ -6490,7 +6616,7 @@ mod tests {
         // Each knob maps through merge into `reconstruction.density`; a forgotten
         // arm would silently make the flag a no-op (the four-spot-wiring trap).
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&[
                 "--shadow-balance",
                 "0.1,0,-0.05",
@@ -6712,7 +6838,7 @@ mod tests {
     #[test]
     fn dump_params_round_trips_through_params() {
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--density-gamma", "1.8", "--output-hdr"]),
         )
         .unwrap();
@@ -6722,15 +6848,11 @@ mod tests {
         // The sigmoid form and the simple form round-trip too.
         for cfg in [
             merge(
-                ResolvedConfig::default(),
+                base_cfg(),
                 &parse_convert(&["--density-curve", "sigmoid", "--sigmoid-toe", "0.1"]),
             )
             .unwrap(),
-            merge(
-                ResolvedConfig::default(),
-                &parse_convert(&["--reconstruction", "simple"]),
-            )
-            .unwrap(),
+            merge(base_cfg(), &parse_convert(&["--reconstruction", "simple"])).unwrap(),
         ] {
             let json = serde_json::to_string(&cfg).unwrap();
             assert_eq!(serde_json::from_str::<ResolvedConfig>(&json).unwrap(), cfg);
@@ -6742,7 +6864,7 @@ mod tests {
         // Schema fixtures (design-spec §8): every resolved recipe emits
         // `reconstruction.schema_version = 1` and exactly one tagged curve — an
         // omitted input curve never survives normalization.
-        let v = serde_json::to_value(ResolvedConfig::default()).unwrap();
+        let v = serde_json::to_value(base_cfg()).unwrap();
         assert_eq!(v["reconstruction"]["schema_version"], 1);
         assert_eq!(v["reconstruction"]["type"], "density");
         assert_eq!(v["reconstruction"]["curve"]["type"], "exponential");
@@ -6892,7 +7014,7 @@ mod tests {
         // The convert report's `recipe` is the effective config, so
         // `recipe.reconstruction` is the exact tagged schema (design-spec §8).
         let report = Report {
-            recipe: Some(ResolvedConfig::default()),
+            recipe: Some(base_cfg()),
             ..Report::default()
         };
         let v = serde_json::to_value(&report).unwrap();
@@ -6908,10 +7030,10 @@ mod tests {
     fn merge_output_hdr_flag_sets_but_never_clears() {
         // Flag present → hdr on (a forgotten merge arm would silently make the
         // flag a no-op — the four-spot-wiring trap).
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-hdr"])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--output-hdr"])).unwrap();
         assert!(cfg.output.hdr);
         // No flag → the default stays off.
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&[])).unwrap();
         assert!(!cfg.output.hdr);
         // An absent (false) presence flag must not clobber a recipe `true`.
         let recipe: ResolvedConfig = serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap();
@@ -6922,7 +7044,7 @@ mod tests {
         let cfg = merge(recipe, &parse_convert(&["--output-sdr"])).unwrap();
         assert!(!cfg.output.hdr);
         // ...and is a no-op on an already-SDR config.
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--output-sdr"])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--output-sdr"])).unwrap();
         assert!(!cfg.output.hdr);
     }
 
@@ -6962,7 +7084,7 @@ mod tests {
                 preset: OutputPreset::FilmMaster,
                 ..OutputParams::default()
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         }
     }
 
@@ -6979,7 +7101,7 @@ mod tests {
         // The merge arm — a forgotten one silently makes `--output-preset` a no-op
         // (the four-spot-wiring trap).
         let cfg = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--output-preset", "film-master"]),
         )
         .unwrap();
@@ -7005,7 +7127,7 @@ mod tests {
         );
         // No flag, no recipe key → the default.
         assert_eq!(
-            merge(ResolvedConfig::default(), &parse_convert(&[]))
+            merge(base_cfg(), &parse_convert(&[]))
                 .unwrap()
                 .output
                 .preset,
@@ -7014,7 +7136,7 @@ mod tests {
         // The flag shares `OutputPreset::parse`, so a renamed/unknown value is a
         // usage error at merge, not a silent fallback to legacy.
         let err = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--output-preset", "scene-master"]),
         )
         .unwrap_err();
@@ -7024,18 +7146,10 @@ mod tests {
     #[test]
     fn merge_linear_range_flag_replaces_the_recipe_pair() {
         // The merge arm for the atomic `[low, high]` pair.
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--linear-range", "0.02,0.97"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--linear-range", "0.02,0.97"])).unwrap();
         assert_eq!(cfg.print.linear_range, [0.02, 0.97]);
         // A negative low parses (a leading `-` must not be read as a flag).
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--linear-range", "-0.1,1.2"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--linear-range", "-0.1,1.2"])).unwrap();
         assert_eq!(cfg.print.linear_range, [-0.1, 1.2]);
         // Absent flag → the recipe pair survives.
         let recipe: ResolvedConfig =
@@ -7103,7 +7217,7 @@ mod tests {
                 preset,
                 ..OutputParams::default()
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         };
         // Legacy → the "no consumer" rule.
         let msg = validate_err(&cfg_with(OutputPreset::Legacy));
@@ -7118,7 +7232,7 @@ mod tests {
         );
         validate(&cfg_with(OutputPreset::UltraHdrV1)).unwrap();
         // The default pair is of course fine on both branches.
-        validate(&ResolvedConfig::default()).unwrap();
+        validate(&base_cfg()).unwrap();
         validate(&film_master_cfg()).unwrap();
     }
 
@@ -7129,7 +7243,7 @@ mod tests {
                 preset: OutputPreset::UltraHdrV1,
                 ..OutputParams::default()
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         };
         let mut args = parse_convert(&["--output-preset", "ultra-hdr-v1"]);
         assert!(validate_convert(&cfg, &args).is_err());
@@ -7150,7 +7264,7 @@ mod tests {
                     preset,
                     ..OutputParams::default()
                 },
-                ..ResolvedConfig::default()
+                ..base_cfg()
             };
             // A `.tiff` (or the default) path is rejected; `.avif` in any case passes.
             let mut args = parse_convert(&["--output-preset", name]);
@@ -7179,7 +7293,7 @@ mod tests {
                     hdr: true,
                     ..OutputParams::default()
                 },
-                ..ResolvedConfig::default()
+                ..base_cfg()
             };
             assert!(
                 validate(&hdr_flag).is_err(),
@@ -7202,7 +7316,7 @@ mod tests {
                     preset,
                     ..OutputParams::default()
                 },
-                ..ResolvedConfig::default()
+                ..base_cfg()
             };
             let mut args = parse_convert(&["--output-preset", name]);
             args.output = PathBuf::from("out.avif");
@@ -7229,7 +7343,7 @@ mod tests {
                     hdr: true,
                     ..OutputParams::default()
                 },
-                ..ResolvedConfig::default()
+                ..base_cfg()
             };
             assert!(
                 validate(&hdr_flag).is_err(),
@@ -7239,7 +7353,7 @@ mod tests {
             // stated here at the CLI level (through `merge`) rather than by poking a
             // resolved value, so the flag spelling is what the assertion pins.
             let big = merge(
-                ResolvedConfig::default(),
+                base_cfg(),
                 &parse_convert(&["--output-preset", name, "--bigtiff", "on"]),
             )
             .unwrap();
@@ -7249,7 +7363,7 @@ mod tests {
             // for nothing, so it must still pass — otherwise the assertion above
             // would also hold for a rule that rejected the flag outright.
             let auto = merge(
-                ResolvedConfig::default(),
+                base_cfg(),
                 &parse_convert(&["--output-preset", name, "--bigtiff", "auto"]),
             )
             .unwrap();
@@ -7286,7 +7400,7 @@ mod tests {
                 preset: OutputPreset::HdrLinearTiff,
                 ..OutputParams::default()
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         };
 
         // `.jpg` is rejected and the message names both the preset and what it wants.
@@ -7339,7 +7453,7 @@ mod tests {
         ] {
             let bad = ResolvedConfig {
                 output: offender,
-                ..ResolvedConfig::default()
+                ..base_cfg()
             };
             assert!(
                 validate(&bad).is_err(),
@@ -7351,14 +7465,14 @@ mod tests {
         // (through `merge`) so the flag spelling is what is pinned — with
         // `--bigtiff auto`, the documented default, as the falsifiable control.
         let big = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--output-preset", "hdr-linear-tiff", "--bigtiff", "on"]),
         )
         .unwrap();
         let err = validate(&big).unwrap_err().to_string();
         assert!(err.contains("output.bigtiff"), "{err}");
         let auto = merge(
-            ResolvedConfig::default(),
+            base_cfg(),
             &parse_convert(&["--output-preset", "hdr-linear-tiff", "--bigtiff", "auto"]),
         )
         .unwrap();
@@ -7377,7 +7491,7 @@ mod tests {
                 linear_range: [0.05, 0.95],
                 ..PrintParams::default()
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         };
         validate(&ranged).unwrap();
         // Control: the same range under the legacy path is still an error, so the
@@ -7385,7 +7499,7 @@ mod tests {
         // stopped working altogether.
         let legacy_ranged = ResolvedConfig {
             print: ranged.print.clone(),
-            ..ResolvedConfig::default()
+            ..base_cfg()
         };
         assert!(validate(&legacy_ranged).is_err());
 
@@ -7570,7 +7684,7 @@ mod tests {
                 },
                 curve: DensityCurve::default(),
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         })
         .unwrap();
     }
@@ -7643,7 +7757,9 @@ mod tests {
         // for the *same* resolved value. Every case below is therefore run through
         // `merge` + `validate` twice: once flag-sourced, once recipe-sourced.
         let outcome = |argv: &[&str], recipe_json: &str| -> std::result::Result<(), String> {
-            let recipe: ResolvedConfig = serde_json::from_str(recipe_json).unwrap();
+            let mut recipe: ResolvedConfig = serde_json::from_str(recipe_json).unwrap();
+            // State a base so `validate` reaches the atomicity rule under test.
+            recipe.film_base.source = Some(FilmBaseSource::Auto);
             let mut full = vec!["--output-preset", "film-master"];
             full.extend_from_slice(argv);
             let cfg = merge(recipe, &parse_convert(&full)).unwrap();
@@ -7713,11 +7829,11 @@ mod tests {
         }
 
         // The same recipes without the preset stay perfectly legal (legacy path).
-        let legacy: ResolvedConfig =
+        let mut legacy: ResolvedConfig =
             serde_json::from_str(r#"{"output":{"hdr":true,"bigtiff":"on"}}"#).unwrap();
+        legacy.film_base.source = Some(FilmBaseSource::Auto);
         validate(&legacy).unwrap();
-        validate(&merge(ResolvedConfig::default(), &parse_convert(&["--output-hdr"])).unwrap())
-            .unwrap();
+        validate(&merge(base_cfg(), &parse_convert(&["--output-hdr"])).unwrap()).unwrap();
     }
 
     #[test]
@@ -7806,10 +7922,13 @@ mod tests {
         // The rejection is on the *resolved* value, so flags-win semantics stay
         // usable: a roll recipe carrying print controls can be re-exported as a
         // master by resetting them on the command line, without editing the recipe.
-        let recipe: ResolvedConfig = serde_json::from_str(
+        let mut recipe: ResolvedConfig = serde_json::from_str(
             r#"{"print":{"print_exposure":0.5,"white_balance":{"explicit":[1.05,1.0,0.93]}}}"#,
         )
         .unwrap();
+        // State a base so the accepted case reaches the print-control rule under
+        // test rather than the film-base requirement.
+        recipe.film_base.source = Some(FilmBaseSource::Auto);
         // Without the resets the master rejects it…
         let cfg = merge(
             recipe.clone(),
@@ -7916,7 +8035,7 @@ mod tests {
 
         // legacy u16 (the default): the print stage runs for a density
         // reconstruction and the working→output ICC transform always runs.
-        let legacy = value(&ResolvedConfig::default());
+        let legacy = value(&base_cfg());
         assert_eq!(legacy["preset"], "legacy");
         assert_eq!(legacy["print_controls"], true);
         assert_eq!(legacy["display_render"], true);
@@ -7929,7 +8048,7 @@ mod tests {
                 hdr: true,
                 ..OutputParams::default()
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         });
         assert_eq!(hdr["encoding"], "transitional-rendered-float-tiff");
         assert!(
@@ -8005,11 +8124,181 @@ mod tests {
     }
 
     #[test]
-    fn params_default_is_valid_parseable_json() {
+    fn params_default_is_parseable_json_but_no_longer_runnable() {
+        // The subject is the exact document `nc params` prints — `run_params`
+        // serializes `ResolvedConfig::default()` — so this must stay on the real
+        // default, not on a film-base-stated stand-in. Substituting `base_cfg()`
+        // here would leave nothing asserting that the printed scaffold round-trips.
         let json = serde_json::to_string_pretty(&ResolvedConfig::default()).unwrap();
         let back: ResolvedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ResolvedConfig::default());
-        validate(&back).unwrap();
+
+        // ...and the scaffold is deliberately NOT runnable as printed: it states no
+        // film base, so `validate` rejects it. That is the new contract — `nc
+        // params` emits a template to edit, not a recipe to run — and pinning it
+        // here is what stops a future default from quietly making it runnable again.
+        let msg = match validate(&back) {
+            Err(NcError::Usage(m)) => m,
+            other => panic!(
+                "the printed default scaffold must be rejected until a film base is \
+                 stated, got {other:?}"
+            ),
+        };
+        assert!(msg.contains("film_base.source"), "{msg}");
+
+        // Falsifiable control: the same document with a base stated does validate,
+        // so the rejection above is about the film base and nothing else.
+        let mut runnable = back.clone();
+        runnable.film_base.source = Some(FilmBaseSource::Auto);
+        validate(&runnable).unwrap();
+    }
+
+    #[test]
+    fn validate_requires_a_stated_film_base() {
+        // `film_base.source` has no default: `Dmin` is the divisor of the density
+        // conversion, so falling into auto-detection by omission decided the most
+        // consequential parameter for the user. All three stated forms are fine —
+        // including `auto`, which is what this used to default to. The rule is
+        // that the choice is *made*, not that it is explicit.
+        let unstated = ResolvedConfig::default();
+        assert_eq!(unstated.film_base.source, None, "there must be no default");
+        let msg = match validate(&unstated) {
+            Err(NcError::Usage(m)) => m,
+            other => panic!("an unstated film base must be a usage error, got {other:?}"),
+        };
+        // The message has to be actionable: name every way out, since a user who
+        // hit this has no idea which of the three they wanted.
+        for expected in [
+            "--film-base",
+            "--base-region",
+            "--auto-base",
+            "film_base.source",
+        ] {
+            assert!(msg.contains(expected), "{expected} missing from: {msg}");
+        }
+
+        for stated in [
+            FilmBaseSource::Auto,
+            FilmBaseSource::Region([0, 0, 100, 40]),
+            FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
+        ] {
+            let mut cfg = ResolvedConfig::default();
+            cfg.film_base.source = Some(stated.clone());
+            validate(&cfg)
+                .unwrap_or_else(|e| panic!("a stated {stated:?} base must be accepted: {e}"));
+        }
+    }
+
+    #[test]
+    fn roll_is_told_about_the_shared_recipe_rather_than_flags_it_rejects() {
+        // Same rule, different remedy: `RollArgs` flattens only `MemoryArgs` /
+        // `ReportArgs`, so every film-base flag exits 2 on `roll`. Naming them
+        // would be advice the user cannot follow.
+        let unstated = ResolvedConfig::default();
+        let msg = match validate_with_remedy(&unstated, FilmBaseRemedy::SharedRecipe) {
+            Err(NcError::Usage(m)) => m,
+            other => panic!("an unstated film base must be a usage error, got {other:?}"),
+        };
+        assert!(msg.contains("--params"), "{msg}");
+        assert!(msg.contains("film_base.source"), "{msg}");
+        for absent in ["--auto-base", "--film-base"] {
+            assert!(!msg.contains(absent), "{absent} must not be offered: {msg}");
+        }
+        // `--base-region` *does* appear — but only inside the `nc estimate`
+        // invocation the message recommends, which is a different command and does
+        // accept it. What must never appear is a `roll` flag.
+        assert!(
+            msg.matches("--base-region")
+                .count()
+                .eq(&msg.matches("nc estimate --base-region").count()),
+            "--base-region may only appear as an argument of `nc estimate`: {msg}"
+        );
+        // The *requirement* is remedy-independent — only the wording moves.
+        let mut stated = ResolvedConfig::default();
+        stated.film_base.source = Some(FilmBaseSource::Auto);
+        validate_with_remedy(&stated, FilmBaseRemedy::SharedRecipe).unwrap();
+        // And `convert_frame`'s totality guard shares the same two spellings, so
+        // the unreachable restatement cannot drift from the gate's.
+        assert_eq!(
+            missing_film_base_message(FilmBaseRemedy::for_command("roll")),
+            missing_film_base_message(FilmBaseRemedy::SharedRecipe)
+        );
+        assert_eq!(
+            missing_film_base_message(FilmBaseRemedy::for_command("convert")),
+            missing_film_base_message(FilmBaseRemedy::Flags)
+        );
+    }
+
+    #[test]
+    fn the_missing_base_rule_never_pre_empts_a_more_specific_one() {
+        // `validate`'s documented principle is flag-shape first: a config that both
+        // contradicts itself and states no base must be told about the
+        // contradiction, which names the two things the user actually typed.
+        // Placing the `None` arm first (its original position) reversed that for
+        // every rule in the function.
+        let mut contradictory = ResolvedConfig::default();
+        contradictory.output.preset = OutputPreset::FilmMaster;
+        contradictory.print.linear_range = [0.05, 0.95];
+        assert_eq!(contradictory.film_base.source, None);
+        let msg = validate(&contradictory).unwrap_err().to_string();
+        assert!(
+            msg.contains("linear_range"),
+            "the contradiction must be diagnosed ahead of the missing base: {msg}"
+        );
+
+        // Falsifiable control: with the contradiction removed, the same config does
+        // report the missing base — so the assertion above is about ordering, not
+        // about the missing-base rule having stopped working.
+        let mut only_unstated = ResolvedConfig::default();
+        only_unstated.output.preset = OutputPreset::FilmMaster;
+        assert!(
+            validate(&only_unstated)
+                .unwrap_err()
+                .to_string()
+                .contains("no film base selected")
+        );
+        only_unstated.film_base.source = Some(FilmBaseSource::Auto);
+        validate(&only_unstated).unwrap();
+    }
+
+    #[test]
+    fn every_v1_film_base_spelling_still_deserializes() {
+        // Back-compat for archived recipes and sidecars: `film_base.source` became
+        // an `Option`, and every recipe ever written spells one of these three. If
+        // any stopped deserializing to `Some(..)`, every archived recipe would exit
+        // 2 instead of replaying. The `= Some(..)` pokes elsewhere in this module
+        // bypass serde entirely, so nothing else pins the wire format.
+        for (json, want) in [
+            (r#"{"film_base":{"source":"auto"}}"#, FilmBaseSource::Auto),
+            (
+                r#"{"film_base":{"source":{"region":[10,20,30,40]}}}"#,
+                FilmBaseSource::Region([10, 20, 30, 40]),
+            ),
+            (
+                r#"{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}}}"#,
+                FilmBaseSource::Explicit([0.9, 0.55, 0.42]),
+            ),
+        ] {
+            let cfg: ResolvedConfig = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("a v1 recipe spelling must still parse: {json}: {e}"));
+            assert_eq!(cfg.film_base.source, Some(want), "{json}");
+            validate(&cfg).unwrap_or_else(|e| panic!("{json} must still validate: {e}"));
+        }
+
+        // Falsifiable control: omitting the key is the one thing that now yields
+        // `None` — which is the whole point of the change.
+        let omitted: ResolvedConfig = serde_json::from_str(r#"{"film_base":{}}"#).unwrap();
+        assert_eq!(omitted.film_base.source, None);
+        assert!(validate(&omitted).is_err());
+    }
+
+    #[test]
+    fn auto_base_flag_states_the_source_rather_than_relying_on_a_default() {
+        // The flag is the migration path for anyone who *wanted* detection: it
+        // resolves to exactly the source that used to be implicit.
+        let cfg = merge(ResolvedConfig::default(), &parse_convert(&["--auto-base"])).unwrap();
+        assert_eq!(cfg.film_base.source, Some(FilmBaseSource::Auto));
+        validate(&cfg).unwrap();
     }
 
     #[test]
@@ -8021,23 +8310,23 @@ mod tests {
         });
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
-        let mut cfg = ResolvedConfig::default();
+        let mut cfg = base_cfg();
         cfg.print.white_balance = WbSource::Explicit([1.0, f32::NAN, 1.0]);
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         // Non-positive explicit gains are rejected too (a recipe can smuggle
         // them past the CLI value parser).
-        let mut cfg = ResolvedConfig::default();
+        let mut cfg = base_cfg();
         cfg.print.white_balance = WbSource::Explicit([1.0, 0.0, 1.0]);
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         // Negative highlight compression is rejected (the print render silently
         // treats it as "off", so a wrong-sign value must fail loudly, not no-op).
-        let mut cfg = ResolvedConfig::default();
+        let mut cfg = base_cfg();
         cfg.print.highlight_compress = -0.3;
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
         // Zero is valid (disables the roll-off).
-        let mut cfg = ResolvedConfig::default();
+        let mut cfg = base_cfg();
         cfg.print.highlight_compress = 0.0;
         validate(&cfg).unwrap();
 
@@ -8052,7 +8341,7 @@ mod tests {
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
         // A clean default (and the simple config) pass.
-        validate(&ResolvedConfig::default()).unwrap();
+        validate(&base_cfg()).unwrap();
         validate(&simple_cfg()).unwrap();
     }
 
@@ -8060,30 +8349,26 @@ mod tests {
     fn validate_rejects_recipe_smuggled_bad_values() {
         // A recipe can carry values the CLI value-parsers would have rejected,
         // so validate is the only guard for these once they're in the config.
-        let mut cfg = ResolvedConfig::default();
-        cfg.film_base.source = FilmBaseSource::Explicit([0.9, 0.0, 0.4]); // zero transmission
+        let mut cfg = base_cfg();
+        cfg.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.0, 0.4])); // zero transmission
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
-        let mut cfg = ResolvedConfig::default();
-        cfg.film_base.source = FilmBaseSource::Explicit([0.9, 90.0, 0.4]); // "90" typo for "0.90"
+        let mut cfg = base_cfg();
+        cfg.film_base.source = Some(FilmBaseSource::Explicit([0.9, 90.0, 0.4])); // "90" typo for "0.90"
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
-        let mut cfg = ResolvedConfig::default();
-        cfg.film_base.source = FilmBaseSource::Explicit([1.0, 1.0, 1.0]); // 1.0 exactly is valid
+        let mut cfg = base_cfg();
+        cfg.film_base.source = Some(FilmBaseSource::Explicit([1.0, 1.0, 1.0])); // 1.0 exactly is valid
         validate(&cfg).unwrap();
 
-        let mut cfg = ResolvedConfig::default();
-        cfg.film_base.source = FilmBaseSource::Region([0, 0, 0, 0]); // zero-area region
+        let mut cfg = base_cfg();
+        cfg.film_base.source = Some(FilmBaseSource::Region([0, 0, 0, 0])); // zero-area region
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
     }
 
     #[test]
     fn export_ir_and_seed_parse_into_the_right_homes() {
         // `--export-ir` is an input/decode key (design-spec §9), not output.
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--export-ir", "ir.tiff"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--export-ir", "ir.tiff"])).unwrap();
         assert_eq!(cfg.input.export_ir.as_deref(), Some("ir.tiff"));
 
         // The reserved `--seed` flag parses rather than being rejected by clap.
@@ -8094,12 +8379,12 @@ mod tests {
     #[test]
     fn merge_keeps_recipe_source_until_a_flag_replaces_it() {
         // No flag → the recipe's mutually-exclusive choice survives.
-        let mut recipe = ResolvedConfig::default();
-        recipe.film_base.source = FilmBaseSource::Explicit([0.9, 0.5, 0.4]);
+        let mut recipe = base_cfg();
+        recipe.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.5, 0.4]));
         let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
         assert_eq!(
             cfg.film_base.source,
-            FilmBaseSource::Explicit([0.9, 0.5, 0.4])
+            Some(FilmBaseSource::Explicit([0.9, 0.5, 0.4]))
         );
 
         // A flag replaces the whole source — no field is left behind to win on
@@ -8107,7 +8392,7 @@ mod tests {
         let cfg = merge(recipe, &parse_convert(&["--base-region", "0,0,100,40"])).unwrap();
         assert_eq!(
             cfg.film_base.source,
-            FilmBaseSource::Region([0, 0, 100, 40])
+            Some(FilmBaseSource::Region([0, 0, 100, 40]))
         );
     }
 
@@ -8115,7 +8400,7 @@ mod tests {
     fn input_axes_merge_independently_and_flags_win() {
         // transfer and meaning are independent axes: a flag on one axis replaces
         // that axis and leaves the other at the recipe value (flags win per axis).
-        let mut recipe = ResolvedConfig::default();
+        let mut recipe = base_cfg();
         recipe.input.transfer = TransferAssertion::Auto;
         recipe.input.meaning = MeaningAssertion::ScannerDevice;
 
@@ -8144,7 +8429,7 @@ mod tests {
         // `--film-type` maps to `input.film_type`; the flag replaces a recipe
         // value, and its absence never clobbers one (a forgotten merge arm would
         // silently make the flag a no-op — the four-spot knob rule).
-        let mut recipe = ResolvedConfig::default();
+        let mut recipe = base_cfg();
         recipe.input.film_type = FilmType::Silver;
 
         // No flag → the recipe value survives.
@@ -8156,14 +8441,10 @@ mod tests {
         assert_eq!(cfg.input.film_type, FilmType::Chromogenic);
 
         // Over the default recipe, the flag sets the declared type.
-        let cfg = merge(
-            ResolvedConfig::default(),
-            &parse_convert(&["--film-type", "chromogenic"]),
-        )
-        .unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&["--film-type", "chromogenic"])).unwrap();
         assert_eq!(cfg.input.film_type, FilmType::Chromogenic);
         // ...and the untouched default is `unknown` (the safe off state).
-        let cfg = merge(ResolvedConfig::default(), &parse_convert(&[])).unwrap();
+        let cfg = merge(base_cfg(), &parse_convert(&[])).unwrap();
         assert_eq!(cfg.input.film_type, FilmType::Unknown);
     }
 
@@ -8273,7 +8554,7 @@ mod tests {
         // `film_base` section value and inside a full recipe — otherwise the
         // advertised paste-into-a-roll-recipe workflow is broken.
         let fragment = FilmBaseParams {
-            source: FilmBaseSource::Explicit([0.553, 0.271, 0.159]),
+            source: Some(FilmBaseSource::Explicit([0.553, 0.271, 0.159])),
         };
         let json = serde_json::to_string(&fragment).unwrap();
         assert_eq!(json, r#"{"source":{"explicit":[0.553,0.271,0.159]}}"#);
@@ -8295,7 +8576,7 @@ mod tests {
         let value = flag.strip_prefix("--film-base ").unwrap();
         assert_eq!(parse_rgb(value).unwrap(), rgb);
         // The two forms carry the same value — never allowed to drift.
-        assert_eq!(fragment.source, FilmBaseSource::Explicit(rgb));
+        assert_eq!(fragment.source, Some(FilmBaseSource::Explicit(rgb)));
     }
 
     #[test]
@@ -8313,10 +8594,13 @@ mod tests {
         // Merged into a curve object (the documented destination), it parses on
         // both variants and validates.
         for curve_type in ["exponential", "sigmoid"] {
-            let recipe: ResolvedConfig = serde_json::from_str(&format!(
+            let mut recipe: ResolvedConfig = serde_json::from_str(&format!(
                 r#"{{"reconstruction":{{"curve":{{"type":"{curve_type}","dmax":{{"explicit":1.2734}}}}}}}}"#
             ))
             .unwrap();
+            // The fragment under test is the `dmax` one; state a base so
+            // `validate` reaches it (`film_base.source` has no default).
+            recipe.film_base.source = Some(FilmBaseSource::Auto);
             assert_eq!(
                 curve_of(&recipe).dmax(),
                 DmaxSource::Explicit(1.2734),
@@ -8460,7 +8744,7 @@ mod tests {
             reuse: Some(ReuseReady {
                 flag: "--film-base 0.5,0.25,0.125".to_string(),
                 recipe: FilmBaseParams {
-                    source: FilmBaseSource::Explicit([0.5, 0.25, 0.125]),
+                    source: Some(FilmBaseSource::Explicit([0.5, 0.25, 0.125])),
                 },
             }),
             ..Report::default()
@@ -8494,7 +8778,7 @@ mod tests {
         assert_eq!(flag, "--film-base 0.553,0.271,0.159");
         assert_eq!(
             fragment.source,
-            FilmBaseSource::Explicit([0.553, 0.271, 0.159])
+            Some(FilmBaseSource::Explicit([0.553, 0.271, 0.159]))
         );
     }
 
@@ -8649,7 +8933,7 @@ mod tests {
         // claim is pinned end-to-end by
         // `params_hash_is_the_hash_of_the_dump_params_bytes`; asserting it here
         // against `to_string_pretty` would only restate this function's own body.)
-        let cfg = ResolvedConfig::default();
+        let cfg = base_cfg();
         let json = canonical_params_json(&cfg).unwrap();
         assert_eq!(serde_json::from_str::<ResolvedConfig>(&json).unwrap(), cfg);
     }
@@ -8661,7 +8945,7 @@ mod tests {
         // either name, every recipe carrying it would be silently reinterpreted as
         // an envelope (or rejected), so pin that the resolved recipe's own top level
         // never uses them.
-        let value = serde_json::to_value(ResolvedConfig::default()).unwrap();
+        let value = serde_json::to_value(base_cfg()).unwrap();
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         for reserved in ["params", "meta"] {
             assert!(
@@ -8772,6 +9056,10 @@ mod tests {
         }
         // An empty object stays valid on both levels — that is a recipe (or an
         // envelope body) that legitimately means "all defaults".
+        // Note this compares against the *bare* default: a recipe that says
+        // nothing leaves `film_base.source` unset (`None`), which `validate`
+        // later rejects for `convert`. "All defaults" is not the same as "ready
+        // to run" any more, and that is the point of the requirement.
         assert_eq!(
             load_recipe_body("obj-bare", "{}").unwrap().cfg,
             ResolvedConfig::default()
@@ -8924,7 +9212,7 @@ mod tests {
         // Reconstruction density → simple: the stale `density`/`curve` blocks
         // must not survive (simple takes neither) — and the merged JSON must
         // deserialize back to a valid config.
-        let mut base = serde_json::to_value(ResolvedConfig::default()).unwrap();
+        let mut base = serde_json::to_value(base_cfg()).unwrap();
         let overlay = serde_json::json!({"reconstruction": {"type": "simple"}});
         merge_json(&mut base, &overlay);
         assert_eq!(
@@ -8965,7 +9253,7 @@ mod tests {
             gamma: 1.8,
             dmax: DmaxSource::Explicit(1.6),
         });
-        shared.film_base.source = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
+        shared.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]));
         let mut warnings = Vec::new();
         let log = Log::new(&args.report);
         let planned = resolve_frames(&args, &shared, true, &mut warnings, &log);
@@ -9024,9 +9312,9 @@ mod tests {
         };
         let shared = ResolvedConfig {
             film_base: FilmBaseParams {
-                source: FilmBaseSource::Region([10, 10, 20, 20]),
+                source: Some(FilmBaseSource::Region([10, 10, 20, 20])),
             },
-            ..ResolvedConfig::default()
+            ..base_cfg()
         };
         let mut warnings = Vec::new();
         let log = Log::new(&args.report);
@@ -9036,7 +9324,7 @@ mod tests {
         assert_eq!(planned.len(), 1);
         assert_eq!(
             planned[0].cfg.film_base.source,
-            FilmBaseSource::Explicit([0.9, 0.55, 0.42])
+            Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]))
         );
         assert!(
             !warnings.is_empty(),
@@ -9054,7 +9342,7 @@ mod tests {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(1.6),
         });
-        shared.film_base.source = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
+        shared.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]));
         let mut v = serde_json::to_value(&shared).unwrap();
         let ov: serde_json::Value =
             serde_json::from_str(r#"{"print":{"print_exposure":0.15}}"#).unwrap();
@@ -9063,7 +9351,7 @@ mod tests {
         assert_eq!(cfg.print.print_exposure, 0.15);
         assert_eq!(
             cfg.film_base.source,
-            FilmBaseSource::Explicit([0.9, 0.55, 0.42])
+            Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]))
         );
         assert_eq!(curve_of(&cfg).dmax(), DmaxSource::Explicit(1.6));
     }
@@ -9092,13 +9380,7 @@ mod tests {
         };
         let mut warnings = Vec::new();
         let log = Log::new(&args.report);
-        let got = resolve_frames(
-            &args,
-            &ResolvedConfig::default(),
-            false,
-            &mut warnings,
-            &log,
-        );
+        let got = resolve_frames(&args, &base_cfg(), false, &mut warnings, &log);
         std::fs::remove_dir_all(&dir).ok();
         let err = got.expect_err("a legacy per-frame override must be rejected");
         assert_eq!(err.exit_code(), 2);
@@ -9179,7 +9461,7 @@ mod tests {
 
     #[test]
     fn reject_roll_unsupported_rejects_export_ir() {
-        let mut cfg = ResolvedConfig::default();
+        let mut cfg = base_cfg();
         assert!(reject_roll_unsupported(&cfg).is_ok());
         cfg.input.export_ir = Some("ir.tiff".into());
         assert!(matches!(
@@ -9255,7 +9537,7 @@ mod tests {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(1.6),
         });
-        shared.film_base.source = FilmBaseSource::Explicit([0.9, 0.55, 0.42]);
+        shared.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]));
         let roll = RollReport {
             command: "roll",
             identity: Identity::with_params_hash(version::stable_hash("{}")),
@@ -9335,7 +9617,7 @@ mod tests {
         let pf = PlannedFrame {
             input: PathBuf::from("bad.tif"),
             output: PathBuf::from("out/bad_positive.tiff"),
-            cfg: ResolvedConfig::default(),
+            cfg: base_cfg(),
             overrides: None,
             dmax_setting: DmaxSetting::Default,
         };

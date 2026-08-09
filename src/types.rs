@@ -378,12 +378,16 @@ pub struct InputParams {
 /// (`film_base.source = "content"` / `--base-content`) is owned by the separate
 /// `film-base/content-fallback` task and is deliberately **not** a variant here —
 /// the auto detector only *suggests* it on refusal, never falls back to it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+/// **Deliberately has no `Default`.** `Dmin` is a roll calibration, and picking
+/// one silently is the difference between a measured conversion and a guessed
+/// one — so `convert` requires the choice to be stated (see
+/// [`FilmBaseParams::source`]). `Auto` remains a perfectly good *stated* answer;
+/// what is gone is arriving at it by omission.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FilmBaseSource {
     /// Estimate the base from the detected unexposed rebate band behind the
     /// film holder (the inward-scan detector; fails loudly on low confidence).
-    #[default]
     Auto,
     /// Sample the base from this border region `[x, y, w, h]`.
     Region([u32; 4]),
@@ -395,8 +399,22 @@ pub enum FilmBaseSource {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilmBaseParams {
-    /// Where the film base comes from (default `auto`).
-    pub source: FilmBaseSource,
+    /// Where the film base comes from — **required, with no default**.
+    ///
+    /// `None` means the user has not chosen, and `cli::validate` rejects it for
+    /// `convert`/`roll` rather than silently estimating. The measurement commands
+    /// exist to *produce* a base, so requiring one first would be circular:
+    /// `estimate` resolves an unstated source to [`FilmBaseSource::Auto`], and
+    /// `inspect` never reads this struct at all — it always runs the detector
+    /// (`rebate_candidates` + `select_auto_base` directly).
+    ///
+    /// Why: `Dmin` is a per-roll calibration that sets both the black point and
+    /// the colour balance (it is the divisor of the density conversion). Auto
+    /// detection is best-effort on real scans — the rebate is a thin inset band,
+    /// not the outer margin — so falling into it by omission produced conversions
+    /// whose most important parameter nobody had decided. Stating `--auto-base`
+    /// is still one flag; the point is that it is now a decision.
+    pub source: Option<FilmBaseSource>,
 }
 
 /// Where the density render's display-white anchor (`Dmax`) comes from

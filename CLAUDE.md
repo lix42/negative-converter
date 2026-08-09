@@ -464,6 +464,12 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   a field in the CLI `*Overrides` struct (`cli.rs`), the recipe `*Params` struct
   (`types.rs`), a `merge` arm, and usually a `validate` check — a forgotten
   `merge` arm silently makes the flag a no-op, so add a merge test for new knobs.
+  **`film_base.source` is the first knob with no default at all** (`Option`, no
+  `Default` on `FilmBaseSource`): `convert`/`roll` refuse an unstated one rather
+  than choosing. A defaultless knob adds two obligations — every `ResolvedConfig`
+  in a test that is not *about* it must state it (`cli::tests::base_cfg`), and its
+  `validate` rule goes **last**, since "you chose nothing" is the least specific
+  diagnosis and would otherwise pre-empt every contradiction rule.
 - **Recipe shape mirrors design-spec §9.** A flag's recipe key lives under the
   stage section §9 assigns it (`--export-ir` ⇒ `input.export_ir`); because every
   recipe struct uses `deny_unknown_fields`, a misplaced key silently rejects
@@ -493,7 +499,16 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     base finite-and-positive on every channel at birth** (a region on the dark
     holder → zero channel now errors loudly there, not silently downstream). The
     per-algo guards (`algo/simple.rs`, `algo/density.rs`) remain as
-    defense-in-depth for any base reaching a converter directly.
+    defense-in-depth for any base reaching a converter directly. **There is no
+    default source**: `cli::validate` refuses an unstated `film_base.source` for
+    `convert`/`roll` (exit 2), and `film_base::estimate` therefore takes a
+    *resolved* `&FilmBaseSource`, never the params object — "unset" is an
+    orchestration state, not a stage input. The message is command-aware
+    (`missing_film_base_message` / `FilmBaseRemedy`) because `roll` accepts none
+    of the three film-base flags and must be pointed at the shared `--params`
+    recipe. `estimate` resolves an unstated source to `Auto` and `inspect` always
+    runs the detector — that `estimate` fallback is now the crate's only default
+    film-base choice, and **no fingerprint watches it**.
   - *Clamping boundary:* range-clamp to the output gamut **only** at the u16
     encode step; color/algo stages pass values through unclamped (float output
     preserves the current rendered working values). `io::encode` counts every

@@ -34,8 +34,15 @@ and hardening work tracked in the task roadmap.
 ## Usage (current CLI)
 
 ```sh
-# Convert a negative scan to a positive 16-bit TIFF.
-nc convert in.tiff -o out.tiff --reconstruction density
+# Measure the film base (Dmin) once per roll from an unexposed border.
+nc estimate reference.tiff --base-region 0,0,120,40
+
+# Convert a negative scan to a positive 16-bit TIFF. Every conversion must state
+# where the film base comes from — there is no default, because Dmin sets both the
+# black point and the colour balance. Use the measured value, or --auto-base to
+# detect the rebate band (best-effort; it fails loudly when it can't).
+nc convert in.tiff -o out.tiff --reconstruction density \
+  --film-base 0.92,0.55,0.42
 
 # Full HDR float output with explicit controls.
 nc convert in.tiff -o out.tiff --reconstruction density --output-hdr \

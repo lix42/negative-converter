@@ -302,9 +302,7 @@ fn ms_since(started: Instant) -> f64 {
 mod tests {
     use super::*;
     use crate::pipeline::film_base;
-    use crate::types::{
-        DensityCurve, DensityParams, FilmBaseParams, FilmBaseSource, SigmoidParams,
-    };
+    use crate::types::{DensityCurve, DensityParams, FilmBaseSource, SigmoidParams};
 
     /// A small synthetic negative with the real scan layout — a near-black
     /// holder ring, then a bright, uniform orange rebate band (the film base),
@@ -345,13 +343,9 @@ mod tests {
     /// Resolve the film base the way the orchestrator does (stage 2), so the
     /// render tests exercise the same estimate → render sequence as `cli`.
     fn resolve(img: &LinearImage, source: FilmBaseSource) -> FilmBase {
-        film_base::estimate(
-            img,
-            &FilmBaseParams { source },
-            crate::types::FilmType::Unknown,
-        )
-        .unwrap()
-        .base
+        film_base::estimate(img, &source, crate::types::FilmType::Unknown)
+            .unwrap()
+            .base
     }
 
     #[test]
