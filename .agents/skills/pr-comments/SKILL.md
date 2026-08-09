@@ -100,6 +100,26 @@ A finding you can refute is a *good* outcome — it just routes to "push back," 
 Push back when you disagree — don't just comply. But when the fix is cheap and the
 reviewer is right, do it; don't argue to win.
 
+### Plan / task-doc PRs: a higher bar for changing the doc
+
+When the PR changes a **plan document** — a task spec, a roadmap, a design sketch —
+a correct finding is *not* automatically worth acting on. A plan cannot cover
+everything, and a mistake is cheap when execution will surface it anyway. So for
+each verified finding, ask:
+
+> Is this **critical** — would it mislead the design, bake in a wrong claim, or
+> cause wasted work? Or is it a **flaw the implementer will trip over in the first
+> hour** and fix as a matter of course?
+
+Only the first earns a doc update. For the second, **reply and resolve without
+changing the doc** — say plainly that it is real, that it is left to
+implementation, and why. Typical "leave it" shapes: something the type system or a
+function signature forces you to confront, an unspecified detail with one obvious
+resolution, a mechanical consequence discovered by the first test run.
+
+The point is to stop iterating a plan toward completeness it can never reach. Spend
+the review budget on the parts that steer the work; let execution find the rest.
+
 ## Step 5 — Update the PR (only where warranted)
 
 - Make the change on the PR's `headRefName` branch (check it out; it may be a

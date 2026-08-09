@@ -405,6 +405,23 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
 
 ## Conventions
 
+- **Write for the future reader, not for the conversation.** Docs and comments
+  earn their place by long-term value only. Keep documents simple and
+  straightforward. Keep code comments **short** — the non-obvious constraint, the
+  reason a surprising choice is correct, the trap the next person would otherwise
+  fall into — not a transcript of how the decision was reached. Don't record
+  discussion detail, and don't add a section or comment merely because something
+  came up once: a question answered is not automatically a document to maintain.
+  When asked for a change, write the part that will still matter in six months and
+  leave the rest out.
+- **A plan doc is not code — don't iterate it toward completeness.** Task specs,
+  roadmaps and design sketches cannot cover everything, and a gap is cheap when
+  execution surfaces it anyway. Reviewing a plan-doc PR, ask of each finding: is it
+  **critical** (misleads the design, bakes in a wrong claim, causes wasted work), or
+  a **flaw the implementer trips over in the first hour**? Only the first earns an
+  edit; for the second, reply and resolve without touching the doc. Anything the
+  type system, a function signature, or the first test run forces you to confront
+  belongs to implementation, not to the plan.
 - **Skill layout.** Agent skills live in `.agents/skills/` (the directory Codex
   CLI scans; Codex invokes them as `$<name>`); `.claude/skills/` holds relative
   symlinks into it for Claude Code. Exception: `review-fix-loop` ships as two
