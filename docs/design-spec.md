@@ -1207,7 +1207,8 @@ ran. `encoding` is a stable identifier — one of
 `unclamped-linear-acescg-float-tiff` | `legacy-ultra-hdr-v1-xmp-mpf-jpeg` |
 `rec2100-pq-10bit-444-avif` | `rec2100-hlg-10bit-444-avif` |
 `display-linear-bt2020-float-tiff` | `rec2100-pq-u16-tiff` |
-`rec2100-hlg-u16-tiff` — and the legacy float name deliberately reads
+`rec2100-hlg-u16-tiff` | `display-p3-u16-tiff` | `srgb-u16-tiff` — and the
+legacy float name deliberately reads
 as *rendered*, because `--output-hdr` is never a film master. The three float names
 are mutually exclusive on purpose: `unclamped-linear-acescg-float-tiff` is the
 pre-display master, `display-linear-bt2020-float-tiff` is display-rendered but

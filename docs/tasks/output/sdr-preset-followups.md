@@ -106,6 +106,27 @@ left out of them — real, bounded, and not defaults questions.
   composed gate rather than adding a second check — a parallel check is exactly
   how the suffix rule and the convert-only refusal drifted apart before.
 
+- **The telemetry record's preset enum has outrun its schema version**
+  (`src/telemetry.rs`). `SCHEMA_VERSION` is 3 and its rustdoc still describes
+  `conversion.preset` as `legacy|film-master`, while `OutputPreset` now has ten
+  variants. This is **not** this PR's drift: `telemetry.rs` was last touched by
+  `#60`, and `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
+  `hdr-pq-tiff` and `hdr-hlg-tiff` all landed after v3 without a bump — these two
+  presets are the seventh and eighth to do so. Worth settling deliberately rather
+  than in a preset PR, because the answer is a policy question the module states
+  but has never had to apply: is *adding* an enum member a wire-shape change (the
+  rustdoc's rule, read strictly) or an additive one a forward-compatible consumer
+  tolerates? Whichever way it goes, the rustdoc's preset list must stop naming two
+  of ten. `telemetry/ingestion-service` is the consumer that makes it matter.
+- **The asset manifest infers encoding from bit depth alone**
+  (`scripts/analysis/nctool/manifest.py`, the `bits == 16` arm). Every 16-bit `nc`
+  output is labelled `u16-srgb`, which was true while `nc` had no other 16-bit SDR
+  encoding. A `display-p3` result dropped into `converted/nc/` would be recorded
+  as sRGB and any cross-encoding analysis would then decode it with the wrong
+  primaries. Latent today — no P3 asset exists yet — and the fix needs real
+  provenance (the sidecar's `output_render.encoding`) rather than a second
+  filename guess.
+
 ## Dependencies
 
 - [Output presets and guidance](presets.md)
