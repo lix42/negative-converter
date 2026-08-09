@@ -414,6 +414,17 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   came up once: a question answered is not automatically a document to maintain.
   When asked for a change, write the part that will still matter in six months and
   leave the rest out.
+- **A task file tracks work; it does not specify it.** When creating a task,
+  record the **goal**, the **open questions**, and what is **known vs unknown** —
+  and leave room to investigate. Keep the door open on approach. Leave out the
+  details that are cheap to get wrong: exact formulas, computed tables, function
+  signatures, exhaustive test lists. Those are settled *while implementing*, where
+  the code answers them. If a number is load-bearing evidence for why the task
+  exists, one line is enough. Over-specifying does not de-risk the work — it moves
+  the argument into review, where a detail that implementation would have settled
+  for free costs a round-trip instead. `docs/tasks/algo/curve-endpoint-validation.md`
+  is the counter-example: ~215 lines of formulas and test bullets took five review
+  rounds, the last two spent propagating one correction across four files.
 - **A plan doc is not code — don't iterate it toward completeness.** Task specs,
   roadmaps and design sketches cannot cover everything, and a gap is cheap when
   execution surfaces it anyway. Reviewing a plan-doc PR, ask of each finding: is it
