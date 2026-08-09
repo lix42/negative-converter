@@ -113,11 +113,13 @@ not be the gate.
 Two resolved values are frame-measured, and **either one alone defers the check**:
 
 - **`DmaxSource::Auto`** — see the table below.
-- **`balance_range: Auto` with a non-zero `shadow_balance`/`highlight_balance`** —
-  the ramp anchors are measured from decoded densities, so `D′base` is not known
-  pre-decode either. The **default is neutral balance**, which skips the regional
-  pass entirely, so the common case stays pre-decode; an explicit
-  `balance_range` does too.
+- **`balance_range: Auto` — but only when the range is actually consulted.** Use
+  the existing predicate `density::consults_balance_range`, which is
+  `shadow_balance != highlight_balance`. Equal-but-non-zero balances short-circuit
+  to a tone-independent offset and never measure the range, so their base endpoint
+  *is* pre-decode: `density.offset + shadow_balance`. Deferring on "any non-zero
+  balance" would silently skip the warning for a uniformly lifted black. The
+  neutral default and an explicit `balance_range` are pre-decode too.
 
 | `DmaxSource` | Numeric `R` known pre-decode? | Where the check runs |
 |---|---|---|
@@ -216,6 +218,7 @@ untouched and no `pipeline_version` bump is owed.
 - [Density-domain algorithm](density.md)
 - [Reference-anchored sigmoid calibration and redesign](reference-anchored-sigmoid.md)
 - [Pipeline orchestration](../core/pipeline-orchestration.md)
+- [Regional (shadow/highlight) color balance](regional-color-balance.md)
 
 **Boundary vs [Density safety bounds](density-safety-bounds.md)** — deliberately
 complementary, and the split is by *mechanism*. That task enforces per-parameter

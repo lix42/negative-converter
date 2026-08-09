@@ -309,6 +309,7 @@ graph TD
   algo/reference-anchored-sigmoid --> film-base/dmax-per-channel-reduction
   algo/density --> algo/curve-endpoint-validation
   core/pipeline-orchestration --> algo/curve-endpoint-validation
+  algo/regional-color-balance --> algo/curve-endpoint-validation
   algo/reference-anchored-sigmoid --> algo/curve-endpoint-validation
   algo/reference-anchored-sigmoid --> analysis/comparison-review-tooling
   algo/film-stock-profiles --> io/scanner-density-calibration
@@ -428,7 +429,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   — the last is a hard prerequisite, not a nicety: content-driven anchoring is currently
   unusable because `DmaxSource::Auto` measures the whole frame and the opaque holder owns the
   top percentile
-- `algo/curve-endpoint-validation` (post-MVP): `algo/density`, `algo/reference-anchored-sigmoid`, `core/pipeline-orchestration`
+- `algo/curve-endpoint-validation` (post-MVP): `algo/density`, `algo/reference-anchored-sigmoid`, `core/pipeline-orchestration`, `algo/regional-color-balance`
   — pre-decode check that a resolved curve places its tonal endpoints usefully. The shipped sigmoid
   defect (black asymptote 0.053 → 72/255) was computable from config the whole time; the same hole
   is open on the default exponential curve, where the film base renders to
