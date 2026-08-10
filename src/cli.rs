@@ -32,7 +32,7 @@ use crate::telemetry;
 use crate::types::{
     AnchorPlacement, BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams,
     DmaxSource, EncodeReport, FilmBase, FilmBaseParams, FilmBaseSource, FilmType, InputParams,
-    MeaningAssertion, NcError, OutputParams, OutputPreset, OutputStats, PrintParams,
+    MeaningAssertion, NcError, OutDepth, OutputParams, OutputPreset, OutputStats, PrintParams,
     Reconstruction, ReconstructionType, Result, TransferAssertion, WbSource,
 };
 use crate::version::{self, Identity};
@@ -583,52 +583,75 @@ pub struct SimpleOverrides {
 /// `--bigtiff`) are the pre-preset depth/profile/container knobs a **named**
 /// preset resolves itself, so a non-default one alongside it is a usage error —
 /// checked on the *resolved value* in [`validate_output_preset`], identically for
-/// a flag and for a recipe key. `--output-sdr` is the one exception: it *forces*
-/// 16-bit integer output, which a named preset cannot produce, so it is rejected by
-/// flag **presence** ([`reject_output_sdr_with_named_preset`]) even though its
-/// resolved value is the default. (None of this can be a clap `conflicts_with`: the
+/// a flag and for a recipe key. `--out-depth` is the one exception: it *forces*
+/// a depth an atomic preset cannot produce, and `--out-depth u16` resolves the
+/// documented *default* — so it is rejected by flag **presence**
+/// ([`reject_out_depth_with_atomic_preset`]) because no value rule can see it.
+/// (None of this can be a clap `conflicts_with`: the
 /// conflict depends on the preset's *value* — `--output-preset legacy` is the
 /// no-preset state and stays compatible with all three — and, for the other
 /// selectors, on the selector's own value, since `--bigtiff auto` resolves the
 /// documented default and is therefore accepted.)
 #[derive(Args, Debug, Default)]
 pub struct OutputOverrides {
-    /// Named output policy: `legacy` (default — the transitional TIFF path, where
-    /// the print controls run before the output ICC transform), `film-master`
-    /// (unclamped 32-bit float linear ACEScg TIFF taken straight from the NC film
-    /// RGB v1 mapping, bypassing every print/display control), `ultra-hdr-v1`
-    /// (legacy gain-map JPEG through the shared display stages), `hdr-pq` /
-    /// `hdr-hlg` (10-bit 4:4:4 Rec.2100 PQ/HLG AVIF, requires `.avif`), or
+    /// Named output policy. **Default: `gain-map-hdr`** (since `pipeline_version` 3)
+    /// — a gain-map JPEG carrying both the ISO 21496-1 and legacy Ultra HDR v1
+    /// metadata dialects, and the one that decodes as HDR on Apple platforms. It
+    /// requires a `.jpg`/`.jpeg` output path, so `-o out.tif` with no preset is a
+    /// usage error rather than a TIFF.
+    ///
+    /// The rest:
+    /// `ultra-hdr-v1` (the same file with only the legacy dialect — the
+    /// compatibility form, which Apple opens as plain SDR);
+    /// `display-p3` / `compatibility` (a modern-pipeline SDR render stored losslessly
+    /// as 16-bit integer TIFF, in Display P3 and sRGB respectively);
+    /// `film-master` (unclamped 32-bit float linear ACEScg TIFF taken straight from
+    /// the NC film RGB v1 mapping, bypassing every print/display control);
+    /// `hdr-pq` / `hdr-hlg` (10-bit 4:4:4 Rec.2100 PQ/HLG AVIF, requires `.avif`);
     /// `hdr-linear-tiff` (32-bit float display-linear BT.2020 interchange TIFF with
-    /// no transfer applied), or `hdr-pq-tiff` / `hdr-hlg-tiff` (the same Rec.2100
-    /// PQ/HLG signal as the AVIF presets, stored as full-range 16-bit TIFF code
-    /// values), or `display-p3` / `compatibility` (a modern-pipeline SDR render
-    /// stored losslessly as 16-bit integer TIFF, in Display P3 and sRGB
-    /// respectively) — every TIFF preset requires `.tif`/`.tiff`, as do `legacy`
-    /// and `film-master`. Recipe key
-    /// `output.preset`. A named preset is atomic: it resolves container, depth, and
-    /// profile itself, so it rejects a non-default `--output-hdr` /
-    /// `--output-profile` / `--bigtiff` (from a flag or the recipe alike; a value that
-    /// already equals the documented default, like `--bigtiff auto`, is accepted), and
-    /// rejects `--output-sdr` outright — it forces 16-bit integer output that most named
-    /// presets cannot produce, and that the SDR presets already resolve. On top
-    /// of that, `film-master` rejects the frame-local measurements
-    /// `--auto-d-max`/`--auto-balance-range` plus every non-default
-    /// downstream control; every display preset consumes those controls instead.
-    /// `--output-hdr` is a *rendered* float TIFF: it is never an alias for
+    /// no transfer applied);
+    /// `hdr-pq-tiff` / `hdr-hlg-tiff` (the same Rec.2100 signal as the AVIF presets,
+    /// stored as full-range 16-bit TIFF code values);
+    /// `legacy` (the transitional TIFF path, where the print controls run *before*
+    /// the output ICC transform — this was the default before `pipeline_version` 3);
+    /// and `custom` (the same legacy TIFF path, named explicitly).
+    /// Every TIFF preset requires `.tif`/`.tiff`. Recipe key `output.preset`.
+    ///
+    /// **`legacy` and `custom` are the only non-atomic presets**: they accept the
+    /// depth/profile/container selectors. Every other preset resolves those itself,
+    /// so it rejects a non-default `--out-depth` / `--output-profile` / `--bigtiff`
+    /// (from a flag or the recipe alike; a value already equal to the documented
+    /// default, like `--bigtiff auto`, is accepted), and rejects the `--out-depth`
+    /// *flag* outright even at its default value — `u16` resolves that default while
+    /// still forcing a depth the preset cannot produce, so no value rule could see
+    /// it. Reach the flag-driven TIFF path with `--output-preset legacy` or `custom`.
+    /// On top of that, `film-master` rejects the frame-local measurements
+    /// `--auto-d-max`/`--auto-balance-range` plus every non-default downstream
+    /// control; every display preset consumes those controls instead.
+    /// `--out-depth f32` is a *rendered* float TIFF: it is never an alias for
     /// `film-master`, nor for `hdr-linear-tiff` (which is display-linear BT.2020,
-    /// not the selected output space). The remaining planned preset names
-    /// (`gain-map-hdr`, `custom`) are not accepted yet.
+    /// not the selected output space).
     #[arg(long = "output-preset", value_name = "PRESET")]
     pub output_preset: Option<String>,
-    /// Write a 32-bit float TIFF (full HDR, no precision loss) instead of the
-    /// default 16-bit integer TIFF.
-    #[arg(long, conflicts_with = "output_sdr")]
+    /// Encoder bit depth for the TIFF paths: `u16` (default, archival) or `f32`
+    /// (written verbatim, values above 1.0 preserved). Recipe key `output.depth`.
+    ///
+    /// Consulted only by `legacy` and `custom` — every other preset resolves depth
+    /// itself, so a non-default value alongside one is a usage error.
+    ///
+    /// `f32` here is the **transitional print-rendered** float TIFF in the selected
+    /// output space: not `film-master` (unclamped linear ACEScg before display
+    /// rendering) and not a Rec.2100 display-HDR image.
+    #[arg(long = "out-depth", value_enum, value_name = "DEPTH")]
+    pub out_depth: Option<OutDepth>,
+    /// Removed: `--output-hdr` / `--output-sdr` (recipe key `output.hdr`). One
+    /// mutually-exclusive choice modelled as two presence flags plus a bool, and
+    /// "HDR" named neither thing the float TIFF actually is. Hidden, and kept only
+    /// to emit a migration error — nc is unreleased, so there is no alias.
+    #[arg(long, hide = true)]
     pub output_hdr: bool,
-    /// Force the default 16-bit integer TIFF, overriding a recipe's
-    /// `output.hdr = true` (the flags-win escape hatch; without it a bool
-    /// presence flag could set HDR but never clear it).
-    #[arg(long)]
+    /// Removed: see [`output_hdr`](Self::output_hdr).
+    #[arg(long, hide = true)]
     pub output_sdr: bool,
     /// Output ICC profile (`sRGB` / `prophoto` / `acescg` / `display-p3` / path).
     #[arg(long, value_name = "PROFILE")]
@@ -1060,7 +1083,10 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
                  scene-linear recovery"
             },
         ),
-        OutputPreset::Legacy => (
+        // `custom` resolves the same legacy branch and the same bytes; only the
+        // report's `preset` field distinguishes them, which is the point — the
+        // combination was chosen rather than inherited.
+        OutputPreset::Legacy | OutputPreset::Custom => (
             // The legacy print render only runs for a density reconstruction;
             // `simple`'s positive passes through it untouched (design-spec §7.1).
             matches!(cfg.reconstruction, Reconstruction::Density { .. }),
@@ -1078,7 +1104,17 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
             true,
             "legacy-ultra-hdr-v1-xmp-mpf-jpeg",
             "independently rendered SDR Display P3 base and HDR rendition, paired \
-             by a single-channel luminance legacy Ultra HDR v1 gain map; not ISO 21496-1",
+             by a single-channel luminance legacy Ultra HDR v1 gain map; not ISO 21496-1. \
+             Apple platforms ignore this dialect and open the file as plain SDR",
+        ),
+        OutputPreset::GainMapHdr => (
+            true,
+            true,
+            "dual-dialect-gain-map-jpeg",
+            "the same rendition pair and single-channel luminance gain map as \
+             `ultra-hdr-v1`, packaged with ISO 21496-1 segments in both images \
+             alongside the legacy Ultra HDR v1 XMP/MPF metadata. Which dialect a \
+             dual-aware decoder prefers is observed behaviour, not a conformance claim",
         ),
         OutputPreset::HdrPq => (
             true,
@@ -1408,6 +1444,11 @@ fn parse_floats<const N: usize>(s: &str) -> std::result::Result<[f32; N], String
 struct LoadedRecipe {
     cfg: ResolvedConfig,
     curve_dmax_present: bool,
+    /// Whether the file explicitly set `output.preset`. The same raw-JSON witness
+    /// problem as `curve_dmax_present`: once the default became a *named* preset,
+    /// a resolved `gain-map-hdr` no longer says whether anyone chose it. The suffix
+    /// diagnosis varies on that (see [`SuffixContext`]).
+    output_preset_present: bool,
     /// `meta.pipeline_version` from a sidecar envelope, when the loaded file
     /// carried one. Provenance only — never applied, only compared (see
     /// [`pipeline_version_warning`]).
@@ -1495,6 +1536,7 @@ fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
         None => Ok(LoadedRecipe {
             cfg: ResolvedConfig::default(),
             curve_dmax_present: false,
+            output_preset_present: false,
             meta_pipeline_version: None,
             // No recipe file means nothing was archived and nothing is being
             // reinterpreted — the run simply *is* this build's defaults. Only a
@@ -1543,9 +1585,11 @@ fn load_recipe(path: Option<&Path>) -> Result<LoadedRecipe> {
                 None => serde_json::from_str(&txt).map_err(usage)?,
             };
             let curve_dmax_present = body.is_some_and(sets_curve_dmax);
+            let output_preset_present = body.is_some_and(sets_output_preset);
             Ok(LoadedRecipe {
                 cfg,
                 curve_dmax_present,
+                output_preset_present,
                 meta_pipeline_version,
                 unpinned_curve: body.and_then(unpinned_curve),
             })
@@ -1893,6 +1937,14 @@ fn reject_legacy_recipe_keys(v: &serde_json::Value, context: &str) -> Result<()>
              (auto|scanner-device|colorimetric)."
         )));
     }
+    if v.get("output").and_then(|o| o.get("hdr")).is_some() {
+        return Err(NcError::Usage(format!(
+            "{context}: `output.hdr` is no longer supported — output depth is now one \
+             explicit value. Replace `\"output\": {{\"hdr\": true}}` with \
+             `\"output\": {{\"depth\": \"f32\"}}` (values `u16`|`f32`, default `u16`). \
+             The pixels are unchanged; only the key and its spelling moved."
+        )));
+    }
     if let Some(key) = ["algorithm", "density", "sigmoid", "simple"]
         .into_iter()
         .find(|k| v.get(k).is_some())
@@ -1938,9 +1990,10 @@ fn sets_curve_anchor(v: &serde_json::Value) -> bool {
 }
 
 /// Whether a recipe/override JSON object explicitly carries `output.preset` — the
-/// witness behind `roll`'s roll-consistency warning for the output policy. A raw-JSON
-/// probe like [`sets_curve_dmax`], not a resolved-value comparison, because an override
-/// that *restates* the shared preset is still a per-frame assertion of the output policy
+/// witness behind `roll`'s roll-consistency warning for the output policy, and behind
+/// `convert`'s suffix diagnosis ([`SuffixContext`]). A raw-JSON probe like
+/// [`sets_curve_dmax`], not a resolved-value comparison, because an override that
+/// *restates* the shared preset is still a per-frame assertion of the output policy
 /// and the roll report has no other place to surface it.
 fn sets_output_preset(v: &serde_json::Value) -> bool {
     v.get("output").and_then(|o| o.get("preset")).is_some()
@@ -2224,17 +2277,12 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
         cfg.output.preset = OutputPreset::parse(name)?;
     }
 
-    // output: `--output-hdr` is a presence flag — passing it switches the output
-    // to 32-bit float; when absent it must not clobber a recipe's `hdr: true`
-    // (same convention as `--auto-base`), so only a set flag merges.
-    // output depth: the two flags are mutually exclusive (clap-enforced);
-    // whichever is given replaces the recipe's choice — `--output-sdr` exists
-    // so a recipe `hdr: true` stays CLI-overridable (flags win), since an
-    // absent presence flag never clobbers a recipe value.
-    if args.output_opts.output_hdr {
-        cfg.output.hdr = true;
-    } else if args.output_opts.output_sdr {
-        cfg.output.hdr = false;
+    // output depth: an ordinary `Option` value flag now, so the flags-win merge is
+    // the plain one — absent leaves the recipe's choice, present replaces it. The
+    // old pair needed a two-branch dance because a bool presence flag can set a
+    // value but never clear it; one enum removes the asymmetry at its source.
+    if let Some(v) = args.output_opts.out_depth {
+        cfg.output.depth = v;
     }
     if let Some(v) = &args.output_opts.output_profile {
         cfg.output.output_profile = Some(v.clone());
@@ -2276,38 +2324,106 @@ fn validate_explicit_film_base(base: &[f32; 3]) -> Result<()> {
 }
 
 /// The **complete** `convert` parameter gate: everything [`validate`] checks, plus the
-/// one rule that needs the raw flags rather than the resolved config
-/// ([`reject_output_sdr_with_named_preset`]).
+/// two rules that need a knob's *provenance* rather than its resolved value — the
+/// `--out-depth` flag-presence check ([`reject_out_depth_with_atomic_preset`]) and the
+/// suffix diagnosis, which must know whether anyone actually selected the preset it
+/// is about to name ([`reject_output_suffix_mismatch`]).
 ///
 /// `convert` orchestrators must call **this**, not `validate` — a `merge` + `validate`
 /// pair silently omits the flag-presence rule and reinstates the bug where
-/// `--output-sdr` next to a named preset writes an f32 master. `roll` legitimately
+/// `--out-depth u16` next to an atomic preset writes an f32 master. `roll` legitimately
 /// calls `validate` directly: it has no output flags at all, so there is nothing for
 /// the extra rule to see. `output/presets` must preserve the same rule when it
 /// adds roll-aware activation for the remaining named policies.
-pub fn validate_convert(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
+pub fn validate_convert(
+    cfg: &ResolvedConfig,
+    args: &ConvertArgs,
+    recipe_preset: RecipePreset,
+) -> Result<()> {
     // Flag-shape first: "these two requests contradict each other" is a clearer
     // diagnosis than whatever value rule the same config might also trip.
-    reject_output_sdr_with_named_preset(cfg, args)?;
+    reject_out_depth_with_atomic_preset(cfg, args)?;
     // The output path's suffix is likewise a property of *this invocation*, so it
     // outranks `validate`'s value rules — and specifically outranks the
     // missing-base rule, which `validate` deliberately reports last because an
     // omission is the least specific diagnosis available. Without this ordering,
     // `-o out.jpg --output-preset hdr-pq` with no base demands a base first and
     // only then mentions the suffix, making the user fix two things in series.
-    reject_output_suffix_mismatch(cfg, args)?;
+    reject_output_suffix_mismatch(cfg, args, recipe_preset)?;
     validate(cfg)?;
     Ok(())
 }
 
+/// Whether the loaded `--params` recipe stated `output.preset`, as
+/// [`validate_convert`] takes it.
+///
+/// A separate argument rather than something read off [`ResolvedConfig`]: the merge
+/// has already erased the difference between "the recipe wrote `gain-map-hdr`" and
+/// "nobody wrote anything", and only [`sets_output_preset`]'s raw-JSON probe still
+/// knows. Spelled as an enum so the call sites say which they mean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecipePreset {
+    /// The recipe carried an `output.preset` key (whatever value).
+    Stated,
+    /// No recipe, or a recipe that left `output.preset` out.
+    Unstated,
+}
+
 /// The resolved container's suffix rule: the output path is never rewritten, so a
 /// mismatch is a usage error naming what the container accepts (design-spec §5).
-fn reject_output_suffix_mismatch(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
-    let Some(extensions) = required_extensions(cfg.output.preset) else {
+fn reject_output_suffix_mismatch(
+    cfg: &ResolvedConfig,
+    args: &ConvertArgs,
+    recipe_preset: RecipePreset,
+) -> Result<()> {
+    reject_suffix_mismatch(
+        cfg.output.preset,
+        &args.output,
+        // Blame the preset only when the user actually chose one — from *either*
+        // provenance. Since the default became `gain-map-hdr`, "a named preset" no
+        // longer implies "a preset was stated": pointing at one nobody selected sends
+        // the user looking for a flag that is not in their command line, and telling
+        // someone whose recipe says `legacy` that "with no --output-preset, nc writes
+        // `legacy`" is simply false.
+        if args.output_opts.output_preset.is_some() || recipe_preset == RecipePreset::Stated {
+            SuffixContext::Chosen
+        } else {
+            SuffixContext::Default
+        },
+    )
+}
+
+/// Where the resolved preset came from, which is what the suffix diagnosis must
+/// vary on. Not derivable from the preset value since the default became a *named*
+/// one: `gain-map-hdr` reaches `reject_suffix_mismatch` both ways.
+#[derive(Clone, Copy, Debug)]
+enum SuffixContext<'a> {
+    /// `convert` with an explicit `--output-preset`, or a recipe that set one.
+    Chosen,
+    /// `convert` with no preset selected — the default resolved it.
+    Default,
+    /// A `roll` frame whose manifest entry supplied the path.
+    RollFrame(&'a Path),
+}
+
+/// The same rule against an arbitrary path, so `roll` shares it instead of growing
+/// a parallel check — which is exactly how the suffix rule and the convert-only
+/// refusal drifted apart once before.
+///
+/// `frame` names the roll frame whose *manifest entry* supplied the path, so the
+/// diagnosis says which entry to fix. Roll's **derived** names never reach here:
+/// they are built from this same table, so a mismatch would be an nc bug rather
+/// than a user error.
+fn reject_suffix_mismatch(
+    preset: OutputPreset,
+    output: &Path,
+    context: SuffixContext<'_>,
+) -> Result<()> {
+    let Some(extensions) = required_extensions(preset) else {
         return Ok(());
     };
     if extensions.iter().any(|want| {
-        args.output
+        output
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
     }) {
@@ -2318,22 +2434,36 @@ fn reject_output_suffix_mismatch(cfg: &ResolvedConfig, args: &ConvertArgs) -> Re
         .map(|e| format!(".{e}"))
         .collect::<Vec<_>>()
         .join(" or ");
-    // Only a *named* preset may be blamed. Under the default path there is no
-    // preset to point at — `--output-preset legacy` may never have been typed — so
-    // the requirement is stated as a property of the output path itself. An
-    // **extensionless** path fails the same way and deliberately so: a file called
-    // `positive` is as misleading about its contents as one called `positive.jpg`,
-    // and nc is unreleased, so the strict rule is cheap now (design-spec §5).
-    Err(NcError::Usage(if cfg.output.preset.is_named() {
-        format!(
+    Err(NcError::Usage(match context {
+        // A manifest named this path, so point at the entry to fix and at the way
+        // out (the derived name always matches by construction).
+        SuffixContext::RollFrame(input) => format!(
+            "frame {}: the manifest's explicit output {} does not match output preset \
+             `{}`, which requires {list} — nc never renames the path you gave it (drop \
+             the entry's `output` key to take the derived name instead)",
+            input.display(),
+            output.display(),
+            preset.name()
+        ),
+        // A preset the user selected — by flag or in the recipe — can be blamed by
+        // name; neither wording points at a flag they may not have passed.
+        SuffixContext::Chosen => format!(
             "output preset `{}` requires an output path ending in {list}",
-            cfg.output.preset.name()
-        )
-    } else {
-        format!(
-            "the output path must end in {list} (nc writes a TIFF here, and never \
-             renames the path you gave it)"
-        )
+            preset.name()
+        ),
+        // Nothing was typed, so name the *default* explicitly rather than a flag the
+        // user never passed — and say how to get a different container, since this
+        // is the message someone meets the first time the new default surprises
+        // them. An **extensionless** path fails the same way and deliberately so: a
+        // file called `positive` is as misleading about its contents as one called
+        // `positive.jpg`, and nc is unreleased, so the strict rule is cheap now
+        // (design-spec §5).
+        SuffixContext::Default => format!(
+            "the output path must end in {list}: with no --output-preset, nc writes \
+             `{}` (see --help for the other presets, e.g. `display-p3` for a 16-bit \
+             TIFF), and it never renames the path you gave it",
+            preset.name()
+        ),
     }))
 }
 
@@ -2345,7 +2475,7 @@ fn reject_output_suffix_mismatch(cfg: &ResolvedConfig, args: &ConvertArgs) -> Re
 /// what makes it roll-aware.
 fn required_extensions(preset: OutputPreset) -> Option<&'static [&'static str]> {
     match preset {
-        OutputPreset::UltraHdrV1 => Some(&["jpg", "jpeg"]),
+        OutputPreset::UltraHdrV1 | OutputPreset::GainMapHdr => Some(&["jpg", "jpeg"]),
         OutputPreset::HdrPq | OutputPreset::HdrHlg => Some(&["avif"]),
         // A TIFF like the legacy path and `film-master` — but unlike them this
         // preset states the rule, because a `.jpg` path under an f32 BT.2020 master
@@ -2361,6 +2491,7 @@ fn required_extensions(preset: OutputPreset) -> Option<&'static [&'static str]> 
         OutputPreset::DisplayP3
         | OutputPreset::Compatibility
         | OutputPreset::Legacy
+        | OutputPreset::Custom
         | OutputPreset::FilmMaster => Some(&["tif", "tiff"]),
     }
 }
@@ -2703,23 +2834,25 @@ fn linear_range_is_default(cfg: &ResolvedConfig) -> bool {
 /// its documented default is legitimately accepted under flags-win semantics
 /// (that is how a roll recipe carrying print controls is re-exported as a master
 /// with `--print-exposure 0`, and it is why `--bigtiff auto` and a recipe
-/// `"hdr": false` — which ask for nothing the preset does not already do — are
+/// `"depth": "u16"` — which ask for nothing the preset does not already do — are
 /// accepted next to a named preset).
 ///
 /// A *general* presence rule would have to be mirrored for recipe keys to behave the
 /// same, and mirroring it means probing raw JSON per key (the
 /// `LoadedRecipe::curve_dmax_present` machinery) for no gain: the two provenances
 /// must be indistinguishable here, and only the resolved value is. The one flag that
-/// escapes this reasoning is `--output-sdr`, which has *no* recipe spelling and whose
-/// documented meaning a named preset contradicts rather than subsumes; it is rejected
-/// by presence in [`reject_output_sdr_with_named_preset`], which explains why.
+/// escapes this reasoning is `--out-depth`, whose `u16` value resolves the default
+/// and so is invisible to a value rule while still *forcing* a depth an atomic preset
+/// contradicts; it is rejected by presence in
+/// [`reject_out_depth_with_atomic_preset`], which explains why. The recipe side needs
+/// no mirror: `"depth": "u16"` is the serde default and asserts nothing.
 ///
 /// Three rules:
 ///
 /// 1. **A named preset is atomic** — it resolves the container, bit depth, and
 ///    colour profile itself, so a non-default legacy selector is a loud error
 ///    rather than a silent override. Applies to *every* named preset (gated on
-///    [`OutputPreset::is_named`], not on `film-master`), so the next preset cannot
+///    [`OutputPreset::is_atomic`], not on `film-master`), so the next preset cannot
 ///    silently lose the protection.
 /// 2. **`film-master` bypasses every downstream control, so it rejects a
 ///    non-default one** rather than silently ignoring it, and rejects the two
@@ -2738,23 +2871,32 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
     let usage = NcError::Usage;
     let preset = cfg.output.preset;
 
-    if !linear_range_is_default(cfg) && preset == OutputPreset::Legacy {
+    // Gated on **which branch renders**, not on one preset name: `custom` routes
+    // through `render_legacy` exactly as `legacy` does (`stages::render`), so it
+    // ignores `linear_range` in exactly the same way. Naming only `Legacy` here let
+    // `--output-preset custom --linear-range …` exit 0 and write a byte-identical
+    // file — the silent knob drop this rule exists to prevent.
+    if !linear_range_is_default(cfg)
+        && matches!(preset, OutputPreset::Legacy | OutputPreset::Custom)
+    {
         let [lo, hi] = cfg.print.linear_range;
         return Err(usage(format!(
             "--linear-range / print.linear_range ({lo},{hi}) is applied only by the \
-             shared display stage of a named display preset. The legacy \
-             no-preset TIFF path keeps its frozen ordering and does not apply it, so \
+             shared display stage of a named display preset. The `{}` TIFF path keeps \
+             the frozen legacy ordering and does not apply it, so \
              the value would be silently ignored — it is rejected instead. Leave it at \
-             the default `0,1`."
+             the default `0,1`.",
+            preset.name()
         )));
     }
 
     // Rule 1 — a named preset is atomic: it resolves the container *format*, depth, and
     // profile itself, so a non-default legacy selector must not be silently overridden.
-    // Gated on `is_named()` (not on `FilmMaster`) so the next named preset inherits
+    // Gated on `is_atomic()` (not on `FilmMaster`) so the next named preset inherits
     // the protection instead of silently losing it, and the offender is named
     // individually — a message listing all three would let a "did we blame the right
-    // selector?" test pass vacuously.
+    // selector?" test pass vacuously. `custom` is the one named preset excluded, by
+    // design: accepting these selectors explicitly is the whole reason it exists.
     //
     // "Atomic" is deliberately not total: `bigtiff` stays at its `auto` default, which
     // means the **classic-vs-BigTIFF promotion decision is still delegated** to the
@@ -2762,7 +2904,7 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
     // `--bigtiff auto` is accepted here and why a master over ~4 GiB legitimately comes
     // out as BigTIFF. Only `--bigtiff on|off`, which would *override* that policy, is
     // the atomicity violation.
-    if preset.is_named()
+    if preset.is_atomic()
         && let Some((name, value)) = cfg.output.non_default_legacy_selector()
     {
         return Err(usage(format!(
@@ -2772,12 +2914,12 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
              to a non-default value ({value}). Remove that value — the check runs on the \
              resolved config, so it makes no difference whether it came from the recipe \
              or from a flag — or drop the preset. A value that already equals the \
-             documented default (`--bigtiff auto`, a recipe `\"hdr\": false`) asks for \
-             nothing the preset does not do and is accepted; `--output-sdr` is the \
-             exception, rejected separately because it *forces* 16-bit integer output the \
-             preset cannot produce. Note --output-hdr is the *transitional rendered* \
-             float TIFF — the print controls have already run — and is never an alias for \
-             film-master.",
+             documented default (`--bigtiff auto`, a recipe `\"depth\": \"u16\"`) asks for \
+             nothing the preset does not do and is accepted; the `--out-depth` *flag* is \
+             the exception, rejected separately by presence because `u16` resolves that \
+             very default while still forcing a depth the preset cannot produce. Note \
+             --out-depth f32 is the *transitional rendered* float TIFF — the print \
+             controls have already run — and is never an alias for film-master.",
             preset.name()
         )));
     }
@@ -2880,9 +3022,9 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
         return Err(usage(format!(
             "--output-preset film-master bypasses all print and display controls, but \
              {name} is set to a non-default value ({value}). The master is the \
-             unclamped linear ACEScg film rendering — a linear export that also wants \
-             a creative / print / display adjustment is the `custom` workflow (not \
-             accepted by this build yet; owned by `output/presets`). Reset the control \
+             unclamped linear ACEScg film rendering, and there is no preset that is \
+             the master *plus* a print adjustment — `custom` is the legacy TIFF path, \
+             not a graded master. Reset the control \
              to its default (a flag may reset a recipe value), or drop the preset. \
              There is no ignore-conflicting-controls mode."
         )));
@@ -3225,6 +3367,26 @@ fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
              (design-spec §8)."
         )));
     }
+    // The removed depth switch. One mutually-exclusive choice was modelled as two
+    // presence flags plus a bool — the shape the project bans — and "HDR" named
+    // neither thing the float TIFF is (it is the *transitional print-rendered* float
+    // in the selected output space, not `film-master` and not Rec.2100 display HDR).
+    for (flag, present, replacement) in [
+        ("--output-hdr", args.output_opts.output_hdr, "f32"),
+        ("--output-sdr", args.output_opts.output_sdr, "u16"),
+    ] {
+        if present {
+            return Err(NcError::Usage(format!(
+                "{flag} was removed: output depth is now one explicit value — use \
+                 `--out-depth {replacement}` (recipe key `output.depth`, values \
+                 `u16`|`f32`). The name changed as well as the shape: `f32` is the \
+                 transitional *print-rendered* float TIFF in the selected output \
+                 space, which is neither the `film-master` preset (unclamped linear \
+                 ACEScg, before display rendering) nor a Rec.2100 display-HDR image \
+                 (`hdr-pq` / `hdr-hlg` / `hdr-linear-tiff`). The pixels are unchanged."
+            )));
+        }
+    }
     // The removed simple-reconstruction controls. Their replacement print controls
     // now *exist* (`print.white_balance` shipped with auto-WB; `print.linear_range`
     // shipped with the shared display stage), so the migration error names the
@@ -3272,62 +3434,59 @@ fn reject_removed_flags(args: &ConvertArgs) -> Result<()> {
     Ok(())
 }
 
-/// `--output-sdr` next to a **named** output preset is a contradictory request, and
-/// the one deliberate exception to [`validate_output_preset`]'s resolved-value rule:
-/// it is checked by flag **presence**.
+/// `--out-depth` next to an **atomic** output preset, checked by flag **presence**
+/// rather than resolved value — the one deliberate exception to
+/// [`validate_output_preset`]'s value rule, and it survived the `output.hdr` →
+/// `output.depth` rename rather than being dissolved by it.
 ///
-/// Why this flag and not `--bigtiff auto` or a recipe `"hdr": false`:
+/// Why presence is still required. The value rule catches `--out-depth f32` next to
+/// a u16 preset, because `f32` differs from the default. It **cannot** catch
+/// `--out-depth u16`: that resolves the documented default, and a flag resolving the
+/// default is accepted everywhere else on purpose (it is how a graded roll recipe is
+/// re-exported as a master). So the request "force 16-bit integer output" — which
+/// `film-master` and the AVIF/JPEG presets cannot honour — would be silently dropped
+/// by a value-only rule, exactly as it would have been under the removed
+/// `--output-sdr`.
 ///
-/// - **Its documented meaning is contradicted, not merely redundant.** design-spec §9
-///   defines `--output-sdr` as "*force* the default 16-bit integer output". A named
-///   preset does not write 16-bit integer output, so honouring the preset silently
-///   discards an explicit request. `--bigtiff auto` means "decide for me" and a recipe
-///   `"hdr": false` asserts nothing at all — those two genuinely ask for nothing the
-///   preset does not already do, so they stay accepted.
-/// - **There is no recipe spelling to mirror.** The recipe carries only `hdr: bool`,
-///   and `false` is the `#[serde(default)]` — indistinguishable from omission, so it
-///   can never encode this request. That is what makes a presence check cheap and
-///   provenance-symmetric here: one field read, no raw-JSON probing of the kind
-///   [`LoadedRecipe`]`::curve_dmax_present` needs, and no recipe form left behaving
-///   differently.
+/// What the rename *did* fix is the shape: one flag instead of two, one rule instead
+/// of a value rule plus a bool-presence rule, and a real recipe spelling
+/// (`output.depth`) for the value half. The recipe side needs no presence check —
+/// `"depth": "u16"` is `#[serde(default)]` and indistinguishable from omission, so it
+/// asserts nothing.
 ///
-/// A hard error (exit 2), not a warning: the user asked for a container the preset
-/// cannot produce, and resolving that silently is exactly what "fail loudly" forbids.
-/// Note `--output-hdr` needs no entry here — it resolves a *non-default* `output.hdr`,
-/// so the value rule already rejects it from either provenance.
-fn reject_output_sdr_with_named_preset(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
-    if args.output_opts.output_sdr && cfg.output.preset.is_named() {
-        // The rejection is the same for every named preset; the *reason* is not.
-        // The SDR TIFF presets already resolve exactly what `--output-sdr` asks for,
-        // so calling that a contradiction would tell the user something false about
-        // what they are getting — they would reasonably conclude the preset writes
-        // float. Every other named preset genuinely resolves a container the flag
-        // cannot be honoured in. (A future preset defaults to the contradiction
-        // wording, which is the conservative half.)
-        let reason = if matches!(
-            cfg.output.preset,
-            OutputPreset::DisplayP3 | OutputPreset::Compatibility
-        ) {
-            "already resolves a 16-bit integer TIFF, so the flag restates what the \
-             preset has fixed. nc rejects the redundant request rather than accepting \
-             it, because the flag would silently become a no-op the day the preset's \
-             depth changed"
-        } else {
-            "resolves its own container format, bit depth, and colour profile \
-             (film-master, for example, is an unclamped 32-bit float linear ACEScg \
-             TIFF), so the two requests contradict each other and nc will not silently \
-             honour one of them"
-        };
-        return Err(NcError::Usage(format!(
-            "--output-sdr forces the default 16-bit integer TIFF, but --output-preset {} \
-             {reason}. Drop --output-sdr, or drop the preset. (This one is checked by flag \
-             presence rather than resolved value, because `--output-sdr` has no recipe \
-             spelling: `output.hdr = false` is the default and asserts nothing, so there is \
-             no recipe form of the request to reject in step with it.)",
-            cfg.output.preset.name()
-        )));
+/// A hard error (exit 2), not a warning: the user asked for a depth the preset
+/// cannot produce, and resolving that silently is what "fail loudly" forbids.
+/// Gated on `is_atomic()`, so `custom` and the no-preset state accept the flag —
+/// letting exactly these selectors through is `custom`'s purpose.
+fn reject_out_depth_with_atomic_preset(cfg: &ResolvedConfig, args: &ConvertArgs) -> Result<()> {
+    let Some(requested) = args.output_opts.out_depth else {
+        return Ok(());
+    };
+    if !cfg.output.preset.is_atomic() {
+        return Ok(());
     }
-    Ok(())
+    // The rejection is the same for every atomic preset; the *reason* is not. A
+    // preset that already resolves the requested depth makes the flag redundant, not
+    // contradictory — calling it a contradiction would tell the user something false
+    // about what they are getting. (A preset resolving a different depth defaults to
+    // the contradiction wording, which is the conservative half.)
+    let reason = if cfg.output.depth() == requested {
+        "already resolves exactly that, so the flag restates what the preset has \
+         fixed. nc rejects the redundant request rather than accepting it, because \
+         the flag would silently become a no-op the day the preset's depth changed"
+    } else {
+        "resolves its own container format, bit depth, and colour profile \
+         (film-master, for example, is an unclamped 32-bit float linear ACEScg \
+         TIFF), so the two requests contradict each other and nc will not silently \
+         honour one of them"
+    };
+    Err(NcError::Usage(format!(
+        "--out-depth {requested} was passed, but --output-preset {} {reason}. Drop \
+         --out-depth, or drop the preset. (This is checked by flag presence rather \
+         than resolved value, because `--out-depth u16` resolves the documented \
+         default — a value rule would silently ignore it.)",
+        cfg.output.preset.name()
+    )))
 }
 
 /// Which input axes were asserted via a **CLI flag** (vs the recipe) — threaded
@@ -3502,8 +3661,13 @@ fn sample_plan(source: &FilmBaseSource) -> SamplePlan {
 // would only obscure the call sites.
 enum FrameRender {
     Tiff(stages::Rendered),
+    /// `ultra-hdr-v1` / `gain-map-hdr`: one gain-map render, packaged with the
+    /// metadata dialects the preset selected. The render is identical for both —
+    /// the presets differ only in `dialects`, which is why it is carried here
+    /// rather than re-derived from the preset at the encode site.
     UltraHdr {
         render: Box<gain_map::GainMapRender>,
+        dialects: ultra_hdr::Dialects,
         convert: stages::ConvertReport,
         timings: stages::StageTimings,
     },
@@ -3636,6 +3800,9 @@ fn convert_frame(
             OutputPreset::UltraHdrV1 => RunProfile::UltraHdrV1 {
                 export_ir: export_ir_planned,
             },
+            OutputPreset::GainMapHdr => RunProfile::GainMapHdr {
+                export_ir: export_ir_planned,
+            },
             OutputPreset::HdrPq | OutputPreset::HdrHlg => RunProfile::HdrAvif {
                 export_ir: export_ir_planned,
             },
@@ -3648,10 +3815,12 @@ fn convert_frame(
             OutputPreset::DisplayP3 | OutputPreset::Compatibility => RunProfile::SdrTiff {
                 export_ir: export_ir_planned,
             },
-            OutputPreset::Legacy | OutputPreset::FilmMaster => RunProfile::Convert {
-                depth: cfg.output.depth(),
-                export_ir: export_ir_planned,
-            },
+            OutputPreset::Legacy | OutputPreset::Custom | OutputPreset::FilmMaster => {
+                RunProfile::Convert {
+                    depth: cfg.output.depth(),
+                    export_ir: export_ir_planned,
+                }
+            }
         },
         sample_plan(&base_source),
         budget,
@@ -3796,7 +3965,35 @@ fn convert_frame(
     // transfer_for(..)` chain would silently hand the TIFF presets to the AVIF
     // encoder, so the compiler is made to enumerate the cases instead.
     let rendered = match cfg.output.preset {
-        OutputPreset::UltraHdrV1 => {
+        OutputPreset::UltraHdrV1 | OutputPreset::GainMapHdr => {
+            // One render for both gain-map presets. They differ only in which
+            // metadata dialects get attached during packaging, so resolving the
+            // dialect here keeps the two from drifting into two renders.
+            //
+            // Exhaustive, like the SDR gamut and coded/AVIF splits below and for the
+            // same reason: a `_` arm would silently hand a future gain-map preset
+            // whichever dialect happened to be last, and the difference between the
+            // two is exactly whether the file is HDR on Apple platforms.
+            let dialects = match cfg.output.preset {
+                OutputPreset::UltraHdrV1 => ultra_hdr::Dialects::LegacyUltraHdrV1,
+                OutputPreset::GainMapHdr => ultra_hdr::Dialects::LegacyPlusIso,
+                OutputPreset::Legacy
+                | OutputPreset::Custom
+                | OutputPreset::FilmMaster
+                | OutputPreset::HdrPq
+                | OutputPreset::HdrHlg
+                | OutputPreset::HdrLinearTiff
+                | OutputPreset::HdrPqTiff
+                | OutputPreset::HdrHlgTiff
+                | OutputPreset::DisplayP3
+                | OutputPreset::Compatibility => {
+                    return Err(NcError::Other(format!(
+                        "`{}` reached the gain-map render arm, which only the \
+                         gain-map presets may enter",
+                        cfg.output.preset.name()
+                    )));
+                }
+            };
             let source =
                 stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
             let convert = source.convert;
@@ -3812,6 +4009,7 @@ fn convert_frame(
             timings.color_ms += elapsed_ms(display_started);
             FrameRender::UltraHdr {
                 render: Box::new(render),
+                dialects,
                 convert,
                 timings,
             }
@@ -3875,8 +4073,10 @@ fn convert_frame(
                     timings,
                 },
                 OutputPreset::Legacy
+                | OutputPreset::Custom
                 | OutputPreset::FilmMaster
                 | OutputPreset::UltraHdrV1
+                | OutputPreset::GainMapHdr
                 | OutputPreset::HdrLinearTiff
                 | OutputPreset::DisplayP3
                 | OutputPreset::Compatibility => {
@@ -3899,8 +4099,10 @@ fn convert_frame(
                 OutputPreset::DisplayP3 => sdr::SdrGamut::DisplayP3,
                 OutputPreset::Compatibility => sdr::SdrGamut::SRgb,
                 OutputPreset::Legacy
+                | OutputPreset::Custom
                 | OutputPreset::FilmMaster
                 | OutputPreset::UltraHdrV1
+                | OutputPreset::GainMapHdr
                 | OutputPreset::HdrPq
                 | OutputPreset::HdrHlg
                 | OutputPreset::HdrLinearTiff
@@ -3921,13 +4123,15 @@ fn convert_frame(
                 gamut,
             )?)
         }
-        OutputPreset::Legacy | OutputPreset::FilmMaster => FrameRender::Tiff(stages::render(
-            &image,
-            &base.base,
-            &cfg.reconstruction,
-            &cfg.print,
-            &cfg.output,
-        )?),
+        OutputPreset::Legacy | OutputPreset::Custom | OutputPreset::FilmMaster => {
+            FrameRender::Tiff(stages::render(
+                &image,
+                &base.base,
+                &cfg.reconstruction,
+                &cfg.print,
+                &cfg.output,
+            )?)
+        }
     };
     // lcms2 transform/profile failures reach us only through the global handler
     // (`transform_in_place` is infallible), so check the flag it sets.
@@ -4016,7 +4220,9 @@ fn convert_frame(
         FrameRender::Tiff(rendered) => {
             encode::encode(&rendered.image, &cfg.output, Some(&rendered.icc), output)?
         }
-        FrameRender::UltraHdr { render, .. } => ultra_hdr::encode(*render, output)?,
+        FrameRender::UltraHdr {
+            render, dialects, ..
+        } => ultra_hdr::encode_with(*render, output, dialects)?,
         FrameRender::HdrAvif { render, .. } => {
             let (staged, outcome, summary) = avif::encode(*render, output)?;
             avif_summary = Some(summary);
@@ -4384,10 +4590,15 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     } else {
         DmaxSetting::Default
     };
+    let recipe_preset = if loaded.output_preset_present {
+        RecipePreset::Stated
+    } else {
+        RecipePreset::Unstated
+    };
     let cfg = merge(loaded.cfg, &args)?;
-    // The *complete* convert gate: `validate`'s resolved-config rules plus the one
-    // flag-presence rule that cannot live there (see `validate_convert`).
-    validate_convert(&cfg, &args)?;
+    // The *complete* convert gate: `validate`'s resolved-config rules plus the two
+    // provenance-sensitive rules that cannot live there (see `validate_convert`).
+    validate_convert(&cfg, &args, recipe_preset)?;
 
     // Guard every write target against the input and against each other before
     // anything is decoded or written.
@@ -4763,23 +4974,73 @@ fn expand_input(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Default per-frame output name in the out-dir: `<input-stem>_positive.tiff`.
-fn default_output_name(input: &Path, out_dir: &Path) -> PathBuf {
+/// Default per-frame output name in the out-dir: `<input-stem>_positive.<ext>`,
+/// where the suffix comes from the **frame's own resolved preset** rather than a
+/// hardcoded `tiff`.
+///
+/// The preset is per frame, not per roll, because a manifest's per-frame `params`
+/// override may change `output.preset` — that override already warns loudly (it
+/// emits a different image class), but the name still has to describe the bytes
+/// actually written.
+///
+/// The spelling comes from [`derived_extension`], **not** from the first entry of
+/// [`required_extensions`] — that table lists `tif` before `tiff`, so taking its
+/// head would have silently renamed every existing roll output from
+/// `_positive.tiff` to `_positive.tif`.
+fn default_output_name(input: &Path, out_dir: &Path, preset: OutputPreset) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "frame".to_string());
-    out_dir.join(format!("{stem}_positive.tiff"))
+    out_dir.join(format!("{stem}_positive.{}", derived_extension(preset)))
+}
+
+/// The extension roll writes when it derives a frame's name.
+///
+/// Separate from [`required_extensions`], which says what nc *accepts* — several
+/// presets accept two spellings and a derived name must pick exactly one. The
+/// invariant tying them together is that this value is always **a member of** that
+/// preset's accepted set, so a derived name can never fail
+/// [`reject_suffix_mismatch`]; a test asserts it for every preset in
+/// `OutputPreset::ALL`, which is what keeps the two from drifting.
+///
+/// TIFF presets keep `tiff` because that is what roll wrote before containers
+/// existed; changing it would rename every output of an unchanged recipe.
+fn derived_extension(preset: OutputPreset) -> &'static str {
+    match preset {
+        OutputPreset::GainMapHdr | OutputPreset::UltraHdrV1 => "jpg",
+        OutputPreset::HdrPq | OutputPreset::HdrHlg => "avif",
+        OutputPreset::Legacy
+        | OutputPreset::Custom
+        | OutputPreset::FilmMaster
+        | OutputPreset::DisplayP3
+        | OutputPreset::Compatibility
+        | OutputPreset::HdrLinearTiff
+        | OutputPreset::HdrPqTiff
+        | OutputPreset::HdrHlgTiff => "tiff",
+    }
 }
 
 /// Resolve a frame's output path: a manifest's explicit path (absolute used
-/// verbatim, relative joined onto the out-dir) or the default `<stem>_positive.tiff`.
-fn resolve_frame_output(explicit: Option<&Path>, input: &Path, out_dir: &Path) -> PathBuf {
-    match explicit {
+/// verbatim, relative joined onto the out-dir) or the derived
+/// `<stem>_positive.<ext>`.
+///
+/// An explicit manifest path is checked against the frame's resolved container
+/// through the **same** rule `convert` uses; a derived one is correct by
+/// construction and is not re-checked.
+fn resolve_frame_output(
+    explicit: Option<&Path>,
+    input: &Path,
+    out_dir: &Path,
+    preset: OutputPreset,
+) -> Result<PathBuf> {
+    let path = match explicit {
         Some(o) if o.is_absolute() => o.to_path_buf(),
         Some(o) => out_dir.join(o),
-        None => default_output_name(input, out_dir),
-    }
+        None => return Ok(default_output_name(input, out_dir, preset)),
+    };
+    reject_suffix_mismatch(preset, &path, SuffixContext::RollFrame(input))?;
+    Ok(path)
 }
 
 /// Deep-merge `overlay` into `base`: JSON objects merge key-by-key (recursively),
@@ -4900,32 +5161,20 @@ fn load_manifest(path: &Path) -> Result<RollManifest> {
 /// `input.export_ir` path — which every frame would overwrite — is nonsensical.
 /// Reject it loudly rather than silently clobbering one IR file N times.
 fn reject_roll_unsupported(cfg: &ResolvedConfig) -> Result<()> {
-    // Roll capability is its **own axis**, listed explicitly rather than derived
-    // from `required_extensions`.
+    // **Every preset is roll-capable now.** The blanket convert-only refusal that
+    // used to live here was waiting on exactly one missing capability — roll derived
+    // `<stem>_positive.tiff` for every frame regardless of container, so a JPEG or
+    // AVIF preset would have written a file whose contents its name denied.
+    // `default_output_name` now takes the suffix from `derived_extension` — **not**
+    // from `required_extensions`, whose head is `tif` and would have renamed every
+    // roll output; see that function for why the two are separate — and an explicit
+    // manifest path goes through the same `reject_suffix_mismatch` rule `convert`
+    // uses, so the gap is closed rather than guarded.
     //
-    // It used to be derived — "pins a suffix" meant "convert-only" — and that
-    // inference died when the suffix table was completed: `legacy` and
-    // `film-master` now state `.tif`/`.tiff` like every other TIFF preset, so the
-    // derived rule refused *every* preset and broke `nc roll` outright. The two
-    // concepts had merely coincided.
-    //
-    // What roll actually lacks is container-aware naming and collision handling:
-    // it derives `<stem>_positive.tiff` for every frame, which is why the TIFF
-    // presets are refused too even though that name would satisfy their suffix
-    // rule — roll would still write a file whose *contents* the manifest does not
-    // describe. `output/presets` owns lifting this.
-    if !matches!(
-        cfg.output.preset,
-        OutputPreset::Legacy | OutputPreset::FilmMaster
-    ) {
-        return Err(NcError::Usage(format!(
-            "output.preset = \"{}\" is currently supported only by `nc convert`; roll \
-             derives every frame's name as `<stem>_positive.tiff` and its naming, \
-             manifests and collision handling are not container-aware yet — that is \
-             owned by the later output/presets task",
-            cfg.output.preset.name()
-        )));
-    }
+    // Do not reintroduce a preset list here. Roll capability was once *derived* from
+    // "pins a suffix", and completing the suffix table then refused every preset and
+    // broke `nc roll` outright — the two concepts had merely coincided. They are
+    // separate axes, and the correct number of presets on this one is now zero.
     if cfg.input.export_ir.is_some() {
         return Err(NcError::Usage(
             "input.export_ir (--export-ir) is not supported in roll mode: it names a \
@@ -5118,7 +5367,12 @@ fn resolve_frames(
                     }
                     None => (shared.clone(), None, shared_setting),
                 };
-                let output = resolve_frame_output(mf.output.as_deref(), &mf.input, out_dir);
+                let output = resolve_frame_output(
+                    mf.output.as_deref(),
+                    &mf.input,
+                    out_dir,
+                    cfg.output.preset,
+                )?;
                 planned.push(PlannedFrame {
                     input: mf.input,
                     output,
@@ -5141,7 +5395,7 @@ fn resolve_frames(
                 ));
             }
             for input in inputs {
-                let output = default_output_name(&input, out_dir);
+                let output = default_output_name(&input, out_dir, shared.output.preset);
                 planned.push(PlannedFrame {
                     input,
                     output,
@@ -5244,6 +5498,12 @@ fn run_roll(args: RollArgs) -> Result<()> {
         curve_dmax_present: shared_dmax_present,
         meta_pipeline_version,
         unpinned_curve: shared_unpinned_curve,
+        // Roll's suffix diagnosis never takes the convert arms: a manifest path is
+        // blamed as `SuffixContext::RollFrame` and a derived name matches by
+        // construction, so the shared recipe's provenance has nothing to vary.
+        // (Roll's *per-frame* `output.preset` witness is probed separately, at the
+        // override, for the roll-consistency warning.)
+        output_preset_present: _,
     } = load_recipe(args.recipe_in.as_deref())?;
     // Roll-specific rejections run **before** the shared `validate`, and the order
     // is the same least-specific-diagnosis-last policy `validate` itself now
@@ -6002,7 +6262,7 @@ fn emit_telemetry(
         // record cannot disagree with what `io::encode` actually wrote. Reading
         // `cfg.output.hdr` here would report `false` for a `film-master` run, whose
         // switch is pinned at its default while the branch resolves f32.
-        output_hdr: cfg.output.depth() == crate::types::OutDepth::F32,
+        output_depth: cfg.output.primary_depth_label(),
         warnings: report.warnings.len(),
     });
 
@@ -6095,6 +6355,23 @@ mod tests {
                 source: Some(FilmBaseSource::Auto),
             },
             ..ResolvedConfig::default()
+        }
+    }
+
+    /// `base_cfg()` pinned to the **legacy** preset.
+    ///
+    /// `base_cfg` carries the real product default, which is `gain-map-hdr` since the
+    /// `output/presets` migration — an *atomic* preset that resolves its own depth and
+    /// profile. Any test about the legacy TIFF path's selectors, print controls or
+    /// ordering must say so, or it silently becomes a test of the gain-map preset's
+    /// refusals instead.
+    fn legacy_cfg() -> ResolvedConfig {
+        ResolvedConfig {
+            output: OutputParams {
+                preset: OutputPreset::Legacy,
+                ..base_cfg().output
+            },
+            ..base_cfg()
         }
     }
     use crate::types::{ExponentialParams, SigmoidParams};
@@ -7248,7 +7525,8 @@ mod tests {
                 "exponential",
                 "--density-gamma",
                 "1.8",
-                "--output-hdr",
+                "--out-depth",
+                "f32",
             ]),
         )
         .unwrap();
@@ -7453,42 +7731,51 @@ mod tests {
     }
 
     #[test]
-    fn merge_output_hdr_flag_sets_but_never_clears() {
-        // Flag present → hdr on (a forgotten merge arm would silently make the
+    fn merge_out_depth_is_an_ordinary_flags_win_value() {
+        // Flag present → that depth (a forgotten merge arm would silently make the
         // flag a no-op — the four-spot-wiring trap).
-        let cfg = merge(base_cfg(), &parse_convert(&["--output-hdr"])).unwrap();
-        assert!(cfg.output.hdr);
-        // No flag → the default stays off.
+        let cfg = merge(base_cfg(), &parse_convert(&["--out-depth", "f32"])).unwrap();
+        assert_eq!(cfg.output.depth, OutDepth::F32);
+        // No flag → the default stays u16.
         let cfg = merge(base_cfg(), &parse_convert(&[])).unwrap();
-        assert!(!cfg.output.hdr);
-        // An absent (false) presence flag must not clobber a recipe `true`.
-        let recipe: ResolvedConfig = serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap();
+        assert_eq!(cfg.output.depth, OutDepth::U16);
+        // An absent flag must not clobber a recipe value.
+        let recipe: ResolvedConfig = serde_json::from_str(r#"{"output":{"depth":"f32"}}"#).unwrap();
         let cfg = merge(recipe.clone(), &parse_convert(&[])).unwrap();
-        assert!(cfg.output.hdr);
-        // `--output-sdr` is the explicit escape hatch: it forces a recipe
-        // `hdr: true` back to 16-bit (flags win by presence, not value).
-        let cfg = merge(recipe, &parse_convert(&["--output-sdr"])).unwrap();
-        assert!(!cfg.output.hdr);
-        // ...and is a no-op on an already-SDR config.
-        let cfg = merge(base_cfg(), &parse_convert(&["--output-sdr"])).unwrap();
-        assert!(!cfg.output.hdr);
+        assert_eq!(cfg.output.depth, OutDepth::F32);
+        // ...and a present one replaces it in *either* direction. This is the whole
+        // gain over the removed bool: forcing 16-bit back over a recipe no longer
+        // needs its own escape-hatch flag, so there is no presence-vs-value
+        // asymmetry left to special-case.
+        let cfg = merge(recipe, &parse_convert(&["--out-depth", "u16"])).unwrap();
+        assert_eq!(cfg.output.depth, OutDepth::U16);
+        let cfg = merge(base_cfg(), &parse_convert(&["--out-depth", "u16"])).unwrap();
+        assert_eq!(cfg.output.depth, OutDepth::U16);
     }
 
     #[test]
-    fn mutually_exclusive_output_depth_flags_are_rejected() {
-        // clap must reject the conflicting pair rather than silently pick one.
-        assert!(
-            Cli::try_parse_from([
-                "nc",
-                "convert",
-                "i",
-                "-o",
-                "o",
-                "--output-hdr",
-                "--output-sdr"
-            ])
-            .is_err()
-        );
+    fn removed_depth_flags_and_recipe_key_emit_migration_errors() {
+        // nc is unreleased: the old spellings are rejections, never aliases.
+        for flag in ["--output-hdr", "--output-sdr"] {
+            let err = reject_removed_flags(&parse_convert(&[flag])).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{flag}");
+            let msg = err.to_string();
+            assert!(msg.contains("--out-depth"), "{flag}: {msg}");
+            assert!(msg.contains("output.depth"), "{flag}: {msg}");
+            // The message must say what the float TIFF is *not*, since that
+            // confusion is the reason for the rename.
+            assert!(msg.contains("film-master"), "{flag}: {msg}");
+        }
+        let err =
+            reject_legacy_recipe_keys(&serde_json::json!({"output": {"hdr": true}}), "recipe")
+                .unwrap_err();
+        assert_eq!(err.exit_code(), 2, "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("depth"), "{msg}");
+        assert!(msg.contains("f32"), "{msg}");
+        // A recipe that already uses the new key is untouched by the migration check.
+        reject_legacy_recipe_keys(&serde_json::json!({"output": {"depth": "f32"}}), "recipe")
+            .unwrap();
     }
 
     #[test]
@@ -7551,13 +7838,14 @@ mod tests {
                 .preset,
             OutputPreset::Legacy
         );
-        // No flag, no recipe key → the default.
+        // No flag, no recipe key → the default, which is `gain-map-hdr` since the
+        // `output/presets` migration (it was `legacy`).
         assert_eq!(
             merge(base_cfg(), &parse_convert(&[]))
                 .unwrap()
                 .output
                 .preset,
-            OutputPreset::Legacy
+            OutputPreset::GainMapHdr
         );
         // The flag shares `OutputPreset::parse`, so a renamed/unknown value is a
         // usage error at merge, not a silent fallback to legacy.
@@ -7645,10 +7933,17 @@ mod tests {
             },
             ..base_cfg()
         };
-        // Legacy → the "no consumer" rule.
-        let msg = validate_err(&cfg_with(OutputPreset::Legacy));
-        assert!(msg.contains("linear_range"), "{msg}");
-        assert!(msg.contains("legacy no-preset TIFF"), "{msg}");
+        // Both non-atomic presets → the "no consumer" rule. `custom` is included
+        // because it renders the *same* `render_legacy` branch, which never applies
+        // `linear_range`; gating this rule on the `Legacy` name alone let
+        // `--output-preset custom --linear-range …` exit 0 and write a byte-identical
+        // file, silently dropping an explicit control.
+        for preset in [OutputPreset::Legacy, OutputPreset::Custom] {
+            let msg = validate_err(&cfg_with(preset));
+            assert!(msg.contains("linear_range"), "{preset:?}: {msg}");
+            assert!(msg.contains(preset.name()), "{preset:?}: {msg}");
+            assert!(msg.contains("frozen legacy ordering"), "{preset:?}: {msg}");
+        }
         // film-master → the print-control bypass sweep, which is a different reason.
         let msg = validate_err(&cfg_with(OutputPreset::FilmMaster));
         assert!(msg.contains("linear_range"), "{msg}");
@@ -7672,11 +7967,12 @@ mod tests {
             ..base_cfg()
         };
         let mut args = parse_convert(&["--output-preset", "ultra-hdr-v1"]);
-        assert!(validate_convert(&cfg, &args).is_err());
+        assert!(validate_convert(&cfg, &args, RecipePreset::Unstated).is_err());
         args.output = PathBuf::from("out.JPEG");
-        validate_convert(&cfg, &args).unwrap();
-        let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
-        assert!(err.contains("convert"), "{err}");
+        validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+        // Roll-capable now that names are container-aware: it derives
+        // `<stem>_positive.jpg` for this preset.
+        reject_roll_unsupported(&cfg).unwrap();
     }
 
     #[test]
@@ -7694,29 +7990,29 @@ mod tests {
             };
             // A `.tiff` (or the default) path is rejected; `.avif` in any case passes.
             let mut args = parse_convert(&["--output-preset", name]);
-            let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+            let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(".avif"), "{name}: {err}");
             assert!(err.contains(name), "{name}: {err}");
             args.output = PathBuf::from("out.AVIF");
-            validate_convert(&cfg, &args).unwrap();
+            validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
 
-            // Roll mode names the preset it is refusing.
-            let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
-            assert!(err.contains("convert"), "{name}: {err}");
-            assert!(err.contains(name), "{name}: {err}");
+            // Roll-capable now: `derived_extension` gives it `.avif`.
+            reject_roll_unsupported(&cfg).unwrap();
 
             // Atomic like every named preset: a legacy depth selector cannot ride
             // along, by flag presence *or* resolved value.
-            let mut sdr = parse_convert(&["--output-preset", name, "--output-sdr"]);
+            let mut sdr = parse_convert(&["--output-preset", name, "--out-depth", "u16"]);
             sdr.output = PathBuf::from("out.avif");
             assert!(
-                validate_convert(&cfg, &sdr).is_err(),
+                validate_convert(&cfg, &sdr, RecipePreset::Unstated).is_err(),
                 "{name} must reject --output-sdr"
             );
             let hdr_flag = ResolvedConfig {
                 output: OutputParams {
                     preset,
-                    hdr: true,
+                    depth: OutDepth::F32,
                     ..OutputParams::default()
                 },
                 ..base_cfg()
@@ -7746,28 +8042,30 @@ mod tests {
             };
             let mut args = parse_convert(&["--output-preset", name]);
             args.output = PathBuf::from("out.avif");
-            let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+            let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(".tif"), "{name}: {err}");
             assert!(err.contains(name), "{name}: {err}");
             args.output = PathBuf::from("out.TIF");
-            validate_convert(&cfg, &args).unwrap();
+            validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
 
-            // Convert-only — a capability of its own now, no longer derived from the
-            // suffix table (`legacy`/`film-master` pin suffixes and stay roll-capable).
-            let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
-            assert!(err.contains(name), "{name}: {err}");
+            // Roll-capable since roll derives container-aware names. This used to
+            // assert the opposite; the refusal existed only because roll hardcoded
+            // `.tiff`, and `derived_extension` closed that.
+            reject_roll_unsupported(&cfg).unwrap();
 
             // Atomic: the legacy selectors cannot ride along.
-            let mut sdr = parse_convert(&["--output-preset", name, "--output-sdr"]);
+            let mut sdr = parse_convert(&["--output-preset", name, "--out-depth", "u16"]);
             sdr.output = PathBuf::from("out.tif");
             assert!(
-                validate_convert(&cfg, &sdr).is_err(),
+                validate_convert(&cfg, &sdr, RecipePreset::Unstated).is_err(),
                 "{name} must reject --output-sdr"
             );
             let hdr_flag = ResolvedConfig {
                 output: OutputParams {
                     preset,
-                    hdr: true,
+                    depth: OutDepth::F32,
                     ..OutputParams::default()
                 },
                 ..base_cfg()
@@ -7833,34 +8131,30 @@ mod tests {
         // `.jpg` is rejected and the message names both the preset and what it wants.
         let mut args = parse_convert(&["--output-preset", "hdr-linear-tiff"]);
         args.output = PathBuf::from("out.jpg");
-        let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+        let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains(".tif"), "{err}");
         assert!(err.contains("hdr-linear-tiff"), "{err}");
 
         // Both spellings pass, in any case.
         for name in ["out.tif", "out.TIFF", "out.tiff"] {
             args.output = PathBuf::from(name);
-            validate_convert(&cfg, &args)
+            validate_convert(&cfg, &args, RecipePreset::Unstated)
                 .unwrap_or_else(|e| panic!("{name} should be accepted: {e}"));
         }
 
-        // Roll refuses it — and the reason must be roll's own naming gap, not a claim
-        // that the container is not a TIFF (it is one, and it would even satisfy the
-        // derived name).
-        let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
-        assert!(err.contains("convert"), "{err}");
-        assert!(err.contains("hdr-linear-tiff"), "{err}");
-        assert!(
-            err.contains("_positive.tiff"),
-            "the refusal must state roll's derived name as the reason: {err}"
-        );
+        // Roll accepts it now. The old refusal was roll's own naming gap rather than
+        // anything about this container — which is why this preset, whose derived
+        // `_positive.tiff` name already satisfied its suffix rule, was refused anyway.
+        reject_roll_unsupported(&cfg).unwrap();
 
         // Atomic like every named preset. `--output-sdr` is rejected by presence
         // (it forces 16-bit integer output this preset cannot produce)...
-        let mut sdr = parse_convert(&["--output-preset", "hdr-linear-tiff", "--output-sdr"]);
+        let mut sdr = parse_convert(&["--output-preset", "hdr-linear-tiff", "--out-depth", "u16"]);
         sdr.output = PathBuf::from("out.tiff");
         assert!(
-            validate_convert(&cfg, &sdr).is_err(),
+            validate_convert(&cfg, &sdr, RecipePreset::Unstated).is_err(),
             "must reject --output-sdr"
         );
         // ...and a non-default `output.hdr` / `output_profile` by resolved value.
@@ -7870,7 +8164,7 @@ mod tests {
         for offender in [
             OutputParams {
                 preset: OutputPreset::HdrLinearTiff,
-                hdr: true,
+                depth: OutDepth::F32,
                 ..OutputParams::default()
             },
             OutputParams {
@@ -7927,7 +8221,7 @@ mod tests {
         // stopped working altogether.
         let legacy_ranged = ResolvedConfig {
             print: ranged.print.clone(),
-            ..base_cfg()
+            ..legacy_cfg()
         };
         assert!(validate(&legacy_ranged).is_err());
 
@@ -7979,27 +8273,29 @@ mod tests {
             // rejected *every* path would pass the first assertion alone).
             let mut args = parse_convert(&["--output-preset", name]);
             args.output = PathBuf::from("out.jpg");
-            let err = validate_convert(&cfg, &args).unwrap_err().to_string();
+            let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains(".tif"), "{name}: {err}");
             assert!(err.contains(name), "{name}: {err}");
             for path in ["out.tif", "out.TIFF", "out.tiff"] {
                 args.output = PathBuf::from(path);
-                validate_convert(&cfg, &args)
+                validate_convert(&cfg, &args, RecipePreset::Unstated)
                     .unwrap_or_else(|e| panic!("{name}: {path} should be accepted: {e}"));
             }
 
-            // Roll refuses it, naming the preset.
-            let err = reject_roll_unsupported(&cfg).unwrap_err().to_string();
-            assert!(err.contains("convert"), "{name}: {err}");
-            assert!(err.contains(name), "{name}: {err}");
+            // Roll-capable now; it derives `<stem>_positive.tiff`.
+            reject_roll_unsupported(&cfg).unwrap();
 
             // Atomic like every named preset. `--output-sdr` is rejected by flag
             // presence — and because this preset *does* resolve 16-bit integer, the
             // message must say "redundant", never that the two requests contradict
             // each other (a user reading that would conclude the preset writes float).
-            let mut sdr_flag = parse_convert(&["--output-preset", name, "--output-sdr"]);
+            let mut sdr_flag = parse_convert(&["--output-preset", name, "--out-depth", "u16"]);
             sdr_flag.output = PathBuf::from("out.tiff");
-            let err = validate_convert(&cfg, &sdr_flag).unwrap_err().to_string();
+            let err = validate_convert(&cfg, &sdr_flag, RecipePreset::Unstated)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("redundant"), "{name}: {err}");
             assert!(
                 !err.contains("contradict"),
@@ -8010,7 +8306,7 @@ mod tests {
             for offender in [
                 OutputParams {
                     preset,
-                    hdr: true,
+                    depth: OutDepth::F32,
                     ..OutputParams::default()
                 },
                 OutputParams {
@@ -8069,17 +8365,29 @@ mod tests {
     fn a_missing_extension_is_rejected_and_blames_the_path_not_an_unpassed_preset() {
         // Extensionless is rejected on purpose (design-spec §5): a file called
         // `positive` misleads about its contents exactly as `positive.jpg` does.
-        // Under the *default* path there is no preset to blame — `--output-preset
-        // legacy` need never have been typed — so the message must be about the path.
+        // With no `--output-preset` typed, the message must not blame a flag the
+        // user never passed — it names the *default* preset instead. That distinction
+        // stopped being derivable from the preset value when the default became a
+        // named one, which is why `SuffixContext` exists.
         let cfg = base_cfg();
         let mut args = parse_convert(&[]);
         args.output = PathBuf::from("positive");
-        let err = validate_convert(&cfg, &args).unwrap_err().to_string();
-        assert!(err.contains(".tif"), "{err}");
+        let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".jpg"), "{err}");
+        assert!(err.contains("gain-map-hdr"), "{err}");
         assert!(
-            !err.contains("--output-preset"),
+            !err.contains("--output-preset gain-map-hdr"),
             "the default path must not blame a flag the user never passed: {err}"
         );
+        // The same mismatch *with* the flag blames the preset by name.
+        let mut chosen = parse_convert(&["--output-preset", "gain-map-hdr"]);
+        chosen.output = PathBuf::from("positive");
+        let err = validate_convert(&cfg, &chosen, RecipePreset::Unstated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("output preset `gain-map-hdr`"), "{err}");
         // Control: the same path under a *named* preset names it, and a `.tiff` path
         // under the default is of course accepted.
         let named = ResolvedConfig {
@@ -8089,10 +8397,66 @@ mod tests {
             },
             ..base_cfg()
         };
-        let err = validate_convert(&named, &args).unwrap_err().to_string();
+        let err = validate_convert(&named, &args, RecipePreset::Unstated)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("film-master"), "{err}");
-        args.output = PathBuf::from("positive.tiff");
-        validate_convert(&cfg, &args).unwrap();
+        args.output = PathBuf::from("positive.jpg");
+        validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+    }
+
+    #[test]
+    fn a_recipe_chosen_preset_is_blamed_by_name_not_reported_as_the_default() {
+        // A preset selected in `--params` is just as chosen as one typed, but the
+        // merge erases the difference — so without the recipe witness the message
+        // took the default arm and stated a falsehood: "with no --output-preset, nc
+        // writes `legacy`", when nc's default is `gain-map-hdr` and the *recipe*
+        // picked `legacy`. That sends the reader hunting for a default that does not
+        // exist.
+        let cfg = ResolvedConfig {
+            output: OutputParams {
+                preset: OutputPreset::Legacy,
+                ..OutputParams::default()
+            },
+            ..base_cfg()
+        };
+        let mut args = parse_convert(&[]);
+        args.output = PathBuf::from("out.jpg");
+        let err = validate_convert(&cfg, &args, RecipePreset::Stated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("output preset `legacy`"), "{err}");
+        assert!(
+            !err.contains("--output-preset"),
+            "the recipe path must not blame a flag either: {err}"
+        );
+        // Falsifiable: the *same* config with nothing stated is the genuine default
+        // arm, and that message does name the no-preset default.
+        let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("with no --output-preset"), "{err}");
+    }
+
+    #[test]
+    fn load_recipe_records_whether_the_file_stated_an_output_preset() {
+        // The witness behind the test above. `output.preset` resolves to a *named*
+        // default, so only the raw JSON distinguishes "the recipe chose it" from
+        // "nobody did" — the same reason `curve_dmax_present` exists.
+        let stated =
+            load_recipe_body("preset-stated", r#"{"output":{"preset":"legacy"}}"#).unwrap();
+        assert!(stated.output_preset_present);
+        // A recipe that touches `output` without naming a preset has not stated one.
+        let other = load_recipe_body("preset-absent", r#"{"output":{"depth":"f32"}}"#).unwrap();
+        assert!(!other.output_preset_present);
+        assert!(!load_recipe(None).unwrap().output_preset_present);
+        // The envelope's `params` body is the witness, not the whole document.
+        let wrapped = load_recipe_body(
+            "preset-wrapped",
+            r#"{"meta":{"nc_version":"0.1.0"},"params":{"output":{"preset":"film-master"}}}"#,
+        )
+        .unwrap();
+        assert!(wrapped.output_preset_present);
     }
 
     #[test]
@@ -8347,9 +8711,9 @@ mod tests {
         // three would make this assertion vacuous).
         for (key, flag, recipe) in [
             (
-                "output.hdr",
-                vec!["--output-hdr"],
-                r#"{"output":{"hdr":true}}"#,
+                "output.depth",
+                vec!["--out-depth", "f32"],
+                r#"{"output":{"depth":"f32"}}"#,
             ),
             (
                 "output.output_profile",
@@ -8368,11 +8732,11 @@ mod tests {
             ] {
                 assert!(msg.contains(key), "{key} via {provenance}: {msg}");
                 assert!(msg.contains("atomic output policy"), "{provenance}: {msg}");
-                // `--output-hdr` is a *rendered* float TIFF; the message must say so
+                // `--out-depth f32` is a *rendered* float TIFF; the message must say so
                 // rather than let a reader assume it is the same thing as the master.
                 assert!(msg.contains("never an alias"), "{provenance}: {msg}");
                 // Only the offender is blamed.
-                for other in ["output.hdr", "output.output_profile", "output.bigtiff"] {
+                for other in ["output.depth", "output.output_profile", "output.bigtiff"] {
                     assert_eq!(
                         other == key,
                         msg.contains(other),
@@ -8389,7 +8753,7 @@ mod tests {
         //
         // `--output-sdr` is deliberately NOT in this list even though it also resolves
         // `hdr = false`: it *forces* 16-bit integer output, so it is rejected by
-        // presence in `reject_output_sdr_with_named_preset` (which `validate` cannot
+        // presence in `reject_out_depth_with_atomic_preset` (which `validate` cannot
         // see, hence the separate test below).
         for (name, flag, recipe) in [
             (
@@ -8397,25 +8761,28 @@ mod tests {
                 vec!["--bigtiff", "auto"],
                 r#"{"output":{"bigtiff":"auto"}}"#,
             ),
-            ("hdr false", vec![], r#"{"output":{"hdr":false}}"#),
+            ("depth u16", vec![], r#"{"output":{"depth":"u16"}}"#),
         ] {
             outcome(&flag, "{}").unwrap_or_else(|e| panic!("{name} flag must be accepted: {e}"));
             outcome(&[], recipe)
                 .unwrap_or_else(|e| panic!("{name} recipe key must be accepted: {e}"));
         }
 
-        // The same recipes without the preset stay perfectly legal (legacy path).
+        // The same values under a non-atomic preset stay perfectly legal. Stated
+        // explicitly now: omitting the preset resolves `gain-map-hdr`, which is
+        // atomic, so "without the preset" no longer means "the legacy path".
         let mut legacy: ResolvedConfig =
-            serde_json::from_str(r#"{"output":{"hdr":true,"bigtiff":"on"}}"#).unwrap();
+            serde_json::from_str(r#"{"output":{"preset":"legacy","depth":"f32","bigtiff":"on"}}"#)
+                .unwrap();
         legacy.film_base.source = Some(FilmBaseSource::Auto);
         validate(&legacy).unwrap();
-        validate(&merge(base_cfg(), &parse_convert(&["--output-hdr"])).unwrap()).unwrap();
+        validate(&merge(legacy_cfg(), &parse_convert(&["--out-depth", "f32"])).unwrap()).unwrap();
     }
 
     #[test]
-    fn output_sdr_is_rejected_by_presence_next_to_a_named_preset() {
+    fn out_depth_is_rejected_by_presence_next_to_an_atomic_preset() {
         // The one deliberate presence check, and the reason it is not a value check:
-        // `--output-sdr` *forces* the default 16-bit integer TIFF (design-spec §9), which
+        // `--out-depth u16` *forces* the default 16-bit integer TIFF (design-spec §9), which
         // a named preset cannot produce — so it is a contradicted request, not a
         // redundant one, even though its resolved value (`hdr = false`) IS the default.
         // Under the value rule alone it exited 0 and silently wrote an f32 master.
@@ -8423,7 +8790,7 @@ mod tests {
             let recipe: ResolvedConfig = serde_json::from_str(recipe_json).unwrap();
             let args = parse_convert(argv);
             let cfg = merge(recipe, &args).unwrap();
-            reject_output_sdr_with_named_preset(&cfg, &args).map_err(|e| e.to_string())
+            reject_out_depth_with_atomic_preset(&cfg, &args).map_err(|e| e.to_string())
         };
 
         // Rejected next to a named preset, from either preset provenance — the flag is
@@ -8431,49 +8798,55 @@ mod tests {
         for (name, argv, recipe) in [
             (
                 "flag preset",
-                vec!["--output-preset", "film-master", "--output-sdr"],
+                vec!["--output-preset", "film-master", "--out-depth", "u16"],
                 "{}",
             ),
             (
                 "recipe preset",
-                vec!["--output-sdr"],
+                vec!["--out-depth", "u16"],
                 r#"{"output":{"preset":"film-master"}}"#,
             ),
             (
                 // The case that motivated the reversal: the user asked for 16-bit
                 // twice and previously received f32 with no diagnostic.
-                "recipe preset + recipe hdr:true",
-                vec!["--output-sdr"],
-                r#"{"output":{"preset":"film-master","hdr":true}}"#,
+                "recipe preset + recipe depth:f32",
+                vec!["--out-depth", "u16"],
+                r#"{"output":{"preset":"film-master","depth":"f32"}}"#,
             ),
         ] {
             let msg = check(&argv, recipe).unwrap_err();
-            assert!(msg.contains("--output-sdr"), "{name}: {msg}");
+            assert!(msg.contains("--out-depth"), "{name}: {msg}");
             assert!(msg.contains("film-master"), "{name}: {msg}");
-            assert!(msg.contains("16-bit integer"), "{name}: {msg}");
+            assert!(msg.contains("flag presence"), "{name}: {msg}");
         }
 
-        // Accepted without a named preset — `--output-sdr` keeps its whole legacy job,
-        // including resetting a recipe `hdr: true`.
-        check(&["--output-sdr"], "{}").unwrap();
-        check(&["--output-sdr"], r#"{"output":{"hdr":true}}"#).unwrap();
+        // Accepted without an atomic preset — the flag keeps its whole job there,
+        // including resetting a recipe `depth: "f32"`. Both cases must name a
+        // non-atomic preset now: the *default* is `gain-map-hdr`, which is atomic.
+        check(&["--output-preset", "legacy", "--out-depth", "u16"], "{}").unwrap();
         check(
-            &["--output-preset", "legacy", "--output-sdr"],
-            r#"{"output":{"hdr":true}}"#,
+            &["--output-preset", "custom", "--out-depth", "u16"],
+            r#"{"output":{"depth":"f32"}}"#,
+        )
+        .unwrap();
+        check(
+            &["--output-preset", "legacy", "--out-depth", "u16"],
+            r#"{"output":{"depth":"f32"}}"#,
         )
         .unwrap();
         // …and the flag's merge behaviour is untouched by the new rejection.
-        assert!(
-            !merge(
-                serde_json::from_str(r#"{"output":{"hdr":true}}"#).unwrap(),
-                &parse_convert(&["--output-sdr"])
+        assert_eq!(
+            merge(
+                serde_json::from_str(r#"{"output":{"depth":"f32"}}"#).unwrap(),
+                &parse_convert(&["--out-depth", "u16"])
             )
             .unwrap()
             .output
-            .hdr
+            .depth,
+            OutDepth::U16
         );
         // Absent flag → nothing to reject, even under the preset.
-        reject_output_sdr_with_named_preset(&film_master_cfg(), &parse_convert(&[])).unwrap();
+        reject_out_depth_with_atomic_preset(&film_master_cfg(), &parse_convert(&[])).unwrap();
     }
 
     #[test]
@@ -8488,7 +8861,7 @@ mod tests {
         // A raw-JSON probe like `sets_curve_dmax`: an override that merely *restates*
         // the shared preset is still a per-frame assertion, and the roll report has
         // nowhere else to surface it (`FrameStatus` carries no `output_render`).
-        assert!(!probe(r#"{"output":{"hdr":true}}"#));
+        assert!(!probe(r#"{"output":{"depth":"f32"}}"#));
         assert!(!probe(r#"{"print":{"print_exposure":0.5}}"#));
         assert!(!probe(r#"{}"#));
     }
@@ -8609,19 +8982,21 @@ mod tests {
             "the default fixed anchor must be claimed: {content}"
         );
 
-        // legacy u16 (the default): the print stage runs for a density
-        // reconstruction and the working→output ICC transform always runs.
-        let legacy = value(&base_cfg());
+        // legacy u16 (no longer the default, so stated explicitly): the print stage
+        // runs for a density reconstruction and the working→output ICC transform
+        // always runs.
+        let legacy = value(&legacy_cfg());
         assert_eq!(legacy["preset"], "legacy");
         assert_eq!(legacy["print_controls"], true);
         assert_eq!(legacy["display_render"], true);
         assert_eq!(legacy["encoding"], "rendered-u16-tiff");
 
-        // legacy `--output-hdr`: still a *rendered* float TIFF — the identifier must
-        // not read like a master.
+        // legacy `--out-depth f32`: still a *rendered* float TIFF — the identifier
+        // must not read like a master.
         let hdr = value(&ResolvedConfig {
             output: OutputParams {
-                hdr: true,
+                preset: OutputPreset::Legacy,
+                depth: OutDepth::F32,
                 ..OutputParams::default()
             },
             ..base_cfg()
@@ -8635,7 +9010,16 @@ mod tests {
         );
 
         // legacy `simple`: its positive passes through with no print stage.
-        assert_eq!(value(&simple_cfg())["print_controls"], false);
+        assert_eq!(
+            value(&ResolvedConfig {
+                output: OutputParams {
+                    preset: OutputPreset::Legacy,
+                    ..simple_cfg().output
+                },
+                ..simple_cfg()
+            })["print_controls"],
+            false
+        );
     }
 
     #[test]
@@ -9990,31 +10374,101 @@ mod tests {
         assert!(!has_tiff_ext(Path::new("a.png")));
         assert!(!has_tiff_ext(Path::new("a")));
         assert_eq!(
-            default_output_name(Path::new("/scans/frame01.tif"), Path::new("/out")),
+            default_output_name(
+                Path::new("/scans/frame01.tif"),
+                Path::new("/out"),
+                OutputPreset::Legacy
+            ),
             PathBuf::from("/out/frame01_positive.tiff")
         );
         // A manifest output: relative joins the out-dir, absolute is used verbatim,
-        // and `None` falls back to the default name.
+        // and `None` falls back to the derived name.
         assert_eq!(
             resolve_frame_output(
                 Some(Path::new("custom.tiff")),
                 Path::new("/s/f.tif"),
-                Path::new("/out")
-            ),
+                Path::new("/out"),
+                OutputPreset::Legacy
+            )
+            .unwrap(),
             PathBuf::from("/out/custom.tiff")
         );
         assert_eq!(
             resolve_frame_output(
                 Some(Path::new("/abs/c.tiff")),
                 Path::new("/s/f.tif"),
-                Path::new("/out")
-            ),
+                Path::new("/out"),
+                OutputPreset::Legacy
+            )
+            .unwrap(),
             PathBuf::from("/abs/c.tiff")
         );
         assert_eq!(
-            resolve_frame_output(None, Path::new("/s/f.tif"), Path::new("/out")),
+            resolve_frame_output(
+                None,
+                Path::new("/s/f.tif"),
+                Path::new("/out"),
+                OutputPreset::Legacy
+            )
+            .unwrap(),
             PathBuf::from("/out/f_positive.tiff")
         );
+    }
+
+    #[test]
+    fn roll_derives_every_container_suffix_and_checks_only_explicit_paths() {
+        // The derived name follows the preset's container, which is the capability
+        // the blanket convert-only roll refusal was waiting on. One case per
+        // container rather than per preset — the mapping itself is
+        // `derived_extension`'s job, and this asserts roll consumes it.
+        for (preset, want) in [
+            (OutputPreset::Legacy, "f_positive.tiff"),
+            (OutputPreset::FilmMaster, "f_positive.tiff"),
+            (OutputPreset::GainMapHdr, "f_positive.jpg"),
+            (OutputPreset::UltraHdrV1, "f_positive.jpg"),
+            (OutputPreset::HdrPq, "f_positive.avif"),
+            (OutputPreset::DisplayP3, "f_positive.tiff"),
+        ] {
+            assert_eq!(
+                default_output_name(Path::new("/s/f.tif"), Path::new("/out"), preset),
+                PathBuf::from(format!("/out/{want}")),
+                "{}",
+                preset.name()
+            );
+        }
+        // The invariant that lets roll skip re-checking a derived name: every
+        // preset's derived spelling is one the suffix rule accepts. Looped over
+        // `ALL`, so a new preset cannot pick an extension its own table rejects.
+        for preset in OutputPreset::ALL {
+            let derived = default_output_name(Path::new("/s/f.tif"), Path::new("/out"), preset);
+            assert!(
+                reject_suffix_mismatch(
+                    preset,
+                    &derived,
+                    SuffixContext::RollFrame(Path::new("/s/f.tif"))
+                )
+                .is_ok(),
+                "{} derives {} which its own suffix rule rejects",
+                preset.name(),
+                derived.display()
+            );
+        }
+        // The pre-container roll name is unchanged for TIFF presets: `tiff`, not the
+        // `tif` that heads the accepted list.
+        assert_eq!(derived_extension(OutputPreset::Legacy), "tiff");
+        // An **explicit** manifest path is checked, and the diagnosis names the frame
+        // and the way out rather than just the rule.
+        let err = resolve_frame_output(
+            Some(Path::new("frame.tiff")),
+            Path::new("/s/f.tif"),
+            Path::new("/out"),
+            OutputPreset::GainMapHdr,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("frame /s/f.tif"), "{err}");
+        assert!(err.contains(".jpg"), "{err}");
+        assert!(err.contains("gain-map-hdr"), "{err}");
     }
 
     #[test]

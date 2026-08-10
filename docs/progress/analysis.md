@@ -372,3 +372,31 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 - Wanted: one entry point instead of two overlapping script pairs, the configuration matrix as
   data rather than code, HDR review for frames whose range exceeds SDR, and build-vs-build
   comparison so a future default change can be reviewed the same way.
+
+## harness-regression-tests
+
+**Status:** not started
+**Updated:** 2026-08-09
+
+- Goal: give `scripts/real-scan-verify/harness.sh` automated coverage, so a change
+  to nc's CLI surface cannot break it silently. See
+  [the task file](../tasks/analysis/harness-regression-tests.md).
+- Filed 2026-08-09 out of the `output/presets` review round. The default flip to
+  `gain-map-hdr` broke the harness in three places with all four CI gates green:
+  `stage_freeze`'s `jq` generator still wrote the removed `output.hdr` key; the four
+  `convert` stages passed `.tiff` paths and hit exit 2; and `stage_convert` failed
+  **without an error at all** — `nc roll` had become container-aware, so it succeeded
+  and wrote `_positive.jpg`, the `for g in "$htmp"/*_positive.tiff` rename glob
+  matched nothing, the float-HDR outputs stayed stranded in `.hdrtmp`, and the stage
+  printed its usual `converted <roll>: N frames x2 modes`.
+- The silent one is the reason the task exists. An exit 2 is found the next time
+  someone runs the harness; a success line over the wrong container in the wrong
+  directory is not.
+- Second, narrower lesson recorded in the task: the checked-in recipes were migrated
+  by hand while the `jq` generator that *writes* them was not, so re-running
+  `stage_freeze` would have silently restored the broken state. Coverage that ties
+  the generator to the committed recipes would catch that class directly.
+- Deliberately left open: whether a fixture-only harness run is possible at all,
+  whether it belongs in CI (no assets, no `exiftool` there), and what language it
+  should be in — `scripts/analysis/`'s 91 Python tests already run under no CI gate,
+  which is worth resolving together rather than adding a third untested surface.

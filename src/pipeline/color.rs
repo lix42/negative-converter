@@ -322,9 +322,9 @@ struct CodedHdrProfile {
 }
 
 /// The ICC blob for `hdr-pq-tiff`: BT.2020 primaries, the ST 2084 transfer, full
-/// range, PCS `Y = L / 203`. **See [`synth_coded_hdr`] for two open ICC conformance
-/// gaps** (`BToA0Tag`, `chromaticAdaptationTag`) — this is a valid *source* profile,
-/// not yet a fully conformant Display-class one.
+/// range, PCS `Y = L / 203`. See [`synth_coded_hdr`] for the ICC.1:2022 Display-class
+/// requirements it satisfies (`BToA0Tag`, `chromaticAdaptationTag`) and why Input
+/// class was evaluated and rejected.
 ///
 /// **Display-referred and unclipped.** A 203 cd/m² diffuse white lands on PCS
 /// `1.0`, and highlights carry on past it to `10000/203 ≈ 49.26` — an *extended
@@ -374,7 +374,7 @@ pub fn hdr_pq_tiff_icc() -> Result<Vec<u8>> {
 
 /// The ICC blob for `hdr-hlg-tiff`: BT.2020 primaries, the HLG transfer, full
 /// range, **scene-referred** PCS with diffuse white at `1.0`. **See
-/// [`synth_coded_hdr`] for two open ICC conformance gaps.**
+/// [`synth_coded_hdr`] for the ICC conformance requirements it satisfies.**
 ///
 /// **Why scene-referred, when the PQ profile is display-referred.** HLG's OOTF is
 /// `R_D = α · Y_S^(γ-1) · R_S` — it scales each channel by a function of the
@@ -417,37 +417,46 @@ pub fn hdr_hlg_tiff_icc() -> Result<Vec<u8>> {
 /// Build a coded-HDR profile: `mAB` pipeline (tone curves → scaled colorant matrix
 /// → identity) plus the `cicp` tag, description, and D50 media white.
 ///
-/// # Two known conformance gaps, verified against ICC.1:2022 and deliberately open
+/// # The two ICC.1:2022 conformance requirements, and how they are met
 ///
-/// This profile is **not yet a fully conformant Display-class profile**, and the
-/// surrounding documentation must not claim it is. Both gaps are in the normative
-/// text, checked rather than assumed:
+/// Both were **open gaps** when `output/lossless-hdr-tiff` shipped and were closed by
+/// `output/presets` on 2026-08-09. Recorded here because the reasoning is what a
+/// future edit needs, not the fact:
 ///
 /// * **§8.4.2 requires `BToA0Tag` as well as `AToB0Tag`** for an N-component
-///   LUT-based Display profile. Only `AToB0Tag` is written, so a strict CMM cannot
-///   use this profile as a transform *destination* (Little CMS's output-LUT reader
-///   has neither a `B2A0` nor matrix-shaper tags to fall back on). It works as a
-///   *source*, which is the only direction nc needs — an embedded profile describing
-///   this file's pixels — and macOS ColorSync accepts it in practice.
+///   LUT-based Display profile. Written as a `mBA ` mirror of the A2B — B curves
+///   (identity) → inverse matrix → M curves (the forward transfer). nc only ever
+///   uses these profiles as *sources*, so nothing here depends on it; it is written
+///   because the profile claims Display class and must therefore satisfy the class.
 /// * **§8.2 requires `chromaticAdaptationTag`** "when the measurement data used to
 ///   calculate the profile was specified for an adopted white with a chromaticity
 ///   different from that of the PCS adopted white". The colorants are Bradford
-///   D65→D50 adapted and `mediaWhitePointTag` declares D50, so `chad` is required
-///   and is missing; without it a consumer cannot recover that the *encoding* white
-///   is D65. Every profile Little CMS builds for nc carries it automatically —
-///   including `hdr_linear_bt2020_icc` — because `Profile::new_rgb` writes it.
+///   D65→D50 adapted and `mediaWhitePointTag` declares D50, so `chad` is required;
+///   it carries `pinned::BRADFORD_D65_TO_ICC_PCS`, the same adaptation the colorants
+///   were built with. Every profile Little CMS builds for nc gets one automatically
+///   — including `hdr_linear_bt2020_icc` — because `Profile::new_rgb` writes it;
+///   an authored profile does not.
 ///
-/// Neither gap affects the stored code values, and the `cicp` tag remains the
-/// authoritative signal. **Both are owned by `output/presets`** (deferred there by
-/// decision on 2026-08-06, with the full closing recipe in its task file): fixing
-/// them needs two more pinned colorimetry artifacts — the inverse colorant matrix
-/// and the Bradford D65→D50 matrix — and changes these profiles' bytes, which wants
-/// one re-review alongside that task's preset activation.
+/// **Input class was evaluated and rejected.** ICC §8.3.2 requires no `BToA0Tag` for
+/// an Input profile and §9.2.17 still permits `cicpTag`, so declaring Input class
+/// would have closed the first gap for free. Measured: the two profiles differ in
+/// exactly **3 bytes** (the class signature), macOS ColorSync parses and names both
+/// identically, and transforming through each as a source produces byte-identical
+/// output. Since the class is not observably load-bearing, the choice falls to
+/// truthfulness — an Input profile describes a *capture device*, and these describe a
+/// display encoding — so Display class stays and the tag is written. That also keeps
+/// nc's profiles consistent (every other one is Display class) and matches Adobe's
+/// reference BT.2100 profiles.
 ///
-/// Note also that a conformant `BToA0` is *inherently* range-limited here: its PCS
-/// input is `u1Fixed15Number`, capping it at ≈1.99997 — about 406 cd/m² — so it
-/// cannot round-trip the extended range the `AToB0` carries. That is a property to
-/// document, not to engineer around.
+/// **Neither tag is enforced by any decoder we can test**, which is worth stating
+/// plainly: macOS ColorSync used the profile as a transform *destination* even
+/// without `BToA0`, so the acceptance evidence does not discriminate. These are
+/// conformance requirements met on the strength of the normative text.
+///
+/// Note that a conformant `BToA0` is *inherently* range-limited here: its PCS input
+/// is `u1Fixed15Number`, capping it at ≈1.99997 — about 406 cd/m² — so it cannot
+/// round-trip the extended range the `AToB0` carries (to ≈49.26). That is a property
+/// to document, not to engineer around; Adobe's reference profiles ship one anyway.
 ///
 /// **One of two places nc reaches past the safe `lcms2` wrapper**, and they are
 /// unsafe for unrelated reasons. *Here* it is to **build a profile**: the safe crate
@@ -479,20 +488,45 @@ fn synth_coded_hdr(spec: &CodedHdrProfile) -> Result<Vec<u8>> {
         .map(|value| value * spec.peak_relative * PCS_XYZ_U1FIXED15)
         .collect();
 
+    // The `BToA0Tag` matrix is the exact inverse of the one above, scaling undone.
+    // ICC.1:2022 §8.4.2 requires the tag for an N-component LUT-based Display
+    // profile, and without it a strict CMM cannot use the profile as a transform
+    // *destination*.
+    //
+    // **It is inherently range-limited and that is stated, not engineered around.**
+    // Its PCS input is `u1Fixed15Number`, capped at ≈1.99997 — about 406 cd/m² — so
+    // it cannot round-trip the extended range the `AToB0` carries (to ≈49.26, i.e.
+    // 10,000 nits). Adobe's reference BT.2100 profiles ship a `BToA0` anyway, and
+    // matching that precedent is the point; over-claiming its reach is not. nc only
+    // ever uses these profiles as *sources*, so nothing in nc depends on it.
+    let inverse_matrix: Vec<f64> = pinned::XYZ_D50_TO_BT2020
+        .iter()
+        .flatten()
+        .map(|value| value / (spec.peak_relative * PCS_XYZ_U1FIXED15))
+        .collect();
+
+    // `chromaticAdaptationTag`, ICC.1:2022 §8.2: required because the colorants are
+    // Bradford D65→D50 adapted while `mediaWhitePointTag` declares D50. Without it a
+    // consumer cannot recover that the *encoding* white is D65. Row-major, and the
+    // same adaptation the colorants carry — a test pins that relationship.
+    let chad: Vec<f64> = pinned::BRADFORD_D65_TO_ICC_PCS
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+
     let description = cstring(spec.description)?;
     let copyright = cstring("No copyright, use freely")?;
     let language = cstring("en")?;
     let country = cstring("US")?;
     // ICC.1:2022's PCS white point: X = 0,9642, Y = 1,0000, Z = 0,8249.
     //
-    // ⚠ **Known inconsistency, deferred to `output/presets` with the `chad` work.**
-    // `pinned::BT2020_TO_XYZ_D50` adapts to `definitions::D50.to_xyz()` — D50 derived
-    // from its *rounded chromaticities*, which is `[0.96429568, 1, 0.82510460]` — so
-    // a neutral maps ≈2.4e-4 away from the white declared here. Small and invisible,
-    // but real, and the fix belongs with `chromaticAdaptationTag`: that tag must use
-    // the same white, and both together are one profile-bytes change wanting one
-    // re-review. Do not "fix" the media white to match the matrix — the spec value
-    // above is the correct target; the *matrix* is what should adapt to it.
+    // The colorant matrix now adapts to **this** value
+    // (`definitions::ICC_PCS_WHITE_XYZ`), so a neutral lands on the white the profile
+    // declares. It previously adapted to `D50.to_xyz()` — D50 derived from its
+    // *rounded chromaticities*, `[0.96429568, 1, 0.82510460]` — leaving a neutral
+    // ≈2.4e-4 off. If that ever needs revisiting: the spec value here is the correct
+    // target and the *matrix* is what adapts to it, never the reverse.
     let media_white = sys::CIEXYZ {
         X: 0.9642,
         Y: 1.0,
@@ -640,6 +674,75 @@ fn synth_coded_hdr(spec: &CodedHdrProfile) -> Result<Vec<u8>> {
         ) == 0
         {
             fail!("A2B0 tag");
+        }
+
+        if sys::cmsWriteTag(
+            profile.0,
+            sys::TagSignature::ChromaticAdaptationTag,
+            chad.as_ptr().cast(),
+        ) == 0
+        {
+            fail!("chromatic adaptation tag");
+        }
+
+        // The `BToA0` mirror. A `lutBtoAType` runs B curves → matrix → M curves —
+        // the reverse order of the `AToB` above — so the identity goes first and the
+        // *forward* transfer (linear → code) last. Little CMS recognizes only that
+        // pattern for the compact `mBA `; a two-stage pipeline is rejected with "LUT
+        // is not suitable to be saved as LutBtoA", the same way its A2B twin is.
+        let reverse = sys::cmsReverseToneCurve(curve.0.cast_const());
+        if reverse.is_null() {
+            fail!("reverse tone curve");
+        }
+        let reverse = CurveHandle(reverse);
+        let b2a = sys::cmsPipelineAlloc(std::ptr::null_mut(), 3, 3);
+        if b2a.is_null() {
+            fail!("B2A pipeline");
+        }
+        let b2a = PipelineHandle(b2a);
+        for (stage, what) in [
+            (
+                sys::cmsStageAllocToneCurves(
+                    std::ptr::null_mut(),
+                    3,
+                    [identity.0.cast_const(); 3].as_ptr(),
+                ),
+                "B2A identity stage",
+            ),
+            (
+                sys::cmsStageAllocMatrix(
+                    std::ptr::null_mut(),
+                    3,
+                    3,
+                    inverse_matrix.as_ptr(),
+                    std::ptr::null(),
+                ),
+                "B2A matrix stage",
+            ),
+            (
+                sys::cmsStageAllocToneCurves(
+                    std::ptr::null_mut(),
+                    3,
+                    [reverse.0.cast_const(); 3].as_ptr(),
+                ),
+                "B2A tone-curve stage",
+            ),
+        ] {
+            // Same eager-allocation leak window as the A2B loop above, and the same
+            // reasoning for documenting rather than guarding it.
+            if stage.is_null()
+                || sys::cmsPipelineInsertStage(b2a.0, sys::StageLoc::AT_END, stage) == 0
+            {
+                fail!(what);
+            }
+        }
+        if sys::cmsWriteTag(
+            profile.0,
+            sys::TagSignature::BToA0Tag,
+            b2a.0.cast_const().cast(),
+        ) == 0
+        {
+            fail!("B2A0 tag");
         }
 
         let mut length: u32 = 0;
@@ -851,6 +954,7 @@ mod tests {
     use crate::pipeline::render_split::display_source;
     use crate::pipeline::sdr;
     use crate::pipeline::working_space::map_nc_film_rgb_v1;
+    use crate::types::OutputPreset;
     use crate::types::{FilmBase, PrintParams, Reconstruction};
 
     fn gray_image(v: f32) -> LinearImage {
@@ -996,6 +1100,7 @@ mod tests {
         assert!(matches!(space, OutputSpace::Custom(_)));
 
         let params = OutputParams {
+            preset: OutputPreset::Legacy,
             output_profile: Some(path.to_string_lossy().into_owned()),
             ..Default::default()
         };
@@ -1107,7 +1212,8 @@ mod tests {
         // linear and wider than the working gamut, so neutral gray stays a
         // sensible near-0.5 value (no sRGB tone curve applied).
         let params = OutputParams {
-            hdr: true, // → F32 → AcesCg
+            preset: OutputPreset::Legacy,
+            depth: OutDepth::F32, // → AcesCg
             ..Default::default()
         };
         let (out, icc) = to_output(gray_image(0.5), &params).unwrap();
@@ -1127,7 +1233,8 @@ mod tests {
         // off 0 — this pins down the primaries/white-point, not just the TRC.
         let img = LinearImage::new(1, 1, vec![1.0, 0.0, 0.0], None).unwrap();
         let params = OutputParams {
-            hdr: true, // → F32 → AcesCg
+            preset: OutputPreset::Legacy,
+            depth: OutDepth::F32, // → AcesCg
             ..Default::default()
         };
         let (out, _icc) = to_output(img, &params).unwrap();
@@ -1584,6 +1691,44 @@ mod tests {
     }
 
     #[test]
+    fn coded_tiff_profiles_carry_the_tags_icc_requires_of_a_display_profile() {
+        // The two conformance gaps `output/lossless-hdr-tiff` shipped with and
+        // `output/presets` closed: ICC.1:2022 §8.4.2 requires `BToA0Tag` alongside
+        // `AToB0Tag` for an N-component LUT-based Display profile, and §8.2 requires
+        // `chromaticAdaptationTag` when the colorants' adopted white differs from the
+        // PCS adopted white (they are Bradford D65→D50 adapted here).
+        //
+        // Read straight out of the serialized tag table rather than through Little
+        // CMS, which would happily synthesize what it cannot find — the question is
+        // what the *bytes* contain, since that is what another CMM reads.
+        for (name, icc) in [
+            ("PQ", hdr_pq_tiff_icc().unwrap()),
+            ("HLG", hdr_hlg_tiff_icc().unwrap()),
+        ] {
+            let tags = icc_tag_signatures(&icc);
+            for want in ["A2B0", "B2A0", "chad", "wtpt", "cicp"] {
+                assert!(
+                    tags.iter().any(|t| t == want),
+                    "{name} profile is missing the {want} tag; has {tags:?}"
+                );
+            }
+        }
+    }
+
+    /// The four-character signatures in a serialized profile's tag table.
+    fn icc_tag_signatures(icc: &[u8]) -> Vec<String> {
+        let count = u32::from_be_bytes(icc[128..132].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|i| {
+                let at = 132 + i * 12;
+                String::from_utf8_lossy(&icc[at..at + 4])
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
     fn coded_tiff_profiles_are_deterministic_named_and_distinct() {
         let pq = hdr_pq_tiff_icc().unwrap();
         let hlg = hdr_hlg_tiff_icc().unwrap();
@@ -1664,6 +1809,7 @@ mod tests {
         // the linear Rec.709 working profile, so selecting Display P3 does a
         // lossless Rec.709→P3 primaries remap (Rec.709 ⊂ P3) PLUS the sRGB TRC.
         let params = OutputParams {
+            preset: OutputPreset::Legacy,
             output_profile: Some("display-p3".into()),
             ..Default::default()
         };
@@ -1733,6 +1879,7 @@ mod tests {
         // `to_output` path and embeds the generated P3 ICC (byte-identical to the
         // standalone `icc_profile`), so the encoder tags the file correctly.
         let params = OutputParams {
+            preset: OutputPreset::Legacy,
             output_profile: Some("display-p3".into()),
             ..Default::default()
         };

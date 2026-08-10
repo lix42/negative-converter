@@ -91,10 +91,14 @@ stage_freeze() {
     dmin=$(echo "$jmin" | jq -c '.film_base'); dflag=$(echo "$jmin" | jq -r '.film_base_flag' | sed 's/--film-base //')
     jmax=$($NC estimate --film-base "$dflag" --d-max-region "$freg" "$F" 2>"$ART/$roll.dmax.warn")
     dmax=$(echo "$jmax" | jq -r '.dmax')
+    # `output.preset` is stated, not defaulted: the product default is `gain-map-hdr`
+    # (a JPEG) since pipeline_version 3, and this harness converts to TIFFs
+    # throughout. `output.depth` replaced the removed `output.hdr` bool, and is
+    # consulted only by the non-atomic presets — hence `legacy` on both.
     jq -n --argjson b "$dmin" --argjson d "$dmax" \
-      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},reconstruction:{type:"density",curve:{type:"exponential",dmax:{explicit:$d}}}}' > "$REC/$roll.json"
+      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},reconstruction:{type:"density",curve:{type:"exponential",dmax:{explicit:$d}}},output:{preset:"legacy"}}' > "$REC/$roll.json"
     jq -n --argjson b "$dmin" --argjson d "$dmax" \
-      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},reconstruction:{type:"density",curve:{type:"exponential",dmax:{explicit:$d}}},output:{hdr:true}}' > "$REC/$roll.hdr.json"
+      '{film_base:{source:{explicit:[$b.r,$b.g,$b.b]}},reconstruction:{type:"density",curve:{type:"exponential",dmax:{explicit:$d}}},output:{preset:"legacy",depth:"f32"}}' > "$REC/$roll.hdr.json"
     jq -n --arg roll "$roll" --arg uf "$uf" --arg ureg "$ureg" --arg ff "$ff" --arg freg "$freg" \
       --argjson b "$dmin" --argjson d "$dmax" \
       --arg mw "$(tr '\n' ' ' <"$ART/$roll.dmin.warn")" --arg xw "$(tr '\n' ' ' <"$ART/$roll.dmax.warn")" '{

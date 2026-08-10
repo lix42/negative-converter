@@ -160,22 +160,87 @@ pub const BT2020_TO_DISPLAY_P3: [[f32; 3]; 3] = [
 /// inverse), *not* the published-inverse variant — that one exists only for the
 /// frozen `nc-film-rgb-v1` mapping.
 ///
+/// Adapted to `definitions::ICC_PCS_WHITE_XYZ`, **not** to `D50.to_xyz()`. The
+/// earlier pinning used the latter and left a neutral ≈2.4e-4 from the white the
+/// profile's own `mediaWhitePointTag` declares; the column sums now equal that
+/// declared triple. Changing this moves ICC bytes — see
+/// `docs/reports/render-defaults-v3.md`'s sibling note in `output/presets`.
+///
 /// [`BRADFORD`]: super::definitions::BRADFORD
 pub const BT2020_TO_XYZ_D50: [[f64; 3]; 3] = [
     [
-        0.673_515_463_188_276,
-        0.165_697_263_703_904_64,
-        0.125_082_949_537_387_08,
+        0.673_480_187_925_327_2,
+        0.165_671_206_657_657_14,
+        0.125_048_605_417_015_54,
     ],
     [
-        0.279_059_005_141_120_7,
-        0.675_318_005_749_109_7,
-        0.045_622_989_109_769_654,
+        0.279_042_584_746_334_5,
+        0.675_344_495_876_176_8,
+        0.045_612_919_377_488_764,
     ],
     [
-        -0.001_932_427_134_004_349_5,
-        0.029_977_826_792_829_163,
-        0.797_059_202_851_635_6,
+        -0.001_933_482_780_052_796_7,
+        0.029_982_849_966_411_092,
+        0.796_850_632_813_641_8,
+    ],
+];
+
+/// The inverse of [`BT2020_TO_XYZ_D50`]: PCS XYZ (D50) → linear BT.2020.
+///
+/// The matrix stage of the `hdr-pq-tiff` / `hdr-hlg-tiff` profiles'
+/// `BToA0Tag` — the mirror of the `AToB0Tag` its forward twin serves. It is pinned
+/// rather than inverted at run time because **the runtime never derives**: an
+/// inversion is derivation, and doing it per profile would put a matrix the ICC
+/// bytes depend on outside this module's review.
+///
+/// Held in `f64` for the same reason as its forward twin: the consumer is an ICC
+/// `s15Fixed16` matrix stage built in binary64.
+pub const XYZ_D50_TO_BT2020: [[f64; 3]; 3] = [
+    [
+        1.647_232_432_571_893_2,
+        -0.393_612_487_905_996_34,
+        -0.235_966_812_437_656_3,
+    ],
+    [
+        -0.682_617_327_253_648_8,
+        1.647_612_370_157_605_3,
+        0.012_810_348_866_968_356,
+    ],
+    [
+        0.029_681_482_923_754_315,
+        -0.062_949_259_747_089_34,
+        1.253_885_772_714_274_7,
+    ],
+];
+
+/// Bradford adaptation from BT.2020's D65 adopted white to the **ICC PCS white as
+/// ICC declares it** (`definitions::ICC_PCS_WHITE_XYZ`).
+///
+/// Serialized verbatim as the `chromaticAdaptationTag` of the coded HDR profiles.
+/// ICC.1:2022 §8.2 requires that tag whenever the colorants' adopted white differs
+/// from the PCS adopted white, which is exactly this case: the colorants are
+/// D65→D50 adapted and `mediaWhitePointTag` declares D50, so without `chad` a
+/// consumer cannot recover that the *encoding* white is D65.
+///
+/// It adapts to the XYZ white, not to `D50`'s chromaticity-derived XYZ, and it must
+/// stay in step with [`BT2020_TO_XYZ_D50`] — the tag is supposed to describe the
+/// very adaptation baked into the colorants, so two different whites there would
+/// make the profile describe an adaptation it did not perform.
+pub const BRADFORD_D65_TO_ICC_PCS: [[f64; 3]; 3] = [
+    [
+        1.047_886_003_222_550_5,
+        0.022_918_765_174_779_525,
+        -0.050_216_095_311_733_044,
+    ],
+    [
+        0.029_581_782_498_003_504,
+        0.990_483_518_490_548_8,
+        -0.017_078_707_704_482_7,
+    ],
+    [
+        -0.009_251_880_839_208_842,
+        0.015_072_607_487_031_334,
+        0.751_678_133_617_603_5,
     ],
 ];
 

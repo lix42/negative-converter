@@ -2018,3 +2018,33 @@ What other epics need to know about `algo`:
   the override-provenance one are written down in the task doc rather than
   patched over, and both belong to `core/conversion-versioning`'s per-version
   default table.
+
+## reconstruction-render-curve-split
+
+**Status:** not started
+**Updated:** 2026-08-10
+
+- Goal: try a modified exponential as the density→linear reconstruction with the
+  sigmoid character applied by the display stage instead of inside reconstruction.
+  See [the task file](../tasks/algo/reconstruction-render-curve-split.md).
+- Filed 2026-08-10, user's stated next step, out of the `output/presets` review
+  round. Two things motivated it. **(a)** The reference-anchored sigmoid does tone
+  shaping *during reconstruction* — floor, midtone, shoulder — which partly
+  collapses the "density conversion and print rendering are separate sub-stages"
+  rule; `pipeline::sdr`/`pipeline::hdr` already carry a reference-white-preserving
+  shoulder, so some of the downstream machinery exists. **(b)** It is the same
+  question as HDR headroom: on one Gold 200 frame with identical base and `Dmax`,
+  the sigmoid's HDR rendition peaks at *exactly* the 203-nit reference white
+  (`GainMapMax` 1.0x) while the exponential reaches 4.87x, because the exponential
+  pins white at `Dmax` with no placement rule.
+- **Correction worth carrying:** the film is not the limitation. Negative stock has
+  wide latitude (10–14 stops is the usual figure); the *print rendering* decides
+  whether output exceeds diffuse white, and today's default declines to. So HDR is a
+  rendering-intent choice, not range the source failed to supply — which is why it
+  is deprioritised rather than abandoned, and why the HDR presets stay first-class.
+- Deliberately left open: what "modified" must mean for the exponential (it has no
+  `AnchorPlacement`, worth 2.75 EV of midtone displacement — possibly subsuming
+  `algo/exponential-mid-grey-anchor`), what reconstruction should still own, whether
+  the existing display shoulder suffices, and **what happens to `film-master`**,
+  whose definition includes the curve. That last one is likely the sharpest
+  constraint.

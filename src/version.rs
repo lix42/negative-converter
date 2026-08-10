@@ -55,7 +55,8 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// |---|---|
 /// | 0 | the Step-1 MVP baseline recorded in `docs/reports/v0-baseline.md`: per-frame `auto` `Dmax` (99.5th-percentile density), exponential curve, no auto WB |
 /// | 1 | every default change since that baseline, collapsed into one label: `film-base/dmax-reference` replaced the per-frame anchor with the roll-fixed nominal `Dmax = 2.0` **density**, `film-base/auto-base-redesign` replaced the auto film-base detector with the inward-scan rebate detector, and `core/input-semantics` added the stage-1b transfer/meaning resolution. The tagged-`reconstruction` split was proven bit-identical and is *not* part of the change. |
-/// | 2 | **current** — three render defaults moved together (2026-08-08, `algo/negative-reconstruction-density-curves`): the nominal `Fixed` anchor `Dmax = 2.0` → **1.3**, the default density curve exponential → **sigmoid** (mid-grey anchored), and `ExponentialParams::gamma` 1.0 → **2.0** for anyone still selecting that curve explicitly. Measured in `docs/reports/render-defaults-v2.md`. Film-base estimation is untouched, which is why the row's `base` fingerprint is unchanged. |
+/// | 3 | **current** — the output-preset default migration (2026-08-09, `output/presets`): the default `output.preset` became **`gain-map-hdr`**, a dual-dialect gain-map JPEG, where it was `legacy` (16-bit TIFF). This is a **container** change as much as a render one — `nc convert -o out.tif` with no preset is now a usage error — and the pixels differ because the default path crosses the ACEScg boundary into the SDR/HDR display renderers instead of running `finish_print` before the ICC transform. `legacy` is unchanged and still reachable by name. The row's `render`/`base` fingerprints are **unmoved**: they measure `reconstruct_and_print` and `film_base::estimate`, neither of which the preset selects — which is exactly the coverage limit `PipelineFingerprint` documents, so this row's evidence is the report in `docs/reports/render-defaults-v3.md`, not the gate. |
+/// | 2 | three render defaults moved together (2026-08-08, `algo/negative-reconstruction-density-curves`): the nominal `Fixed` anchor `Dmax = 2.0` → **1.3**, the default density curve exponential → **sigmoid** (mid-grey anchored), and `ExponentialParams::gamma` 1.0 → **2.0** for anyone still selecting that curve explicitly. Measured in `docs/reports/render-defaults-v2.md`. Film-base estimation is untouched, which is why the row's `base` fingerprint is unchanged. |
 ///
 /// **The v1 row is a collapse, not a single step.** `docs/reports/v0-baseline.md`
 /// measured its numbers with an **explicit** `--film-base`, so those numbers stay
@@ -82,7 +83,7 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// test fails until the fingerprints **and** this constant are updated together.
 /// Read `PipelineFingerprint` for exactly which stages those are — the gate is not
 /// whole-pipeline coverage and must not be described as if it were.
-pub const PIPELINE_VERSION: u32 = 2;
+pub const PIPELINE_VERSION: u32 = 3;
 
 /// The recorded ⟨`pipeline_version`, fingerprints, behavior⟩ rows — the
 /// machine-enforced half of "the behavioral version cannot silently drift" (see
@@ -144,9 +145,38 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
     // `base` is unchanged: none of these touch film-base estimation.
     PipelineFingerprint {
         pipeline_version: 2,
+        // Frozen literal, not `PIPELINE_BEHAVIOR`: the v3 bump took the constant over
+        // (see v1's row for the same handover).
+        behavior: "roll-fixed nominal Dmax 1.3 density, mid-grey-anchored sigmoid curve, \
+                   no auto white balance",
         render: "9beca8b24eb785b0",
         base: "01c5acccc36a3388",
+        // **Left at the value a v2 build actually emitted** (`"hdr": false`), not
+        // refreshed for the `output.hdr` → `output.depth` rename. It was briefly
+        // refreshed to `662384df7a2255dd` while `PIPELINE_VERSION` was still 2, which
+        // was legitimate at that instant — but the same change went on to bump to v3,
+        // and nothing ever shipped a v2 build emitting the new key. Leaving the
+        // refreshed hash would have made this row an unverifiable claim about a
+        // document shape v2 never wrote, and `drift_gate` cannot catch it: it only
+        // recomputes the row matching the *current* `PIPELINE_VERSION`.
+        //
+        // The rule the field's doc states is "refresh the **current** version's
+        // recipe hash for a neutral-default change without bumping". Once a bump
+        // lands in the same change, the prior row is history again.
         recipe: "3d37b13ecb7a5095",
+    },
+    PipelineFingerprint {
+        pipeline_version: 3,
+        // **Unchanged from v2, and that is the point to read before trusting this
+        // row.** The two fingerprints cover `reconstruct_and_print` and
+        // `film_base::estimate`; the output preset selects neither, so the gate
+        // cannot witness the default's move from a TIFF through `finish_print` to a
+        // gain-map JPEG through the display renderers. Only `recipe` moved. The
+        // before/after evidence for this version is
+        // `docs/reports/render-defaults-v3.md`.
+        render: "9beca8b24eb785b0",
+        base: "01c5acccc36a3388",
+        recipe: "5b22d0505ed4fb79",
         behavior: PIPELINE_BEHAVIOR,
     },
 ];
@@ -172,8 +202,12 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
 ///   percentile changes every default conversion and nothing else here would move.
 /// - `recipe` — [`stable_hash`] over the canonical JSON of
 ///   `cli::ResolvedConfig::default()`. This is the default *configuration*: it
-///   covers default **values** the other two cannot see (`output.hdr`,
-///   `output.output_profile`, `film_base.source`, the `input` defaults). Note it
+///   covers default **values** the other two cannot see (`output.preset`,
+///   `output.depth`, `output.output_profile`, `film_base.source`, the `input`
+///   defaults). It is also the *only* fingerprint that moves when the default
+///   **preset** changes: `render` and `base` measure `reconstruct_and_print` and
+///   `film_base::estimate`, which the preset does not select — the v3 row is exactly
+///   that case, and its evidence is `docs/reports/render-defaults-v3.md`. Note it
 ///   covers the *values*, never the code implementing them — `film_base.source`
 ///   appears in it only as `null` (it has no default and must be chosen), which
 ///   is why `base` exists.
@@ -213,8 +247,10 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
 /// - `render` hashes **exactly** the per-pixel values a `stages::golden` test
 ///   already pins as literal bit patterns, so hashing adds a version label without
 ///   widening the numeric surface by one value. Which test depends on the row: the
-///   **v2** (current) render is the mid-grey-anchored sigmoid at `NOMINAL_DMAX =
-///   1.3`, pinned by `golden_new_default_is_bit_identical`; the **v1** render is
+///   **v2 and v3** render is the mid-grey-anchored sigmoid at `NOMINAL_DMAX =
+///   1.3`, pinned by `golden_new_default_is_bit_identical` — the two share it,
+///   because v3 changed the default *preset* and not the reconstruction; the **v1**
+///   render is
 ///   the exponential straight line at gamma 1.0 / anchor 2.0, which is no longer a
 ///   default but is still pinned by
 ///   `golden_density_exponential_reference_is_bit_identical`.
@@ -286,8 +322,9 @@ pub struct PipelineFingerprint {
 /// render v1 labels was unchanged, and the removed clause described a resolution
 /// step that is no longer part of any *default* render, there being no default).
 /// The v1 row records the outcome; read it before amending anything here.
-pub const PIPELINE_BEHAVIOR: &str = "roll-fixed nominal Dmax 1.3 density, mid-grey-anchored \
-     sigmoid curve, no auto white balance";
+pub const PIPELINE_BEHAVIOR: &str = "gain-map-hdr default output (dual-dialect gain-map \
+     JPEG), roll-fixed nominal Dmax 1.3 density, mid-grey-anchored sigmoid curve, no auto \
+     white balance";
 
 /// The short git commit hash, or `None` when the build could not determine it
 /// (source tarball / no `git` / not this package's repository). `None` is reported

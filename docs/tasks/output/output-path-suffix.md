@@ -22,8 +22,19 @@ optional.
 - `cli::required_extensions` already lists the accepted spellings per preset, and
   the mismatch error already names them. This task changes what happens when the
   suffix is **absent**, and which spelling wins when it is present.
-- The suffix table no longer drives the `roll` refusal — that is a separate
-  explicit list — so changing suffix handling does not disturb roll's gate.
+- **`roll` already derives suffixes, and answered question 1 for its own names**
+  (`output/presets`, 2026-08-09). `cli::derived_extension` picks one canonical
+  spelling per container — `tiff`, `jpg`, `avif` — kept deliberately separate from
+  `required_extensions`, whose head is `tif` and would have renamed every existing
+  `_positive.tiff`. A test asserts the derived spelling is always a member of the
+  accepted set. Reuse it rather than deciding the spellings again; its doc frames
+  it as roll-only, which is a framing to widen, not a constraint.
+- There is **no `roll` refusal left** to disturb: every preset is roll-capable
+  since the same change, so suffix handling and roll's gate are fully decoupled.
+- The **default is now `gain-map-hdr`**, so a bare `-o out` derives `out.jpg`, not
+  `out.tiff`. Extensionless paths are currently rejected outright (exit 2) — that
+  rejection is precisely what this task proposes to replace, so re-read
+  `reject_suffix_mismatch`'s `SuffixContext::Default` arm before changing it.
 
 ## Open questions
 

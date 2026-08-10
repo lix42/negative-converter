@@ -49,8 +49,8 @@ advanced/diagnostic paths pending a separate retirement decision. All paths
 produce one typed `FilmRgbImage`; NC film RGB v1 interprets that rendering
 consistently as linear Rec.709/D65 and maps it into ACEScg/D60. This is
 film-rendering intent, not physical scene recovery. Optional measured correction
-profiles have no downstream blockers. Today’s `--output-hdr` remains a rendered
-float TIFF, not the future master branch.
+profiles have no downstream blockers. The rendered float TIFF is now
+`--out-depth f32` on the `legacy` / `custom` path, and is not the master branch.
 
 One bullet per epic below — the name is the epic id the task list is grouped
 under, and the parenthesized paths are the modules it owns.
@@ -186,6 +186,7 @@ graph TD
     algo/auto-anchor-interior-measurement
     algo/curve-endpoint-validation
     algo/sigmoid-parameter-calibration
+    algo/reconstruction-render-curve-split
   end
   subgraph color
     color/management
@@ -231,6 +232,7 @@ graph TD
     analysis/nlp-comparison
     analysis/drive-asset-migration
     analysis/comparison-review-tooling
+    analysis/harness-regression-tests
   end
   core/project-foundation --> io/silverfast-decode
   core/project-foundation --> io/tiff-encode
@@ -305,6 +307,8 @@ graph TD
   algo/reference-anchored-sigmoid --> algo/auto-anchor-interior-measurement
   film-base/auto-base-redesign --> algo/auto-anchor-interior-measurement
   algo/auto-anchor-interior-measurement --> algo/content-aware-sigmoid-toe
+  algo/reference-anchored-sigmoid --> algo/reconstruction-render-curve-split
+  color/film-master-render-pipeline --> algo/reconstruction-render-curve-split
   algo/reference-anchored-sigmoid --> algo/sigmoid-parameter-calibration
   algo/film-stock-profiles --> algo/sigmoid-parameter-calibration
   io/scanner-density-calibration --> algo/sigmoid-parameter-calibration
@@ -362,6 +366,7 @@ graph TD
   output/presets --> analysis/display-output-acceptance
   analysis/real-scan-verification --> analysis/display-output-acceptance
   analysis/real-scan-verification --> analysis/conversion-analysis-tooling
+  analysis/real-scan-verification --> analysis/harness-regression-tests
   analysis/conversion-analysis-tooling --> analysis/asset-manifest
   analysis/asset-manifest --> analysis/conversion-metrics
   analysis/conversion-metrics --> analysis/nlp-comparison
@@ -463,6 +468,15 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   (that task can loosen its floor without a full registry; a false edge would kill
   real parallelism), but the two must be coordinated so stock-awareness is not
   solved twice
+- `algo/reconstruction-render-curve-split` (post-MVP, **experiment with a verdict**):
+  `algo/reference-anchored-sigmoid`, `color/film-master-render-pipeline`
+  — filed 2026-08-10. Try a modified exponential as the density→linear reconstruction with
+  the sigmoid character applied by the *display* stage, restoring the "density conversion
+  and print rendering are separate sub-stages" rule the current curve partly collapses.
+  Same frame, same base/`Dmax`: sigmoid peaks at exactly reference white
+  (`GainMapMax` 1.0x), exponential reaches 4.87x — so this task and the HDR-headroom
+  question are one question. May subsume `algo/exponential-mid-grey-anchor`; settle that
+  early. Sharpest constraint is `film-master`, whose definition *includes* the curve
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
@@ -544,6 +558,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `analysis/conversion-metrics` (post-MVP): `analysis/asset-manifest`
 - `analysis/nlp-comparison` (post-MVP): `analysis/conversion-metrics`
 - `analysis/drive-asset-migration` (post-MVP, in progress — move+reorg+manifest done): `analysis/asset-manifest`
+- `analysis/harness-regression-tests` (post-MVP): `analysis/real-scan-verification`
+  — filed 2026-08-09 after the `output/presets` default flip broke `harness.sh` in three
+  places with all four gates green, one of them **silently** (`nc roll` succeeded, wrote
+  `_positive.jpg`, and the `*_positive.tiff` rename glob stranded the outputs while the
+  stage printed success). The harness has no automated coverage at all
 - `analysis/comparison-review-tooling` (post-MVP): `algo/reference-anchored-sigmoid`
   — promote the ad-hoc review pages into a maintained config-comparison tool; the user asked
   for it as a separate task rather than continued inline patching
@@ -704,6 +723,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   (resolves 2.23–2.37 against roll Dmax 1.28–1.38) and every frame renders black. Restrict the
   measurement to the picture area; an implausible anchor must fail loudly, not render a black
   image. Blocks every content-driven rendering mode.
+- [ ] [Reconstruction / render curve split](tasks/algo/reconstruction-render-curve-split.md) —
+  **the next rendering step (2026-08-10).** Try a modified exponential at reconstruction with
+  the sigmoid character moved to the render stage. Restores the separate-sub-stages rule, and
+  decides the HDR-headroom question as a side effect: the sigmoid places diffuse white *at*
+  reference white by construction (`GainMapMax` 1.0x), the exponential reaches 4.87x on the
+  same frame. A verdict either way is a complete outcome
 - [ ] [Sigmoid parameter calibration](tasks/algo/sigmoid-parameter-calibration.md) — turn the
   provisional contrast (≈2.07), shoulder (≈0.6) and per-stock anchor offsets into calibrated
   values. Needs a **bracketed roll** (so exposure labels are true by construction) and a **grey
@@ -747,12 +772,26 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Final ISO gain-map metadata](tasks/output/iso-gain-map-metadata.md) — add verified ISO 21496-1:2025 metadata to the same JPEG and prove dual-dialect agreement. **Metadata and container halves implemented against the licensed text** (2026-08-04: `pipeline/gain_map/iso.rs` C.2.2 payload + normative validation; `io/ultra_hdr.rs` `Dialects::LegacyPlusIso` writing C.4.3/C.4.6 segments into both images, MPF-safe). **Code complete**; verified with exiftool (MPF index resolves, second image extracts, 2350+1186=3536 bytes) and `sips`. **Both blockers cleared 2026-08-06**: the CIPA DC-007 text was fetched and read (its two conformance gaps split into `output/mp-container-conformance`), and the external decoder oracle ran — Apple ImageIO, harness committed at `scripts/iso-decoder-oracle/`. The oracle found a real defect: the baseline segment sat *after* `SOF0`, where no reader scans, so ImageIO saw no gain map at all; fixed, and the metadata now reads back field-for-field as written (the decoder's 4.926 headroom is nc's own declared constant echoed back, not evidence — `GainMapMax` is). **Done 2026-08-07** on the strength of the Apple oracle plus libultrahdr; the Android 15+ half and CLI activation moved to `output/gain-map-dialect-activation` so they stop gating `output/presets`. **Note the `ts:` URN is the published first edition's, not a draft** — and libultrahdr's compact-denominator ISO layout is *non-conformant*, so nc owns its serializer.
 - [ ] [MP container conformance (CIPA DC-007)](tasks/output/mp-container-conformance.md) — **deferred conformance**, split out of `iso-gain-map-metadata` on 2026-08-06 after reading the free CIPA text. Three gaps, none functional: the gain map carries MP Type `000000` (Undefined) where DC-007 Table 4 assigns `050000` and marks `000000` "shall not be used" in a Baseline MP File — inherited from libultrahdr, whose own output does the same — the baseline is JFIF with no Exif APP1 where §4.2.1/§5.1 specify an Exif file (§7's *tag* requirements are only "should"), and in the gain-map image libultrahdr's prepended XMP puts `APP1` before `APP0 JFIF`, so JFIF is not first in the dependent image (found by review, not in the CIPA read). The type code is a masked 4-byte MPEntry patch but **changes shipped `ultra-hdr-v1` bytes**; the Exif half must be probed against `package()` and re-run through the ImageIO oracle, since a marker-layout change is exactly what silently disabled the ISO metadata once. Blocks nothing
 - [ ] [Gain-map dialect activation](tasks/output/gain-map-dialect-activation.md) — the two items `iso-gain-map-metadata` shipped without: **Android 15+** decoder verification (the only platform reading *both* dialects, so the only place coexistence is observable — record whichever it prefers as *observed behaviour*, never a conformance property) and a **CLI path** for `Dialects::LegacyPlusIso`, which is implemented, Apple-verified, and reachable only from an `#[ignore]` test. Removing its `#[allow(dead_code)]` is the mechanical definition of done. Blocks nothing; **not** a dependency of `output/presets` — per the `hdr-avif-output` boundary rule, whichever task ships the CLI surface owns the `gain-map-hdr` name, so coordinate rather than race. `ultra-hdr-v1` must stay byte-identical
-- [ ] [SDR preset follow-ups](tasks/output/sdr-preset-followups.md) — the three questions the `display-p3` / `compatibility` presets deliberately left open: **which becomes the default** (pixel change ⇒ its own version bump + report, and what finally lets `legacy` be deleted; sRGB is the safe pick, P3 the faithful one), **Adobe RGB** as a first-class gamut (the one notable omission for a photography tool — usable today only via `--output-profile <icc>`, and a real addition because the modern renderer *gamut-maps* rather than tags), and a **machine-readable SDR contract** in the report (today the preset's tone/gamut/transfer contract is prose only, where `hdr-pq-tiff` emits an `hdr_coded_tiff` block). `RunProfile::SdrTiff` was one of the three and is now settled — measured against peak on two frame sizes on 2026-08-09. Blocks nothing
+- [ ] [SDR preset follow-ups](tasks/output/sdr-preset-followups.md) — the three questions the `display-p3` / `compatibility` presets deliberately left open: **making `display-p3` the default** (decided 2026-08-09; a pixel *and* container change against the incumbent `gain-map-hdr`, so it needs its own version bump + report, and it is what finally lets `legacy` be deleted), **Adobe RGB** as a first-class gamut (the one notable omission for a photography tool — usable today only via `--output-profile <icc>`, and a real addition because the modern renderer *gamut-maps* rather than tags), and a **machine-readable SDR contract** in the report (today the preset's tone/gamut/transfer contract is prose only, where `hdr-pq-tiff` emits an `hdr_coded_tiff` block). `RunProfile::SdrTiff` was one of the three and is now settled — measured against peak on two frame sizes on 2026-08-09. Blocks nothing
 - [ ] [Derive the output suffix from the resolved preset](tasks/output/output-path-suffix.md) — let `-o out` name the output without its container and take the suffix from the resolved preset; an explicit matching suffix is honoured verbatim (`.jpeg` stays `.jpeg`), a mismatched one still fails. Follow-up to completing the suffix table, which closed the `-o out.jpg` writing a TIFF hole but left the user needing to know each preset's container. Open: canonical spellings, when a dotted stem is a suffix, and how it meets `output/presets`' roll naming
 - [x] [HDR AVIF output](tasks/output/hdr-avif-output.md) — 10-bit 4:4:4 Rec.2100 PQ/HLG AVIF via published `libaom-sys` plus an **nc-written MIAF container** (no libavif: no published crate ships ≥ 1.4.2, and `avif-serialize` cannot emit `MA1A`). `hdr-pq`/`hdr-hlg` are live as explicit `convert`-only presets; `av1C` is parsed back out of the codestream; `MA1A` only inside the published Advanced-Profile limits, else general-brand-only **with the reason reported**; `cq_level` and codec bounds calibrated and pinned by equality against `avifdec`/dav1d; `RunProfile::HdrAvif` calibrated on two real scans. Windows deferred → `output/hdr-avif-windows-packaging`; counsel review of the AOM patent grant stays with release
 - [ ] [HDR AVIF Windows packaging](tasks/output/hdr-avif-windows-packaging.md) — add the missing `windows-latest` CI job and prove the static libaom build under MSVC; encoding behavior unchanged, and cross-build byte identity is explicitly not required
 - [x] [Lossless HDR TIFF outputs](tasks/output/lossless-hdr-tiff.md) — preserve display-linear BT.2020 as 32-bit float TIFF and Rec.2100 PQ/HLG as losslessly stored 16-bit TIFF code values with truthful signaling. **Done 2026-08-06** in two chunks: A = `hdr-linear-tiff` (bit-exact f32 display-linear BT.2020), B = `hdr-pq-tiff`/`hdr-hlg-tiff` (full-range 16-bit codes stored exactly + the ICC `cicpTag` contract). Never blocked on a paywalled standard — ICC.1:2022 §9.2.17/§10.3 pins the code points (`9-16-0-1` PQ, `9-18-0-1` HLG) with **MatrixCoefficients 0** for RGB, unlike the AVIF path's 9. The PQ profile is an **extended-range A2B** (PCS `Y = L/203`, unclipped to ≈49.26) matching Adobe's reference BT.2100 profiles, since a matrix-shaper TRC cannot exceed 1.0; HLG's is scene-referred because its OOTF is not per-channel separable. Verified end to end: PQ-decoding the stored codes recovers the linear TIFF's samples to 0.0149% on a real 18.66 MP scan. Documented as **limited-interoperability interchange, not display-ready** — only a CICP-aware reader honours the tag; the 2026-08-06 viewer gate confirmed the files render correctly but was **not discriminating** for HDR presentation (diffuse-highlight scene, exponential default curve). **Two ICC conformance gaps are documented and deferred to `output/presets`** (§8.4.2 `BToA0Tag`, §8.2 `chromaticAdaptationTag`): the coded profiles are valid *sources* but not conformant Display-class profiles. Neither moves a stored code value; closing them changes the profile bytes, so it rides with preset activation
-- [~] [Output presets and guidance](tasks/output/presets.md) — make `gain-map-hdr` the default, expose clear compatibility/master/PQ/HLG choices, and migrate `nc roll` naming/manifests to resolved containers. **In progress**: the SDR half shipped — `display-p3` and `compatibility` are accepted, calibrated and `convert`-only, so what remains here is `gain-map-hdr` + `custom`, the default migration, and roll's container-aware naming. **Also inherits** (deferred 2026-08-06) the two ICC conformance gaps in the `hdr-pq-tiff`/`hdr-hlg-tiff` profiles — §8.4.2 `BToA0Tag` and §8.2 `chromaticAdaptationTag` — which need two more pinned colorimetry artifacts and change the profile bytes
+- [x] [Output presets and guidance](tasks/output/presets.md) — **done 2026-08-09.** All
+  twelve presets ship and `gain-map-hdr` is the default (`pipeline_version` **3**,
+  measured in [reports/render-defaults-v3.md](reports/render-defaults-v3.md)). Shipped in
+  five chunks: the dual-dialect `gain-map-hdr` preset (Apple-ImageIO verified; it also
+  exposed and fixed libultrahdr's 8192-px packaging refusal, which the shipped
+  `ultra-hdr-v1` had too); **roll is container-aware**, so no preset is `convert`-only
+  any more and an explicit manifest `output` goes through `convert`'s own suffix rule;
+  `custom` as the one non-atomic named preset; the default flip; and the inherited
+  coded-TIFF ICC gaps closed (`chad` + `BToA0`, plus re-deriving the colorant matrix
+  against ICC's *declared* PCS white). `--output-hdr`/`--output-sdr`/`output.hdr`
+  were replaced by one `--out-depth u16|f32` / `output.depth` enum.
+  **Known open, and deliberate:** the default gain map is *inert* at the default
+  sigmoid (`GainMapMax` 1.0x — the HDR rendition peaks at reference white), so the
+  default currently writes a valid HDR container carrying no HDR. That is a render
+  gap, tracked for the follow-on tuning work and recorded in the v3 report
 
 ### telemetry — [progress](progress/telemetry.md)
 > `src/telemetry.rs` and the opt-in upload stack (schema, ingestion service,
@@ -803,6 +842,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Conversion metrics & thumbnails](tasks/analysis/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
 - [ ] [NLP vs nc comparison](tasks/analysis/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
 - [ ] [Drive asset migration](tasks/analysis/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
+- [ ] [Harness regression tests](tasks/analysis/harness-regression-tests.md) — give
+  `scripts/real-scan-verify/harness.sh` coverage that a CLI-surface change cannot break
+  it silently. It has none today, which is how the 2026-08-09 default flip broke its
+  recipe generator, its four `convert` stages, and — without any error — its `roll`
+  stage, all behind green gates
 - [ ] [Comparison review tooling](tasks/analysis/comparison-review-tooling.md) — promote the
   ad-hoc review pages from `algo/reference-anchored-sigmoid` into a maintained tool for
   comparing rendering configurations by eye: one entry point, the matrix as data rather than

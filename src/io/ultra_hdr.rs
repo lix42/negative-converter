@@ -33,20 +33,12 @@ pub enum Dialects {
     LegacyUltraHdrV1,
     /// The same legacy metadata plus ISO 21496-1 segments in both images,
     /// describing the one shared gain map.
-    // No CLI caller yet by design: `output/presets` owns the neutral
-    // `gain-map-hdr` name and its default activation, and the shipped
-    // `ultra-hdr-v1` preset is contractually ISO-free (a test asserts its bytes
-    // contain no "21496"). Inventing a preset name here would hand that task a
-    // migration instead of a capability. Remove this allowance when presets wires
-    // it up. Scoped to the variant, which is what the lint names — an allowance on
-    // the enum would also hide a genuinely dead future variant.
-    #[allow(dead_code)]
+    ///
+    /// Reached from the `gain-map-hdr` preset. It is the only dialect Apple
+    /// platforms read, so it is what makes a gain-map file actually HDR there;
+    /// `ultra-hdr-v1` stays contractually ISO-free (a test asserts its bytes
+    /// contain no `21496`).
     LegacyPlusIso,
-}
-
-/// Encode and package one explicit legacy Ultra HDR v1 output.
-pub fn encode(render: gain_map::GainMapRender, path: &Path) -> Result<(Staged, EncodeOutcome)> {
-    encode_with(render, path, Dialects::LegacyUltraHdrV1)
 }
 
 /// Encode and package a gain-map JPEG carrying the selected metadata dialects.

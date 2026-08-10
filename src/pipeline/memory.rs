@@ -352,6 +352,20 @@ pub enum RunProfile {
         /// Whether a u16 IR TIFF is staged before the primary JPEG.
         export_ir: bool,
     },
+    /// `gain-map-hdr`: the same renditions, gain map and JPEGs as
+    /// [`UltraHdrV1`](Self::UltraHdrV1), packaged with the ISO 21496-1 segments as
+    /// well as the legacy ones.
+    ///
+    /// **Shares that arm's arithmetic, and the sharing is measured rather than
+    /// assumed** (the `SdrTiff` precedent). The two dialects render identical
+    /// pixels through identical buffers; the ISO half adds ~3.5 KB of segments and
+    /// one more full copy of the packaged JPEG in `insert_baseline_iso_segment`,
+    /// both already inside the arm's 20 B/px staging term — which was written
+    /// against this dialect before it had a caller and re-checked when it got one.
+    GainMapHdr {
+        /// Whether a u16 IR TIFF is staged before the primary JPEG.
+        export_ir: bool,
+    },
     /// `hdr-pq` / `hdr-hlg`: one display rendition, then the AVIF encoder's own
     /// planes and libaom's internal working set.
     ///
@@ -810,7 +824,9 @@ pub fn estimate_peak(
                 sum(sum(mul(image, 2)?, quantize)?, sampled)?,
             )
         }
-        RunProfile::UltraHdrV1 { export_ir } => {
+        // One arm for both dialects: see `RunProfile::GainMapHdr`'s note on why they
+        // share it, and what in the staging term covers the ISO half.
+        RunProfile::UltraHdrV1 { export_ir } | RunProfile::GainMapHdr { export_ir } => {
             // Decoded + shared adjusted ACEScg, then SDR, BT.2020 HDR,
             // common-P3 HDR, and full-resolution ratios (four f32 RGB buffers).
             let display_buffers = mul(pixels, 4 * WORKING_CHANNELS * F32_BYTES)?;
@@ -825,13 +841,15 @@ pub fn estimate_peak(
             // copy made before the native encoder is released, and — for
             // `Dialects::LegacyPlusIso` — `insert_baseline_iso_segment`'s second
             // full copy of the packaged JPEG, which exists alongside the first.
-            // Nothing is under-approved today: that dialect has no CLI caller, and
-            // the 20 B/px is deliberately loose against a package far smaller than
-            // the raw frame. Whoever wires the dialect up must still re-check this
-            // term, and `iso::encode_iso_gain_map` would add roughly 24 B/px of
-            // full-frame buffers (f32 per-channel normalization plus its
-            // deinterleaved planes) if it ever reaches a live path. Per CLAUDE.md,
-            // nothing tests this model against the code.
+            // That dialect now *has* a CLI caller (`gain-map-hdr`), and this term
+            // was re-checked when it got one: both JPEGs together are far smaller
+            // than the raw frame, so 20 B/px stays loose over the extra copy, and
+            // both profiles are measured on two frame sizes below. Still true:
+            // `iso::encode_iso_gain_map` would add roughly 24 B/px of full-frame
+            // buffers (f32 per-channel normalization plus its deinterleaved planes)
+            // if it ever reaches a live path — the shipped presets both encode the
+            // *legacy* map and project ISO fields from it. Per CLAUDE.md, nothing
+            // tests this model against the code.
             let byte_staging = mul(pixels, 20)?;
             let ir_export = if export_ir && shape.ir_present {
                 mul(pixels, 2)?
@@ -1208,6 +1226,34 @@ mod tests {
         RunProfile::Convert {
             depth: OutDepth::U16,
             export_ir: false,
+        }
+    }
+
+    #[test]
+    fn both_gain_map_dialects_share_one_measured_profile() {
+        // `gain-map-hdr` adds ISO segments to the very same renditions, gain map and
+        // JPEGs `ultra-hdr-v1` packages, so it shares that arm. Pinned as an
+        // *equality* rather than left implicit: if a future edit gives the ISO
+        // dialect its own buffers, this is what fails.
+        for ir in [false, true] {
+            for export_ir in [false, true] {
+                let shape = shape(10, 10, ir);
+                assert_eq!(
+                    estimate_peak(
+                        &shape,
+                        RunProfile::UltraHdrV1 { export_ir },
+                        SamplePlan::none()
+                    )
+                    .unwrap(),
+                    estimate_peak(
+                        &shape,
+                        RunProfile::GainMapHdr { export_ir },
+                        SamplePlan::none()
+                    )
+                    .unwrap(),
+                    "ir={ir} export_ir={export_ir}"
+                );
+            }
         }
     }
 
