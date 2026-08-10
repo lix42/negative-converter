@@ -2255,3 +2255,20 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   drops `SdrRenderMetadata` as `_metadata` while the HDR TIFF presets surface
   their equivalent blocks, so the SDR contract reaches the report only as prose.
   `RenderedSdr::metadata()`'s `#[allow(dead_code)]` is the marker for it.
+
+## output-path-suffix
+
+**Status:** not started
+**Updated:** 2026-08-09
+
+- Goal: `-o` names the output, the resolved preset supplies the container. An
+  explicit suffix is still validated, and honoured verbatim when it matches.
+- Origin: raised 2026-08-09 while updating `docs/using-nc.md` for the completed
+  suffix table. Completing the table was right — `nc convert -o out.jpg` used to
+  write a TIFF named `.jpg` — but it made the user responsible for knowing each
+  preset's container, which is what the preset is for.
+- The one thing to settle before writing code: `output/presets` states "the output
+  path remains required and is never silently renamed" and owns container-aware
+  roll naming. Completing an absent suffix is arguably not renaming, but that
+  wording is the governing statement and presets is `[~]` in progress — agree the
+  boundary with it rather than around it.
