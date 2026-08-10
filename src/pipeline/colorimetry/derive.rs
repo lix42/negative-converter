@@ -147,27 +147,57 @@ pub fn luma_row(space: ColorSpace) -> [f64; 3] {
     normalized_primary_matrix(space)[1]
 }
 
-/// Linear RGB → XYZ **adapted to another white**: the ICC "colorant" matrix.
+/// [`adaptation`] to a destination white given **as XYZ** rather than as a
+/// chromaticity. A pure chromatic-adaptation matrix — no primaries involved.
 ///
-/// This is [`normalized_primary_matrix`] followed by a chromatic adaptation,
-/// stopping at XYZ instead of continuing into a second RGB space the way
-/// [`rgb_to_rgb`] does. It exists because an ICC profile's PCS *is* XYZ under the
-/// D50 adopted white: the three columns are exactly the `redColorantTag` /
-/// `greenColorantTag` / `blueColorantTag` values, which is what a `lutAtoBType`
-/// matrix stage must contain when nc writes an A2B profile itself rather than
-/// letting Little CMS synthesize one from primaries.
+/// Exists for the ICC serialization path: ICC.1:2022 declares its PCS white as the
+/// rounded XYZ triple [`ICC_PCS_WHITE_XYZ`], which is *not* what D50's rounded
+/// chromaticities derive to. Adapting to the chromaticity instead leaves a neutral
+/// ≈2.4e-4 from the white the profile itself declares. It is also the value an ICC
+/// `chromaticAdaptationTag` carries verbatim.
+///
+/// [`ICC_PCS_WHITE_XYZ`]: super::definitions::ICC_PCS_WHITE_XYZ
+pub fn adaptation_to_xyz(
+    cone: ConeResponse,
+    source_white: Chromaticity,
+    destination_white_xyz: [f64; 3],
+) -> Matrix3 {
+    let forward = cone.matrix;
+    let backward = cone.inverse.unwrap_or_else(|| inverse(forward));
+    let source = transform(forward, source_white.to_xyz());
+    let destination = transform(forward, destination_white_xyz);
+    let gain: Matrix3 = [
+        [destination[0] / source[0], 0.0, 0.0],
+        [0.0, destination[1] / source[1], 0.0],
+        [0.0, 0.0, destination[2] / source[2]],
+    ];
+    multiply(backward, multiply(gain, forward))
+}
+
+/// Linear RGB → XYZ adapted to an XYZ destination white: the ICC "colorant" matrix.
+///
+/// [`normalized_primary_matrix`] followed by a chromatic adaptation, stopping at XYZ
+/// instead of continuing into a second RGB space the way [`rgb_to_rgb`] does. It
+/// exists because an ICC profile's PCS *is* XYZ under the D50 adopted white: the
+/// three columns are exactly the `redColorantTag` / `greenColorantTag` /
+/// `blueColorantTag` values, which is what a `lutAtoBType` matrix stage must contain
+/// when nc writes an A2B profile itself rather than letting Little CMS synthesize
+/// one from primaries. Inverted, they are the `lutBtoAType` matrix stage.
+///
+/// The destination white is taken as **XYZ**, not as a chromaticity — see
+/// [`adaptation_to_xyz`] for why that distinction is load-bearing here.
 ///
 /// Unlike `rgb_to_rgb` there is no same-white short-circuit: a D50-adopted source
 /// would legitimately compose with an identity adaptation, and skipping it would
 /// silently make this function's result depend on *which* white was requested in a
 /// way the caller cannot see.
-pub fn rgb_to_xyz_adapted(
+pub fn rgb_to_xyz_adapted_to_white_xyz(
     space: ColorSpace,
-    destination_white: Chromaticity,
+    destination_white_xyz: [f64; 3],
     cone: ConeResponse,
 ) -> Matrix3 {
     let npm = normalized_primary_matrix(space);
-    let cat = adaptation(cone, space.white, destination_white);
+    let cat = adaptation_to_xyz(cone, space.white, destination_white_xyz);
     multiply(cat, npm)
 }
 

@@ -16,5 +16,8 @@
         "explicit": 1.2758015
       }
     }
+  },
+  "output": {
+    "preset": "legacy"
   }
 }

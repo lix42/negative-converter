@@ -68,10 +68,24 @@ enum Source {
     /// Derived from the *tabulated* luma, not from primaries — see
     /// [`pinned::BT2020_NCL_RGB_TO_YCBCR`](super::pinned::BT2020_NCL_RGB_TO_YCBCR).
     YCbCrFromLuma([f64; 3]),
-    /// Linear RGB → XYZ adapted to another white: an ICC colorant matrix.
-    RgbToXyzAdapted {
+    /// The same, against a destination white given **as XYZ** — the ICC PCS white,
+    /// whose declared triple is not what D50's rounded chromaticities derive to.
+    RgbToXyzAdaptedToWhiteXyz {
         source: ColorSpace,
-        destination_white: Chromaticity,
+        destination_white_xyz: [f64; 3],
+        cone: ConeResponse,
+    },
+    /// The inverse of an [`RgbToXyzAdaptedToWhiteXyz`](Self::RgbToXyzAdaptedToWhiteXyz)
+    /// colorant matrix — an ICC `BToA0Tag` matrix stage.
+    XyzToRgbFromWhiteXyz {
+        destination: ColorSpace,
+        source_white_xyz: [f64; 3],
+        cone: ConeResponse,
+    },
+    /// A chromatic-adaptation matrix on its own, for an ICC `chromaticAdaptationTag`.
+    AdaptationToWhiteXyz {
+        source_white: Chromaticity,
+        destination_white_xyz: [f64; 3],
         cone: ConeResponse,
     },
 }
@@ -142,13 +156,33 @@ fn catalog() -> Vec<Artifact> {
         },
         Artifact {
             name: "BT2020_TO_XYZ_D50",
-            description: "bt2020/d65 -> xyz/d50 colorants, cone=bradford",
-            source: Source::RgbToXyzAdapted {
+            description: "bt2020/d65 -> xyz/icc-pcs-white colorants, cone=bradford",
+            source: Source::RgbToXyzAdaptedToWhiteXyz {
                 source: BT2020,
-                destination_white: definitions::D50,
+                destination_white_xyz: definitions::ICC_PCS_WHITE_XYZ,
                 cone: BRADFORD,
             },
             shipped: Shipped::matrix_f64(pinned::BT2020_TO_XYZ_D50),
+        },
+        Artifact {
+            name: "XYZ_D50_TO_BT2020",
+            description: "xyz/icc-pcs-white -> bt2020/d65 (BToA0 matrix), cone=bradford",
+            source: Source::XyzToRgbFromWhiteXyz {
+                destination: BT2020,
+                source_white_xyz: definitions::ICC_PCS_WHITE_XYZ,
+                cone: BRADFORD,
+            },
+            shipped: Shipped::matrix_f64(pinned::XYZ_D50_TO_BT2020),
+        },
+        Artifact {
+            name: "BRADFORD_D65_TO_ICC_PCS",
+            description: "d65 -> xyz/icc-pcs-white adaptation (chad tag), cone=bradford",
+            source: Source::AdaptationToWhiteXyz {
+                source_white: BT2020.white,
+                destination_white_xyz: definitions::ICC_PCS_WHITE_XYZ,
+                cone: BRADFORD,
+            },
+            shipped: Shipped::matrix_f64(pinned::BRADFORD_D65_TO_ICC_PCS),
         },
         Artifact {
             name: "ACESCG_TO_DISPLAY_P3",
@@ -236,17 +270,41 @@ fn canonical(source: Source) -> Vec<(String, f64)> {
                 .flat_map(|i| (0..3).map(move |j| (format!("[{i}][{j}]"), m[i][j])))
                 .collect()
         }
-        Source::RgbToXyzAdapted {
+        Source::RgbToXyzAdaptedToWhiteXyz {
             source,
-            destination_white,
+            destination_white_xyz,
             cone,
-        } => {
-            let m = derive::rgb_to_xyz_adapted(source, destination_white, cone);
-            (0..3)
-                .flat_map(|i| (0..3).map(move |j| (format!("[{i}][{j}]"), m[i][j])))
-                .collect()
-        }
+        } => flatten(derive::rgb_to_xyz_adapted_to_white_xyz(
+            source,
+            destination_white_xyz,
+            cone,
+        )),
+        Source::XyzToRgbFromWhiteXyz {
+            destination,
+            source_white_xyz,
+            cone,
+        } => flatten(derive::inverse(derive::rgb_to_xyz_adapted_to_white_xyz(
+            destination,
+            source_white_xyz,
+            cone,
+        ))),
+        Source::AdaptationToWhiteXyz {
+            source_white,
+            destination_white_xyz,
+            cone,
+        } => flatten(derive::adaptation_to_xyz(
+            cone,
+            source_white,
+            destination_white_xyz,
+        )),
     }
+}
+
+/// A 3x3 matrix flattened row-major with its `[i][j]` labels.
+fn flatten(m: [[f64; 3]; 3]) -> Vec<(String, f64)> {
+    (0..3)
+        .flat_map(|i| (0..3).map(move |j| (format!("[{i}][{j}]"), m[i][j])))
+        .collect()
 }
 
 /// Signed distance between two `f32` values in ulps (`0` means bit-identical).

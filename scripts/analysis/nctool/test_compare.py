@@ -25,11 +25,11 @@ from nctool import compare  # noqa: E402
 
 
 def frame(name, mean, clipped=0, total=300, timing=None, phash="aaaa",
-          sha="00ff", checksums="computed", hdr=False):
+          sha="00ff", checksums="computed", depth="u16"):
     """A run-record frame entry, with the clip fraction kept consistent with the
     counts (the record writer derives it, so a test fixture must too)."""
     return dict(name=name, input=f"{name}.tif", input_sha256=sha, checksums=checksums,
-                params_hash=phash, output_hdr=hdr, mean=list(mean),
+                params_hash=phash, output_depth=depth, mean=list(mean),
                 clipped=clipped, non_finite=0, total_samples=total,
                 clip_fraction=(clipped / total if total else 0.0),
                 timing_ms=timing or {"total": 10.0, "encode": 1.0})
@@ -43,13 +43,19 @@ def record(frames, pipeline_version=1, commit="abc123", dirty=False,
                 frames=frames)
 
 
-def nc_report(params_hash="feed", mean=(0.25, 0.5, 0.75), hdr=False,
+def nc_report(params_hash="feed", mean=(0.25, 0.5, 0.75), depth="u16",
+              encoding="rendered-u16-tiff",
               total=400, low=10, high=30, non_finite=0):
-    """A complete `nc convert` report, i.e. every block+field `run` reads."""
+    """A complete `nc convert` report, i.e. every block+field `run` reads.
+
+    `depth` is the `output.depth` **knob** and `encoding` the container the preset
+    actually resolved. They are separate arguments because the whole point of the
+    marker is that an atomic preset makes them disagree."""
     return dict(identity=dict(nc_version="0.1.0", git_commit="abc", git_dirty=False,
                               pipeline_version=1, target="t", params_hash=params_hash),
                 output_stats=dict(mean=list(mean)),
-                recipe=dict(output=dict(hdr=hdr)),
+                recipe=dict(output=dict(depth=depth)),
+                output_render=dict(preset="legacy", encoding=encoding),
                 loss=dict(total_samples=total, clipped_low=low, clipped_high=high,
                           non_finite=non_finite))
 
@@ -112,8 +118,8 @@ class TestDiff(unittest.TestCase):
     def test_a_depth_change_withholds_the_mean_delta_instead_of_reporting_units(self):
         # u16 means are quantized into [0,1]; f32 means are verbatim and unclamped.
         # Subtracting one from the other reports a UNIT change as a rendering change.
-        a = record([frame("a", [0.5, 0.5, 0.5], hdr=False)])
-        b = record([frame("a", [2.0, 2.0, 2.0], hdr=True)])
+        a = record([frame("a", [0.5, 0.5, 0.5], depth="u16")])
+        b = record([frame("a", [2.0, 2.0, 2.0], depth="f32")])
         rows, identical = compare.diff_frames(a, b)
         self.assertFalse(identical)
         self.assertTrue(rows[0]["output_depth_changed"])
@@ -218,8 +224,8 @@ class TestDiffCommand(unittest.TestCase):
                      "DIFFERENT RECIPE")
 
         # (c) a different output depth — the two means are in different units.
-        self.blocked(record([frame("a", base, hdr=False)]),
-                     record([frame("a", differing, hdr=True)]),
+        self.blocked(record([frame("a", base, depth="u16")]),
+                     record([frame("a", differing, depth="f32")]),
                      "different output depth")
 
         # (d) a different frame set — the two runs did not convert the same work.
@@ -254,8 +260,8 @@ class TestDiffCommand(unittest.TestCase):
     def test_every_offending_frame_is_named_not_just_the_first(self):
         # A multi-frame set must name each frame that blocks the check: the operator
         # needs the whole list to know what to fix.
-        a = record([frame("a", [0.1] * 3, phash="p1"), frame("b", [0.1] * 3, hdr=False)])
-        b = record([frame("a", [0.9] * 3, phash="p2"), frame("b", [0.9] * 3, hdr=True)])
+        a = record([frame("a", [0.1] * 3, phash="p1"), frame("b", [0.1] * 3, depth="u16")])
+        b = record([frame("a", [0.9] * 3, phash="p2"), frame("b", [0.9] * 3, depth="f32")])
         blockers = compare.determinism_blockers(a, b)
         self.assertTrue(any("'a'" in r and "DIFFERENT RECIPE" in r for r in blockers),
                         blockers)
@@ -414,25 +420,25 @@ class TestDiffCommand(unittest.TestCase):
         self.assertIn("duplicate frame name", err)
 
     def test_a_record_without_the_depth_marker_is_refused(self):
-        # A *missing* `output_hdr` equals a missing `output_hdr`, so two older records
+        # A *missing* `output_depth` equals a missing `output_depth`, so two older records
         # got `output_depth_changed=False` and their u16 and f32 means were compared —
         # or, when the numbers coincided, declared identical. Refusing is the only safe
         # reading of "the units are unknown".
         a = record([frame("a", [0.5, 0.5, 0.5])])
         b = record([frame("a", [0.5, 0.5, 0.5])])
         for r in (a, b):
-            del r["frames"][0]["output_hdr"]
+            del r["frames"][0]["output_depth"]
         code, _, err = self.run_diff(a, b)
         self.assertEqual(code, 2)
-        self.assertIn("output_hdr", err)
+        self.assertIn("output_depth", err)
 
-        # A non-bool marker is just as unusable as an absent one.
+        # An unrecognized marker is just as unusable as an absent one.
         a, b = record([frame("a", [0.5] * 3)]), record([frame("a", [0.5] * 3)])
         for r in (a, b):
-            r["frames"][0]["output_hdr"] = "false"
+            r["frames"][0]["output_depth"] = "u12"
         code, _, err = self.run_diff(a, b)
         self.assertEqual(code, 2)
-        self.assertIn("expected a bool", err)
+        self.assertIn("expected one of u8, u10, u16, f32", err)
 
     def test_non_numeric_measurements_are_refused_not_tracebacked(self):
         # `mean: ["x", 0, 0]` used to reach `round(y - x, 12)` and raise TypeError —
@@ -542,10 +548,31 @@ class TestConvertCase(unittest.TestCase):
         self.assertEqual(entry["input_sha256"], "beef")
         self.assertEqual(entry["checksums"], "computed")
         # The mean's units depend on the depth, so the depth is recorded with it.
-        self.assertFalse(entry["output_hdr"])
+        self.assertEqual(entry["output_depth"], "u16")
         # The build identity carries the binary's labels, NOT the per-frame hash.
         self.assertEqual(identity["pipeline_version"], 1)
         self.assertNotIn("params_hash", identity)
+
+    def test_the_depth_marker_follows_the_container_not_the_recipe_knob(self):
+        # The bug this pins: `output.depth` is the *knob*, and an atomic preset
+        # ignores it. A `film-master` run reports `depth: "u16"` while writing
+        # unclamped f32 and a mean in the f32 domain, so recording the knob labelled
+        # the mean with units it is not in — defeating the one field whose job is to
+        # stop `diff` subtracting incomparable means. The JPEG and AVIF presets are
+        # further out still: their primaries are 8- and 10-bit, depths the knob
+        # cannot even spell.
+        for encoding, want in (("unclamped-linear-acescg-float-tiff", "f32"),
+                               ("dual-dialect-gain-map-jpeg", "u8"),
+                               ("rec2100-pq-10bit-444-avif", "u10"),
+                               ("display-p3-u16-tiff", "u16")):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory() as d:
+                # `depth="u16"` throughout — the knob's default, which is exactly what
+                # every one of these presets reports while resolving its own container.
+                report = nc_report(depth="u16", encoding=encoding)
+                with mock.patch("subprocess.run", self.fake_run(report)):
+                    entry, _, err = compare.convert_case("nc", self.case(d), d)
+                self.assertIsNone(err)
+                self.assertEqual(entry["output_depth"], want)
 
     def test_a_pre_versioning_build_is_refused_loudly(self):
         # A build with no `identity`/`output_stats` would otherwise produce a record
@@ -573,7 +600,8 @@ class TestConvertCase(unittest.TestCase):
             ("no params_hash", {**nc_report(),
                                 "identity": {"nc_version": "0.1.0", "pipeline_version": 1,
                                              "target": "t"}}),
-            ("no depth", {k: v for k, v in nc_report().items() if k != "recipe"}),
+            ("no depth", {k: v for k, v in nc_report().items() if k != "output_render"}),
+            ("unknown encoding", {**nc_report(), "output_render": {"encoding": "who-knows"}}),
         ]
         for label, report in hollow:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as d:
@@ -833,11 +861,12 @@ class TestShippedBenchmark(unittest.TestCase):
         # this module's promised exit-coded message. Every JSON document here is
         # external input — an nc report, a telemetry record, a hand-editable benchmark
         # or asset manifest — so any parent can be the wrong type.
-        gaps = compare._report_gaps({"recipe": [1]})
-        self.assertIn("recipe.output.hdr", gaps)
-        self.assertIn("recipe.output.hdr", compare._report_gaps({"recipe": "x"}))
-        self.assertIn("recipe.output.hdr",
-                      compare._report_gaps({"recipe": {"output": "x"}}))
+        gaps = compare._report_gaps({"output_render": [1]})
+        self.assertTrue(any("output_render.encoding" in g for g in gaps), gaps)
+        for hollow in ({"output_render": "x"}, {"output_render": {"preset": "legacy"}}):
+            self.assertTrue(
+                any("output_render.encoding" in g for g in compare._report_gaps(hollow)),
+                hollow)
 
         # A non-dict `timing_ms` is informational data, so it degrades to "no
         # timings" rather than sinking the comparison — but never raises.

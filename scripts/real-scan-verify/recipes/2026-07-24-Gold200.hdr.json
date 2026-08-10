@@ -18,6 +18,7 @@
     }
   },
   "output": {
-    "hdr": true
+    "preset": "legacy",
+    "depth": "f32"
   }
 }

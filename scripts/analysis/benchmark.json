@@ -4,12 +4,14 @@
   "sets": {
     "fixtures": {
       "root": "repo",
-      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default sigmoid curve, the exponential curve (explicitly, since it is no longer the default), `simple` reconstruction, and f32 (HDR) output. This is the set to use for a determinism / zero-diff check.",
+      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default sigmoid curve, the exponential curve (explicitly, since it is no longer the default), `simple` reconstruction, and f32 (HDR) output. This is the set to use for a determinism / zero-diff check. Every case here states `--output-preset legacy` explicitly: the product default became `gain-map-hdr` (a JPEG) at pipeline_version 3, and these cases write TIFFs and exist to stay comparable against records made before that flip. The default preset is therefore NOT covered by this benchmark -- adding a case for it changes the fixed comparison set, which is core/conversion-versioning's call.",
       "cases": [
         {
           "name": "hdri-default",
           "input": "tests/fixtures/hdri-64bit.tif",
           "args": [
+            "--output-preset",
+            "legacy",
             "--film-base",
             "0.9,0.55,0.42"
           ]
@@ -18,6 +20,8 @@
           "name": "hdr-default",
           "input": "tests/fixtures/hdr-48bit.tif",
           "args": [
+            "--output-preset",
+            "legacy",
             "--film-base",
             "0.9,0.55,0.42"
           ]
@@ -26,15 +30,20 @@
           "name": "hdri-f32",
           "input": "tests/fixtures/hdri-64bit.tif",
           "args": [
+            "--output-preset",
+            "legacy",
             "--film-base",
             "0.9,0.55,0.42",
-            "--output-hdr"
+            "--out-depth",
+            "f32"
           ]
         },
         {
           "name": "hdri-sigmoid",
           "input": "tests/fixtures/hdri-64bit.tif",
           "args": [
+            "--output-preset",
+            "legacy",
             "--film-base",
             "0.9,0.55,0.42",
             "--density-curve",
@@ -45,6 +54,8 @@
           "name": "hdri-exponential",
           "input": "tests/fixtures/hdri-64bit.tif",
           "args": [
+            "--output-preset",
+            "legacy",
             "--film-base",
             "0.9,0.55,0.42",
             "--density-curve",
@@ -55,6 +66,8 @@
           "name": "hdri-simple",
           "input": "tests/fixtures/hdri-64bit.tif",
           "args": [
+            "--output-preset",
+            "legacy",
             "--film-base",
             "0.9,0.55,0.42",
             "--reconstruction",

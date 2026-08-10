@@ -26,7 +26,18 @@ roxmltree = "0.21.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tiff = "0.11.3"
-ultrahdr-sys = { path = "vendor/ultrahdr-sys", default-features = false, features = ["vendored", "xmp"] }
+# `jpeg-max-dimension` raises libultrahdr's compile-time `UHDR_MAX_DIMENSION` from
+# its 8192 default to libjpeg-turbo's own `JPEG_MAX_DIMENSION` (65500), which the
+# library's own `static_assert` names as the ceiling. Without it, packaging refuses
+# any frame over 8192 px on a side — real 5000 dpi 35mm scans are 10368x7200 — and
+# it refuses *after* the full render, as an exit-5 write error. It is an upstream
+# build option, so no vendored source is patched and `check-vendored-native.py`
+# still hashes the pristine snapshot.
+ultrahdr-sys = { path = "vendor/ultrahdr-sys", default-features = false, features = [
+    "vendored",
+    "xmp",
+    "jpeg-max-dimension",
+] }
 
 [dev-dependencies]
 # Enables libaom's decoder for `io::avif`'s round-trip tests only. Resolver v3

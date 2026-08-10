@@ -130,16 +130,40 @@ What other epics need to know about `output`:
   render correctly — but that gate was **not discriminating** for HDR presentation
   (diffuse-highlight scene, and the still-default exponential curve rather than the
   sigmoid), so presentation stays unclaimed.
-- **⚠ The coded-HDR profiles are valid *source* profiles, not conformant
-  Display-class ones, and `output/presets` owns closing that.** Verified against
-  ICC.1:2022: §8.4.2 requires `BToA0Tag` (only `AToB0Tag` is written, so a strict CMM
-  cannot use them as a transform *destination*) and §8.2 requires
-  `chromaticAdaptationTag` (missing, so the D65 encoding white is unrecoverable).
-  Deferred there on 2026-08-06 because closing them needs two more pinned colorimetry
-  artifacts and **changes the profile bytes**. Anyone reading `synth_coded_hdr`'s
-  conformance notes should treat the `cicp` tag — not the profile's tag completeness —
-  as the authoritative signal. A conformant `BToA0` is also inherently capped at
-  ≈406 cd/m² by the `u1Fixed15` PCS, so it can never carry the `AToB0`'s range.
+- **The coded-HDR profiles are conformant Display-class profiles as of 2026-08-09**
+  (`output/presets`, closing what `output/lossless-hdr-tiff` deferred): they carry
+  `chromaticAdaptationTag` (ICC.1:2022 §8.2) and `BToA0Tag` (§8.4.2) beside
+  `A2B0`/`wtpt`/`cicp`. Three things downstream work should carry forward:
+  **(a)** *no decoder available here enforces either tag* — macOS ColorSync used the
+  old profile as a transform destination without `BToA0` — so they are met on the
+  normative text, and acceptance evidence must not be quoted as proof they were
+  needed; **(b)** Input class was evaluated and rejected: it would have dropped the
+  `BToA0` requirement (§8.3.2) at a measured cost of **3 bytes** with byte-identical
+  transform output, so the decision turned on truthfulness (an Input profile claims
+  to describe a capture device) rather than behaviour; **(c)** the `BToA0` is
+  inherently capped at ≈406 cd/m² by the `u1Fixed15` PCS and can never carry the
+  `AToB0`'s range — documented, not engineered around, as Adobe's reference profiles
+  also do. The `cicp` tag remains the authoritative signal.
+- **The default's gain map is inert, and that is an accepted state, not a bug to
+  fix here (2026-08-10).** `GainMapMax` decodes as 1.0x on every measured roll,
+  because under the default sigmoid the HDR rendition peaks at exactly the 203-nit
+  reference white. The cause is the *curve*, not the container: the sigmoid places
+  diffuse white at reference white by construction, while the exponential — which
+  pins white at `Dmax` with no placement rule — reaches 4.87x on the same frame.
+  Two consequences for other epics: **(a)** do not read a flat gain map as an
+  `output` defect, and do not add headroom in the gain-map stage to compensate;
+  **(b)** HDR is now explicitly **lower priority** and must not block the sigmoid
+  path, but the HDR presets stay first-class and `gain-map-hdr` stays the default,
+  deliberately, so the capability stays exercised while
+  `algo/reconstruction-render-curve-split` explores moving tone shaping out of
+  reconstruction. Measured in
+  [reports/render-defaults-v3.md](../reports/render-defaults-v3.md).
+- **`definitions::ICC_PCS_WHITE_XYZ` is not `D50.to_xyz()`.** ICC declares its PCS
+  white as `[0.9642, 1, 0.8249]`; deriving XYZ from D50's rounded four-decimal
+  *chromaticities* gives `[0.96429568, 1, 0.82510460]`, ≈2.4e-4 away. The coded
+  profiles' colorants adapted to the latter until 2026-08-09, so a neutral landed off
+  the white the profile itself announced. Anything serializing an ICC profile adapts
+  to the declared triple; anything else keeps using `D50`.
 - **ICC PCSXYZ in a LUT tag is `u1Fixed15Number`** (`1.0` → `0x8000`), so any future
   A2B matrix must be pre-divided by `32768/65535` or every luminance comes out 2×.
   And Little CMS serializes `mAB ` only for a recognized stage pattern — M curves →
@@ -148,7 +172,11 @@ What other epics need to know about `output`:
   Every other nc profile lets Little CMS derive colorants from pinned primaries;
   an A2B pipeline cannot, so the colorant matrix became a pinned artifact with its
   own audit entry and an independent anchor (the colorants lcms itself computed,
-  read back with `exiftool`).
+  read back with `exiftool`). It is now joined by `XYZ_D50_TO_BT2020` (the `BToA0`
+  matrix) and `BRADFORD_D65_TO_ICC_PCS` (the `chad` tag), each anchored on a
+  *relationship* rather than restated numbers — the inverse by `A·B == I`, the
+  adaptation by `chad · NPM(BT2020) == BT2020_TO_XYZ_D50`, since the tag is supposed
+  to describe the adaptation the colorants already carry.
 - **ISO 22028-5:2026 was never a blocker for the TIFF work**, correcting
   `iso-gain-map-metadata`'s 2026-08-04 note that grouped `lossless-hdr-tiff` with it.
   The reference-white and peak numbers come from the closed spike; TIFF 6.0,
@@ -2272,3 +2300,366 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   roll naming. Completing an absent suffix is arguably not renaming, but that
   wording is the governing statement and presets is `[~]` in progress — agree the
   boundary with it rather than around it.
+
+## sdr-preset-followups (default decided)
+
+**Status:** not started
+**Updated:** 2026-08-09
+
+- 2026-08-09: **The default gamut question is answered: `display-p3`.** User
+  decision, on the reasoning that nc's whole thrust is wide-gamut fidelity —
+  which outweighs sRGB's "a default should surprise nobody" argument. Item 1 of
+  the task file is now execution, not a choice.
+- 2026-08-09: **Sequencing decided, and it changes what item 1 replaces.**
+  `output/presets` proceeds unchanged and ships `gain-map-hdr` as the default
+  first; real-image conversion, measurement and value tuning happen against that;
+  the default then moves to `display-p3` here. So the incumbent this task
+  displaces is `gain-map-hdr` (a JPEG), not `legacy` — the flip carries a
+  container change as well as a pixel change, and the default path's tests churn
+  twice across the two tasks. `output/presets` scope was deliberately **not**
+  narrowed; the user chose the sequence over a scope change.
+
+## presets (gain-map-hdr: the dual-dialect preset)
+
+**Status:** in progress
+**Updated:** 2026-08-09
+
+- 2026-08-09: **`gain-map-hdr` is live** — `convert`-only, `.jpg`/`.jpeg`,
+  `Dialects::LegacyPlusIso`. Eleven preset names are accepted now; `custom` is the
+  last planned one. This is chunk 1 of the remaining `output/presets` work
+  (gain-map preset → roll naming → `custom`/`--output-hdr` → the default flip →
+  the inherited coded-TIFF ICC gaps).
+- 2026-08-09: It is the *same render* as `ultra-hdr-v1`, packaged twice. The
+  dialect rides in `FrameRender::UltraHdr` rather than being re-derived at the
+  encode site, and a test pins `output_stats` equal across the two presets so they
+  cannot drift into two renders. `ultra_hdr::encode` (the legacy-only wrapper) is
+  gone — both presets go through `encode_with`, so the dialect is always an
+  explicit argument. `Dialects::LegacyPlusIso`'s `#[allow(dead_code)]` is removed,
+  which was `output/gain-map-dialect-activation`'s stated definition of done for
+  its CLI half; what remains there is Android 15+ verification. Per the
+  `hdr-avif-output` boundary rule, this task shipped the CLI surface and so owns
+  the name.
+- 2026-08-09: **Verified with the Apple ImageIO oracle on the CLI's own output**,
+  not on the `#[ignore]` sample writer — which is the point, since a CLI path now
+  exists. `gain-map-hdr`: ISO gain map `PRESENT`, HDR decode headroom 4.926107,
+  base profile read as Display P3. `ultra-hdr-v1` from the same frame: `ABSENT`,
+  headroom 1.0 — the measured confirmation that Apple ignores the legacy dialect.
+  Also verified at 10368x7200.
+- 2026-08-09: **A real defect fell out of the 74.65 MP measurement, and it was
+  already shipped in `ultra-hdr-v1`.** libultrahdr's compile-time
+  `UHDR_MAX_DIMENSION` defaults to **8192**, so packaging refused a 10368x7200
+  scan — *after* the full render, as an exit-5 write error, with the memory
+  preflight having passed. Real 5000 dpi 35mm scans are exactly that size. The fix
+  is `vendor/ultrahdr-sys`'s own `jpeg-max-dimension` feature, which sets the
+  constant to libjpeg-turbo's `JPEG_MAX_DIMENSION` (65500) — the value
+  libultrahdr's own `static_assert` names as the ceiling. **No vendored source is
+  patched**, so the "one file modified from upstream" invariant holds and
+  `check-vendored-native.py` still passes on the pristine snapshot (219 + 555
+  files). Worth knowing: the limit lives in a *decoder* helper
+  (`jpegdecoderhelper.cpp`), which is why grepping the encoder path for it finds
+  nothing.
+- 2026-08-09: `RunProfile::GainMapHdr` added and **measured on two frame sizes**,
+  not inherited — the `SdrTiff` precedent. 18.66 MP: estimate 1,851,158,528 =
+  1.095x a measured 1,691,271,168 peak RSS, accounted 0.883x. 74.65 MP: estimate
+  7,001,980,928 = 1.060x a measured 6,603,358,208, accounted 0.904x. Measured
+  scaling is 90.6 → 88.5 B/px, i.e. linear, and `accounted` sits under measured at
+  both sizes as the 15% allowance requires. It shares `UltraHdrV1`'s arm, and a
+  test pins that as an **equality** across both `ir` and `export_ir`, so giving the
+  ISO dialect its own buffers would fail loudly. The arm's 20 B/px staging term
+  already anticipated `insert_baseline_iso_segment`'s second full copy of the
+  packaged JPEG; that comment is updated from "no CLI caller" to re-checked.
+- 2026-08-09: **Open, and it matters for the default flip: the gain map is inert
+  at current defaults.** On a real Gold 200 frame through the sigmoid default the
+  oracle reads `GainMapMax = 0.000001` and `GainMapMin = -0.056356` (log2), i.e.
+  gains of 0.96–1.00x — the HDR rendition never exceeds the SDR one, so the file is
+  a structurally correct dual-dialect gain-map JPEG carrying no HDR. This matches
+  the ≈1.0027x already recorded in the epic summary and is a **render** property,
+  not a container defect. It is why the `output/presets` default should not be
+  read as "nc now produces HDR" until the rendering work the user planned after
+  this task has run. The epic summary already notes that the warning which would
+  say so belongs to the gain-map stage and is unimplemented.
+- 2026-08-09: Cosmetic, noticed while checking the oracle's profile reading and
+  **not** fixed here (it moves ICC bytes and belongs to `output/display-p3-output`):
+  the synthesized Display P3 profile's `ProfileDescription` is Little CMS's default
+  `RGB built-in`. The colorants are correct Display P3 (red `0.51512 0.2412
+  -0.00105`), and both gain-map presets embed byte-identical profiles, so this is a
+  naming wart rather than a colour error.
+
+## presets (roll container-aware naming)
+
+**Status:** in progress
+**Updated:** 2026-08-09
+
+- 2026-08-09: **Every preset is roll-capable now** — chunk 2. The blanket
+  convert-only refusal in `reject_roll_unsupported` is gone; that function is back
+  to its original single job (rejecting `--export-ir`, which one path would have
+  every frame overwrite). The refusal had been waiting on exactly one capability,
+  and lifting it needed only that capability, not a preset list.
+- 2026-08-09: `default_output_name` takes the frame's **own** resolved preset, not
+  the roll's — a per-frame `params` override may change `output.preset`, and while
+  that already warns loudly (different image class), the name still has to describe
+  the bytes written. An explicit manifest `output` now goes through
+  `reject_suffix_mismatch`, the same rule `convert` uses, which closes the
+  carried-over P2 in `output/sdr-preset-followups`: `resolve_frames` called bare
+  `validate`, so a manifest `"output": "frame.jpg"` under a TIFF preset was never
+  checked. Shared rule, not a parallel one — a parallel check is how the suffix
+  rule and the convert-only refusal drifted apart before.
+- 2026-08-09: **The derived suffix is its own function (`derived_extension`), and
+  that is load-bearing.** The obvious implementation — take the head of
+  `required_extensions` — silently renames every existing roll output, because that
+  table lists `tif` before `tiff` and roll has always written `_positive.tiff`. It
+  was caught by an existing test rather than by review. The two are tied together
+  by an invariant instead: the derived spelling must be a *member* of the preset's
+  accepted set, asserted over `OutputPreset::ALL`, which is what makes it safe for
+  roll not to re-check its own derived names.
+- 2026-08-09: Five unit tests that asserted "convert-only" now assert
+  roll-capability. Kept as positive assertions rather than deleted — they are the
+  record that the refusal was roll's naming gap and never a property of the
+  containers.
+
+## presets (custom, and the --output-hdr replacement)
+
+**Status:** in progress
+**Updated:** 2026-08-09
+
+- 2026-08-09: **`custom` shipped** — chunk 3. Twelve preset names accepted; there is
+  no planned-but-unaccepted tier left, so an unknown name now always means a typo
+  and the "does not accept yet" arm is deleted. `custom` is the **one named preset
+  that is not atomic**: it accepts the depth/profile/container selectors, which is
+  its entire purpose. That needed a second predicate — `is_atomic()` beside
+  `is_named()` — rather than special-casing `Custom` at each of the three call
+  sites, where a missed one silently re-opens the accepted-and-ignored bug.
+- 2026-08-09: `custom` resolves the **same legacy branch and the same bytes** as the
+  no-preset state for a given selector combination; a test asserts the two files are
+  byte-identical and that only the recorded `preset` differs. The difference is
+  provenance — the combination was chosen, not inherited — and it becomes load-bearing
+  at the default flip, when omitting a preset stops meaning "legacy flags work".
+  Widening it to the modern display path is **not** attempted: the SDR renderer
+  gamut-*maps* into a named space, so an arbitrary `--output-profile` has no
+  destination there. That is the same gap `output/sdr-preset-followups` records for
+  Adobe RGB, and it is stated in the variant's rustdoc rather than left to be
+  rediscovered.
+- 2026-08-09: **`--output-hdr` / `--output-sdr` / `output.hdr` are gone**, replaced by
+  one `OutDepth` enum: `--out-depth u16|f32`, recipe key `output.depth`. Two reasons,
+  both pre-existing: the pair was one mutually-exclusive choice modelled as parallel
+  fields — the shape CLAUDE.md bans — and "HDR" named neither thing the float TIFF is
+  (it is the *transitional print-rendered* float in the selected output space, not
+  `film-master` and not Rec.2100). Old flags and the old recipe key emit migration
+  errors; nc is unreleased, so no aliases. Note the history: `--out-depth` **was** the
+  original spelling and PR #20 renamed it to `--output-hdr` with no recorded
+  rationale — before `hdr-pq`/`hdr-hlg`/`hdr-linear-tiff` existed to make "HDR"
+  ambiguous. This is not a reversal of a reasoned decision; it is that decision's
+  premise expiring. Don't rename it back.
+- 2026-08-09: **The presence-check exception survived the rename — I initially
+  claimed it dissolved, and that was wrong.** `--out-depth u16` resolves the
+  documented *default*, so the value rule cannot see it while it still *forces* a
+  depth an atomic preset cannot produce — exactly the hole `--output-sdr` had. So
+  `reject_out_depth_with_atomic_preset` keeps a flag-presence check; what the rename
+  actually bought is one flag and one rule instead of two, plus a real recipe
+  spelling for the value half. The recipe side still needs no mirror, because
+  `"depth": "u16"` is the serde default and asserts nothing.
+- 2026-08-09: Blast radius, for the record: `PIPELINE_FINGERPRINTS`' v2 `recipe` hash
+  refreshed **in place, without a version bump** — the default document changed shape
+  but the default *value* is the depth it always was (`u16` == the old `hdr: false`),
+  so `render` and `base` are byte-identical and no default pixel moved. Telemetry's
+  `conversion.output_hdr` (bool) became `conversion.output_depth` (`u16`|`f32`) with
+  `SCHEMA_VERSION` **3 → 4**: a *renamed field* is a wire change under any reading,
+  unlike the enum-member question `output/sdr-preset-followups` still owns. The seven
+  frozen `scripts/real-scan-verify/recipes/*.hdr.json` were migrated, and `nctool
+  compare` now reads `output.depth` and stores `output_depth` verbatim instead of a
+  boolean — a record written before the rename is refused rather than guessed at,
+  which is that field's existing rule. All 91 Python tests pass (that half has no CI
+  gate, so it was run by hand).
+
+## presets (the default migration)
+
+**Status:** in progress
+**Updated:** 2026-08-09
+
+- 2026-08-09: **`gain-map-hdr` is the default**, `pipeline_version` **2 → 3** with
+  its own `PIPELINE_FINGERPRINTS` row and a before/after report at
+  [reports/render-defaults-v3.md](../reports/render-defaults-v3.md). Chunk 4. The
+  user chose to ship the flip now rather than wait on the rendering work — the
+  inert-gain-map finding below was on the table when they decided.
+- 2026-08-09: **The drift gate cannot witness this bump, and the row says so.** Its
+  `render`/`base` fingerprints cover `reconstruct_and_print` and
+  `film_base::estimate`; the output preset selects neither, so v3 carries the *same*
+  two hashes as v2 and only `recipe` moved. That is `PipelineFingerprint`'s
+  documented coverage limit, but it means the report — not the gate — is this
+  version's evidence. Worth knowing before trusting a green gate on a preset change.
+- 2026-08-09: Measured across seven rolls: **no clipping on either version**, and a
+  consistent small *warming* — red up to +0.017, blue down to −0.009, green flat.
+  Largest on the saturated stocks (Ektar, Portra), near zero on the two flattest
+  frames. That is the display renderer's gamut mapping and reference white replacing
+  the legacy `finish_print` → ICC ordering.
+- 2026-08-09: **The default now produces a valid HDR container carrying no HDR.**
+  `GainMapMax` decodes as 1.00x on every roll measured, because under the default
+  sigmoid the HDR rendition peaks at exactly the 203-nit reference white
+  (`hdr::sdr_range_warning` says so on the single-rendition presets; the gain-map
+  presets deliberately don't get that warning). The exponential curve on the same
+  frame reaches 2.2827 log2 ≈ 4.87x. This is a **render** gap, not a container one,
+  and it is the first thing the follow-on rendering work should close.
+- 2026-08-09: **`is_named()` is gone.** It meant "not the no-preset state", which the
+  flip made meaningless — the default *is* a named preset, so "named" no longer
+  implies "chosen". Atomicity moved to `is_atomic()` (false for `legacy` and
+  `custom`), and the one diagnostic that genuinely needed "did the user type
+  `--output-preset`?" takes a `SuffixContext` carrying flag presence. Without that,
+  a bare `nc convert -o out.tif` blamed a flag the user never passed.
+- 2026-08-09: **Test churn, and the shape of the fix.** ~87 integration tests wrote
+  `.tiff` with no preset. Rather than edit each, `tests/pipeline.rs`'s harness
+  injects `--output-preset legacy` for a `convert` that names no preset, loads no
+  `--params`, and writes a `.tif`/`.tiff` — those tests assert sidecar naming,
+  staging temps, sample round-trips and the memory model, none of which is about
+  which preset a bare invocation resolves. The `--params` exclusion is load-bearing:
+  flags win, so injecting would *override* a preset the recipe set and turn a
+  film-master test into a legacy test that passes for the wrong reason. Tests that
+  are about the default use `run_exact`, which injects nothing —
+  `the_default_output_is_the_dual_dialect_gain_map_jpeg` is the one that matters.
+  Roll recipes state `"preset": "legacy"` inline instead, since `roll` has no output
+  flag at all.
+
+## presets (the inherited coded-HDR ICC gaps)
+
+**Status:** in progress
+**Updated:** 2026-08-09
+
+- 2026-08-09: **Both ICC.1:2022 gaps inherited from `output/lossless-hdr-tiff` are
+  closed** — chunk 5. `hdr-pq-tiff` / `hdr-hlg-tiff` now carry `chromaticAdaptationTag`
+  (§8.2) and `BToA0Tag` (§8.4.2) beside the existing `A2B0`/`wtpt`/`cicp`. The
+  profile grew 6,708 → 31,516 bytes; stored code values are untouched and repeated
+  encodes are byte-identical.
+- 2026-08-09: **Input class was evaluated first, as the task asked, and rejected —
+  but not for the reason the task file anticipated.** Its two open questions both
+  resolved *toward* Input class on the evidence: the two profiles differ in exactly
+  **3 bytes** (the class signature), macOS ColorSync parses and names both
+  identically, and transforming through each as a source gives byte-identical output.
+  So the class is not observably load-bearing, and with no functional argument left
+  the decision falls to truthfulness: an Input profile describes a *capture device*
+  and these describe a display encoding. Display class stays, which also keeps nc's
+  profiles consistent (every other one is Display class) and matches Adobe's
+  reference BT.2100 profiles — the precedent the task named.
+- 2026-08-09: **The acceptance evidence does not discriminate, and saying so matters.**
+  macOS ColorSync used the *old* profile as a transform destination too, without any
+  `BToA0` — so no decoder available here enforces either requirement. These are
+  conformance requirements met on the strength of the normative text, not fixes for
+  an observed failure. Same shape as the 2026-08-06 viewer gate that "confirmed they
+  render correctly but was not discriminating".
+- 2026-08-09: **The third fix rode along and is the one with real numbers.**
+  `pinned::BT2020_TO_XYZ_D50` adapted to `definitions::D50.to_xyz()` — D50 derived
+  from its *rounded four-decimal chromaticities*, `[0.96429568, 1, 0.82510460]` —
+  while the profile's `mediaWhitePointTag` declares ICC's `[0.9642, 1, 0.8249]`. A
+  neutral therefore landed ≈2.4e-4 from the white the profile itself announced. The
+  matrix is what adapts to the spec value, never the reverse, so
+  `definitions::ICC_PCS_WHITE_XYZ` is now a named source definition with provenance
+  and the colorants re-derive against it. Its column sums equal the declared triple
+  to 1e-12 — the assertion that previously named the derived white and so could never
+  have caught this.
+- 2026-08-09: Three artifacts through `docs/colorimetry-maintenance.md`:
+  `BT2020_TO_XYZ_D50` re-pinned, plus new `XYZ_D50_TO_BT2020` (the `BToA0` matrix)
+  and `BRADFORD_D65_TO_ICC_PCS` (the `chad` tag). Each has an **independent anchor**
+  in `tests.rs` that checks a *relationship* rather than restating the numbers: the
+  inverse is pinned by `XYZ_D50_TO_BT2020 · BT2020_TO_XYZ_D50 == I` (the runtime uses
+  them as a pair and never inverts anything itself), and `chad` by
+  `chad · NPM(BT2020) == BT2020_TO_XYZ_D50` — the tag is supposed to describe the
+  adaptation the colorants already carry, so two different whites there would make
+  the profile describe an adaptation it did not perform. `derive::rgb_to_xyz_adapted`
+  is gone: the only colorant matrix now adapts to an XYZ white, so the chromaticity
+  form had no consumer left.
+- 2026-08-09: The `BToA0`'s range limit is **documented, not engineered around**: its
+  PCS input is `u1Fixed15Number`, capped at ≈1.99997 ≈ 406 cd/m², so it cannot
+  round-trip the extended range the `AToB0` carries to ≈49.26. nc only ever uses
+  these profiles as sources, so nothing here depends on it; Adobe ships one anyway.
+
+## presets (done)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: **`output/presets` is complete.** Twelve presets ship, `gain-map-hdr`
+  is the default at `pipeline_version` 3, roll is container-aware, and the inherited
+  coded-TIFF ICC gaps are closed. Delivered in five chunks, each with all four CI
+  gates green; the per-chunk sections above carry the detail.
+- 2026-08-09: **What the next task should know, in one place.**
+  - The default writes a **JPEG**. `nc convert -o out.tif` with no preset is exit 2,
+    by design; `--output-preset legacy` / `custom` / `display-p3` give a TIFF.
+  - The default gain map is **inert** (1.0x) under the default sigmoid, because the
+    HDR rendition peaks at exactly the 203-nit reference white. Selecting the
+    exponential curve on the same frame reaches ≈4.87x. This is the first thing the
+    rendering work should look at, and it is why the v3 report says the default
+    "produces a valid HDR container carrying no HDR".
+  - The warning that *would* say so does not exist for the gain-map presets:
+    `hdr::sdr_range_warning` is single-rendition only, deliberately. A dual-rendition
+    equivalent — "this frame's gain map is flat" — is unwritten and belongs with the
+    gain-map stage that can measure it.
+  - `output/sdr-preset-followups` is now unblocked and holds the next default flip
+    (to `display-p3`, decided 2026-08-09), Adobe RGB, and the SDR report block. Two
+    of its carried-over review findings were fixed here in passing: the roll
+    manifest-suffix hole, and — no — only that one; the luminance-only SDR-range
+    warning and the telemetry preset-enum/schema question are still open there
+    (`SCHEMA_VERSION` did move to 4, but for the `output_hdr` → `output_depth` field
+    *rename*, which is a wire change under any reading; the enum-member policy
+    question it records is untouched).
+  - `output/gain-map-dialect-activation`'s CLI half is consumed: `Dialects::LegacyPlusIso`
+    has a caller and its `#[allow(dead_code)]` is gone. What remains there is Android
+    15+ verification.
+
+## presets (review round: 11 findings fixed)
+
+**Status:** done
+**Updated:** 2026-08-09
+
+- 2026-08-09: Two independent reviews (Codex + `nc-reviewer`) over the finished
+  change found **11 defects, none of which any gate caught**. All four gates were
+  green throughout, which is the useful part of the story: the real-scan harness has
+  no CI gate, `--help` text has no test, and `PIPELINE_FINGERPRINTS` only recomputes
+  the *current* row. Fixed, with regression tests where tests were possible.
+- 2026-08-09: **The one behaviour bug: `--output-preset custom --linear-range …`
+  exited 0 and silently dropped the control.** `custom` renders the same
+  `render_legacy` branch as `legacy`, which never applies `linear_range`, but the
+  rejection was gated on the `Legacy` *name*. Reproduced as byte-identical output
+  with and without the flag. Now gated on **which branch renders**
+  (`Legacy | Custom`), with a test covering both plus a display-preset control so the
+  rule can't pass vacuously. This is the exact failure mode the rule was written for,
+  re-opened by adding a second preset to the branch it guards.
+- 2026-08-09: **The default flip broke the committed real-scan harness end to end,
+  in three places at once.** Both recipe families (`*.json` *and* `*.hdr.json`) omit
+  `output.preset` and so resolved the new JPEG default against `.tiff` paths;
+  `harness.sh`'s `stage_freeze` still *generated* `output:{hdr:true}`, which my own
+  migration error then rejects; and `stage_convert`'s rename loop globs
+  `*_positive.tiff`, which roll no longer writes under a JPEG preset. All fourteen
+  recipes now state `"preset": "legacy"` and the generator emits it. **The lesson:
+  migrating the checked-in artifacts is not the same as migrating the thing that
+  writes them** — I updated seven recipes by hand and never looked for their source.
+- 2026-08-09: `nctool compare`'s six fixture cases likewise wrote `.tiff` with no
+  preset; they now state `--output-preset legacy` so their records stay comparable
+  against pre-flip ones. **Consequence worth knowing: `compare` therefore does not
+  cover the product default.** Adding a case changes the fixed comparison set, which
+  is `core/conversion-versioning`'s call, so it is recorded rather than done.
+- 2026-08-09: **Telemetry reported the wrong depth for the newly-default container.**
+  `OutputParams::depth()` is the *optional IR TIFF's* depth for the JPEG and AVIF
+  presets, so `conversion.output_depth` labelled a gain-map run `u16` when its
+  primary is a fixed 8-bit JPEG. Added `primary_depth_label()`
+  (`u8`|`u10`|`u16`|`f32`); the v4 record now reports the primary container, and
+  `SCHEMA_VERSION` did not need a second bump because v4 is itself unshipped.
+- 2026-08-09: **The v2 fingerprint row is restored to `3d37b13ecb7a5095`** — the hash
+  a v2 build actually emitted, with `"hdr": false`. I had refreshed it to the
+  post-rename value while `PIPELINE_VERSION` was still 2 (legitimate at that
+  instant), then bumped to 3 in the same change — leaving the row an unverifiable
+  claim about a document shape v2 never wrote. `drift_gate` cannot catch this: it
+  only recomputes the row matching the *current* version. **Rule to carry forward:
+  once a bump lands in the same change, the prior row is history again and its
+  in-place refresh must be undone.**
+- 2026-08-09: Remaining doc/comment drift, all of it mine: `--help` still called
+  `legacy` the default and said `custom` "is not accepted yet" — and the *new*
+  default-path suffix error points users at `--help`, so the first thing they hit
+  after the migration denied the escape hatch existed; the `film-master` conflict
+  message claimed `custom` was unaccepted (and implied it is a graded master, which
+  it is not); the `derive.rs` rename left the colorant-matrix doc block attached to
+  the pure-CAT `adaptation_to_xyz` plus a dangling intra-doc link (`cargo doc`
+  unresolved-link count is back to its pre-change 16); design-spec §5 said "twelve"
+  beside a list of eleven; the roll comment credited `required_extensions` for the
+  derived suffix, contradicting the warning two functions away that taking its head
+  renames every roll output; `version.rs` still said "v2 (current)" and named
+  `output.hdr`; `run()`'s doc claimed `convert`/`roll` when it matches `convert`
+  only, now with the standing trap stated; and `TASKS.md` still referenced
+  `--output-hdr`.

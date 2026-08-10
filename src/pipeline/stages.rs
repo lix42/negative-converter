@@ -156,7 +156,9 @@ pub fn render(
     output_params: &OutputParams,
 ) -> Result<Rendered> {
     match output_params.preset {
-        OutputPreset::Legacy => {
+        // `custom` is the same legacy branch, explicitly chosen rather than
+        // inherited from the default — same bytes, different provenance.
+        OutputPreset::Legacy | OutputPreset::Custom => {
             render_legacy(image, film_base, reconstruction, print, output_params)
         }
         OutputPreset::FilmMaster => render_film_master(image, film_base, reconstruction),
@@ -164,6 +166,7 @@ pub fn render(
         // reconstruction and the print controls resolve exactly once for whichever
         // rendition(s) the preset needs.
         OutputPreset::UltraHdrV1
+        | OutputPreset::GainMapHdr
         | OutputPreset::HdrPq
         | OutputPreset::HdrHlg
         | OutputPreset::HdrLinearTiff
@@ -335,6 +338,20 @@ fn ms_since(started: Instant) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::types::OutDepth;
+
+    /// `OutputParams::default()` pinned to the **legacy** preset.
+    ///
+    /// The product default is `gain-map-hdr` since the `output/presets` migration,
+    /// and `render` refuses it by design (display presets go through
+    /// `render_display_source`). Any test calling `render` therefore has to say
+    /// which TIFF branch it means.
+    fn legacy_output() -> OutputParams {
+        OutputParams {
+            preset: OutputPreset::Legacy,
+            ..OutputParams::default()
+        }
+    }
     use super::*;
     use crate::pipeline::film_base;
     use crate::types::{
@@ -414,7 +431,7 @@ mod tests {
             &base,
             &Reconstruction::Simple,
             &PrintParams::default(),
-            &OutputParams::default(),
+            &legacy_output(),
         )
         .unwrap();
         assert_eq!((out.image.width, out.image.height), (40, 40));
@@ -433,7 +450,8 @@ mod tests {
             &density_default(),
             &PrintParams::default(),
             &OutputParams {
-                hdr: true,
+                preset: OutputPreset::Legacy,
+                depth: OutDepth::F32,
                 ..OutputParams::default()
             },
         )
@@ -451,7 +469,8 @@ mod tests {
             &sigmoid_default(),
             &PrintParams::default(),
             &OutputParams {
-                hdr: true,
+                preset: OutputPreset::Legacy,
+                depth: OutDepth::F32,
                 ..OutputParams::default()
             },
         )
@@ -482,12 +501,14 @@ mod tests {
         };
         for reconstruction in [Reconstruction::Simple, density_default(), sigmoid_default()] {
             for output in [
-                OutputParams::default(),
+                legacy_output(),
                 OutputParams {
-                    hdr: true,
+                    preset: OutputPreset::Legacy,
+                    depth: OutDepth::F32,
                     ..OutputParams::default()
                 },
                 OutputParams {
+                    preset: OutputPreset::Legacy,
                     output_profile: Some("srgb".into()),
                     ..OutputParams::default()
                 },
@@ -586,7 +607,8 @@ mod tests {
             &midtone_reconstruction(),
             &hot,
             &OutputParams {
-                hdr: true,
+                preset: OutputPreset::Legacy,
+                depth: OutDepth::F32,
                 ..OutputParams::default()
             },
         )
@@ -618,6 +640,7 @@ mod tests {
             &midtone_reconstruction(),
             &PrintParams::default(),
             &OutputParams {
+                preset: OutputPreset::Legacy,
                 output_profile: Some("srgb".into()),
                 ..OutputParams::default()
             },
@@ -641,16 +664,16 @@ mod tests {
     }
 
     #[test]
-    fn film_master_render_ignores_the_output_hdr_switch_entirely() {
-        // `film-master` resolves f32 by definition, not via `output.hdr`. The depth
-        // half is pinned in `types` (`film_master_resolves_f32_independently_of_the_
-        // hdr_switch`); what belongs *here* is that `render` itself does not consult
-        // the switch — flip it and the master's pixels and ICC must be bit-identical.
+    fn film_master_render_ignores_the_output_depth_knob_entirely() {
+        // `film-master` resolves f32 by definition, not via `output.depth`. The depth
+        // half is pinned in `types`; what belongs *here* is that `render` itself does
+        // not consult the knob — change it and the master's pixels and ICC must be
+        // bit-identical.
         // (`render` is pure, so it is callable with the combination `cli::validate`
         // rejects, which is what makes this a bypass proof.)
         let img = synthetic_negative(8, 8);
         let base = FilmBase::from([0.9, 0.55, 0.42]);
-        let render_with = |hdr: bool| {
+        let render_with = |depth: OutDepth| {
             render(
                 &img,
                 &base,
@@ -658,22 +681,22 @@ mod tests {
                 &PrintParams::default(),
                 &OutputParams {
                     preset: OutputPreset::FilmMaster,
-                    hdr,
+                    depth,
                     ..OutputParams::default()
                 },
             )
             .unwrap()
         };
-        let (off, on) = (render_with(false), render_with(true));
+        let (off, on) = (render_with(OutDepth::U16), render_with(OutDepth::F32));
         let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
         assert_eq!(bits(&off.image.rgb), bits(&on.image.rgb));
         assert_eq!(off.icc, on.icc);
         // …and both resolve the f32 encode depth the branch is defined by.
-        for hdr in [false, true] {
+        for depth in [OutDepth::U16, OutDepth::F32] {
             assert_eq!(
                 OutputParams {
                     preset: OutputPreset::FilmMaster,
-                    hdr,
+                    depth,
                     ..OutputParams::default()
                 }
                 .depth(),
@@ -718,7 +741,7 @@ mod tests {
             &base,
             &density_default(),
             &PrintParams::default(),
-            &OutputParams::default(),
+            &legacy_output(),
         ) {
             Err(e) => assert_eq!(e.exit_code(), 1),
             Ok(_) => panic!("expected a degenerate-base error"),

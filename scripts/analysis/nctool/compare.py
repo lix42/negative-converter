@@ -31,13 +31,17 @@ field name is stronger than the measurement; treat `identical: true` as "no
 difference in the recorded statistics", not "the same image".
 
 **Comparability is checked, not assumed.** `mean` is written by two different
-functions depending on `output.hdr` — quantized to `[0, 1]` for u16, verbatim and
-unclamped for f32 — so a u16-vs-f32 comparison would report a *unit* change as a
-rendering regression. `identity.target` is likewise a real axis: transcendental
+functions depending on the depth of the artifact actually produced — quantized to
+`[0, 1]` for integer output, verbatim and unclamped for f32 — so a u16-vs-f32
+comparison would report a *unit* change as a rendering regression. That depth comes
+from the report's `output_render.encoding`, not from the `output.depth` knob: an
+atomic preset resolves its own container, so the knob says `u16` on a `film-master`
+run that writes f32 and on the 8-bit JPEG and 10-bit AVIF presets alike.
+`identity.target` is likewise a real axis: transcendental
 libm results and the lcms2 transform differ by target (design-spec §8), so a
 cross-target diff must be read as such. `diff` surfaces `output_depth_changed`,
 `target_changed`, and `pipeline_version_changed` rather than leaving the caveat to
-the reader — and it **refuses** a record that omits the `output_hdr` marker, since an
+the reader — and it **refuses** a record that omits the `output_depth` marker, since an
 absent marker equals an absent marker and would silently permit the one comparison
 the marker exists to prevent.
 
@@ -91,7 +95,15 @@ BENCHMARK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 # from another version may not carry the fields the verdict reads, and defaulting a
 # missing field would make the comparison quietly trivial — the exact failure mode
 # `identical` must never have.
-RECORD_SCHEMA = 1
+#
+# v2: the frame field `output_hdr` (bool) became `output_depth` (`u8`/`u10`/`u16`/
+# `f32`), following nc's `output.hdr` -> `output.depth` rename and, more importantly,
+# a change of *meaning*: it now records the primary container's real depth rather
+# than a recipe knob the atomic presets ignore. A v1 record carries neither the field
+# nor the meaning, so it must be rejected as an unsupported schema — leaving this at
+# 1 made an old record advertise the same version while failing later as merely
+# "malformed", which hides why.
+RECORD_SCHEMA = 2
 
 # Fields whose equality decides `identical` — see the module docstring on why
 # timings are excluded. Every one must be *present* on every frame: `None == None`
@@ -100,7 +112,7 @@ DETERMINISTIC = ("params_hash", "mean", "clipped", "non_finite", "total_samples"
 
 # Everything a frame entry must carry for `diff` to be able to read it.
 #
-# `output_hdr` is required, not optional. It is the marker that says which of two
+# `output_depth` is required, not optional. It is the marker that says which set of
 # incompatible units `mean` is in (see the module docstring), and a *missing* marker
 # compares equal to a missing marker — so two records that both omitted it would have
 # their u16 and f32 means subtracted, or declared identical, which is exactly the
@@ -113,7 +125,45 @@ DETERMINISTIC = ("params_hash", "mean", "clipped", "non_finite", "total_samples"
 # genuinely different — input bytes was reported identical **and** attested to have
 # been verified. A false attestation in the artifact whose purpose is attribution is
 # worse than an omission, so a record that cannot substantiate the claim is refused.
-FRAME_FIELDS = DETERMINISTIC + ("name", "clip_fraction", "output_hdr", "checksums")
+FRAME_FIELDS = DETERMINISTIC + ("name", "clip_fraction", "output_depth", "checksums")
+
+# Output path suffixes a benchmark case may ask for. nc validates the suffix against
+# the resolved preset, so this is the set its containers accept — not a free string.
+OUTPUT_EXTENSIONS = ("tiff", "tif", "jpg", "jpeg", "avif")
+
+# The output depths a record may carry — the depth of the **primary** artifact each
+# preset actually writes, which for the JPEG and AVIF presets is neither of the two
+# values `output.depth` can hold.
+OUTPUT_DEPTHS = ("u8", "u10", "u16", "f32")
+
+# The primary artifact's depth per `output_render.encoding` identifier.
+#
+# **Not `recipe.output.depth`.** That is the *knob*, and an atomic preset ignores it:
+# a `film-master` run reports `depth: "u16"` while writing unclamped f32 and a mean in
+# the f32 domain, so recording the knob labelled the mean with the wrong units —
+# defeating the one field whose whole job is to stop `diff` subtracting incomparable
+# means. `output_render.encoding` is the report's container-truthful identifier (nc
+# derives it from the resolved preset, the same source as `OutputParams::
+# primary_depth_label`), so it is right for every preset including the ones whose
+# depth the recipe cannot express.
+#
+# An encoding this table does not know is **refused**, not guessed: a new preset that
+# reaches `run` before this map does must stop the comparison rather than silently
+# label its mean with some other preset's units.
+PRIMARY_DEPTH_BY_ENCODING = {
+    "dual-dialect-gain-map-jpeg": "u8",
+    "legacy-ultra-hdr-v1-xmp-mpf-jpeg": "u8",
+    "rec2100-pq-10bit-444-avif": "u10",
+    "rec2100-hlg-10bit-444-avif": "u10",
+    "rendered-u16-tiff": "u16",
+    "display-p3-u16-tiff": "u16",
+    "srgb-u16-tiff": "u16",
+    "rec2100-pq-u16-tiff": "u16",
+    "rec2100-hlg-u16-tiff": "u16",
+    "transitional-rendered-float-tiff": "f32",
+    "unclamped-linear-acescg-float-tiff": "f32",
+    "display-linear-bt2020-float-tiff": "f32",
+}
 
 # How a frame's input bytes were accounted for.
 CHECKSUM_MODES = ("verified", "computed", "skipped")
@@ -287,7 +337,14 @@ def resolve_cases(bench: dict, set_name: str, asset_root: str,
             recipe = os.path.join(repo_root(), recipe)
             if not os.path.isfile(recipe):
                 return [], f"case {name!r}: recipe not found: {recipe}"
-        out.append(dict(name=name, input=path, recipe=recipe,
+        # Defaults to `tiff` so every existing case is unchanged; a case selecting a
+        # JPEG/AVIF preset states its own. Validated here rather than at use, so a
+        # typo fails while resolving the set instead of mid-run.
+        output_ext = case.get("output_ext", "tiff")
+        if output_ext not in OUTPUT_EXTENSIONS:
+            return [], (f"case {name!r}: output_ext {output_ext!r} is not one of "
+                        f"{', '.join(sorted(OUTPUT_EXTENSIONS))}")
+        out.append(dict(name=name, input=path, recipe=recipe, output_ext=output_ext,
                         args=list(case.get("args", [])), expect_sha256=expect))
     if not out:
         return [], f"benchmark set {set_name!r} has no cases"
@@ -346,8 +403,8 @@ def _report_gaps(report: dict) -> list[str]:
         if mean is not None and not (isinstance(mean, list) and len(mean) == 3
                                      and all(isinstance(v, (int, float)) for v in mean)):
             gaps.append("output_stats.mean (must be three numbers)")
-    if not isinstance(_dict(_dict(report.get("recipe")).get("output")).get("hdr"), bool):
-        gaps.append("recipe.output.hdr")
+    if _dict(report.get("output_render")).get("encoding") not in PRIMARY_DEPTH_BY_ENCODING:
+        gaps.append("output_render.encoding (a known primary encoding)")
     return gaps
 
 
@@ -363,9 +420,16 @@ def convert_case(nc: str, case: dict, workdir: str,
     (typed: `pipeline_version` is an integer, `git_dirty` a bool) rather than
     scraped from `--version` text, so the record and the report can't disagree.
     """
-    out_tiff = os.path.join(workdir, f"{case['name']}.tiff")
+    # The suffix follows the case, because nc validates it against the resolved
+    # preset and never renames the path. A case selecting a JPEG or AVIF preset would
+    # otherwise fail the CLI suffix check before producing a report, making the
+    # `u8`/`u10` entries in PRIMARY_DEPTH_BY_ENCODING unreachable.
+    # `.get` with the same default `resolve_cases` applies: a hand-built case (the
+    # unit tests) stays valid, while a real benchmark case is already validated
+    # against OUTPUT_EXTENSIONS by the time it reaches here.
+    out_path = os.path.join(workdir, f"{case['name']}.{case.get('output_ext', 'tiff')}")
     tel = os.path.join(workdir, f"{case['name']}.telemetry.json")
-    argv = [nc, "convert", case["input"], "-o", out_tiff, "--telemetry-file", tel]
+    argv = [nc, "convert", case["input"], "-o", out_path, "--telemetry-file", tel]
     if case["recipe"]:
         argv += ["--params", case["recipe"]]
     argv += case["args"]
@@ -407,11 +471,13 @@ def convert_case(nc: str, case: dict, workdir: str,
         input_sha256=case.get("input_sha256"),
         checksums=case.get("checksums", "skipped"),
         params_hash=identity["params_hash"],
-        # `mean`'s units follow the output depth (see the module docstring), so the
-        # depth rides with it — a mean is not comparable without it.
-        # Reachable only because `_report_gaps` already proved the whole chain is
-        # well-formed dicts ending in a bool.
-        output_hdr=_dict(_dict(report["recipe"]).get("output"))["hdr"],
+        # `mean`'s units follow the depth of the artifact actually written (see the
+        # module docstring), so that depth rides with it — a mean is not comparable
+        # without it. Taken from the resolved *encoding*, never from the
+        # `output.depth` knob an atomic preset ignores. Reachable only because
+        # `_report_gaps` already proved the chain is well-formed dicts ending in a
+        # known encoding identifier.
+        output_depth=PRIMARY_DEPTH_BY_ENCODING[report["output_render"]["encoding"]],
         mean=stats["mean"],
         clipped=_number(loss.get("clipped_low")) + _number(loss.get("clipped_high")),
         non_finite=_number(loss.get("non_finite")),
@@ -595,10 +661,10 @@ def validate_record(record: dict, label: str) -> str | None:
                     + ", ".join(f"{f}={frame[f]!r}" for f in bad)
                     + " — a malformed count would be coerced to 0 and compare as "
                       "trivially equal, or reach the arithmetic and traceback")
-        if not isinstance(frame["output_hdr"], bool):
-            return (f"{label}: frames[{i}] ({frame['name']}) has output_hdr="
-                    f"{frame['output_hdr']!r}, expected a bool — it decides which "
-                    "units `mean` is in")
+        if frame["output_depth"] not in OUTPUT_DEPTHS:
+            return (f"{label}: frames[{i}] ({frame['name']}) has output_depth="
+                    f"{frame['output_depth']!r}, expected one of "
+                    f"{', '.join(OUTPUT_DEPTHS)} — it decides which units `mean` is in")
         mode = frame["checksums"]
         if mode not in CHECKSUM_MODES:
             return (f"{label}: frames[{i}] ({frame['name']}) has checksums={mode!r}, "
@@ -648,7 +714,7 @@ def diff_frames(a: dict, b: dict) -> tuple[list[dict], bool]:
         mean_a, mean_b = fa.get("mean") or [], fb.get("mean") or []
         # `mean`'s units depend on the output depth, so a u16-vs-f32 delta would be a
         # unit conversion dressed up as a rendering change. Refuse to compute it.
-        depth_changed = fa.get("output_hdr") != fb.get("output_hdr")
+        depth_changed = fa.get("output_depth") != fb.get("output_depth")
         d_mean = None
         if not depth_changed and len(mean_a) == len(mean_b):
             d_mean = [round(y - x, 12) for x, y in zip(mean_a, mean_b)]
@@ -697,7 +763,7 @@ def determinism_blockers(a: dict, b: dict) -> list[str]:
       course the output differs. Blaming the pipeline is simply wrong.
     - `checksums: skipped` with no digest: `diff` printed a note conceding the input
       bytes were never verified and then contradicted itself two lines later.
-    - differing `output_hdr`: the means are in different units.
+    - differing `output_depth`: the means are in different units.
     - differing frame sets: the two runs did not convert the same work.
 
     Each was patched-then-rediscovered as a variant of one invariant, so the guard is
@@ -735,7 +801,7 @@ def determinism_blockers(a: dict, b: dict) -> list[str]:
                 "indistinguishable from a pipeline change")
         elif x.get("input_sha256") != y.get("input_sha256"):
             blockers.append(f"frame {name!r} converted different input bytes")
-        if x["output_hdr"] != y["output_hdr"]:
+        if x["output_depth"] != y["output_depth"]:
             blockers.append(
                 f"frame {name!r} was written at a different output depth, so its two "
                 "means are in different units")
@@ -807,9 +873,9 @@ def cmd_diff(args) -> int:
         notes.append("pipeline_version_changed: a difference here is expected and "
                      "attributable — that is what the label is for")
     if any(r.get("output_depth_changed") for r in rows):
-        notes.append("output_depth_changed: `mean` is quantized to [0,1] for u16 and "
-                     "verbatim/unclamped for f32, so the means are in different units "
-                     "and mean_delta_rgb is withheld for those frames")
+        notes.append("output_depth_changed: `mean` is quantized to [0,1] for integer "
+                     "output and verbatim/unclamped for f32, so the means are in "
+                     "different units and mean_delta_rgb is withheld for those frames")
     if skipped:
         notes.append("checksums_skipped: at least one frame's input bytes were never "
                      "verified (--skip-checksums), so an asset change could be "

@@ -67,20 +67,29 @@ A pure-function pipeline orchestrated by a thin CLI layer.
 
 ```text
 decode → film-base → tagged reconstruction → FilmRgbImage
-  ├ legacy (default, no preset) → finish_print → output color transform → encode
+  ├ legacy → finish_print → output color transform → encode
   ├ film-master → NC film RGB v1 → linear ACEScg → encode (unclamped f32, no transform)
   └ display presets → NC film RGB v1 → linear ACEScg → shared print controls
-      ├ ultra-hdr-v1            → SDR + HDR + gain map → JPEG
+      ├ gain-map-hdr (default) / ultra-hdr-v1 → SDR + HDR + gain map → JPEG
       ├ display-p3 / compatibility → SDR → P3/sRGB → 16-bit TIFF
       ├ hdr-pq / hdr-hlg        → HDR → Rec.2100 PQ/HLG → 10-bit 4:4:4 AVIF
       ├ hdr-pq-tiff / hdr-hlg-tiff → the same signal → full-range 16-bit TIFF
       └ hdr-linear-tiff         → HDR, no transfer → 32-bit float BT.2020 TIFF
 ```
 
-Ten preset names are accepted today (`legacy`, `film-master`, `ultra-hdr-v1`,
+Twelve preset names are accepted today (`legacy`, `custom`, `film-master`,
+`gain-map-hdr`, `ultra-hdr-v1`,
 `display-p3`, `compatibility`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
-`hdr-pq-tiff`, `hdr-hlg-tiff`); the remaining planned names (`gain-map-hdr`,
-`custom`) and the default migration are `output/presets`. Keep this list,
+`hdr-pq-tiff`, `hdr-hlg-tiff`) — there is no planned-but-unaccepted tier left, so
+an unknown name always means a typo. Only the default migration remains in
+`output/presets`. **`custom` is the one named preset that is not atomic**: it
+accepts the depth/profile/container selectors, which is why atomicity is gated on
+`OutputPreset::is_atomic()` and not `is_named()` — three call sites, and a missed
+one silently re-opens the accepted-and-ignored bug. It resolves the same legacy
+branch and the same bytes as the no-preset state; the difference is provenance. `gain-map-hdr` and
+`ultra-hdr-v1` are **one render packaged twice** — identical pixels, differing
+only in metadata dialect (`Dialects::LegacyPlusIso` vs `LegacyUltraHdrV1`), and
+only the dual-dialect one decodes as HDR on Apple platforms. Keep this list,
 `OutputPreset::ALL` (which the parse diagnostics are generated from),
 `OutputPreset::parse`,
 `OutputPreset`'s rustdoc, and `OutputOverrides::output_preset`'s **help text** in
@@ -123,11 +132,20 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   (`reconstruct → map_nc_film_rgb_v1 → render_split::film_master`, no colour
   transform). The explicitly selected, `convert`-only display presets are the
   CLI-reachable display (5b) consumers, all sharing one
-  `stages::render_display_source`: `ultra-hdr-v1` feeds `pipeline::gain_map` over
+  `stages::render_display_source`: `gain-map-hdr` / `ultra-hdr-v1` feed
+  `pipeline::gain_map` over
   the implemented `pipeline::sdr` and `pipeline::hdr` stages, and `io::ultra_hdr`
-  writes legacy XMP/MPF metadata (`Dialects::LegacyUltraHdrV1`, the shipped preset,
-  makes no ISO claim; `LegacyPlusIso` adds ISO 21496-1 segments and has no CLI
-  caller yet); `hdr-pq` / `hdr-hlg` take a single `pipeline::hdr` rendition into
+  writes the metadata for whichever `Dialects` the preset resolved —
+  `LegacyUltraHdrV1` (legacy XMP/MPF only, no ISO claim) for `ultra-hdr-v1`,
+  `LegacyPlusIso` (that plus ISO 21496-1 segments in both images) for
+  `gain-map-hdr`. The dialect rides in `FrameRender::UltraHdr`, so it is resolved
+  once beside the render rather than re-derived at the encode site.
+  **libultrahdr's `UHDR_MAX_DIMENSION` must stay raised** — the
+  `jpeg-max-dimension` feature on `ultrahdr-sys` sets it to 65500; at its 8192
+  default, packaging refuses any frame over 8192 px *after* the full render, as an
+  exit-5 write error (real 5000 dpi 35mm scans are 10368x7200). It is an upstream
+  build option, so no vendored source is patched.
+  `hdr-pq` / `hdr-hlg` take a single `pipeline::hdr` rendition into
   `io::avif` — see the AVIF note below. SDR returns opaque rendered-linear Display P3/sRGB
   pixels coupled to resolved 203-nit tone/gamut metadata;
   `color::encode_rendered_sdr` derives the matching transfer/profile without a
@@ -140,11 +158,16 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `docs/tasks/output/hdr-avif-output.md`: whichever task ships an explicit
   `convert`-only preset also calibrates that preset's `memory::RunProfile`. `cli::required_extensions` is now **complete** (every preset states a
   suffix, including `legacy` and `film-master`, which previously let
-  `nc convert -o out.jpg` write a TIFF named `.jpg`). It no longer drives the
-  roll refusal: that is a separate explicit list (`legacy` + `film-master`),
-  because deriving "convert-only" from "pins a suffix" refused *every* preset
-  once the table was completed and broke `nc roll` outright — the two concepts
-  had merely coincided;
+  `nc convert -o out.jpg` write a TIFF named `.jpg`). It never drove the roll
+  refusal — deriving "convert-only" from "pins a suffix" refused *every* preset
+  once the table was completed and broke `nc roll` outright — and **there is no
+  roll refusal left**: every preset is roll-capable, because `default_output_name`
+  derives `<stem>_positive.<ext>` from the frame's own resolved preset and an
+  explicit manifest `output` goes through the same `reject_suffix_mismatch` rule
+  `convert` uses. The derived spelling comes from `cli::derived_extension`, **not**
+  from the head of `required_extensions` — that lists `tif` first, so taking it
+  renames every existing `_positive.tiff`; the two are tied by a test asserting the
+  derived spelling is a member of the accepted set;
   `input_semantics::resolve` is the pure stage-1b transfer/meaning resolver,
   keyed on SilverFast XMP mode metadata — see the input-semantics note below;
   `working_space::map_nc_film_rgb_v1` is the typed NC film RGB v1 → linear
@@ -199,6 +222,13 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
     Nothing automated catches it: `PIPELINE_FINGERPRINTS` stops before lcms2 and
     the audit only compares pinned artifacts. Treat those five as a pixel change
     regardless of the ulp column.
+  - **The ICC PCS white is a *declared* triple, not a derived one.**
+    `definitions::ICC_PCS_WHITE_XYZ` is ICC.1:2022's `[0.9642, 1, 0.8249]`; deriving
+    XYZ from `D50`'s rounded four-decimal chromaticities gives
+    `[0.96429568, 1, 0.82510460]`, ≈2.4e-4 away. Anything **serializing an ICC
+    profile** (colorant matrices, `chad`) adapts to the declared triple — adapting to
+    the derived one makes a profile announce one white and produce another, which
+    shipped once in the coded HDR profiles. Everything else keeps using `D50`.
   - **Two Bradford conventions coexist deliberately.** `BRADFORD` (exact `f64`
     inverse) is canonical; `BRADFORD_PUBLISHED_INVERSE` (Lindbloom's printed
     7-decimal inverse) exists *only* because `NC_FILM_RGB_V1_TO_ACESCG` was
@@ -225,6 +255,23 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
     form, so deriving from primaries would put nc's forward transform ~2e-6 from
     every decoder's inverse. A test pins row 0 as the *same literal* as
     `BT2020_LUMA` so the two cannot desynchronize.
+- **Known issue — the default gain map is inert, and HDR is deliberately
+  deprioritised.** Under the default sigmoid the HDR rendition peaks at *exactly*
+  the 203-nit reference white, so `gain-map-hdr` (the default) writes a
+  structurally valid gain-map JPEG whose `GainMapMax` decodes as **1.0x**. This is
+  a **rendering** property, not a container defect: the reference-anchored sigmoid
+  pins mid-grey at half the reference density and rolls its shoulder so diffuse
+  white lands *at* reference white, so nothing exceeds it by construction. The
+  exponential curve on the same frame reaches **4.87x** — it pins white at `Dmax`
+  with no placement rule, so contrast pushes values past reference white.
+  **The film is not the limitation.** Negative stock carries wide latitude; the
+  *print rendering* decides whether output exceeds diffuse white, and today's
+  default declines to. So HDR is a rendering-intent option, not a correctness gap —
+  it is **not a blocker** for the sigmoid path (user decision 2026-08-10). The HDR
+  presets stay first-class and stay the default *precisely* to keep that door open
+  while the reconstruction/render split is explored
+  (`algo/reconstruction-render-curve-split`). Do not "fix" this by widening the
+  container or by re-deriving headroom in the gain-map stage.
 - **nc writes the AVIF container itself; libaom only makes the codestream.**
   `io/avif.rs` is the `hdr-pq`/`hdr-hlg` encoder. There is **no libavif
   dependency** — no published crate ships libavif ≥ 1.4.2 (`libavif-sys` is
@@ -340,6 +387,14 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
 - **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
   `cargo build` → `cargo test`. The gate is strict — warnings fail the build.
+- **The four gates do not cover `scripts/analysis/`.** Its `nctool` Python suite
+  (92 tests) runs under no gate — `python3 -m unittest discover -s scripts/analysis
+  -p "test_*.py"` by hand after touching it.
+- **`tests/pipeline.rs`'s `run()` injects `--output-preset legacy`** into a
+  `convert` that names no preset, loads no `--params`, and writes `.tif`/`.tiff` —
+  ~87 tests predate the gain-map default and assert TIFF-path behaviour. A test
+  about what a *bare* invocation resolves must use `run_exact`, which injects
+  nothing.
 - **Determinism is per build/architecture, not cross-platform — write golden
   tests accordingly.** Tests run locally (macOS/aarch64) *and* in CI (x86_64
   Linux), so a green local `cargo test` is not proof CI is green. Reconstruction's
@@ -526,14 +581,18 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     sample into `EncodeReport` (`types.rs`) so the loss rides back to the
     orchestrator as a report warning (`--strict` promotes it) — never clamp
     silently anywhere.
-  - *Output-preset atomicity is deliberately asymmetric — don't unify it.* A named
-    preset rejects a **non-default resolved value** for `output.hdr` /
-    `output_profile` / `bigtiff` (either provenance), but rejects `--output-sdr` by
-    **flag presence**. `--output-sdr` has no recipe spelling (`output.hdr = false`
-    *is* the serde default, indistinguishable from omission), so no value rule can
-    see it, and unlike `--bigtiff auto` its documented meaning ("force 16-bit
-    integer") is one the master contradicts. Collapsing the two rules silently
-    writes an f32 master when the user asked for 16-bit.
+  - *Output-preset atomicity is deliberately asymmetric — don't unify it.* An atomic
+    preset rejects a **non-default resolved value** for `output.depth` /
+    `output_profile` / `bigtiff` (either provenance), but rejects the `--out-depth`
+    **flag** by presence. `--out-depth u16` resolves the documented *default*, so no
+    value rule can see it, yet it still *forces* a depth the preset cannot produce —
+    unlike `--bigtiff auto`, which genuinely asks for nothing. Collapsing the two
+    rules silently writes an f32 master when the user asked for 16-bit. This
+    asymmetry **survived** the `output.hdr` (bool + `--output-hdr`/`--output-sdr`) →
+    `output.depth` (`OutDepth` enum + `--out-depth`) rename: the enum removed the
+    parallel-fields shape and gave the value half a real recipe spelling, but the
+    presence hole is a property of "u16 is the default", not of the old modelling —
+    a first pass at the rename assumed it dissolved and was wrong.
   - *`validate` is not the whole `convert` gate.* Every rule inside it reads only
     the resolved config — which is why `roll` and each per-frame override share it
     verbatim. `convert` must call **`validate_convert`**, which composes it with the

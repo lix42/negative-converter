@@ -121,14 +121,67 @@ impl Drop for TempDir {
 }
 
 /// Run `nc` with `args`; return (exit code, stdout, stderr).
+///
+/// **Injects `--output-preset legacy`** into a **`convert`** that names no preset, no
+/// `--params`, and writes a `.tif`/`.tiff`. (`roll` is excluded: it has no
+/// output-preset flag at all, so its tests state the preset in their shared recipe —
+/// `ROLL_RECIPE` is the pattern.) The product default became `gain-map-hdr` (a JPEG)
+/// in `output/presets`, and these tests were written when a TIFF *was* the default:
+/// every one of them asserts something about the TIFF path — sidecar naming, staging
+/// temps, u16/f32 sample round-trips, the memory model — and none is about which
+/// preset a bare invocation resolves. Making the preset they always meant explicit
+/// is the honest fix; silently letting them assert the gain-map path would be a
+/// rewrite of ~87 tests into tests of something else.
+///
+/// Tests that *are* about the default use [`run_exact`], which injects nothing.
+///
+/// **Standing trap:** a *new* test written with `run()` that means to exercise the
+/// default output path silently gets `legacy` appended and nothing signals it. If you
+/// are testing what a bare invocation resolves, reach for `run_exact`.
 fn run(args: &[&str]) -> (i32, String, String) {
     run_env(args, &[])
+}
+
+/// Whether a `convert` invocation should have `--output-preset legacy` appended:
+/// it converts, names no preset **and loads no recipe**, and writes a `.tif`/`.tiff`.
+///
+/// The `--params` exclusion is load-bearing. Flags win over a recipe, so injecting a
+/// preset would *override* one the recipe set — silently turning a film-master or
+/// coded-TIFF test into a legacy test that still passes for the wrong reason. A test
+/// whose recipe names no preset states `legacy` in the recipe instead (`ROLL_RECIPE`
+/// is the pattern).
+fn wants_legacy_injection(args: &[&str]) -> bool {
+    args.first().is_some_and(|a| *a == "convert")
+        && !args
+            .iter()
+            .any(|a| *a == "--output-preset" || *a == "--params")
+        && args.windows(2).any(|w| {
+            (w[0] == "-o" || w[0] == "--output")
+                && std::path::Path::new(w[1]).extension().is_some_and(|e| {
+                    e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
+                })
+        })
+}
+
+/// [`run`] with no preset injection — for tests about what a bare invocation
+/// actually resolves.
+fn run_exact(args: &[&str]) -> (i32, String, String) {
+    spawn(args, &[])
 }
 
 /// Like [`run`], but with extra environment variables set for the child (used to
 /// point `NC_TELEMETRY_LOG` at a temp file so telemetry tests never touch the
 /// real user data dir).
 fn run_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let mut owned: Vec<&str> = args.to_vec();
+    if wants_legacy_injection(args) {
+        owned.extend_from_slice(&["--output-preset", "legacy"]);
+    }
+    spawn(&owned, envs)
+}
+
+/// Spawn `nc` verbatim — the one place that runs the binary, with no injection.
+fn spawn(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let mut cmd = Command::new(NC);
     cmd.args(args);
     for (k, v) in envs {
@@ -820,7 +873,8 @@ fn hdr_linear_tiff_rejects_a_non_tiff_path_and_conflicting_flags() {
         out.to_str().unwrap(),
     ];
     args.extend_from_slice(&base[1..]);
-    args.push("--output-hdr");
+    args.push("--out-depth");
+    args.push("f32");
     let (code, _, err) = run(&args);
     assert_eq!(code, 2, "{err}");
     assert!(!out.exists(), "a rejected run must write nothing");
@@ -1008,7 +1062,7 @@ fn hdr_hlg_signals_its_own_transfer_and_omits_content_light_level() {
 }
 
 #[test]
-fn hdr_avif_presets_reject_a_non_avif_suffix_and_roll_mode() {
+fn hdr_avif_presets_reject_a_non_avif_suffix_and_roll_with_an_avif_name() {
     let tmp = TempDir::new("hdr-avif-gates");
     for preset in ["hdr-pq", "hdr-hlg"] {
         let output = tmp.path(&format!("{preset}.tiff"));
@@ -1026,8 +1080,8 @@ fn hdr_avif_presets_reject_a_non_avif_suffix_and_roll_mode() {
         assert!(err.contains(".avif"), "{err}");
         assert!(!output.exists(), "nothing may be written on a usage error");
     }
-    // Still `convert`-only: roll naming for non-TIFF containers is `output/presets`.
-    // `roll` has no output-selection flags, so the preset arrives via the recipe.
+    // Roll runs this preset now and derives a container-correct name. `roll` has no
+    // output-selection flags, so the preset arrives via the shared recipe.
     let out_dir = tmp.path("roll-out");
     std::fs::create_dir_all(&out_dir).unwrap();
     let recipe = tmp.path("roll.json");
@@ -1044,9 +1098,11 @@ fn hdr_avif_presets_reject_a_non_avif_suffix_and_roll_mode() {
         "--params",
         recipe.to_str().unwrap(),
     ]);
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("convert"), "{err}");
-    assert!(err.contains("hdr-pq"), "{err}");
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out_dir.join("hdr-48bit_positive.avif").exists(),
+        "roll must derive the preset's own container suffix, not `.tiff`"
+    );
 }
 
 #[test]
@@ -1341,7 +1397,8 @@ fn convert_density_f32_avoids_clipping() {
         out.to_str().unwrap(),
         "--reconstruction",
         "density",
-        "--output-hdr",
+        "--out-depth",
+        "f32",
         "--film-base",
         "0.9,0.55,0.42",
     ]);
@@ -1548,7 +1605,8 @@ fn estimate_emits_reuse_ready_output_that_round_trips() {
         fix.to_str().unwrap(),
         "-o",
         out_flag.to_str().unwrap(),
-        "--output-hdr",
+        "--out-depth",
+        "f32",
         "--film-base",
         value,
     ]);
@@ -1573,7 +1631,12 @@ fn estimate_emits_reuse_ready_output_that_round_trips() {
         fix.to_str().unwrap(),
         "-o",
         out_recipe.to_str().unwrap(),
-        "--output-hdr",
+        // The fragment states only a film base, so the preset comes from the flag
+        // (the default `gain-map-hdr` is atomic and would refuse `--out-depth`).
+        "--output-preset",
+        "legacy",
+        "--out-depth",
+        "f32",
         "--params",
         recipe.to_str().unwrap(),
     ]);
@@ -1675,6 +1738,9 @@ fn estimate_measures_roll_fixed_dmax_from_a_reference_region_and_it_round_trips(
         fixture("hdr-48bit.tif").to_str().unwrap(),
         "-o",
         out2.to_str().unwrap(),
+        // The fragment carries only reconstruction, so name the TIFF preset here.
+        "--output-preset",
+        "legacy",
         "--film-base",
         "0.9,0.55,0.42",
         "--params",
@@ -2045,7 +2111,8 @@ fn convert_is_deterministic() {
             out.to_str().unwrap().to_string(),
             "--reconstruction".to_string(),
             "density".to_string(),
-            "--output-hdr".to_string(),
+            "--out-depth".to_string(),
+            "f32".to_string(),
             "--film-base".to_string(),
             "0.9,0.55,0.42".to_string(),
             "--report".to_string(),
@@ -2083,7 +2150,8 @@ fn sidecar_recipe_round_trips_through_recipe_in() {
         out_a.to_str().unwrap(),
         "--reconstruction",
         "density",
-        "--output-hdr",
+        "--out-depth",
+        "f32",
         "--film-base",
         "0.9,0.55,0.42",
         "--density-curve",
@@ -2567,7 +2635,8 @@ fn input_assertion_provenance_distinguishes_cli_from_recipe() {
     std::fs::write(
         &recipe,
         r#"{"input":{"transfer":"linear","meaning":"scanner-device"},
-            "film_base":{"source":{"explicit":[0.9,0.55,0.42]}}}"#,
+            "film_base":{"source":{"explicit":[0.9,0.55,0.42]}},
+            "output":{"preset":"legacy"}}"#,
     )
     .unwrap();
 
@@ -2961,7 +3030,7 @@ fn telemetry_file_writes_full_record() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
 
-    assert_eq!(record["schema_version"], 3);
+    assert_eq!(record["schema_version"], 4);
     assert!(record["timestamp_ms"].as_u64().unwrap() > 0);
     assert!(record["nc_version"].is_string());
     assert!(record["target"].is_string());
@@ -3010,7 +3079,7 @@ fn telemetry_file_writes_full_record() {
         conv["film_base_source"]["explicit"],
         serde_json::json!([0.9, 0.55, 0.42])
     );
-    assert_eq!(conv["output_hdr"], false);
+    assert_eq!(conv["output_depth"], "u16");
 
     let outcome = &record["outcome"];
     // No `success` field today — a record is emitted only on success, so a
@@ -3123,7 +3192,7 @@ fn telemetry_log_appends_one_line_per_run() {
     // Each line is an independent, valid JSON object.
     for line in lines {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
     }
 }
 
@@ -3233,7 +3302,8 @@ fn telemetry_write_failure_is_fail_soft_even_under_strict() {
         out.to_str().unwrap(),
         "--reconstruction",
         "density",
-        "--output-hdr",
+        "--out-depth",
+        "f32",
         "--film-base",
         "0.9,0.55,0.42",
         "--telemetry-file",
@@ -3354,7 +3424,7 @@ fn telemetry_file_dash_writes_json_to_stdout() {
     ]);
     assert_eq!(code, 0, "telemetry to stdout should succeed:\n{err}");
     let record = json(&stdout);
-    assert_eq!(record["schema_version"], 3);
+    assert_eq!(record["schema_version"], 4);
     assert_eq!(record["image"]["format"], "hdr");
 }
 
@@ -3492,7 +3562,8 @@ fn telemetry_outcome_counts_ir_ignored_warning() {
         out.to_str().unwrap(),
         "--reconstruction",
         "density",
-        "--output-hdr", // f32 never clips, so the IR-ignored warning is isolated
+        "--out-depth",
+        "f32", // f32 never clips, so the IR-ignored warning is isolated
         "--film-base",
         "0.9,0.55,0.42",
         "--telemetry-file",
@@ -3823,7 +3894,8 @@ fn auto_wb_reports_gains_that_reproduce_the_output_when_reused() {
             out.to_str().unwrap().to_string(),
             "--film-base".to_string(),
             "0.9,0.55,0.42".to_string(),
-            "--output-hdr".to_string(),
+            "--out-depth".to_string(),
+            "f32".to_string(),
         ];
         v.extend(wb.iter().map(|s| s.to_string()));
         v
@@ -4026,12 +4098,22 @@ fn write_file(path: &Path, contents: &str) -> PathBuf {
 /// A hand-authored frozen roll recipe: explicit roll-fixed film base + Dmax, so
 /// every frame converts deterministically without auto-base (real scans are
 /// holder → rebate → picture, where auto-base fails loudly).
+/// The shared roll recipe these tests convert with.
+///
+/// It states `output.preset` explicitly because `roll` has **no** output-preset
+/// flag — the recipe is the only place a roll can choose one — and because the
+/// product default became `gain-map-hdr` (a JPEG) in `output/presets`. Every roll
+/// test below asserts TIFF names, TIFF sidecars or byte-identical TIFF reruns, so
+/// `legacy` is the preset they always meant; the container-aware naming these tests
+/// would otherwise be silently retesting has its own coverage in
+/// `roll_checks_explicit_manifest_suffixes_and_derives_per_frame_preset_names`.
 const ROLL_RECIPE: &str = r#"{
   "reconstruction": {
     "type": "density",
     "curve": { "type": "exponential", "dmax": { "explicit": 1.6 } }
   },
-  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } }
+  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+  "output": { "preset": "legacy" }
 }"#;
 
 #[test]
@@ -4351,7 +4433,8 @@ fn roll_empty_batch_errors_loudly_on_both_paths() {
 /// re-estimates its own Dmin, so the roll is not truly frozen.
 const ROLL_RECIPE_REGION: &str = r#"{
   "reconstruction": { "type": "density" },
-  "film_base": { "source": { "region": [0, 0, 502, 462] } }
+  "film_base": { "source": { "region": [0, 0, 502, 462] } },
+  "output": { "preset": "legacy" }
 }"#;
 
 #[test]
@@ -4429,7 +4512,7 @@ fn roll_warns_on_per_frame_film_base_override() {
     let manifest_txt = format!(
         r#"{{ "frames": [
              {{ "input": {hdr:?},
-                "params": {{ "film_base": {{ "source": {{ "explicit": [0.8, 0.5, 0.4] }} }} }} }}
+                "params": {{ "film_base": {{ "source": {{ "explicit": [0.8, 0.5, 0.4] }} }}, "output": {{ "preset": "legacy" }} }} }}
            ] }}"#,
         hdr = hdr.to_str().unwrap(),
     );
@@ -4949,7 +5032,7 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
         (vec!["--auto-wb", "percentile"], "white_balance"),
         (vec!["--highlight-compress", "0.2"], "highlight_compress"),
         (vec!["--linear-range", "0.02,0.97"], "linear_range"),
-        (vec!["--output-hdr"], "output.hdr"),
+        (vec!["--out-depth", "f32"], "--out-depth"),
         (vec!["--output-profile", "srgb"], "output.output_profile"),
         (vec!["--bigtiff", "on"], "output.bigtiff"),
     ] {
@@ -4974,13 +5057,14 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
         assert!(!out.exists(), "{extra:?}: no output may be written");
     }
 
-    // `--output-sdr` is rejected by flag **presence**, not by resolved value: it forces
-    // the default 16-bit integer TIFF, which the master cannot produce, so the request
-    // is contradicted rather than redundant. Rejected regardless of where the *preset*
-    // came from, and regardless of what the recipe says about `hdr`.
+    // `--out-depth` is rejected by flag **presence**, not by resolved value: `u16`
+    // forces the default 16-bit integer TIFF, which the master cannot produce, so a
+    // value rule would see the default and silently ignore the request. Rejected
+    // regardless of where the *preset* came from, and of what the recipe says about
+    // depth.
     let hdr_recipe = write_file(
         &tmp.path("hdr-recipe.json"),
-        r#"{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}},"output":{"hdr":true}}"#,
+        r#"{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}},"output":{"preset":"legacy","depth":"f32"}}"#,
     );
     let preset_recipe = write_file(
         &tmp.path("preset-recipe.json"),
@@ -4990,16 +5074,21 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
     let master_hdr_recipe = write_file(
         &tmp.path("preset-hdr-recipe.json"),
         r#"{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}},
-            "output":{"preset":"film-master","hdr":true}}"#,
+            "output":{"preset":"film-master","depth":"f32"}}"#,
     );
     for (name, args) in [
         (
             "flag preset",
-            vec!["--output-preset", "film-master", "--output-sdr"],
+            vec!["--output-preset", "film-master", "--out-depth", "u16"],
         ),
         (
             "recipe preset",
-            vec!["--params", preset_recipe.to_str().unwrap(), "--output-sdr"],
+            vec![
+                "--params",
+                preset_recipe.to_str().unwrap(),
+                "--out-depth",
+                "u16",
+            ],
         ),
         (
             // The case that motivated rejecting it: 16-bit requested twice, f32 written.
@@ -5007,7 +5096,8 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
             vec![
                 "--params",
                 master_hdr_recipe.to_str().unwrap(),
-                "--output-sdr",
+                "--out-depth",
+                "u16",
             ],
         ),
     ] {
@@ -5021,16 +5111,13 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
         argv.extend_from_slice(&base);
         argv.extend_from_slice(&args);
         let (code, _stdout, err) = run(&argv);
-        assert_eq!(
-            code, 2,
-            "{name}: --output-sdr must be a usage error:\n{err}"
-        );
-        assert!(err.contains("--output-sdr"), "{name}: {err}");
-        assert!(err.contains("16-bit integer"), "{name}: {err}");
+        assert_eq!(code, 2, "{name}: --out-depth must be a usage error:\n{err}");
+        assert!(err.contains("--out-depth"), "{name}: {err}");
+        assert!(err.contains("flag presence"), "{name}: {err}");
         assert!(!out.exists(), "{name}: no output may be written");
     }
-    // …while `--output-sdr` keeps its entire legacy job when no named preset is in play,
-    // including resetting a recipe `hdr: true` back to the 16-bit default.
+    // …while `--out-depth` keeps its entire job when no atomic preset is in play,
+    // including resetting a recipe `depth: "f32"` back to the 16-bit default.
     let sdr_legacy = tmp.path("sdr-legacy.tiff");
     let (code, _stdout, err) = run(&[
         "convert",
@@ -5039,7 +5126,8 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
         sdr_legacy.to_str().unwrap(),
         "--params",
         hdr_recipe.to_str().unwrap(),
-        "--output-sdr",
+        "--out-depth",
+        "u16",
         "--report",
         "none",
     ]);
@@ -5070,12 +5158,12 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
     let (code, _stdout, err) = run(&argv);
     assert_eq!(code, 0, "--bigtiff auto must be accepted:\n{err}");
     assert_eq!(read_f32_tiff(&ok).1, 32);
-    // A recipe `hdr: false` likewise asserts nothing (it is the serde default).
-    let ok_false = tmp.path("ok-hdr-false.tiff");
+    // A recipe `depth: "u16"` likewise asserts nothing (it is the serde default).
+    let ok_false = tmp.path("ok-depth-u16.tiff");
     let hdr_false = write_file(
-        &tmp.path("preset-hdr-false.json"),
+        &tmp.path("preset-depth-u16.json"),
         r#"{"film_base":{"source":{"explicit":[0.9,0.55,0.42]}},
-            "output":{"preset":"film-master","hdr":false}}"#,
+            "output":{"preset":"film-master","depth":"u16"}}"#,
     );
     let (code, _stdout, err) = run(&[
         "convert",
@@ -5089,7 +5177,7 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
     ]);
     assert_eq!(code, 0, "a recipe hdr:false must be accepted:\n{err}");
     assert_eq!(read_f32_tiff(&ok_false).1, 32);
-    // …while a recipe `hdr: true` is the loud value-rule error.
+    // …while a recipe `depth: "f32"` is the loud value-rule error.
     let bad = tmp.path("bad-recipe.tiff");
     let (code, _stdout, err) = run(&[
         "convert",
@@ -5099,8 +5187,8 @@ fn film_master_never_silently_ignores_a_requested_adjustment() {
         "--params",
         master_hdr_recipe.to_str().unwrap(),
     ]);
-    assert_eq!(code, 2, "a recipe hdr:true must be rejected:\n{err}");
-    assert!(err.contains("output.hdr"), "{err}");
+    assert_eq!(code, 2, "a recipe depth:f32 must be rejected:\n{err}");
+    assert!(err.contains("output.depth"), "{err}");
     assert!(!bad.exists());
 
     // A measured balance range is rejected, but the *same* balance with an explicit
@@ -5200,7 +5288,7 @@ fn film_master_embeds_the_same_acescg_icc_the_binary_writes_for_that_space() {
     let master = convert("master.tiff", &["--output-preset", "film-master"]);
     let legacy_acescg = convert(
         "legacy-acescg.tiff",
-        &["--output-hdr", "--output-profile", "acescg"],
+        &["--out-depth", "f32", "--output-profile", "acescg"],
     );
     let icc = read_icc_tag(&master);
     assert!(
@@ -5288,7 +5376,7 @@ fn film_master_ir_sidecar_follows_the_preset_depth_and_carries_the_plane() {
 #[test]
 fn film_master_telemetry_names_the_preset_and_the_written_depth() {
     // The record's `conversion.preset` is what distinguishes a master from a legacy
-    // run, and `conversion.output_hdr` means "an f32 TIFF was written" — which under
+    // run, and `conversion.output_depth` says which depth was written — which under
     // the preset is true while `output.hdr` stays at its default. Reading the switch
     // directly reported `false` for a 4-bytes-per-sample file; this pins the fix
     // end-to-end, and the byte count pins that f32 is what actually landed on disk.
@@ -5314,11 +5402,11 @@ fn film_master_telemetry_names_the_preset_and_the_written_depth() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
     let conv = &record["conversion"];
-    assert_eq!(record["schema_version"], 3);
+    assert_eq!(record["schema_version"], 4);
     assert_eq!(conv["preset"], "film-master");
     assert_eq!(
-        conv["output_hdr"], true,
-        "the master writes f32, so the depth flag must say so: {conv}"
+        conv["output_depth"], "f32",
+        "the master writes f32, so the record's depth must say so: {conv}"
     );
     // Cross-check against the file the run actually wrote: 4 bytes per sample.
     let (samples, bits, _) = read_f32_tiff(&out);
@@ -5350,7 +5438,7 @@ fn film_master_telemetry_names_the_preset_and_the_written_depth() {
     let legacy: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&legacy_rec).unwrap()).unwrap();
     assert_eq!(legacy["conversion"]["preset"], "legacy");
-    assert_eq!(legacy["conversion"]["output_hdr"], false);
+    assert_eq!(legacy["conversion"]["output_depth"], "u16");
 }
 
 #[test]
@@ -5448,19 +5536,22 @@ fn scene_master_is_rejected_as_an_unreleased_schema_break() {
     assert_eq!(code, 2, "the recipe key must reject it too:\n{err}");
     assert!(err.contains("film-master"), "{err}");
 
-    // A planned-but-unaccepted preset name gets its own "not yet" diagnosis.
+    // An unknown name is a typo, and the diagnosis lists every accepted preset. There
+    // is no "planned but not yet accepted" tier any more — `gain-map-hdr` and `custom`
+    // were the last two names in it and both shipped with `output/presets`.
     let (code, _stdout, err) = run(&[
         "convert",
         fixture("hdri-64bit.tif").to_str().unwrap(),
         "-o",
         out.to_str().unwrap(),
         "--output-preset",
-        "gain-map-hdr",
+        "custome",
         "--film-base",
         "0.9,0.55,0.42",
     ]);
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("does not accept yet"), "{err}");
+    assert!(err.contains("unknown output preset"), "{err}");
+    assert!(err.contains("`custom`"), "{err}");
 }
 
 #[test]
@@ -5506,7 +5597,8 @@ fn legacy_no_preset_output_is_unchanged_by_the_preset_machinery() {
         &[
             "--output-preset",
             "legacy",
-            "--output-hdr",
+            "--out-depth",
+            "f32",
             "--bigtiff",
             "on",
         ],
@@ -5819,7 +5911,11 @@ fn recipe_dumped_by_this_build_replays_clean_under_strict() {
     // Falsifiable: the same replay of a recipe that genuinely leaves the curve
     // unpinned — a shape this build never writes — still fails.
     let bare = tmp.path("bare.json");
-    std::fs::write(&bare, r#"{"reconstruction":{"type":"density"}}"#).unwrap();
+    std::fs::write(
+        &bare,
+        r#"{"reconstruction":{"type":"density"},"output":{"preset":"legacy"}}"#,
+    )
+    .unwrap();
     let (code, _, err) = run(&[
         "convert",
         fixture("hdr-48bit.tif").to_str().unwrap(),
@@ -6043,7 +6139,8 @@ fn unknown_meta_fields_are_ignored_but_the_recipe_body_is_still_strict() {
     let ok = write_file(
         &tmp.path("ok.json"),
         r#"{ "meta": { "invented_future_field": [1, 2], "pipeline_version": 1 },
-             "params": { "print": { "print_exposure": 0.25 } } }"#,
+             "params": { "print": { "print_exposure": 0.25 },
+                          "output": { "preset": "legacy" } } }"#,
     );
     let (code, _, err) = run(&[
         "convert",
@@ -6155,7 +6252,7 @@ fn an_unreadable_meta_pipeline_version_is_loud_not_silently_ignored() {
             &tmp.path(&format!("{tag}.json")),
             &format!(
                 r#"{{ "meta": {{ "pipeline_version": {value} }},
-                      "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }} }} }}"#
+                      "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }}, "output": {{ "preset": "legacy" }} }} }}"#
             ),
         );
         let (code, _, err) = run(&[
@@ -6193,7 +6290,7 @@ fn a_malformed_meta_container_is_refused_like_a_malformed_field() {
             &tmp.path(&format!("{tag}.json")),
             &format!(
                 r#"{{ "meta": {meta},
-                      "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }} }} }}"#
+                      "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }}, "output": {{ "preset": "legacy" }} }} }}"#
             ),
         );
         let (code, _, err) = run(&[
@@ -6236,7 +6333,8 @@ fn output_stats_report_the_written_samples_for_both_depths() {
     // f32/HDR output is written verbatim, so the mean is reported in *that* domain
     // (unclamped) — the reason `nctool compare` records the depth beside the mean.
     let hdr = tmp.path("hdr.tiff");
-    let (code, stdout, err) = convert_default(&fixture("hdri-64bit.tif"), &hdr, &["--output-hdr"]);
+    let (code, stdout, err) =
+        convert_default(&fixture("hdri-64bit.tif"), &hdr, &["--out-depth", "f32"]);
     assert_eq!(code, 0, "{err}");
     let report = json(&stdout);
     assert_eq!(
@@ -6409,7 +6507,8 @@ fn replaying_another_pipeline_versions_recipe_warns_and_strict_promotes_it() {
     let stale = write_file(
         &tmp.path("stale.json"),
         r#"{ "meta": { "pipeline_version": 9999 },
-             "params": { "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } } } }"#,
+             "params": { "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+                          "output": { "preset": "legacy" } } }"#,
     );
     let out = tmp.path("out.tiff");
     let (code, stdout, err) = run(&[
@@ -6462,7 +6561,7 @@ fn replaying_another_pipeline_versions_recipe_warns_and_strict_promotes_it() {
         &tmp.path("matching.json"),
         &format!(
             r#"{{ "meta": {{ "pipeline_version": {current} }},
-                  "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }} }} }}"#
+                  "params": {{ "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }}, "output": {{ "preset": "legacy" }} }} }}"#
         ),
     );
     // No `--strict` here: this HDRi fixture legitimately warns about its unconsumed
@@ -7205,7 +7304,8 @@ fn roll_requires_a_stated_film_base_and_says_so_in_roll_terms() {
     // `film_base.source` gets past the gate and converts.
     let recipe = write_file(
         &tmp.path("roll.json"),
-        r#"{"film_base": {"source": {"explicit": [0.9, 0.6, 0.5]}}}"#,
+        r#"{"film_base": {"source": {"explicit": [0.9, 0.6, 0.5]}},
+            "output": {"preset": "legacy"}}"#,
     );
     let (code, stdout, err) = run(&[
         "roll",
@@ -7376,7 +7476,10 @@ fn every_tiff_preset_now_states_its_suffix_including_the_oldest_two() {
         full.extend_from_slice(argv);
         run(&full)
     };
-    for argv in [vec![], vec!["--output-preset", "film-master"]] {
+    for argv in [
+        vec!["--output-preset", "legacy"],
+        vec!["--output-preset", "film-master"],
+    ] {
         for name in ["out.jpg", "out"] {
             let bad = tmp.path(name);
             let (code, _stdout, err) = convert(&bad, &argv);
@@ -7385,7 +7488,7 @@ fn every_tiff_preset_now_states_its_suffix_including_the_oldest_two() {
         }
         // The positive control: without it, a rule that rejected *every* path would
         // pass the assertions above.
-        let good = tmp.path(if argv.is_empty() {
+        let good = tmp.path(if argv[1] == "legacy" {
             "legacy.tiff"
         } else {
             "master.tiff"
@@ -7394,11 +7497,437 @@ fn every_tiff_preset_now_states_its_suffix_including_the_oldest_two() {
         assert_eq!(code, 0, "{argv:?} must accept a .tiff path: {err}");
         assert!(good.exists(), "{argv:?} must write the file");
     }
-    // The default path's diagnosis names the requirement, not a flag nobody passed.
+    // The default path's diagnosis names the *default preset* and the requirement,
+    // never a flag nobody passed.
     let (_code, _stdout, err) = convert(&tmp.path("out"), &[]);
-    assert!(err.contains(".tif"), "{err}");
+    assert!(err.contains(".jpg"), "{err}");
+    assert!(err.contains("gain-map-hdr"), "{err}");
     assert!(
-        !err.contains("--output-preset"),
+        !err.contains("--output-preset gain-map-hdr"),
         "the default path must not blame an unpassed flag: {err}"
     );
+}
+
+#[test]
+fn gain_map_hdr_carries_both_dialects_over_the_same_pixels_as_ultra_hdr_v1() {
+    // The two gain-map presets are one render packaged two ways. This pins both
+    // halves of that: the *pixels* must be identical (so a future edit cannot let
+    // them drift into two renders), and the *metadata* must differ in exactly the
+    // ISO segments — which is the entire reason `gain-map-hdr` exists, since Apple
+    // platforms read only the ISO dialect and open `ultra-hdr-v1` as plain SDR.
+    let tmp = TempDir::new("gain-map-hdr-dialects");
+    let convert = |preset: &str, name: &str| -> (serde_json::Value, Vec<u8>) {
+        let output = tmp.path(name);
+        let (code, stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+        ]);
+        assert_eq!(code, 0, "{err}");
+        (json(&stdout), std::fs::read(&output).unwrap())
+    };
+    let (legacy_report, legacy_bytes) = convert("ultra-hdr-v1", "legacy.jpg");
+    let (dual_report, dual_bytes) = convert("gain-map-hdr", "dual.jpg");
+
+    assert_eq!(dual_report["recipe"]["output"]["preset"], "gain-map-hdr");
+    assert_eq!(
+        dual_report["output_render"]["encoding"],
+        "dual-dialect-gain-map-jpeg"
+    );
+    // Same pixels: `output_stats` is measured on the normalized 8-bit buffer handed
+    // to the compressor, so it witnesses the render rather than the container.
+    assert_eq!(
+        dual_report["output_stats"], legacy_report["output_stats"],
+        "the two gain-map presets must package one identical render"
+    );
+
+    let has =
+        |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+    // Both carry the legacy dialect — dual-dialect is additive, and the shared gain
+    // map is the achromatic one legacy XMP can describe.
+    for bytes in [&legacy_bytes, &dual_bytes] {
+        assert_eq!(&bytes[..2], &[0xff, 0xd8]);
+        assert!(has(bytes, b"hdrgm:Version=\"1.0\""));
+        assert!(has(bytes, b"Item:Semantic=\"GainMap\""));
+    }
+    // Only the dual file carries ISO 21496-1, and `ultra-hdr-v1`'s ISO-free
+    // contract is asserted from its own side too.
+    assert!(
+        has(&dual_bytes, b"urn:iso:std:iso:ts:21496:-1"),
+        "gain-map-hdr must carry the published ISO 21496-1 URN"
+    );
+    assert!(
+        !has(&legacy_bytes, b"21496"),
+        "ultra-hdr-v1 is contractually ISO-free"
+    );
+    // The ISO segment count is 2 (one per image), not 1: a baseline-only file
+    // parses in exiftool but decodes as SDR, which is exactly how a placement
+    // defect once shipped.
+    assert_eq!(
+        dual_bytes
+            .windows(b"urn:iso:std:iso:ts:21496:-1".len())
+            .filter(|window| *window == b"urn:iso:std:iso:ts:21496:-1")
+            .count(),
+        2,
+        "both the baseline and the gain-map image must carry an ISO segment"
+    );
+    // Placement: the baseline's ISO segment must precede both SOF0 and the MPF
+    // label. Meeting only the second constraint produces a well-formed file no
+    // decoder ever parses.
+    let at = |needle: &[u8]| {
+        dual_bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap_or_else(|| panic!("missing marker"))
+    };
+    let iso = at(b"urn:iso:std:iso:ts:21496:-1");
+    assert!(iso < at(&[0xff, 0xc0]), "ISO segment must precede SOF0");
+    assert!(iso < at(b"MPF\0"), "ISO segment must precede the MPF label");
+}
+
+#[test]
+fn gain_map_hdr_rejects_a_non_jpeg_suffix_and_rolls_with_a_jpg_name() {
+    let tmp = TempDir::new("gain-map-hdr-refusals");
+    // Same container as `ultra-hdr-v1`, so the same suffix rule — asserted for this
+    // preset in its own right rather than assumed from the shared table.
+    let output = tmp.path("out.tiff");
+    let (code, _stdout, err) = run(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--output-preset",
+        "gain-map-hdr",
+        "--film-base",
+        "1,1,1",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(".jpg"), "{err}");
+    assert!(!output.exists());
+
+    // Roll runs it and derives `<stem>_positive.jpg`. Roll takes its preset from the
+    // shared recipe, since it accepts no output-preset flag.
+    let out_dir = tmp.path("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let recipe = write_file(
+        &tmp.path("roll.json"),
+        r#"{"output":{"preset":"gain-map-hdr"},"film_base":{"source":{"explicit":[1,1,1]}}}"#,
+    );
+    let (code, _stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let rolled = out_dir.join("hdr-48bit_positive.jpg");
+    assert!(
+        rolled.exists(),
+        "roll must derive `.jpg` for a JPEG container"
+    );
+    // And the rolled frame really is the dual-dialect file, not a renamed TIFF.
+    let bytes = std::fs::read(&rolled).unwrap();
+    assert_eq!(&bytes[..2], &[0xff, 0xd8]);
+    assert!(
+        bytes
+            .windows(b"urn:iso:std:iso:ts:21496:-1".len())
+            .any(|w| w == b"urn:iso:std:iso:ts:21496:-1")
+    );
+}
+
+#[test]
+fn roll_checks_explicit_manifest_suffixes_and_derives_per_frame_preset_names() {
+    // The manifest path is the half `validate_convert` never reached: an explicit
+    // `"output"` was resolved on a code path that called `validate` alone, so a
+    // frame could be pointed at a container its preset cannot write. It now goes
+    // through the same rule `convert` uses.
+    let tmp = TempDir::new("roll-container-naming");
+    let out_dir = tmp.path("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let input = fixture("hdr-48bit.tif");
+
+    let manifest = |body: &str| -> PathBuf { write_file(&tmp.path("frames.json"), body) };
+    let roll = |frames: &Path| {
+        run(&[
+            "roll",
+            "--frames",
+            frames.to_str().unwrap(),
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+            "--params",
+            tmp.path("shared.json").to_str().unwrap(),
+        ])
+    };
+    write_file(
+        &tmp.path("shared.json"),
+        r#"{"output":{"preset":"gain-map-hdr"},"film_base":{"source":{"explicit":[1,1,1]}}}"#,
+    );
+
+    // An explicit path whose suffix contradicts the resolved container fails up
+    // front, naming the frame and the escape hatch.
+    let bad = manifest(&format!(
+        r#"{{"frames":[{{"input":"{}","output":"frame.tiff"}}]}}"#,
+        input.display()
+    ));
+    let (code, _stdout, err) = roll(&bad);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("gain-map-hdr"), "{err}");
+    assert!(err.contains(".jpg"), "{err}");
+    assert!(err.contains("frame"), "{err}");
+
+    // A matching explicit path is accepted verbatim and never renamed.
+    let good = manifest(&format!(
+        r#"{{"frames":[{{"input":"{}","output":"chosen.jpeg"}}]}}"#,
+        input.display()
+    ));
+    let (code, _stdout, err) = roll(&good);
+    assert_eq!(code, 0, "{err}");
+    assert!(out_dir.join("chosen.jpeg").exists(), "{err}");
+
+    // A per-frame `output.preset` override changes that frame's container, so its
+    // *derived* name must follow the frame's preset rather than the roll's. The
+    // override still warns loudly (different image class) — that is unchanged.
+    let mixed = manifest(&format!(
+        r#"{{"frames":[
+             {{"input":"{0}"}},
+             {{"input":"{0}","output":"as-master.tiff","params":{{"output":{{"preset":"film-master"}}}}}}
+           ]}}"#,
+        input.display()
+    ));
+    let (code, stdout, err) = roll(&mixed);
+    assert_eq!(code, 0, "{err}");
+    assert!(out_dir.join("hdr-48bit_positive.jpg").exists(), "{err}");
+    assert!(out_dir.join("as-master.tiff").exists(), "{err}");
+    let report = json(&stdout);
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("output.preset")),
+        "a per-frame preset override must still warn: {report}"
+    );
+}
+
+#[test]
+fn custom_is_the_one_named_preset_that_accepts_the_legacy_selectors() {
+    // `custom` exists to be the explicit spelling of "I am combining the
+    // depth/profile/container selectors myself". Every other named preset rejects
+    // them; this one must accept them and produce the same bytes the no-preset
+    // state does for the same combination — the difference is provenance.
+    let tmp = TempDir::new("custom-preset");
+    let input = fixture("hdr-48bit.tif");
+    let convert = |name: &str, extra: &[&str]| -> (i32, serde_json::Value, PathBuf, String) {
+        let out = tmp.path(name);
+        let mut argv: Vec<&str> = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--film-base",
+            "1,1,1",
+        ];
+        argv.extend_from_slice(extra);
+        let (code, stdout, err) = run(&argv);
+        let report = if code == 0 {
+            json(&stdout)
+        } else {
+            serde_json::Value::Null
+        };
+        (code, report, out, err)
+    };
+
+    // A float TIFF via the legacy no-preset state, and the same via `custom`.
+    let (code, legacy_report, legacy_out, err) = convert("legacy.tiff", &["--out-depth", "f32"]);
+    assert_eq!(code, 0, "{err}");
+    let (code, custom_report, custom_out, err) = convert(
+        "custom.tiff",
+        &["--output-preset", "custom", "--out-depth", "f32"],
+    );
+    assert_eq!(code, 0, "custom must accept --output-hdr: {err}");
+
+    // Same bytes...
+    assert_eq!(
+        std::fs::read(&legacy_out).unwrap(),
+        std::fs::read(&custom_out).unwrap(),
+        "`custom` resolves the legacy branch, so the file must be byte-identical"
+    );
+    // ...and the report distinguishes them only by the preset it records.
+    assert_eq!(legacy_report["recipe"]["output"]["preset"], "legacy");
+    assert_eq!(custom_report["recipe"]["output"]["preset"], "custom");
+    assert_eq!(
+        legacy_report["output_render"]["encoding"],
+        custom_report["output_render"]["encoding"]
+    );
+
+    // `--output-sdr` is rejected by flag *presence* under every atomic preset; under
+    // `custom` it is accepted, which is the same asymmetry the no-preset state has.
+    let (code, _report, _out, err) = convert(
+        "custom-sdr.tiff",
+        &["--output-preset", "custom", "--out-depth", "u16"],
+    );
+    assert_eq!(code, 0, "custom must accept --output-sdr: {err}");
+    // The contrast case: an atomic preset still refuses.
+    let (code, _report, _out, err) = convert(
+        "master-sdr.tiff",
+        &["--output-preset", "film-master", "--out-depth", "u16"],
+    );
+    assert_eq!(code, 2, "film-master must still reject --output-sdr: {err}");
+
+    // `--output-profile` too, which is the selector `custom` is most useful for.
+    let (code, report, _out, err) = convert(
+        "custom-profile.tiff",
+        &[
+            "--output-preset",
+            "custom",
+            "--output-profile",
+            "display-p3",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        report["recipe"]["output"]["output_profile"], "display-p3",
+        "the chosen profile must be recorded in the resolved recipe"
+    );
+}
+
+#[test]
+fn the_default_output_is_the_dual_dialect_gain_map_jpeg() {
+    // The `output/presets` default migration, asserted through the binary with no
+    // preset named — `run_exact`, since `run` injects `legacy` for the ~87 tests
+    // written when a TIFF was the default.
+    let tmp = TempDir::new("default-preset");
+    let out = tmp.path("positive.jpg");
+    let (code, stdout, err) = run_exact(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "1,1,1",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert_eq!(report["recipe"]["output"]["preset"], "gain-map-hdr");
+    assert_eq!(
+        report["output_render"]["encoding"],
+        "dual-dialect-gain-map-jpeg"
+    );
+    assert_eq!(report["identity"]["pipeline_version"], 3);
+    let bytes = std::fs::read(&out).unwrap();
+    assert_eq!(&bytes[..2], &[0xff, 0xd8], "the default writes a JPEG");
+    assert!(
+        bytes
+            .windows(b"urn:iso:std:iso:ts:21496:-1".len())
+            .any(|w| w == b"urn:iso:std:iso:ts:21496:-1"),
+        "the default must carry the ISO dialect — that is what makes it HDR on Apple"
+    );
+
+    // The documented cost of the migration: a `.tif` path with no preset is now a
+    // usage error rather than a 16-bit TIFF, and the message says how to get one.
+    let (code, _stdout, err) = run_exact(&[
+        "convert",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "-o",
+        tmp.path("positive.tiff").to_str().unwrap(),
+        "--film-base",
+        "1,1,1",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("gain-map-hdr"), "{err}");
+    assert!(
+        err.contains("display-p3"),
+        "the way out must be named: {err}"
+    );
+    assert!(!tmp.path("positive.tiff").exists());
+}
+
+#[test]
+fn custom_rejects_linear_range_like_legacy_because_it_renders_the_same_branch() {
+    // Regression: `custom` routes through `render_legacy`, which never applies
+    // `print.linear_range` — but the rejection was gated on the `legacy` name alone,
+    // so this combination exited 0 and wrote a file byte-identical to the same run
+    // without the flag. A silently dropped conversion knob is exactly what the rule
+    // exists to prevent, and no test covered the second non-atomic preset.
+    let tmp = TempDir::new("custom-linear-range");
+    let input = fixture("hdr-48bit.tif");
+    let run_with = |name: &str, preset: &str, extra: &[&str]| -> (i32, PathBuf, String) {
+        let out = tmp.path(name);
+        let mut argv = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+        ];
+        argv.extend_from_slice(extra);
+        let (code, _stdout, err) = run(&argv);
+        (code, out, err)
+    };
+    for preset in ["legacy", "custom"] {
+        let (code, out, err) = run_with(
+            &format!("{preset}.tiff"),
+            preset,
+            &["--linear-range", "0.02,0.97"],
+        );
+        assert_eq!(code, 2, "{preset} must reject --linear-range: {err}");
+        assert!(err.contains(preset), "{preset}: {err}");
+        assert!(!out.exists(), "{preset}: nothing may be written");
+    }
+    // Falsifiable control: a display preset consumes the control, so the rule is
+    // about which branch renders and not about the flag being unusable.
+    let (code, _out, err) = run_with(
+        "display.tiff",
+        "display-p3",
+        &["--linear-range", "0.02,0.97"],
+    );
+    assert_eq!(code, 0, "a display preset must consume it: {err}");
+}
+
+#[test]
+fn telemetry_reports_the_primary_containers_depth_not_the_ir_planes() {
+    // Regression: `OutputParams::depth()` is the *IR TIFF* depth for the JPEG and
+    // AVIF presets, so recording it verbatim labelled a gain-map run `u16` when its
+    // primary is a fixed 8-bit JPEG — and the default is now a gain-map JPEG, so
+    // that mislabelled the ordinary case.
+    let tmp = TempDir::new("telemetry-depth");
+    for (preset, ext, want) in [
+        ("gain-map-hdr", "jpg", "u8"),
+        ("ultra-hdr-v1", "jpg", "u8"),
+        ("hdr-pq", "avif", "u10"),
+        ("legacy", "tiff", "u16"),
+        ("film-master", "tiff", "f32"),
+    ] {
+        let out = tmp.path(&format!("{preset}.{ext}"));
+        let rec = tmp.path(&format!("{preset}.telemetry.json"));
+        let (code, _stdout, err) = run(&[
+            "convert",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "1,1,1",
+            "--telemetry-file",
+            rec.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{preset}: {err}");
+        let record: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
+        assert_eq!(
+            record["conversion"]["output_depth"], want,
+            "{preset} must report its primary container's depth"
+        );
+    }
 }

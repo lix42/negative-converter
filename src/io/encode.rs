@@ -732,6 +732,7 @@ impl From<tiff::TiffError> for NcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::OutputPreset;
     use std::io::Cursor;
     use tiff::decoder::{Decoder, DecodingResult};
 
@@ -741,10 +742,13 @@ mod tests {
 
     fn out(depth: OutDepth, bigtiff: BigTiff) -> OutputParams {
         OutputParams {
-            hdr: depth == OutDepth::F32,
+            // Stated, not defaulted: `output.depth` is consulted only by `legacy` /
+            // `custom`, and the default preset (`gain-map-hdr`) pins u16 — so these
+            // depth tests would silently all become u16 tests without it.
+            preset: OutputPreset::Legacy,
+            depth,
             output_profile: None,
             bigtiff,
-            ..OutputParams::default()
         }
     }
 

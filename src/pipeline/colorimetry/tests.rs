@@ -22,6 +22,15 @@
 //! | Display P3 | ICC-registry colorants and the registered D65 encoding | `pipeline::color` tests |
 //! | ProPhoto | none — no NC-derived matrix exists for it (Little CMS owns that colorimetry) | — |
 //!
+//! The ICC serialization artifacts (`output/lossless-hdr-tiff`) are anchored the
+//! same way: `BT2020_TO_XYZ_D50` against the colorants Little CMS independently
+//! computes, and `BRADFORD_D65_TO_ICC_PCS` against a published Bradford D65→D50.
+//! `XYZ_D50_TO_BT2020` has no direct outside oracle — reading the serialized `BToA0`
+//! back needs a CMM this harness does not have — so it is anchored *transitively*,
+//! as the exact inverse of an externally checked matrix. The tests that only relate
+//! two repo-internal artifacts say so in their names and comments; a consistently
+//! wrong pair passes them, which is the whole reason the header rule exists.
+//!
 //! **The recovery test anchors the *source* space only.** In
 //! `transformed_primaries_recover_the_standards_chromaticities`, the destination
 //! NPM appears both in the pinned matrix and in the recovery step
@@ -45,7 +54,7 @@
 use super::audit::ulps_f32;
 use super::definitions::{
     ACESCG, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, BT2020_LUMA_TABULATED, ColorSpace, D50,
-    D65, DISPLAY_P3, PROPHOTO, REC709,
+    D65, DISPLAY_P3, ICC_PCS_WHITE_XYZ, PROPHOTO, REC709,
 };
 use super::derive::{self, Matrix3, inverse, multiply, rgb_to_rgb, transform};
 use super::pinned;
@@ -607,20 +616,206 @@ fn bt2020_to_xyz_d50_matches_the_colorants_little_cms_computes() {
 }
 
 #[test]
-fn bt2020_to_xyz_d50_maps_white_to_the_d50_adopted_white() {
-    // The defining property of an ICC colorant matrix: R=G=B=1 must land on the
-    // PCS adopted white. `MediaWhitePointTag` states D50, so if this failed the
-    // profile would claim a white it does not produce — and every neutral would
-    // carry a tint no colorant check on its own would reveal.
+fn bt2020_to_xyz_d50_maps_white_to_the_declared_pcs_white() {
+    // The defining property of an ICC colorant matrix: R=G=B=1 must land on the PCS
+    // adopted white. `mediaWhitePointTag` states it, so if this failed the profile
+    // would claim a white it does not produce — and every neutral would carry a tint
+    // no colorant check on its own would reveal.
+    //
+    // The target is `ICC_PCS_WHITE_XYZ`, the triple ICC *declares*, not `D50.to_xyz()`.
+    // Those differ by ≈2.4e-4 because D50's chromaticities are given to four
+    // decimals, and this assertion used to name the derived one — which is how the
+    // profile came to announce one white while its colorants produced another. The
+    // 1e-12 bound is what makes that a loud failure rather than a shrug.
     let sum: [f64; 3] =
         std::array::from_fn(|i: usize| -> f64 { pinned::BT2020_TO_XYZ_D50[i].iter().sum() });
-    let d50 = D50.to_xyz();
-    for (axis, (&got, want)) in sum.iter().zip(d50).enumerate() {
+    for (axis, (&got, want)) in sum.iter().zip(ICC_PCS_WHITE_XYZ).enumerate() {
         assert!(
             (got - want).abs() < 1e-12,
-            "column sum axis {axis} = {got}, D50 adopted white is {want}",
+            "column sum axis {axis} = {got}, declared PCS white is {want}",
         );
     }
+    // …and the two whites really are different, so the assertion above is not
+    // trivially satisfied by either.
+    let derived_d50 = D50.to_xyz();
+    assert!(
+        (derived_d50[0] - ICC_PCS_WHITE_XYZ[0]).abs() > 5e-5,
+        "if these coincided this test would prove nothing"
+    );
+}
+
+#[test]
+fn xyz_d50_to_bt2020_is_consistent_with_the_colorant_matrix_it_inverts() {
+    // A **consistency** check, not an anchor: both operands are repo-internal, so a
+    // consistently-wrong pair passes. What makes the `BToA0` matrix externally
+    // anchored is this test *composed with*
+    // `bt2020_to_xyz_d50_matches_the_colorants_little_cms_computes` — the forward
+    // matrix is pinned against an outside observation, and an exact inverse of an
+    // externally-checked matrix is itself externally checked. Reading the serialized
+    // `BToA0` back through an independent CMM would anchor it directly and would be
+    // better; nothing in this harness can do that, so the transitive argument is
+    // stated rather than dressed up as a direct anchor.
+    //
+    // Round-tripping the forward matrix through it must return the identity, and the
+    // PCS white must come back as R=G=B=1. Checked as a *product*, not by re-deriving
+    // an inverse — the runtime uses the two literals as a pair and never inverts
+    // anything itself.
+    for (i, j) in cells() {
+        let dot: f64 = (0..3)
+            .map(|k| pinned::XYZ_D50_TO_BT2020[i][k] * pinned::BT2020_TO_XYZ_D50[k][j])
+            .sum();
+        let want = if i == j { 1.0 } else { 0.0 };
+        assert!(
+            (dot - want).abs() < 1e-12,
+            "product[{i}][{j}] = {dot}, expected {want}"
+        );
+    }
+    let rgb: [f64; 3] = std::array::from_fn(|i| {
+        (0..3)
+            .map(|k| pinned::XYZ_D50_TO_BT2020[i][k] * ICC_PCS_WHITE_XYZ[k])
+            .sum()
+    });
+    for (axis, &v) in rgb.iter().enumerate() {
+        assert!(
+            (v - 1.0).abs() < 1e-12,
+            "PCS white must invert to R=G=B=1; axis {axis} = {v}"
+        );
+    }
+}
+
+#[test]
+fn the_chad_tag_is_consistent_with_the_adaptation_baked_into_the_colorants() {
+    // A **consistency** check between two repo-internal artifacts — `chad`'s external
+    // anchor is `the_chad_matrix_agrees_with_the_published_bradford_d65_to_d50` below.
+    //
+    // ICC.1:2022 §8.2's `chromaticAdaptationTag` is supposed to describe the very
+    // adaptation the colorants already carry. Two different whites there would make
+    // the profile describe an adaptation it did not perform, so this pins the
+    // relationship rather than the numbers: applying `chad` to BT.2020's *unadapted*
+    // XYZ colorants must reproduce the shipped adapted matrix.
+    let unadapted = derive::normalized_primary_matrix(BT2020);
+    for (i, j) in cells() {
+        let dot: f64 = (0..3)
+            .map(|k| pinned::BRADFORD_D65_TO_ICC_PCS[i][k] * unadapted[k][j])
+            .sum();
+        let want = pinned::BT2020_TO_XYZ_D50[i][j];
+        assert!(
+            (dot - want).abs() < 1e-12,
+            "chad·NPM[{i}][{j}] = {dot}, colorants say {want}"
+        );
+    }
+    // And `chad` maps D65 itself onto the declared PCS white — its defining job.
+    let d65 = BT2020.white.to_xyz();
+    let mapped: [f64; 3] = std::array::from_fn(|i| {
+        (0..3)
+            .map(|k| pinned::BRADFORD_D65_TO_ICC_PCS[i][k] * d65[k])
+            .sum()
+    });
+    for (axis, (&got, want)) in mapped.iter().zip(ICC_PCS_WHITE_XYZ).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-12,
+            "chad(D65) axis {axis} = {got}, declared PCS white is {want}"
+        );
+    }
+}
+
+/// Bradford D65→D50 chromatic adaptation **as Bruce Lindbloom publishes it**
+/// (<http://www.brucelindbloom.com>, "Chromatic Adaptation") — the same outside
+/// source the `BRADFORD_PUBLISHED_INVERSE` cone matrix comes from.
+const BRADFORD_D65_TO_D50_PUBLISHED: [[f64; 3]; 3] = [
+    [1.047_811_2, 0.022_886_6, -0.050_127_0],
+    [0.029_542_4, 0.990_484_4, -0.017_049_1],
+    [-0.009_234_5, 0.015_043_6, 0.752_131_6],
+];
+
+/// The white points that published matrix was built from: the **tabulated** XYZ
+/// triples Lindbloom's reference data lists for D65 and D50, rather than XYZ derived
+/// from the standards' rounded chromaticities.
+const D65_XYZ_TABULATED: [f64; 3] = [0.950_47, 1.0, 1.088_83];
+const D50_XYZ_TABULATED: [f64; 3] = [0.964_22, 1.0, 0.825_21];
+
+/// Bradford adaptation between two whites given as XYZ.
+///
+/// Local to this test because [`derive::adaptation_to_xyz`] takes its *source* white
+/// as a chromaticity, and the point here is to reproduce a published matrix from the
+/// published white **triples** on both ends.
+fn bradford_between_white_xyz(source: [f64; 3], destination: [f64; 3]) -> Matrix3 {
+    let cone = BRADFORD.matrix;
+    let src = transform(cone, source);
+    let dst = transform(cone, destination);
+    let gain: Matrix3 = [
+        [dst[0] / src[0], 0.0, 0.0],
+        [0.0, dst[1] / src[1], 0.0],
+        [0.0, 0.0, dst[2] / src[2]],
+    ];
+    multiply(inverse(cone), multiply(gain, cone))
+}
+
+#[test]
+fn the_chad_matrix_agrees_with_the_published_bradford_d65_to_d50() {
+    // The external anchor for `BRADFORD_D65_TO_ICC_PCS`. Everything else about that
+    // matrix is checked against nc's own definitions, so a mistyped Bradford cone
+    // coefficient or D65 chromaticity would reproduce itself all the way through the
+    // audit. A published matrix cannot.
+    //
+    // It deliberately does **not** match to derivation precision, and the residual is
+    // the property worth pinning. Two documented conventions separate them, and
+    // together they are the *whole* difference:
+    //   1. nc derives white XYZ from the standards' rounded chromaticities, while the
+    //      published matrix uses the tabulated white triples;
+    //   2. nc's destination is ICC's *declared* PCS white [0.9642, 1, 0.8249], not
+    //      D50's XYZ at all (see `ICC_PCS_WHITE_XYZ` — adapting to the derived white
+    //      is the bug that shipped once in the coded HDR profiles).
+    // Measured: the largest entry disagreement is 4.53e-4 (blue Z), which is why the
+    // bound is 5e-4 rather than the 1e-12 an internal identity gets. For scale, a
+    // transposed digit in a cone coefficient moves entries by ~1e-2.
+    for (i, j) in cells() {
+        let delta =
+            (pinned::BRADFORD_D65_TO_ICC_PCS[i][j] - BRADFORD_D65_TO_D50_PUBLISHED[i][j]).abs();
+        assert!(
+            delta < 5e-4,
+            "BRADFORD_D65_TO_ICC_PCS[{i}][{j}] = {} is {delta:e} from the published \
+             Bradford D65→D50 {}",
+            pinned::BRADFORD_D65_TO_ICC_PCS[i][j],
+            BRADFORD_D65_TO_D50_PUBLISHED[i][j],
+        );
+    }
+
+    // Convention (1), pinned: the published matrix is *exactly* Bradford between the
+    // published white triples. This also verifies the transcription above — a mistyped
+    // reference vector would fail here rather than silently widening the tolerance the
+    // shipped matrix is judged against.
+    let from_tabulated = bradford_between_white_xyz(D65_XYZ_TABULATED, D50_XYZ_TABULATED);
+    for (i, j) in cells() {
+        assert!(
+            (from_tabulated[i][j] - BRADFORD_D65_TO_D50_PUBLISHED[i][j]).abs() < 1e-7,
+            "the published matrix must regenerate from the published whites; \
+             [{i}][{j}] = {} vs {}",
+            from_tabulated[i][j],
+            BRADFORD_D65_TO_D50_PUBLISHED[i][j],
+        );
+    }
+
+    // Convention (2), pinned: adapting to D50's *chromaticity-derived* XYZ instead of
+    // the declared PCS white lands measurably closer to the published matrix
+    // (2.6e-4 vs 4.5e-4). That the shipped matrix is the *further* of the two is
+    // deliberate — the ICC declaration is the contract a CMM reads — and this
+    // assertion keeps the difference real rather than assumed.
+    let to_derived_d50 = derive::adaptation(BRADFORD, D65, D50);
+    let spread = |m: Matrix3| {
+        cells()
+            .map(|(i, j)| (m[i][j] - BRADFORD_D65_TO_D50_PUBLISHED[i][j]).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    let (declared, derived) = (
+        spread(pinned::BRADFORD_D65_TO_ICC_PCS),
+        spread(to_derived_d50),
+    );
+    assert!(
+        derived < declared,
+        "if the two PCS whites gave the same answer this test would prove nothing: \
+         declared {declared:e}, derived {derived:e}"
+    );
 }
 
 #[test]

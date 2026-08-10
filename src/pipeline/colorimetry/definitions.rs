@@ -131,6 +131,23 @@ pub const ACES_WHITE: Chromaticity = xy(0.32168, 0.33767);
 /// (`pipeline::color`).
 pub const D50: Chromaticity = xy(0.3457, 0.3585);
 
+/// The ICC PCS adopted white, **as XYZ** — ICC.1:2022 §6.3.4.3 / Annex D:
+/// `X = 0,9642`, `Y = 1,0000`, `Z = 0,8249`.
+///
+/// **Not the same number as `D50.to_xyz()`**, and that is the point. Deriving XYZ
+/// from D50's rounded four-decimal chromaticities gives
+/// `[0.96429568…, 1, 0.82510460…]`, which sits ≈2.4e-4 from the value ICC *declares*
+/// a profile's `mediaWhitePointTag` to carry. A colorant matrix adapted to the
+/// derived white therefore maps a neutral slightly off the white the same profile
+/// announces — small, invisible, and still wrong in the direction that matters,
+/// because the profile's own declaration is the contract a CMM reads.
+///
+/// So an ICC colorant matrix and the `chromaticAdaptationTag` beside it must both
+/// adapt to **this** value, not to `D50`. Anything colorimetric that is not about
+/// serializing an ICC profile keeps using [`D50`] — this constant is the ICC
+/// encoding's rounded convention, not a better measurement of D50.
+pub const ICC_PCS_WHITE_XYZ: [f64; 3] = [0.9642, 1.0, 0.8249];
+
 // -- primaries / colour spaces ------------------------------------------------
 
 /// ITU-R BT.709 / sRGB primaries with D65 white.

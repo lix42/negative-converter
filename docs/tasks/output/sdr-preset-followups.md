@@ -11,25 +11,24 @@ to pre-answer them.
 
 ## Design
 
-### 1. Make one of them the default (replacing `legacy`)
+### 1. Make `display-p3` the default
 
-`legacy` is still the default preset, and it is a genuinely different, older
-*pipeline* — print controls before the ICC transform, never crossing the ACEScg
-boundary. The SDR presets are what make it deletable: they cover what it was
-being used for (16-bit SDR TIFF) on the modern path.
+**Decided 2026-08-09 (user): the default becomes `display-p3`.** nc's thrust is
+wide-gamut fidelity, and that outweighs sRGB's "surprise nobody" argument. What
+remains here is the execution, not the choice.
 
-Open, and worth deciding with a real frame in front of you:
+**Note what this replaces.** `output/presets` ships `gain-map-hdr` as the default
+first, so by the time this runs the incumbent is `gain-map-hdr` — a JPEG — not
+`legacy`. The sequencing is deliberate: gain-map HDR goes in, the rendering gets
+exercised and tuned on real frames, and the default then settles on SDR lossless.
+A container change rides along with the pixel change.
 
-- **Which gamut.** `compatibility` (sRGB) is the safe default and the name says
-  so; `display-p3` preserves more of the film's colour and matches modern
-  displays. nc's whole thrust is wide-gamut fidelity, which argues for P3; "a
-  default should surprise nobody" argues for sRGB.
-- **The cost.** Flipping it is a **pixel change** (different pipeline, not just a
-  different profile), so it needs a `pipeline_version` bump, a before/after
-  report like `reports/render-defaults-v2.md`, and broad test churn — every test
-  that exercises the default output path.
-- Once it lands, `legacy` and its frozen `stages::golden` vectors can be deleted.
-  Do not delete them first.
+- **The cost.** A **pixel change** (different pipeline, not just a different
+  profile), so it needs a `pipeline_version` bump, a before/after report like
+  `reports/render-defaults-v2.md`, and broad test churn — every test that
+  exercises the default output path, twice over if `gain-map-hdr` landed first.
+- `legacy` and its frozen `stages::golden` vectors become deletable once a
+  modern-path preset is the default. Do not delete them first.
 
 ### 2. Adobe RGB as an output gamut
 
@@ -59,8 +58,10 @@ report; only prose in `output_render.content` describes the render. That is an
 asymmetry a scripted consumer feels: the HDR TIFF presets are machine-readable
 about their contract and the SDR ones are not.
 
-`sdr::RenderedSdr::metadata()` still carries `#[allow(dead_code)] // consumed next
-by output/presets report wiring`, which is the marker for this work.
+`sdr::RenderedSdr::metadata()` still carries its `#[allow(dead_code)]`, which is the
+marker for this work. **`output/presets` finished without wiring it** — the report
+block was never in that task's scope — so the allowance's comment naming presets as
+the next consumer is stale and this task is the real owner.
 
 ### Settled: `RunProfile::SdrTiff` is calibrated (2026-08-09)
 
@@ -74,9 +75,10 @@ carries the rows.
 
 ## How to Verify
 
-- **Default flip:** the before/after report exists and shows what changed on real
-  frames; `pipeline_version` bumped with a recorded row; `legacy` either deleted
-  or explicitly retained with a reason.
+- **Default flip:** `display-p3` resolves with no output-selection options; the
+  before/after report exists and shows what changed on real frames;
+  `pipeline_version` bumped with a recorded row; `legacy` either deleted or
+  explicitly retained with a reason.
 - **Adobe RGB:** the definition carries provenance, its artifacts are pinned and
   audited, and a render into it is covered — not merely tagged.
 - **Report block:** an `nc convert --output-preset display-p3` report carries the
@@ -97,27 +99,25 @@ left out of them — real, bounded, and not defaults questions.
   fail valid HDR colour-volume content. Fix by also checking the rendered
   per-channel peak, or by narrowing the claim to "no *luminance* headroom" —
   the latter is the smaller change and matches what MaxCLL actually witnesses.
-- **The output-suffix rule does not reach `roll` frames** (`cli.rs`,
-  `resolve_frames`). `validate_convert` composes the suffix check with
-  `validate`, but a `--frames` manifest carrying an explicit
-  `"output": "frame.jpg"` is resolved on the path that calls `validate` alone,
-  so a `legacy`/`film-master` frame can still be pointed at a container those
-  presets cannot write. Route the per-frame resolution through the same
-  composed gate rather than adding a second check — a parallel check is exactly
-  how the suffix rule and the convert-only refusal drifted apart before.
+- ~~**The output-suffix rule does not reach `roll` frames.**~~ **Fixed 2026-08-09**
+  by `output/presets`' roll chunk: `resolve_frame_output` runs an explicit manifest
+  path through `reject_suffix_mismatch`, the same rule `convert` uses, rather than a
+  parallel check. Derived names are not re-checked — they are built from the same
+  table, and a test over `OutputPreset::ALL` pins that the derived spelling is always
+  one the rule accepts.
 
-- **The telemetry record's preset enum has outrun its schema version**
-  (`src/telemetry.rs`). `SCHEMA_VERSION` is 3 and its rustdoc still describes
-  `conversion.preset` as `legacy|film-master`, while `OutputPreset` now has ten
-  variants. This is **not** this PR's drift: `telemetry.rs` was last touched by
-  `#60`, and `ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`,
-  `hdr-pq-tiff` and `hdr-hlg-tiff` all landed after v3 without a bump — these two
-  presets are the seventh and eighth to do so. Worth settling deliberately rather
-  than in a preset PR, because the answer is a policy question the module states
-  but has never had to apply: is *adding* an enum member a wire-shape change (the
-  rustdoc's rule, read strictly) or an additive one a forward-compatible consumer
-  tolerates? Whichever way it goes, the rustdoc's preset list must stop naming two
-  of ten. `telemetry/ingestion-service` is the consumer that makes it matter.
+- **The telemetry record's preset enum has outrun its schema version — still open,
+  and now clearer.** `OutputPreset` has grown to **twelve** variants, ten of them
+  added after the record last bumped *for a preset reason*. The underlying question
+  is untouched: is *adding* an enum member a wire-shape change (the module's rustdoc
+  rule, read strictly) or an additive one a forward-compatible consumer tolerates?
+  `telemetry/ingestion-service` is the consumer that makes it matter.
+  **What changed on 2026-08-09:** `SCHEMA_VERSION` moved 3 → 4, but for the
+  `conversion.output_hdr` (bool) → `conversion.output_depth` (`u16`|`f32`) **field
+  rename** that rode with `output.hdr` → `output.depth`. A renamed field is a wire
+  change under any reading, so that bump does *not* answer this question — and the
+  rustdoc no longer restates the preset list at all, deliberately, since restating it
+  is what went stale. Do not read the v4 bump as the enum policy having been decided.
 - **The asset manifest infers encoding from bit depth alone**
   (`scripts/analysis/nctool/manifest.py`, the `bits == 16` arm). Every 16-bit `nc`
   output is labelled `u16-srgb`, which was true while `nc` had no other 16-bit SDR
@@ -126,6 +126,20 @@ left out of them — real, bounded, and not defaults questions.
   primaries. Latent today — no P3 asset exists yet — and the fix needs real
   provenance (the sidecar's `output_render.encoding`) rather than a second
   filename guess.
+
+### Not covered by `nctool compare`: the default preset
+
+Recorded 2026-08-09 while fixing the review round. `benchmark.json`'s six fixture
+cases now state `--output-preset legacy` explicitly, because they write `.tiff` and
+exist to stay comparable with records made before the default flip. The consequence
+is that the **product default is not in the fixed comparison set at all** — a
+cross-build comparison says nothing about the container users actually get.
+
+Adding a case changes that fixed set, which is `core/conversion-versioning`'s call
+rather than this task's, so it is filed here as a visible gap. Whoever takes it will
+also meet the units question: `mean` for a JPEG preset is the normalized 8-bit
+buffer handed to the compressor, and the record's marker is `output_depth`, which is
+a depth rather than a container.
 
 ## Dependencies
 

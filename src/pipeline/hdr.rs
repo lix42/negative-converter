@@ -60,8 +60,10 @@ pub fn transfer_for(preset: OutputPreset) -> Option<HdrTransfer> {
         | OutputPreset::DisplayP3
         | OutputPreset::Compatibility
         | OutputPreset::Legacy
+        | OutputPreset::Custom
         | OutputPreset::FilmMaster
-        | OutputPreset::UltraHdrV1 => None,
+        | OutputPreset::UltraHdrV1
+        | OutputPreset::GainMapHdr => None,
     }
 }
 

@@ -53,11 +53,23 @@ use crate::types::{
 /// (`negative-reconstruction-density-curves`).
 ///
 /// v3: added `conversion.preset` (`legacy|film-master`), and
-/// `conversion.output_hdr` now means "an f32 TIFF was written" for *every* branch
-/// — it is derived from `OutputParams::depth()` rather than read off the
-/// `output.hdr` switch, which a named preset pins at its default while still
-/// resolving f32 (`color/film-master-render-pipeline`).
-pub const SCHEMA_VERSION: u32 = 3;
+/// `conversion.output_hdr` meant "an f32 TIFF was written" for *every* branch —
+/// derived from `OutputParams::depth()` rather than read off the `output.hdr`
+/// switch, which a named preset pins at its default while still resolving f32
+/// (`color/film-master-render-pipeline`).
+///
+/// v4: `conversion.output_hdr` (bool) became `conversion.output_depth`
+/// (`u8`|`u10`|`u16`|`f32`), following the CLI/recipe rename of `output.hdr` →
+/// `output.depth`. It reports the **primary image's** depth
+/// (`OutputParams::primary_depth_label`), which for the JPEG and AVIF presets is
+/// the container's fixed 8/10-bit — *not* `OutputParams::depth()`, whose value for
+/// those presets is only the optional IR TIFF's. A **renamed field is a wire-shape change** under any reading of
+/// the rule above, unlike *adding* an enum member — which `conversion.preset` has
+/// now done eight times without a bump, and which
+/// `output/sdr-preset-followups` still owns settling. `conversion.preset` accepts
+/// every name in `OutputPreset::ALL`; do not restate the list here, since that is
+/// exactly the rustdoc that went stale at v3.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Default local JSONL log path, honoring `NC_TELEMETRY_LOG` then the platform
 /// data dir; `None` when no home/data dir can be located (the caller then warns
@@ -217,7 +229,7 @@ pub struct ConversionInfo {
     /// a recipe becomes a depth — not from the `output.hdr` switch: under
     /// `film-master` that switch is pinned at its default while the branch still
     /// resolves f32, so reading it directly would report `false` for an f32 master.
-    pub output_hdr: bool,
+    pub output_depth: &'static str,
 }
 
 /// Run outcome — the quality signals a server watches for regressions. Today a
@@ -259,7 +271,7 @@ pub struct RecordInputs<'a> {
     pub params_hash: String,
     pub film_base_source: FilmBaseSource,
     pub dmax: Option<f32>,
-    pub output_hdr: bool,
+    pub output_depth: &'static str,
     pub warnings: usize,
 }
 
@@ -295,7 +307,7 @@ pub fn build_record(inputs: RecordInputs<'_>) -> TelemetryRecord {
             params_hash: inputs.params_hash,
             film_base_source: inputs.film_base_source,
             dmax: inputs.dmax,
-            output_hdr: inputs.output_hdr,
+            output_depth: inputs.output_depth,
         },
         outcome: OutcomeInfo {
             warnings: warning_count(inputs.warnings),
@@ -452,11 +464,11 @@ mod tests {
             film_base_source: FilmBaseSource::Auto,
             dmax: Some(1.8),
             preset: OutputPreset::Legacy,
-            output_hdr: false,
+            output_depth: "u16",
             warnings: 4,
         });
 
-        assert_eq!(rec.schema_version, 3);
+        assert_eq!(rec.schema_version, 4);
         assert_eq!(rec.image.width, 2000);
         assert_eq!(rec.image.height, 3000);
         // 2000 * 3000 = 6e6 pixels → 6.0 MP.
@@ -498,7 +510,7 @@ mod tests {
             film_base_source: FilmBaseSource::Explicit([0.9, 0.5, 0.4]),
             dmax: None,
             preset: OutputPreset::Legacy,
-            output_hdr: true,
+            output_depth: "f32",
             warnings: 0,
         });
         assert!(!rec.image.ir_present);
@@ -659,7 +671,7 @@ mod tests {
                 params_hash: "0123456789abcdef".into(),
                 film_base_source: FilmBaseSource::Explicit([0.5, 0.25, 0.125]),
                 dmax: Some(1.5),
-                output_hdr: false,
+                output_depth: "u16",
             },
             outcome: OutcomeInfo {
                 warnings: 1,
@@ -668,7 +680,7 @@ mod tests {
             },
         };
         let expected_full = concat!(
-            r#"{"schema_version":3,"timestamp_ms":1700000000000,"nc_version":"9.9.9","#,
+            r#"{"schema_version":4,"timestamp_ms":1700000000000,"nc_version":"9.9.9","#,
             r#""target":"test-triple","cpu_count":8,"#,
             r#""image":{"format":"hdri","width":100,"height":200,"megapixels":0.25,"#,
             r#""bit_depth":16,"channels":3,"ir_present":true,"input_bytes":1000,"#,
@@ -677,7 +689,7 @@ mod tests {
             r#""color":8.0,"encode":4.0,"ir_export":2.0},"#,
             r#""conversion":{"preset":"legacy","reconstruction":"density","curve":"sigmoid","#,
             r#""params_hash":"0123456789abcdef","#,
-            r#""film_base_source":{"explicit":[0.5,0.25,0.125]},"dmax":1.5,"output_hdr":false},"#,
+            r#""film_base_source":{"explicit":[0.5,0.25,0.125]},"dmax":1.5,"output_depth":"u16"},"#,
             r#""outcome":{"warnings":1,"clipped":2,"non_finite":0}}"#,
         );
         assert_eq!(serde_json::to_string(&full).unwrap(), expected_full);
@@ -711,7 +723,7 @@ mod tests {
                 ir_export: None,
             },
             // A `film-master` run of a `simple` reconstruction: no curve, no anchor,
-            // and `output_hdr = true` because the preset resolves f32 without the
+            // and `output_depth = f32` because the preset resolves it without the
             // `output.hdr` switch. Snapshotted here so the `"film-master"` wire name
             // and that depth pairing are both pinned.
             conversion: ConversionInfo {
@@ -721,7 +733,7 @@ mod tests {
                 params_hash: "0".into(),
                 film_base_source: FilmBaseSource::Auto,
                 dmax: None,
-                output_hdr: true,
+                output_depth: "f32",
             },
             outcome: OutcomeInfo {
                 warnings: 0,
@@ -730,7 +742,7 @@ mod tests {
             },
         };
         let expected_minimal = concat!(
-            r#"{"schema_version":3,"timestamp_ms":0,"nc_version":"9.9.9","#,
+            r#"{"schema_version":4,"timestamp_ms":0,"nc_version":"9.9.9","#,
             r#""target":"test-triple","cpu_count":null,"#,
             r#""image":{"format":"hdr","width":1,"height":1,"megapixels":0.0,"#,
             r#""bit_depth":16,"channels":3,"ir_present":false,"input_bytes":null,"#,
@@ -738,7 +750,7 @@ mod tests {
             r#""timing_ms":{"total":0.0,"decode":0.0,"film_base":0.0,"algorithm":0.0,"#,
             r#""color":0.0,"encode":0.0},"#,
             r#""conversion":{"preset":"film-master","reconstruction":"simple","params_hash":"0","#,
-            r#""film_base_source":"auto","output_hdr":true},"#,
+            r#""film_base_source":"auto","output_depth":"f32"},"#,
             r#""outcome":{"warnings":0,"clipped":0,"non_finite":0}}"#,
         );
         assert_eq!(serde_json::to_string(&minimal).unwrap(), expected_minimal);
