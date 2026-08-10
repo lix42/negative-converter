@@ -8,11 +8,11 @@ A practical guide to converting film negative scans to positives with `nc`.
 > *intent* — but this document is verified against the binary, so it wins on
 > *what the CLI currently accepts*.
 >
-> **Verified against:** `nc 0.1.0`, `pipeline_version 2`, commit `e4a56bb2540d`.
+> **Verified against:** `nc 0.1.0`, `pipeline_version 3`, commit `291bdefb8607`.
 > Re-verify with `nc --version` and `nc <command> --help` after pulling.
 >
-> **Known issue:** the output-preset surface (§8) is mid-migration and its
-> section is provisional — see the callout there.
+> **Known issue:** under the default render the gain map is inert (no HDR
+> headroom) — see the callout in §8.
 
 ---
 
@@ -237,7 +237,7 @@ The `d_max_recipe` fragment nests under **`reconstruction.curve`**.
 Convert one frame with your measured values and dump the effective parameters:
 
 ```sh
-nc convert scan.tif -o out.tiff \
+nc convert scan.tif -o out.jpg \
   --film-base 0.163,0.080,0.0377 \
   --d-max 0.391 \
   --dump-params roll-recipe.json
@@ -253,7 +253,8 @@ nc roll frames/*.tif --out-dir positives/ --params roll-recipe.json
 ```
 
 Every frame gets the identical film base, `Dmax`, and print controls, so the roll
-is color-consistent. Outputs are named `<input-stem>_positive.tiff`; a roll-level
+is color-consistent. Outputs are named `<input-stem>_positive.<ext>`, the suffix
+coming from the resolved preset; a roll-level
 JSON report lands on stdout.
 
 ---
@@ -290,7 +291,7 @@ nc params
   "print":     { "print_exposure": 0.0, "black_point": 0.0,
                  "white_balance": { "explicit": [1.0, 1.0, 1.0] },
                  "highlight_compress": 0.0, "linear_range": [0.0, 1.0] },
-  "output":    { "preset": "legacy", "hdr": false,
+  "output":    { "preset": "gain-map-hdr", "depth": "u16",
                  "output_profile": null, "bigtiff": "auto" }
 }
 ```
@@ -345,7 +346,7 @@ explicit `--white-balance 1,1,1` over a recipe's `auto` mode means neutral gains
 not re-estimation.
 
 ```sh
-nc convert scan.tif -o out.tiff --params roll-recipe.json --d-max 0.5
+nc convert scan.tif -o out.jpg --params roll-recipe.json --d-max 0.5
 #                                                          ^ overrides the recipe
 ```
 
@@ -367,8 +368,8 @@ needed:
 Feed the sidecar straight back to reproduce the conversion exactly:
 
 ```sh
-nc convert scan.tif -o repro.tiff --params out.tiff.json
-# → byte-identical to out.tiff
+nc convert scan.tif -o repro.jpg --params out.jpg.json
+# → byte-identical to out.jpg
 ```
 
 ### Per-frame overrides in a roll
@@ -503,15 +504,15 @@ This is deliberate: a flag that quietly did nothing would be worse than a failur
 | `--white-balance R,G,B` | Explicit highlight / neutral gains |
 | `--auto-wb MODE` | Estimate gains per frame — `gray-world` (≈ NLP Auto-AVG) or `percentile` (≈ NLP Auto-Neutral, more robust to a dominant scene colour) |
 | `--highlight-compress F` | Highlight roll-off |
-| `--linear-range LOW,HIGH` | Affine black/white placement, applied last — **display presets only** (see below) |
+| `--linear-range LOW,HIGH` | Affine black/white placement, applied last — **display presets only**, which includes the default (see §8) |
 
 `--white-balance` and `--auto-wb` are the two faces of one setting and are mutually
 exclusive. The report tells you what was actually used:
 
 ```sh
-nc convert scan.tif -o out.tiff --film-base … --auto-wb percentile \
+nc convert scan.tif -o out.jpg --film-base … --auto-wb percentile \
   | jq '.white_balance'
-# [1.6376779, 1.0, 0.63681334]
+# [1.2501934, 1.0, 0.6589681]
 ```
 
 Feed that back as an explicit `--white-balance` to freeze it across a roll.
@@ -520,104 +521,101 @@ Feed that back as an explicit `--white-balance` to freeze it across a roll.
 
 ## 8. Output presets
 
-> ### ⚠️ Known issue: the preset system is incomplete
+> ### ⚠️ Known issue: the default gain map is inert
 >
-> **Treat everything in this section as provisional.** The output-preset surface
-> is mid-migration — [`tasks/output/presets.md`](tasks/output/presets.md) is the
-> task that finishes it, and this section will be rewritten once that merges.
+> Under the **default sigmoid**, the HDR rendition peaks at *exactly* the 203-nit
+> reference white, so `gain-map-hdr` writes a structurally valid gain-map JPEG
+> whose `GainMapMax` decodes as **1.0x** — no HDR headroom. Viewers show it as a
+> normal SDR image.
 >
-> The presets listed below do run and produce files today. What is *not* settled:
+> This is a **rendering** property, not a container defect. The
+> reference-anchored sigmoid pins mid-grey at half the reference density and rolls
+> its shoulder so diffuse white lands *at* reference white, so by construction
+> nothing exceeds it. The `exponential` curve on the same frame reaches 4.87x,
+> because it pins white at `Dmax` with no placement rule and lets contrast push
+> values past reference white. The film is not the limitation — negative stock has
+> wide latitude; the *print rendering* decides whether output exceeds diffuse
+> white, and today's default declines to.
 >
-> - **The default is still `legacy`.** The intended product default is
->   `gain-map-hdr` (ISO gain-map HDR, on reference-anchored sigmoid
->   reconstruction). Neither that preset nor that default exists yet.
-> - **Two planned presets are still absent** — `gain-map-hdr` and `custom`.
-> - **`roll` accepts only `legacy` and `film-master`** — every preset that pins an
->   output suffix is `convert`-only.
-> - **`--output-hdr` keeps its ambiguous meaning.** It is a *rendered* float TIFF,
->   aliasing neither `film-master` nor a display-HDR output; replacing it is part
->   of the same task.
-> - **Rendering semantics may still move** for the presets that do work, and with
->   them the `pipeline_version`. Don't treat current pixel output from a named
->   preset as a stable baseline.
->
-> The `legacy` TIFF path is the stable one. For production work today, prefer it
-> unless you specifically need a gain-map JPEG, an HDR AVIF, or an HDR TIFF.
+> So HDR is a rendering-intent choice rather than a correctness gap, and it is
+> deliberately deprioritised. If you want real headroom today, use the
+> `exponential` curve, or a display-HDR preset that does not depend on gain-map
+> headroom (`hdr-pq` / `hdr-hlg`).
 
 `--output-preset` (recipe key `output.preset`) is an **atomic** policy choice: a
-named preset resolves container, bit depth, and colour profile itself.
+named preset resolves container, bit depth, and colour profile itself. `custom` is
+the deliberate exception — see below.
 
-Ten names are accepted today, and **every one pins a required suffix**:
+Twelve names are accepted, **every one pins a required suffix**, and there is no
+planned-but-unaccepted tier left, so an unknown name always means a typo:
 
-| Preset | Container | Required suffix | Depth | Contents |
+| Preset | Container | Suffix | Depth | Contents |
 |---|---|---|---|---|
-| `legacy` *(default)* | TIFF | `.tif` / `.tiff` | u16 / f32 | 16-bit integer, or 32-bit float with `--output-hdr`. Print controls run before the output ICC transform. |
+| `gain-map-hdr` *(default)* | JPEG | `.jpg` / `.jpeg` | u8 base | SDR base + gain map, packaged **dual-dialect**: ISO 21496-1 segments *and* the legacy Ultra HDR v1 XMP/MPF. |
+| `ultra-hdr-v1` | JPEG | `.jpg` / `.jpeg` | u8 base | The **same pixels** as `gain-map-hdr`, legacy XMP/MPF only — no ISO claim. |
+| `legacy` | TIFF | `.tif` / `.tiff` | u16 / f32 | The transitional path: print controls run before the output ICC transform. |
+| `custom` | TIFF | `.tif` / `.tiff` | u16 / f32 | Same bytes as `legacy`; the difference is **provenance** — it says the combination was chosen. |
 | `film-master` | TIFF | `.tif` / `.tiff` | f32 | Unclamped **linear ACEScg**, straight from the NC film RGB v1 mapping. Bypasses every print/display control. |
 | `display-p3` | TIFF | `.tif` / `.tiff` | u16 | Modern-pipeline SDR render, losslessly stored in **Display P3**. |
 | `compatibility` | TIFF | `.tif` / `.tiff` | u16 | The same SDR render in **sRGB**, for broad compatibility. |
-| `ultra-hdr-v1` | JPEG | `.jpg` / `.jpeg` | u8 base | SDR base image + gain map, with legacy Ultra HDR v1 XMP/MPF metadata. |
 | `hdr-pq` | AVIF | `.avif` | 10-bit | 4:4:4 Rec.2100 **PQ**. |
 | `hdr-hlg` | AVIF | `.avif` | 10-bit | 4:4:4 Rec.2100 **HLG**. |
 | `hdr-linear-tiff` | TIFF | `.tif` / `.tiff` | f32 | Display-linear **BT.2020**, no transfer applied — HDR interchange. |
 | `hdr-pq-tiff` | TIFF | `.tif` / `.tiff` | u16 | The same signal as `hdr-pq`, as losslessly stored Rec.2100 **PQ** codes. |
 | `hdr-hlg-tiff` | TIFF | `.tif` / `.tiff` | u16 | The same signal as `hdr-hlg`, as losslessly stored Rec.2100 **HLG** codes. |
 
-The suffix table is now **complete** — `legacy` and `film-master` state a rule
-too. Previously `nc convert -o out.jpg` would happily write a TIFF named `.jpg`.
+> **The default writes a JPEG.** `nc convert scan.tif -o out.tiff` now *fails* —
+> with no `--output-preset`, nc resolves `gain-map-hdr` and wants `.jpg`. For a
+> TIFF, name the preset: `--output-preset legacy` (or `display-p3`,
+> `compatibility`, `film-master`, …).
+
+`gain-map-hdr` and `ultra-hdr-v1` are **one render packaged twice** — identical
+pixels, differing only in metadata dialect. Only the dual-dialect default decodes
+as HDR on Apple platforms; `ultra-hdr-v1` exists for readers that predate ISO
+21496-1.
 
 The wrong suffix is a usage error, not a silent rename:
 
 ```
-usage: --output-preset hdr-pq requires an output path ending in .avif
-```
-
-Two further names (`gain-map-hdr`, `custom`) are **planned and not accepted yet** —
-they fail with a clear message:
-
-```
-usage: output preset `gain-map-hdr` is a planned name that this build does not
-       accept yet
+usage: output preset `hdr-pq` requires an output path ending in .avif
 ```
 
 ### Preset interaction rules
 
-- A named preset **rejects** a non-default `--output-hdr` / `--output-profile` /
+- An **atomic** preset rejects a non-default `--out-depth` / `--output-profile` /
   `--bigtiff` (from a flag *or* the recipe), because it resolves those itself. A
-  value that already equals the default — like `--bigtiff auto` — is accepted.
-- `--output-sdr` is rejected by **flag presence** with any named preset: it forces
-  16-bit integer output, which no named preset can produce.
-- `--output-hdr` is a *rendered* float TIFF. It is **never** an alias for
-  `film-master`, nor for `hdr-linear-tiff` — three different f32 TIFFs:
-  `--output-hdr` is print-rendered in the selected output profile, `film-master`
-  is unclamped linear ACEScg with no print controls, and `hdr-linear-tiff` is
-  display-linear BT.2020 through the shared display stage.
+  value equal to the documented default — like `--bigtiff auto` — is accepted.
+- **`custom` is the one named preset that is not atomic.** It accepts the
+  depth/profile/container selectors, resolving the same branch and the same bytes
+  as `legacy`. Use it to record that the combination was a decision.
+- **`--out-depth` replaces the old `--output-hdr` / `--output-sdr` pair**:
+  `u16` (default, archival) or `f32`. Only `legacy` and `custom` consult it.
+- `f32` there is the **transitional print-rendered** float TIFF in the selected
+  output space. It is not `film-master` (unclamped linear ACEScg, no print
+  controls) and not `hdr-linear-tiff` (display-linear BT.2020) — three different
+  f32 TIFFs.
 - `film-master` additionally rejects `--auto-d-max` / `--auto-balance-range` and
-  every non-default downstream control — it bypasses them, so accepting them would
-  be a lie.
-- `--linear-range` is consumed **only** by a named display preset. On the legacy
-  path it is a loud error rather than a silently ignored knob.
+  every non-default downstream control — it bypasses them, so accepting them
+  would be a lie.
+- `--linear-range` is consumed **only** by a display preset — which the default
+  now is, so it works out of the box. On `legacy` / `custom` it stays a loud error
+  rather than a silently ignored knob.
 
-### `roll` accepts only `legacy` and `film-master`
+### `roll` takes every preset
 
-That is an explicit list, not a rule derived from anything else. (It briefly *was*
-derived from "pins a suffix" — which broke once every preset pinned one, since that
-refused all of them.) Roll derives its own filenames (`<stem>_positive.tiff`), and
-naming/collision handling for preset-resolved containers is part of the unfinished
-migration:
+The old `convert`-only restriction is gone. `roll` derives
+`<stem>_positive.<ext>` from each frame's own resolved preset, so a
+`gain-map-hdr` roll writes `_positive.jpg` and an `hdr-pq` roll writes
+`_positive.avif`. An explicit manifest `output` path goes through the same
+suffix-mismatch rule `convert` uses.
 
-```
-usage: output.preset = "hdr-pq-tiff" is currently supported only by `nc convert`;
-       it pins a required output extension, and roll naming and collision handling
-       for preset-resolved containers are owned by the later output/presets task
-```
+### Depth, profile and container knobs
 
-So the eight explicit display presets are `convert`-only for now.
-
-### Legacy-path profile and container knobs
+These are consulted by `legacy` and `custom` only.
 
 | Flag | Values |
 |---|---|
-| `--output-hdr` / `--output-sdr` | 32-bit float / force 16-bit integer |
+| `--out-depth` | `u16` (default, archival) or `f32` (written verbatim, values above 1.0 preserved) |
 | `--output-profile` | `sRGB`, `prophoto`, `acescg`, `display-p3`, or a path to an ICC file |
 | `--bigtiff` | `auto` (default — promote only when needed), `on`, `off` |
 
@@ -665,7 +663,7 @@ resolved film base and `Dmax`, the white balance actually used, encode loss
 statistics, and warnings:
 
 ```sh
-nc convert scan.tif -o out.tiff --film-base … | jq '.loss, .warnings'
+nc convert scan.tif -o out.jpg --film-base … | jq '.loss, .warnings'
 ```
 
 Clipping is reported, never silent:
@@ -674,11 +672,12 @@ Clipping is reported, never silent:
 ["output lost 126296 clipped and 0 non-finite of 695772 samples (18.15%)"]
 ```
 
-Under the **default sigmoid curve you should never see this**: its shoulder
+This counter belongs to the **u16 encode**, so it is the TIFF presets that report
+it. And under the **default sigmoid you should never see it**: the shoulder
 approaches display white asymptotically and never reaches it, so a finite density
-cannot clip the u16 encode. Clipping means you are on the `exponential` curve
-(which hits white exactly at `Dmax` and exceeds it above), or that print controls
-pushed samples back over 1.0.
+cannot clip. A clip warning means you are on the `exponential` curve — which hits
+white exactly at `Dmax` and exceeds it above — or that print controls pushed
+samples back over 1.0.
 
 `--strict` promotes **any** warning to a hard error (exit 1) after the report is
 emitted — the right default for scripts and CI.
@@ -742,7 +741,7 @@ Your rectangle mixes rebate with image content. Check the coordinates against
 **Heavy clipping in the report**
 You are on the `exponential` curve — the default sigmoid cannot clip highlights. The
 reference density is probably too low, pushing content past display white. Raise
-`--d-max`, switch to the default sigmoid, or use `--output-hdr` / `--no-d-max` for a
+`--d-max`, switch to the default sigmoid, or use `--no-d-max` with an f32 output for a
 scene-referred float result.
 
 **"reconstruction.curve is missing `type`"**
@@ -766,7 +765,7 @@ So you don't go looking:
 
 | Missing | Owning task |
 |---|---|
-| The finished output-preset system — the `gain-map-hdr` default, `custom`, preset support in `roll`, and the `--output-hdr` replacement (see §8) | [`output/presets`](tasks/output/presets.md) |
+| **A bare `-o out`** — the suffix must currently match the preset's container; deriving it is proposed | [`output/output-path-suffix`](tasks/output/output-path-suffix.md) |
 | **Auto-cascade recipe generation** — a planner that produces a roll recipe for you, instead of you measuring and freezing it by hand | [`core/base-acquisition-planner`](tasks/core/base-acquisition-planner.md) |
 | **Content-based film-base fallback** (`--base-content`) for cropped scans with no visible rebate | [`film-base/content-fallback`](tasks/film-base/content-fallback.md) |
 | **IR dust removal** | roadmap follow-up, no task file yet |
