@@ -144,6 +144,9 @@ graph TD
     core/release-readiness
     core/roll-conversion
     core/base-acquisition-planner
+    core/recipe-composition
+    core/profile-authoring
+    core/unfrozen-auto-mode-warning
   end
   subgraph io
     io/silverfast-decode
@@ -170,6 +173,7 @@ graph TD
     film-base/ir-usability-detection
     film-base/holder-masked-measurement
     film-base/tiling-uniformity-validator
+    film-base/half-frame-calibration
   end
   subgraph algo
     algo/interface
@@ -323,6 +327,12 @@ graph TD
   core/conversion-versioning --> film-base/holder-masked-measurement
   film-base/dmax-reference --> film-base/holder-masked-measurement
   film-base/holder-masked-measurement --> film-base/tiling-uniformity-validator
+  core/cli-framework --> core/recipe-composition
+  core/roll-conversion --> core/recipe-composition
+  core/recipe-composition --> core/profile-authoring
+  core/cli-framework --> core/profile-authoring
+  core/roll-conversion --> core/unfrozen-auto-mode-warning
+  core/base-acquisition-planner --> film-base/half-frame-calibration
   film-base/estimate-reuse-output --> film-base/tiling-uniformity-validator
   algo/reference-anchored-sigmoid --> film-base/dmax-per-channel-reduction
   algo/density --> algo/curve-endpoint-validation
@@ -462,6 +472,23 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   the baseline report's blue-gradient finding. Covers `Dmax`, which has no check today. **Retires
   `--grid`** (it no longer selects an estimator) and absorbs the removed
   `film-base/grid-verdict-enum`. Diagnostics only — no pixel change
+- `core/recipe-composition` (post-MVP): `core/cli-framework`, `core/roll-conversion`
+  — repeatable `--params` (file or `-`), `roll` gains convert's override flags, one precedence
+  chain `defaults < params A < params B < … < flags`. **No schema change**: both halves are
+  already valid partial recipes (verified 2026-08-11); only repeatability is missing.
+  Implements the design-spec §8 target
+- `core/profile-authoring` (post-MVP): `core/recipe-composition`, `core/cli-framework`
+  — `nc params` becomes `nc profile`: takes the override flags, validates config-only, writes an
+  annotated JSONC look with `--out`, no image. **Deletes `--dump-params`**, which is
+  byte-identical to the sidecar and carries nothing the image produced — the same flags over two
+  different scans emit identical files
+- `core/unfrozen-auto-mode-warning` (post-MVP): `core/roll-conversion`
+  — a recipe carrying `dmax: "auto"` or an auto white balance re-measures every frame, defeating
+  the roll, and nothing warns today. Roll already warns on a non-explicit base; same hazard,
+  same plumbing
+- `film-base/half-frame-calibration` (post-MVP, **deferred**, blocks nothing): `core/base-acquisition-planner`
+  — one frame that is part unexposed and part leader serving as both references (HP5 frame 1330).
+  Convenience over the planner's one-reference-per-frame path
 - `algo/interface`: `core/project-foundation`
 - `algo/simple`: `algo/interface`
 - `algo/density`: `algo/interface`
@@ -620,6 +647,17 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Pipeline orchestration](tasks/core/pipeline-orchestration.md)
 - [x] [Roll conversion (batch + frozen recipe)](tasks/core/roll-conversion.md)
 - [ ] [Base-acquisition planner (the cascade)](tasks/core/base-acquisition-planner.md) — the roll-level `Dmin`/`Dmax` acquisition cascade: frozen recipe with provenance + confidence, and the roll→single fallback decision
+- [ ] [Layered recipe composition](tasks/core/recipe-composition.md) — repeatable `--params`
+  (file or `-` for stdin), `roll` gains convert's override flags, one precedence chain
+  `defaults < params A < params B < … < flags`. Enables the pipeline-profile / roll-calibration
+  split with **no schema change** — both halves already parse as partial recipes
+- [ ] [Author a reusable pipeline profile](tasks/core/profile-authoring.md) — `nc params` becomes
+  `nc profile`: takes the override flags, validates config-only, writes annotated JSONC via
+  `--out`, needs no image. **Deletes `--dump-params`** — byte-identical to the sidecar, and it
+  captures nothing measured, so the "frozen" recipe it produced still re-measures per frame
+- [ ] [Warn when auto modes defeat a roll](tasks/core/unfrozen-auto-mode-warning.md) — a recipe
+  carrying `dmax: "auto"` or an auto white balance re-derives per frame and silently breaks roll
+  consistency; roll already warns on a non-explicit film base, this is the same hazard
 - [x] [Conversion versioning & baseline comparison](tasks/core/conversion-versioning.md) — report `identity`, `pipeline_version` **1** (not 0 — `film-base/dmax-reference` already moved the default render) + the golden drift gate, `{meta,params}` sidecar envelope with bare legacy recipes still loading, and `nctool compare run|diff`; `v0` history in [reports/v0-baseline.md](reports/v0-baseline.md). **Known gap: the Python half runs under no CI gate.**
 - [ ] [Recipe replay fidelity for non-default behavior changes](tasks/core/recipe-replay-fidelity.md) — `pipeline_version` covers the **default** path only, so a recipe opting into a non-default curve replays under a new build with the same label and different pixels (first instance: the 2026-08-03 sigmoid defaults). Decide the policy — widen the label, add a second one, generalize the drift warning, or keep historical defaults — then retrofit that instance and retire its bespoke warning.
 - [ ] [Stdout broken-pipe safety](tasks/core/stdout-broken-pipe-safety.md) — make every
@@ -724,6 +762,9 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   0.0390 on Portra 160, independently reproducing the baseline report's blue-gradient finding on that roll.
   Extends the check to `Dmax`, which has none. **Retires `--grid`** and absorbs the removed
   `film-base/grid-verdict-enum`; diagnostics only, no pixel change
+- [ ] [Calibrate from a single part-exposed frame](tasks/film-base/half-frame-calibration.md) —
+  **deferred, blocks nothing**: one frame that is part unexposed and part leader serving as both
+  references (HP5 frame 1330 is one). Convenience over the planner's one-reference-per-frame path
 
 ### algo — [progress](progress/algo.md)
 > `src/algo/`: the `reconstruct` / `finish_print` surface, negative

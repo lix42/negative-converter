@@ -1064,6 +1064,82 @@ the complete `output/presets` migration so help, warnings, recipe provenance, ro
 handling, and the behavioral-version boundary land together. Legacy-preset TIFF
 calls retain their current pixel ordering until migration.
 
+### Target: recipe composition and the calibrate/profile split
+
+> **This subsection describes the target, not the shipped surface** — like the
+> "Target replacement architecture" block in `TASKS.md`. Owned by
+> `core/recipe-composition`, `core/profile-authoring`,
+> `core/base-acquisition-planner` and `core/value-domain-terminology`. Everything
+> above this heading is what ships today.
+
+**Two kinds of configuration, distinguished by lifetime.** The shipped recipe
+conflates them, which is why a "frozen" recipe is neither reusable nor frozen:
+
+| | Scope | Origin | Reused |
+|---|---|---|---|
+| **pipeline profile** — reconstruction, curve shape, print controls, output policy | a look | chosen | across many rolls |
+| **roll calibration** — `film_base`, `dmax` | one roll | measured from film | never |
+
+**The measurements move into their own section**, so the split is structural
+rather than a convention about which keys go in which file. `dmax` leaves
+`reconstruction.curve` — where it sits today only because it was a parameter of
+the exponential equation — and joins the film base:
+
+```json
+{
+  "calibration": {
+    "film_base": {"explicit": [0.163, 0.080, 0.0377]},
+    "dmax": {"explicit": 1.276}
+  }
+}
+```
+
+`curve.anchor` **stays** in the curve: the anchor is the *rule* for what the
+reference places, which is part of the look. Only the measurement leaves. A
+pipeline profile is then "a recipe with no `calibration` section", and a
+calibration is "a recipe with nothing else". The name `dmax` is kept — it
+accurately names the maximum density; the historic confusion was its *role*,
+which `anchor` now carries explicitly.
+
+**Composition is layered, over one schema.** `--params` is repeatable and accepts
+`-` for stdin. Later layers win, and individual flags still win over all of them:
+
+```text
+defaults  <  --params A  <  --params B  <  …  <  individual flags
+```
+
+`roll` gains the same per-knob override flags `convert` has, so a one-off roll
+needs no file at all. Per-frame overrides stay in the `--frames` manifest.
+
+**The workflow.** Freezing no longer runs a conversion:
+
+```sh
+nc inspect scan.tif                                       # optional: what is this file
+nc calibrate --unexposed blank.tif --leader exposed.tif              --out roll-cal.jsonc                          # measure the roll, once
+nc profile --density-curve sigmoid --sigmoid-contrast 2.4            --output-preset display-p3 --out my-look.jsonc  # author a look, no image
+nc roll frames/*.tif --out-dir positives/         --params my-look.jsonc --params roll-cal.jsonc     # apply
+```
+
+Both `--unexposed` and `--leader` are independently optional: either alone
+resolves its own half and leaves the other at its default. Agents can skip the
+files entirely — the report stays on stdout, so
+`nc calibrate … | jq .calibration | nc roll … --params -` composes.
+
+**Authored files are JSONC** (JSON plus comments). It is a superset, so every
+existing recipe, sidecar and `--params` file stays valid, the tagged enums the
+schema leans on keep working, and the machine contracts — report on stdout, the
+output sidecar — remain plain JSON. Comments are **generated from the schema, not
+preserved**: serde round-trips discard them, so nc writes an annotated file once
+and never rewrites a user's file in place.
+
+**Renames and removals.** `nc estimate` becomes **`nc calibrate`** (it resolves a
+roll, not one value) and `nc params` becomes **`nc profile`** (it authors a
+reusable look, not a parameter dump). `--dump-params` is **deleted** rather than
+aliased: it is byte-identical to the sidecar every conversion already writes, and
+it captures none of the measured values, so a "frozen" recipe produced by it still
+re-measures per frame. `--grid` retires separately with
+`film-base/tiling-uniformity-validator`.
+
 ### Reports & determinism
 
 - `--report json` — emit a machine-readable result (estimated values, clip

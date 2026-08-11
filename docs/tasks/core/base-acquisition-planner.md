@@ -7,6 +7,27 @@ Implement the automatic **acquisition cascade** that resolves a roll's `Dmin` an
 confidence**, and decides when to fall back from roll to single conversion. This
 is the "plan" phase of `roll-conversion` and the brains of its auto mode.
 
+## Shape decided 2026-08-11
+
+The command is **`nc calibrate`** (renamed from `nc estimate`: it resolves a roll,
+not a single value), and it resolves both references in **one invocation**:
+
+```sh
+nc calibrate --unexposed blank.tif --leader exposed.tif --out roll-cal.jsonc
+```
+
+Both flags are independently optional — either alone resolves its own half and
+leaves the other at its default. Today this takes two invocations and the user has
+to thread the first's `Dmin` into the second by hand, because `Dmax` needs the
+base to convert transmission to density.
+
+The emitted artifact is a **calibration**, not a whole recipe: only
+`calibration.film_base` and `calibration.dmax` (design-spec §8 target). It
+composes with a pipeline profile through layered `--params`, so this task no
+longer needs to emit a complete runnable recipe — just the measured half, with its
+provenance and confidence. The report stays on stdout so
+`nc calibrate … | jq .calibration | nc roll … --params -` works without a file.
+
 ## Background
 
 Design discussion (2026-07). The cascade, in decreasing reliability:
