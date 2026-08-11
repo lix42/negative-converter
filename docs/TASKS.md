@@ -153,6 +153,7 @@ graph TD
     io/memory-preflight
     io/streaming-tiled-io
     io/scanner-density-calibration
+    io/gray-primary-decode
   end
   subgraph film-base
     film-base/estimation
@@ -162,11 +163,13 @@ graph TD
     film-base/white-holder-support
     film-base/content-fallback
     film-base/estimate-reuse-output
-    film-base/grid-verdict-enum
     film-base/dmax-reference
     film-base/dense-base-dmax-plausibility
     film-base/dmax-anchor-reliability
     film-base/dmax-per-channel-reduction
+    film-base/ir-usability-detection
+    film-base/holder-masked-measurement
+    film-base/tiling-uniformity-validator
   end
   subgraph algo
     algo/interface
@@ -260,8 +263,6 @@ graph TD
   film-base/estimation --> film-base/auto-base-redesign
   film-base/ir-holder-detection --> film-base/white-holder-support
   core/pipeline-orchestration --> film-base/estimate-reuse-output
-  film-base/estimate-reuse-output --> film-base/grid-verdict-enum
-  film-base/estimation --> film-base/grid-verdict-enum
   core/pipeline-orchestration --> analysis/real-scan-verification
   core/pipeline-orchestration --> telemetry/perf-instrumentation
   core/pipeline-orchestration --> telemetry/perf-telemetry
@@ -315,6 +316,14 @@ graph TD
   film-base/dmax-reference --> film-base/dmax-anchor-reliability
   algo/reference-anchored-sigmoid --> film-base/dmax-anchor-reliability
   film-base/dmax-reference --> film-base/dmax-per-channel-reduction
+  io/silverfast-decode --> io/gray-primary-decode
+  io/gray-primary-decode --> algo/bw-support
+  film-base/ir-holder-detection --> film-base/ir-usability-detection
+  film-base/ir-usability-detection --> film-base/holder-masked-measurement
+  core/conversion-versioning --> film-base/holder-masked-measurement
+  film-base/dmax-reference --> film-base/holder-masked-measurement
+  film-base/holder-masked-measurement --> film-base/tiling-uniformity-validator
+  film-base/estimate-reuse-output --> film-base/tiling-uniformity-validator
   algo/reference-anchored-sigmoid --> film-base/dmax-per-channel-reduction
   algo/density --> algo/curve-endpoint-validation
   core/pipeline-orchestration --> algo/curve-endpoint-validation
@@ -398,6 +407,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `io/transactional-output-writes` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/memory-preflight` (post-MVP, hardening): `core/pipeline-orchestration`
 - `io/streaming-tiled-io` (post-MVP, **evaluate-first**): `io/memory-preflight`, `analysis/real-scan-verification`
+- `io/gray-primary-decode` (post-MVP): `io/silverfast-decode`
+  — accept a 16-bit **grayscale primary** (IR page unchanged). Neither existing task owns it:
+  `io/silverfast-decode` required `Gray(16)` only for the IR plane beside an RGB IFD0, and
+  `algo/bw-support` explicitly excludes input-format work. Blocks `algo/bw-support`
 - `io/scanner-density-calibration` (post-MVP): `io/input-data-semantics`, `algo/film-stock-profiles`
   — `algo/reference-anchored-sigmoid` is now transitive via `algo/film-stock-profiles`.
   The registry is a real prerequisite: this task's verification needs the per-stock
@@ -415,7 +428,6 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   — film-base/auto-base-redesign is now transitive via film-base/ir-holder-detection
 - `film-base/content-fallback` (post-MVP): `film-base/estimation`
 - `film-base/estimate-reuse-output` (post-MVP): `core/pipeline-orchestration`
-- `film-base/grid-verdict-enum` (post-MVP): `film-base/estimate-reuse-output`, `film-base/estimation`
 - `film-base/dmax-reference` (post-MVP): `algo/dmax-white-anchor`
 - `film-base/dense-base-dmax-plausibility` (post-MVP): `film-base/dmax-reference`
 - `film-base/dmax-anchor-reliability` (post-MVP): `film-base/dmax-reference`, `algo/reference-anchored-sigmoid`
@@ -433,6 +445,23 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   under the **exponential** curve (a per-channel anchor is exactly a per-channel gain) but
   **not** under the sigmoid, which is the intended default — hence an investigation with a
   quantified verdict, not a presumed fix. Changes no pixels
+- `film-base/ir-usability-detection` (post-MVP): `film-base/ir-holder-detection`
+  — decide IR usability from the **plane itself**, not from `--film-type`, which becomes a hint.
+  Measured 2026-08-11: IR separability tracks the frame's *density*, not the stock's chemistry —
+  an unexposed silver frame separates 20:1 (0.47 film vs 0.02 holder) while its leader is
+  uniformly opaque. Today's gate is wrong for exactly the frame `Dmin` uses
+- `film-base/holder-masked-measurement` (post-MVP): `film-base/ir-usability-detection`, `core/conversion-versioning`, `film-base/dmax-reference`
+  — mask the holder **per edge** (measured 2–5% of the short edge, asymmetric), fixed-fraction
+  fallback otherwise; then estimate the **centre** of what is now a single population instead of
+  reaching for p97, which biases ~0.046 density (0.16 stops, the "pale" direction). **Pixel
+  change**: one `pipeline_version` bump, which is why masking and the estimator ship together.
+  Provenance is per-run, not a persisted pre-processed input
+- `film-base/tiling-uniformity-validator` (post-MVP): `film-base/holder-masked-measurement`, `film-base/estimate-reuse-output`
+  — coarse tiling in the estimate's own pass, reporting within-tile (grain) separately from
+  between-tile (gradient): measured 0.0081 on Gold 200 against 0.0390 on Portra 160, reproducing
+  the baseline report's blue-gradient finding. Covers `Dmax`, which has no check today. **Retires
+  `--grid`** (it no longer selects an estimator) and absorbs the removed
+  `film-base/grid-verdict-enum`. Diagnostics only — no pixel change
 - `algo/interface`: `core/project-foundation`
 - `algo/simple`: `algo/interface`
 - `algo/density`: `algo/interface`
@@ -481,7 +510,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/regional-color-balance` (post-MVP): `algo/density`
-- `algo/bw-support` (post-MVP): `algo/density`, `core/pipeline-orchestration`, `algo/dmax-white-anchor`
+- `algo/bw-support` (post-MVP): `algo/density`, `core/pipeline-orchestration`, `algo/dmax-white-anchor`, `io/gray-primary-decode`
 - `color/management`: `core/project-foundation`
 - `color/film-rgb-working-space` (post-MVP): `algo/negative-reconstruction-density-curves`, `color/management`
 - `color/film-master-render-pipeline` (post-MVP): `color/film-rgb-working-space`, `film-base/dmax-reference`
@@ -635,6 +664,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   exit code 6; peak on the 74.65 MP `largest.tif` 3.808 → 3.146 GB and 975 → 681 MB
   at 18.66 MP (decimal GB/MB, a 30% cut), output byte-identical. Re-measurement
   feeds `io/streaming-tiled-io` STEP 0 (still a conditional GO).
+- [ ] [Decode a single-channel gray SilverFast scan](tasks/io/gray-primary-decode.md) — accept a 16-bit **grayscale primary** (IR page unchanged). nc refuses these outright today: seven real Ilford HP5 frames fail with `found Gray(16)`, each carrying a marker-verified IR page. Neither existing task owns it — `io/silverfast-decode` required `Gray(16)` only for the IR plane beside an RGB IFD0, and `algo/bw-support` explicitly excludes input-format work — so `algo/bw-support` is blocked behind this
 - [ ] [Scanner density calibration](tasks/io/scanner-density-calibration.md) — turn the
   density-scale question into a shipped, reusable scanner profile. Tier 1 (unexposed
   frame only, no new user action) is a **non-calibrating diagnostic**: a scan value is a
@@ -661,7 +691,6 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Light film holder support](tasks/film-base/white-holder-support.md)
 - [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base/content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `film-base/auto-base-redesign` (tell that task's owner)
 - [x] [Reuse-ready `nc estimate` output](tasks/film-base/estimate-reuse-output.md)
-- [ ] [Grid agreement verdict enum](tasks/film-base/grid-verdict-enum.md)
 - [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/film-base/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the replacement density-curve stage preserves scalar exponential placement and sigmoid curve shaping
 - [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/film-base/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
 - [ ] [Dmax anchor reliability](tasks/film-base/dmax-anchor-reliability.md) — follow-up on a
@@ -678,6 +707,23 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   per-channel gain, so it is redundant with `print.white_balance` under the exponential curve — but
   **not** under the sigmoid default, where it shifts each channel's toe/shoulder position.
   Investigation + impact verdict; ships no pixel change
+
+- [ ] [Decide IR usability by measurement](tasks/film-base/ir-usability-detection.md) — key IR holder
+  detection on the **plane itself** rather than `--film-type`, which becomes a hint. Measured 2026-08-11 on
+  real Ilford HP5: separability tracks the *frame's density*, not the stock's chemistry — an unexposed silver
+  frame separates 20:1 while its own leader is uniformly opaque. So today's `silver → IR off` rule is wrong
+  for precisely the frame `Dmin` is measured from
+- [ ] [Mask the holder, then estimate from a single population](tasks/film-base/holder-masked-measurement.md) —
+  mask **per edge** (measured 2–5% of the short edge, and asymmetric), fixed-fraction fallback otherwise —
+  which for silver leaders is the *normal* path, since IR can never separate there. Then estimate the centre
+  of what is now one population rather than reaching for p97, whose ~0.046-density bias costs 0.16 stops in
+  the "pale" direction. **Pixel change, one `pipeline_version` bump**; masking and the estimator ship together
+  so it is one bump, not two
+- [ ] [Validate reference frames by tiling](tasks/film-base/tiling-uniformity-validator.md) — coarse tiling in
+  the estimate's own pass, separating within-tile grain from between-tile gradient: 0.0081 on Gold 200 against
+  0.0390 on Portra 160, independently reproducing the baseline report's blue-gradient finding on that roll.
+  Extends the check to `Dmax`, which has none. **Retires `--grid`** and absorbs the removed
+  `film-base/grid-verdict-enum`; diagnostics only, no pixel change
 
 ### algo — [progress](progress/algo.md)
 > `src/algo/`: the `reconstruct` / `finish_print` surface, negative

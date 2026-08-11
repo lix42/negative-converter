@@ -960,9 +960,10 @@ pub struct GridCell {
 /// disagreement both read ~`1.0`. The CLI (`cli::run_estimate`) therefore
 /// re-derives which case it is by re-inspecting the combined `base` (channel
 /// `<= 0` ⇒ degenerate ⇒ hard error; otherwise disagreement ⇒ warning). Replacing
-/// this bool + overloaded sentinel with a self-describing verdict enum
-/// (`Uniform | Disagree | Degenerate`) so the estimate reports its own verdict
-/// and the CLI stops re-deriving it is the `grid-verdict-enum` follow-up task.
+/// this bool + overloaded sentinel with a self-describing verdict, so the
+/// estimate reports its own outcome and the CLI stops re-deriving it, is carried
+/// by the `film-base/tiling-uniformity-validator` follow-up — which retires
+/// `--grid` and this struct along with it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GridEstimate {
     /// Combined base: the per-channel **median** across cells (robust to one

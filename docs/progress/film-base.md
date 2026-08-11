@@ -1090,3 +1090,72 @@ Four real findings on PR #56, plus one document-only deferral.
   different level.
 - Coordinate with `dmax-anchor-reliability` — same leader measurements, different
   axis; neither blocks the other.
+
+## ir-usability-detection
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: decide whether IR can separate holder from film by measuring the plane, not by
+  trusting `--film-type`.
+- The measurement that motivates it (Ilford HP5, silver-halide, IR median transmission):
+
+  | frame | border p05 | interior p05 | interior median | separable |
+  |---|---|---|---|---|
+  | 1364 unexposed | 0.0229 | 0.4567 | 0.4734 | yes — 20:1 |
+  | 1330 half-leader | 0.0194 | 0.0202 | 0.4620 | partly |
+  | 1354 regular | 0.0186 | 0.0236 | 0.0818 | no |
+  | 1329 leader | 0.0154 | 0.0151 | 0.0163 | no |
+
+- The load-bearing conclusion: separability tracks the **frame's density**, not the
+  stock's chemistry. Silver blocks IR in proportion to accumulated density, so an
+  unexposed frame is IR-transparent against an opaque holder while its own leader is
+  opaque throughout. `silver → IR off` is therefore wrong for exactly the frame `Dmin`
+  is measured from, and right for the frame `Dmax` is measured from.
+
+## holder-masked-measurement
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: mask the holder per edge, then estimate the centre of the resulting single
+  population. Pixel change, one `pipeline_version` bump.
+- Holder depth measured on the unexposed HP5 frame: IR clears at ~2% of the short edge
+  right, ~3% top/bottom, ~5% left — small, and **asymmetric**, so a rectangular crop
+  must take the worst edge while per-edge masking need not.
+- Why the estimator has to move with the mask: p97 exists to select the film
+  sub-population out of a *mixture*. Masking makes the region one population, where an
+  extreme percentile is just its noise tail — measured 0.046 density from p50 on the
+  Gold 200 leader, 0.16 stops through `dA/dR = 0.5`, in the "pale" direction.
+  `reference_dmax` already samples at p = 0.5 for this reason.
+- Reassurance recorded so it is not re-litigated: the p03–p97 span on a leader is ~0.32
+  stops, but it is **grain and scanner noise** — smooth, symmetric, no discontinuity —
+  and split-half medians agree to 1.4e-4 density. Wide population, precise centre.
+- Fallback is a first-class path: for silver stock IR can never separate on a leader, so
+  every silver `Dmax` takes it. Provenance is per-run (user decision 2026-08-11), not a
+  persisted pre-processed input.
+
+## tiling-uniformity-validator
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: replace the 5-cell grid with a coarse tiling in the estimate's own pass, reporting
+  within-tile and between-tile variation separately. Covers `Dmax` too. No pixel change.
+- The decomposition is what makes it worth doing (4x4 tiles, leader interiors):
+
+  | roll | between-tile | within-tile p05–p95 | ratio |
+  |---|---|---|---|
+  | Gold 200 | 0.0081 | 0.0830 | 10 : 1 |
+  | Portra 160 | 0.0390 | 0.0887 | 2.3 : 1 |
+
+  Same scanner, ~5x difference in real spatial structure, independently reproducing the
+  baseline report's finding that Portra 160's leader is the least uniform of the set.
+  `(max − min)` over five patches cannot tell a slope from one bad patch, and a pooled
+  percentile cannot see either.
+- **Retires `--grid`** — once masking and a central estimator are unconditional it selects
+  no estimator, and the tiling is free in a pass already being made.
+- **`film-base/grid-verdict-enum` was removed** on 2026-08-11 and is absorbed here: its
+  goal was replacing `GridEstimate.agreement: bool` and its overloaded spread sentinel
+  with a self-describing verdict. That intent carries over to the tiling verdict; the
+  task itself made no sense once `--grid` goes. It had no dependents.

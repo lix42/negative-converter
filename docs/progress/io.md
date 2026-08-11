@@ -914,3 +914,19 @@ obvious until something breaks:
   `manifest.json` (roll + frame + `sha256`) and driven via `scripts/real-scan-verify/`;
   that half cannot run in CI and skips when assets are absent. Tier 1's *logic* is covered
   by a synthetic committed fixture so a clean checkout can still verify it.
+
+## gray-primary-decode
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: accept a SilverFast scan whose primary is 16-bit grayscale; IR page unchanged.
+- Found 2026-08-11 while testing whether IR can identify the film holder without a
+  declared film type. Seven Ilford HP5 frames in `../nc-assets/rolls/ILFORT-HP5-2026-08-10/`
+  fail at decode: `expected 3-channel 16-bit RGB in the primary image, found Gray(16)`.
+  Their `IFD2` is a full-resolution "Transparency mask" (`NewSubfileType=4`), so the IR
+  plane is present and marker-verified — only the primary's channel count differs.
+- **No existing task owned this.** `io/silverfast-decode` required `Gray(16)` only for
+  the IR plane beside an RGB `IFD0`; `algo/bw-support` explicitly excludes input-format
+  work ("16-bit RAW scan *input* is a separate concern"). So `bw-support` was blocked on
+  a task that did not exist.

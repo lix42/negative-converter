@@ -129,6 +129,8 @@ do not pull input-format work into this task.
 
 ## Dependencies
 
+- [Decode a single-channel gray SilverFast scan](../io/gray-primary-decode.md) — nc
+  cannot read a gray-primary scan at all today, so this is a hard prerequisite
 - [Density-domain algorithm](density.md)
 - [Pipeline orchestration](../core/pipeline-orchestration.md)
 - [Display-range white anchor (Dmax)](dmax-white-anchor.md) — the design
