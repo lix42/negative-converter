@@ -29,6 +29,22 @@ scalar *density*. This has had to be re-explained repeatedly.
    Possibly introduce explicit named values/terms (e.g. `TransClear` /
    `TransBlocking` alongside `Dmin` / `Dmax`) — to be decided at execution.
 
+3. **The CLI/recipe surface is inconsistent on the same axis.** `--film-base`
+   names the *thing*; `--d-max` names the *quantity* — and `--base-region` /
+   `--d-max-region` inherits it. One concrete candidate from the 2026-08-11
+   Dmin/Dmax discussion: **`--film-base` + `--reference-density`** (with
+   `--base-region` / `--reference-region`). The argument for it is that the
+   codebase already moved — the sigmoid anchor split made `curve.dmax` the roll's
+   *reference density* and `curve.anchor` the placement, so source comments, the
+   baseline report and `docs/using-nc.md` all say "reference density" while the
+   flag still says `d-max` and its help text still calls it a "display-white
+   anchor", which has been wrong since that split.
+   **Avoid a symmetric pair** (`--d-min`/`--d-max`, or base/ceiling): `Dmin` is a
+   per-channel *transmission* and `Dmax` a scalar *density*, so symmetric naming
+   would encode into the CLI exactly the conflation this task exists to remove.
+   A rename spans flags, recipe keys, report keys, `DmaxSource`, `NOMINAL_DMAX`
+   and the docs together; nc is unreleased, so it is cheapest now.
+
 ## Constraints
 
 - **Preserve the data flow.** The pipeline stages and the transformations they
