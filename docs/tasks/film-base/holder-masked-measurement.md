@@ -79,3 +79,5 @@ mixtures (`--auto-base` rebate strips, an untrusted user rectangle).
 
 - [Decide IR usability by measurement](ir-usability-detection.md)
 - [Conversion versioning and baseline comparison](../core/conversion-versioning.md)
+- [Roll-fixed Dmax from a fully-exposed reference frame](dmax-reference.md) — this task
+  changes `reference_dmax` sampling, which that task introduced

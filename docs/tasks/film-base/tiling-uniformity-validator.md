@@ -73,6 +73,8 @@ the evidence this belongs in `estimate`.
 ## Dependencies
 
 - [Mask the holder, then estimate from a single population](holder-masked-measurement.md)
+- [Reuse-ready `nc estimate` output](estimate-reuse-output.md) — carried over from the
+  retired `grid-verdict-enum`: this task removes the `--grid` reporting that task shipped
 
 Coordinate with [Dmax anchor reliability](dmax-anchor-reliability.md), which owns
 whether a leader-measured anchor can be trusted at all and is the right place for

@@ -35,10 +35,10 @@ scalar *density*. This has had to be re-explained repeatedly.
    Dmin/Dmax discussion: **`--film-base` + `--reference-density`** (with
    `--base-region` / `--reference-region`). The argument for it is that the
    codebase already moved — the sigmoid anchor split made `curve.dmax` the roll's
-   *reference density* and `curve.anchor` the placement, so source comments, the
-   baseline report and `docs/using-nc.md` all say "reference density" while the
-   flag still says `d-max` and its help text still calls it a "display-white
-   anchor", which has been wrong since that split.
+   *reference density* and `curve.anchor` the placement, so `algo/sigmoid.rs`'s
+   module doc and `reports/sigmoid-reference-baseline.md` both say "reference
+   density" while the flag still says `d-max` and its help text still calls it a
+   "display-white anchor", which has been wrong since that split.
    **Avoid a symmetric pair** (`--d-min`/`--d-max`, or base/ceiling): `Dmin` is a
    per-channel *transmission* and `Dmax` a scalar *density*, so symmetric naming
    would encode into the CLI exactly the conflation this task exists to remove.

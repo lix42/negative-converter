@@ -317,10 +317,13 @@ graph TD
   algo/reference-anchored-sigmoid --> film-base/dmax-anchor-reliability
   film-base/dmax-reference --> film-base/dmax-per-channel-reduction
   io/silverfast-decode --> io/gray-primary-decode
+  io/gray-primary-decode --> algo/bw-support
   film-base/ir-holder-detection --> film-base/ir-usability-detection
   film-base/ir-usability-detection --> film-base/holder-masked-measurement
   core/conversion-versioning --> film-base/holder-masked-measurement
+  film-base/dmax-reference --> film-base/holder-masked-measurement
   film-base/holder-masked-measurement --> film-base/tiling-uniformity-validator
+  film-base/estimate-reuse-output --> film-base/tiling-uniformity-validator
   algo/reference-anchored-sigmoid --> film-base/dmax-per-channel-reduction
   algo/density --> algo/curve-endpoint-validation
   core/pipeline-orchestration --> algo/curve-endpoint-validation
@@ -447,13 +450,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   Measured 2026-08-11: IR separability tracks the frame's *density*, not the stock's chemistry —
   an unexposed silver frame separates 20:1 (0.47 film vs 0.02 holder) while its leader is
   uniformly opaque. Today's gate is wrong for exactly the frame `Dmin` uses
-- `film-base/holder-masked-measurement` (post-MVP): `film-base/ir-usability-detection`, `core/conversion-versioning`
+- `film-base/holder-masked-measurement` (post-MVP): `film-base/ir-usability-detection`, `core/conversion-versioning`, `film-base/dmax-reference`
   — mask the holder **per edge** (measured 2–5% of the short edge, asymmetric), fixed-fraction
   fallback otherwise; then estimate the **centre** of what is now a single population instead of
   reaching for p97, which biases ~0.046 density (0.16 stops, the "pale" direction). **Pixel
   change**: one `pipeline_version` bump, which is why masking and the estimator ship together.
   Provenance is per-run, not a persisted pre-processed input
-- `film-base/tiling-uniformity-validator` (post-MVP): `film-base/holder-masked-measurement`
+- `film-base/tiling-uniformity-validator` (post-MVP): `film-base/holder-masked-measurement`, `film-base/estimate-reuse-output`
   — coarse tiling in the estimate's own pass, reporting within-tile (grain) separately from
   between-tile (gradient): measured 0.0081 on Gold 200 against 0.0390 on Portra 160, reproducing
   the baseline report's blue-gradient finding. Covers `Dmax`, which has no check today. **Retires
@@ -507,7 +510,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/regional-color-balance` (post-MVP): `algo/density`
-- `algo/bw-support` (post-MVP): `algo/density`, `core/pipeline-orchestration`, `algo/dmax-white-anchor`
+- `algo/bw-support` (post-MVP): `algo/density`, `core/pipeline-orchestration`, `algo/dmax-white-anchor`, `io/gray-primary-decode`
 - `color/management`: `core/project-foundation`
 - `color/film-rgb-working-space` (post-MVP): `algo/negative-reconstruction-density-curves`, `color/management`
 - `color/film-master-render-pipeline` (post-MVP): `color/film-rgb-working-space`, `film-base/dmax-reference`
@@ -705,12 +708,6 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   **not** under the sigmoid default, where it shifts each channel's toe/shoulder position.
   Investigation + impact verdict; ships no pixel change
 
-### algo — [progress](progress/algo.md)
-> `src/algo/`: the `reconstruct` / `finish_print` surface, negative
-> reconstruction, the density curves (exponential / sigmoid), and the tone,
-> white-balance, and color-model parameters of that stage. Deterministic
-> statistics only — no ML.
-
 - [ ] [Decide IR usability by measurement](tasks/film-base/ir-usability-detection.md) — key IR holder
   detection on the **plane itself** rather than `--film-type`, which becomes a hint. Measured 2026-08-11 on
   real Ilford HP5: separability tracks the *frame's density*, not the stock's chemistry — an unexposed silver
@@ -727,6 +724,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   0.0390 on Portra 160, independently reproducing the baseline report's blue-gradient finding on that roll.
   Extends the check to `Dmax`, which has none. **Retires `--grid`** and absorbs the removed
   `film-base/grid-verdict-enum`; diagnostics only, no pixel change
+
+### algo — [progress](progress/algo.md)
+> `src/algo/`: the `reconstruct` / `finish_print` surface, negative
+> reconstruction, the density curves (exponential / sigmoid), and the tone,
+> white-balance, and color-model parameters of that stage. Deterministic
+> statistics only — no ML.
+
 - [x] [Algorithm interface](tasks/algo/interface.md)
 - [x] [Simple inversion algorithm](tasks/algo/simple.md)
 - [x] [Density-domain algorithm](tasks/algo/density.md)
