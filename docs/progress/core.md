@@ -1565,3 +1565,49 @@ the task as shipped and stays verbatim.
   `exponential`, which the change does not touch), and per-schema-version historical default
   tables (defensible, but it cannot stop at one knob, and committing to maintaining
   historical defaults is a policy decision that belongs in the new task, not an algo one).
+
+## recipe-composition
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: `--params` repeatable (file or `-`), `roll` gains convert's override flags,
+  one precedence chain. Enables the pipeline/calibration split.
+- **No schema change needed** — verified 2026-08-11 that both halves already parse:
+  a recipe with only `reconstruction`/`print`/`output` works when the base comes
+  from a flag, and one with only `film_base` + `dmax` works with everything else
+  defaulted. The single missing mechanic is that `--params` rejects repetition.
+- Precedence extends the existing rule rather than replacing it: flags already beat
+  the recipe **by source, not value**, and layering adds ordering among recipes.
+
+## profile-authoring
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: `nc params` → `nc profile`; takes overrides, validates config-only, writes
+  annotated JSONC with `--out`, no image. Deletes `--dump-params`.
+- Why `--dump-params` goes, measured 2026-08-11: its output is byte-identical to
+  the sidecar every conversion already writes, and it carries nothing the image
+  produced — the same flags over two *different* scans emit identical files. It
+  records modes (`"auto"`, `"percentile"`), never the measurements the report holds
+  beside it. So "freeze a recipe" ran a full decode/render/encode to echo the
+  flags just typed, and the result still re-measured per frame.
+- JSONC because it is a **superset**: existing recipes, sidecars and `--params`
+  files stay valid, the schema's tagged enums keep working, and the machine
+  contracts (stdout report, sidecar) stay plain JSON. Comments are generated from
+  the schema and **not preserved** across a round trip, so nc must never rewrite a
+  user's file in place.
+
+## unfrozen-auto-mode-warning
+
+**Status:** not started
+**Updated:** 2026-08-11
+
+- Goal: warn when a recipe applied to a roll still re-measures per frame.
+- The gap, one run with `--base-region … --auto-wb percentile --auto-d-max`: the
+  report held `film_base {0.163, 0.080, 0.038}`, `dmax 0.581`, `wb [1.228, 1.0,
+  0.721]` while the recipe held `{"region": …}`, `"auto"`, `"percentile"`. Applying
+  it to a roll re-derived all three per frame, with no warning beyond an incidental
+  region-uniformity note.
+- Precedent exists: roll already warns when the film base is not `explicit`.

@@ -29,21 +29,26 @@ scalar *density*. This has had to be re-explained repeatedly.
    Possibly introduce explicit named values/terms (e.g. `TransClear` /
    `TransBlocking` alongside `Dmin` / `Dmax`) — to be decided at execution.
 
-3. **The CLI/recipe surface is inconsistent on the same axis.** `--film-base`
-   names the *thing*; `--d-max` names the *quantity* — and `--base-region` /
-   `--d-max-region` inherits it. One concrete candidate from the 2026-08-11
-   Dmin/Dmax discussion: **`--film-base` + `--reference-density`** (with
-   `--base-region` / `--reference-region`). The argument for it is that the
-   codebase already moved — the sigmoid anchor split made `curve.dmax` the roll's
-   *reference density* and `curve.anchor` the placement, so `algo/sigmoid.rs`'s
-   module doc and `reports/sigmoid-reference-baseline.md` both say "reference
-   density" while the flag still says `d-max` and its help text still calls it a
-   "display-white anchor", which has been wrong since that split.
+3. **`dmax` lives under its consumer, while its sibling measurement does not.**
+   `film_base` is a roll measurement consumed by reconstruction (it is the
+   divisor) and sits in its **own top-level section**. `dmax` is also a roll
+   measurement consumed by reconstruction (the curve's reference) and sits
+   **nested in `reconstruction.curve`** — history, not principle: it was a
+   parameter of the exponential equation before the anchor split reinterpreted
+   it. Decided 2026-08-11: move it out, next to the film base, so the
+   pipeline/roll split is structural (design-spec §8 target). `curve.anchor`
+   **stays** — the anchor is the *rule* for what the reference places, which is
+   part of the look; only the measurement leaves.
+4. **Keep the name `dmax`.** An earlier revision of this task proposed
+   `--reference-density`; that was **overruled 2026-08-11**. `dmax` accurately
+   names the maximum density, and "reference" does not connote the top end at
+   all. The historic confusion was never the word but the *role* — reading it as
+   "the density that renders to white" — and `anchor` now carries that role
+   explicitly. What does still need fixing is `--d-max`'s help text, which calls
+   it a "display-white anchor" and has been wrong since the split.
    **Avoid a symmetric pair** (`--d-min`/`--d-max`, or base/ceiling): `Dmin` is a
    per-channel *transmission* and `Dmax` a scalar *density*, so symmetric naming
    would encode into the CLI exactly the conflation this task exists to remove.
-   A rename spans flags, recipe keys, report keys, `DmaxSource`, `NOMINAL_DMAX`
-   and the docs together; nc is unreleased, so it is cheapest now.
 
 ## Constraints
 

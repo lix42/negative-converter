@@ -1159,3 +1159,17 @@ Four real findings on PR #56, plus one document-only deferral.
   goal was replacing `GridEstimate.agreement: bool` and its overloaded spread sentinel
   with a self-describing verdict. That intent carries over to the tiling verdict; the
   task itself made no sense once `--grid` goes. It had no dependents.
+
+## half-frame-calibration
+
+**Status:** not started — **deferred, blocks nothing**
+**Updated:** 2026-08-11
+
+- Goal: let one part-unexposed, part-leader frame serve as both calibration
+  references, instead of requiring two frames.
+- Real case: HP5 `20260808-film-1330`, whose IR statistics show both populations in
+  one frame — interior median 0.4620 (transparent, unexposed) against border p05
+  0.0194 and interior p05 0.0202 (opaque).
+- The caution to carry: the exposed half of a *transition* is where exposure was
+  still ramping, so it may not be the film's maximum. `dmax-anchor-reliability`
+  already questions a dedicated leader; a half-leader is weaker evidence still.
