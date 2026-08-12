@@ -116,7 +116,11 @@ impl From<FilmBase> for [f32; 3] {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ReconstructionType {
-    /// Channel-inversion baseline (debug / B&W).
+    /// Channel-inversion baseline — a **debugging** path, not a production
+    /// one. Carries no density correction, curve or `Dmax`, so it isolates
+    /// decode plus film base. **Not** the B&W path: B&W film is still a
+    /// density medium with its own characteristic curve, so `algo/bw-support`
+    /// runs through `density` and adds a mono colour model instead.
     Simple,
     /// Density-domain reconstruction (Cineon / negadoctor) — the default.
     #[default]
@@ -1060,8 +1064,12 @@ pub const RECONSTRUCTION_SCHEMA_VERSION: u32 = 1;
 /// omission never survives into a resolved recipe or report).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Reconstruction {
-    /// Channel-inversion baseline (debug / B&W): the direct unclamped positive
-    /// `1 − scan/Dmin`. No density or curve configuration.
+    /// Channel-inversion baseline: the direct unclamped positive
+    /// `1 − scan/Dmin`. No density or curve configuration — a **debugging**
+    /// path that isolates decode plus film base, **not** the B&W one
+    /// (`algo/bw-support` runs B&W through `density`). It is affine in
+    /// transmission, where `density` is a power law in it, so the two are
+    /// different curve shapes rather than different tunings of one.
     Simple,
     /// Density-domain reconstruction (the default): corrected density `D′`
     /// (stages 1–2, `density`) mapped through the tagged `curve`.
