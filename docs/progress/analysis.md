@@ -76,6 +76,10 @@ What other epics need to know about `analysis`:
 - **Open question for the user:** the committed `recipes/*.hdr.json` key order
   lags the current harness `jq` (values identical); a `freeze` re-run will
   reorder them.
+- **The analysis stdlib suite is CI-gated on Linux and macOS (2026-08-11).** It
+  includes a hermetic real-binary `freeze` → `convert` harness test plus a fake
+  successful-wrong-container regression. The Drive-backed verification matrix
+  remains manual; CI protects its CLI/recipe/container plumbing.
 
 
 ## real-scan-verification
@@ -375,8 +379,8 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 
 ## harness-regression-tests
 
-**Status:** not started
-**Updated:** 2026-08-09
+**Status:** done
+**Updated:** 2026-08-11
 
 - Goal: give `scripts/real-scan-verify/harness.sh` automated coverage, so a change
   to nc's CLI surface cannot break it silently. See
@@ -400,3 +404,39 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
   whether it belongs in CI (no assets, no `exiftool` there), and what language it
   should be in — `scripts/analysis/`'s 91 Python tests already run under no CI gate,
   which is worth resolving together rather than adding a third untested surface.
+- 2026-08-11: Started implementation after inspecting the harness and the existing
+  stdlib `nctool` tests. The committed TIFF fixtures are sufficient for a hermetic
+  `freeze` → `convert` run against the real debug binary: region-based Dmin/Dmax
+  estimation succeeds (a low-Dmax warning is harmless), and neither Drive assets
+  nor `exiftool` is needed. Plan: make recipe/output staging test-overridable, add
+  exact artifact postconditions, reproduce the successful-wrong-container failure
+  with a fake `nc`, and put the full analysis unittest suite into CI.
+- 2026-08-11: Completed. `harness.sh` now uses fail-fast shell semantics, accepts
+  an isolated `REC`, renders u16/f32 into a fresh per-run staging tree, requires
+  exactly one TIFF+sidecar pair per frame per mode, and publishes only after the
+  complete set validates. Wrong suffixes, extra files, ordinary command failures,
+  and determinism differences are hard failures; the expected strict failure is
+  asserted explicitly. `nctool.test_harness` covers the real fixture-backed
+  `freeze` → `convert` path and a fake u16-success/f32-JPEG-success regression that
+  must fail before publication. CI now runs all 94 stdlib analysis tests on Linux
+  and macOS. Verified: targeted harness tests, full Python suite, fmt, clippy with
+  warnings denied, build, and the Rust suite (793 passed, 5 ignored). A real Drive-backed `freeze`
+  regenerated 21 files across seven rolls, all semantically identical to the
+  committed recipes/provenance after normalizing JSON key order.
+- 2026-08-11: Review hardening. Staged and published artifacts are now checked by
+  content (TIFF magic and JSON-object sidecars), directory and directory-symlink
+  publication targets are rejected before any move, and final artifacts are
+  revalidated before the success line. Saved roll reports normalize
+  `frames[].output` to the durable u16 / `_hdr` publication paths instead of
+  retaining deleted `.rsv-*` staging paths; each raw report must name every
+  expected successful staging path before any image moves. The intentional strict probe now
+  accepts only warning-promotion exit 1 with both the IR-ignored and strict
+  diagnostics; usage/crash statuses and unrelated warnings fail. Hermetic tests
+  cover each regression. Verified: 7 targeted harness tests; all 99 analysis
+  tests; fmt; clippy with warnings denied; build; Rust tests (793 passed, 5
+  ignored).
+- 2026-08-11: Sidecar contract correction. Artifact validation now distinguishes
+  generic JSON-object roll reports from conversion sidecars, which must carry the
+  binary's real envelope: object-valued `meta` and `params`. The negative harness
+  case uses parseable `{}` to prove a wrong envelope is rejected before
+  publication; successful fakes emit the minimal valid envelope.

@@ -29,36 +29,33 @@ The checked-in recipes were also migrated by hand *without* the generator that
 writes them, so the fix and the thing that would undo it lived in the same change.
 Any coverage here should make that specific divergence visible.
 
-## Open questions
+## Outcome (2026-08-11)
 
-- **What can run without the Drive assets?** The recipe generator, the argument
-  shapes, and the filename conventions are all assertable against the committed
-  `tests/fixtures/`; the actual verification matrix is not. A split along that line
-  is the obvious candidate, but where exactly it falls is worth deciding against the
-  script rather than in advance.
-- **Does this belong in CI, or as a fast local pre-flight?** CI has no assets and
-  no `exiftool`. A `--dry-run`/`--self-check` mode that exercises the plumbing on
-  fixtures might be the useful artifact; so might a plain `shellcheck` run, which
-  would not have caught any of the three failures above and should not be mistaken
-  for coverage of them.
-- **What language?** The repo already has a Python test suite under
-  `scripts/analysis/` (91 tests, no CI gate of its own — worth resolving together
-  rather than adding a third untested surface).
-- **Should the generator and the checked-in recipes be tied together?** Asserting
-  that re-running `stage_freeze` reproduces the committed recipes byte-for-byte
-  would have caught the `output.hdr` divergence directly. It needs the assets, so
-  it may only be a documented manual step.
+The fixture-only boundary is useful and now runs in CI. A stdlib Python black-box
+test builds a temporary one-roll asset tree from the committed TIFF fixtures and
+drives the real debug `nc` binary through `freeze` and `convert`. It pins the
+generated recipe structure and explicit `legacy`/`f32` selections, then requires
+the exact TIFF and sidecar set.
 
-## Known vs unknown
+The harness itself now runs both render modes in a fresh per-run staging tree and
+publishes nothing until every expected artifact has TIFF magic, every sidecar has
+object-valued `meta` and `params`, and there are no extras or directory-shaped final targets. It
+revalidates published files before success and rewrites each roll report's
+`frames[].output` from the removed staging path to the durable published path.
+The raw roll report must first name every expected staging path exactly once with
+`status: ok`, so a report-schema regression cannot publish images and fail only
+afterward.
+This makes old persistent outputs unable to mask a failure. A fake binary reproduces
+the historical sharp case—u16 TIFF succeeds, float roll exits 0 but writes JPEG—and
+the harness fails before publication or its success line. Ordinary command errors
+and determinism mismatches also propagate nonzero; the intentionally failing strict
+probe accepts only exit 1 carrying both the IR-ignored warning and strict-promotion
+diagnostic.
 
-**Known:** the three failure modes above are real and reproduced; the silent one is
-the dangerous one; `harness.sh` is the only consumer of
-`scripts/real-scan-verify/recipes/*.json`; the Python half of `scripts/` runs under
-no CI gate either.
-
-**Unknown:** whether a useful fixture-only harness run exists at all, and whether
-the right unit of coverage is the script, the recipes, or the CLI contract the
-script depends on.
+The full `scripts/analysis` unittest discovery command is a Linux and macOS CI gate.
+Drive-backed image-quality, interoperability, IR, determinism, and resource checks
+remain manual. `shellcheck` was not added: it would not have caught any of the three
+failures this task exists to prevent.
 
 ## How to Verify
 
