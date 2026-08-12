@@ -59,5 +59,8 @@ jobs:
       - name: Build
         run: cargo build --all-targets --all-features --verbose
 
+      - name: Analysis and harness tests
+        run: PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis -p "test_*.py"
+
       - name: Test
         run: cargo test --all-features --verbose

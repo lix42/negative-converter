@@ -929,11 +929,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Conversion metrics & thumbnails](tasks/analysis/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
 - [ ] [NLP vs nc comparison](tasks/analysis/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
 - [ ] [Drive asset migration](tasks/analysis/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
-- [ ] [Harness regression tests](tasks/analysis/harness-regression-tests.md) — give
-  `scripts/real-scan-verify/harness.sh` coverage that a CLI-surface change cannot break
-  it silently. It has none today, which is how the 2026-08-09 default flip broke its
-  recipe generator, its four `convert` stages, and — without any error — its `roll`
-  stage, all behind green gates
+- [x] [Harness regression tests](tasks/analysis/harness-regression-tests.md) — fixture-backed
+  black-box coverage now exercises real-binary `freeze` → `convert`, pins the recipe and
+  TIFF/sidecar contracts, and reproduces the successful-wrong-container failure; the full
+  stdlib analysis suite runs in Linux and macOS CI
 - [ ] [Comparison review tooling](tasks/analysis/comparison-review-tooling.md) — promote the
   ad-hoc review pages from `algo/reference-anchored-sigmoid` into a maintained tool for
   comparing rendering configurations by eye: one entry point, the matrix as data rather than

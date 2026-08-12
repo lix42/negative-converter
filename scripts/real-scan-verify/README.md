@@ -52,12 +52,36 @@ Stages (no argument runs `freeze → convert → ir → determinism → resource
 | `A` | `<repo>/../nc-assets` | assets root (rolls live under `$A/rolls/<roll>/`) |
 | `OUTDIR` | `$A/converted/nc/2026-07-22` | converted-image output dir |
 | `ART` | `/private/tmp/rsv-artifacts` | per-run JSON reports (not committed) |
+| `REC` | `scripts/real-scan-verify/recipes` | frozen recipe directory |
 
 Example — verify a debug build against a scratch output dir:
 
 ```bash
 NC=target/debug/nc OUTDIR=/tmp/out bash scripts/real-scan-verify/harness.sh convert
 ```
+
+## Automated coverage
+
+The stdlib test suite runs in CI on Linux and macOS after the debug binary is
+built:
+
+```bash
+PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis -p "test_*.py"
+```
+
+`nctool.test_harness` creates a temporary one-roll asset tree from the committed
+TIFF fixtures and drives the real `nc` binary through `freeze` and `convert`. It
+checks the generated recipe shape, explicit legacy/f32 selections, TIFF magic,
+sidecar `{meta, params}` envelopes, normalized report paths, and the success message. Fake binaries
+also cover wrong suffixes, TIFF-named non-TIFF content, directory-shaped final
+targets, and invalid strict-probe failures; the harness must reject those runs
+before reporting success.
+
+CI deliberately does not run the full Drive-backed verification matrix,
+`classify`, `ir`, `determinism`, or `resource`. Those remain manual checks over the
+real scans and external tools. The fixture test covers CLI/recipe/container
+plumbing; it is not a substitute for image-quality, interoperability, or resource
+acceptance.
 
 ## Notes
 
@@ -69,3 +93,10 @@ NC=target/debug/nc OUTDIR=/tmp/out bash scripts/real-scan-verify/harness.sh conv
   rolls with a complete unexposed+leader pair are emitted. If the manifest is
   missing, the harness fails loudly (exit 2) with the generate command to run.
 - Converted images are large and **not committed**; regenerate with `convert`.
+- `convert` renders into a fresh hidden staging directory under each roll output,
+  verifies every expected TIFF container and `{meta, params}` sidecar envelope, and rejects extras or
+  directory-shaped final targets before publishing the complete set. It then
+  revalidates the published files and rewrites the saved roll reports to their
+  durable final paths. A failed run can leave the hidden staging directory as
+  diagnostic evidence, but cannot print the success line or let older persistent
+  outputs mask the failure.

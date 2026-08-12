@@ -389,10 +389,13 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
 - `cargo clippy --all-targets` — lint (keep clean)
 - **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
-  `cargo build` → `cargo test`. The gate is strict — warnings fail the build.
-- **The four gates do not cover `scripts/analysis/`.** Its `nctool` Python suite
-  (92 tests) runs under no gate — `python3 -m unittest discover -s scripts/analysis
-  -p "test_*.py"` by hand after touching it.
+  `cargo build` → the `scripts/analysis` unittest command below → `cargo test`.
+  The gate is strict — warnings fail the build.
+- **The Rust four-gate sequence does not itself cover `scripts/analysis/`.** CI
+  runs its stdlib `nctool` Python suite as a separate gate on Linux and macOS:
+  `PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis
+  -p "test_*.py"`. Run that command by hand after touching it; the suite includes
+  fixture-backed black-box coverage of `scripts/real-scan-verify/harness.sh`.
 - **`tests/pipeline.rs`'s `run()` injects `--output-preset legacy`** into a
   `convert` that names no preset, loads no `--params`, and writes `.tif`/`.tiff` —
   ~87 tests predate the gain-map default and assert TIFF-path behaviour. A test

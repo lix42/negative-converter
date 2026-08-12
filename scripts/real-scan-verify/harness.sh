@@ -13,7 +13,7 @@
 #   ir        - export IR plane, check --strict behaviour
 #   determinism - byte-identical re-run + --params reload
 #   resource  - /usr/bin/time -l peak RSS + wall-clock on the largest scan
-set -uo pipefail
+set -euo pipefail
 
 # Paths resolve relative to this script so the harness is portable across
 # worktrees; every one is env-overridable. `nc-assets` is a sibling of the repo
@@ -23,7 +23,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"        # repo root (worktree)
 NC=${NC:-$ROOT/target/release/nc}
 A=${A:-$ROOT/../nc-assets}
 OUTDIR=${OUTDIR:-$A/converted/nc/2026-07-22}
-REC="$HERE/recipes"
+REC=${REC:-$HERE/recipes}
 ART=${ART:-/private/tmp/rsv-artifacts}   # per-run report JSON (not committed)
 mkdir -p "$REC" "$ART" "$OUTDIR"
 
@@ -44,9 +44,11 @@ mkdir -p "$REC" "$ART" "$OUTDIR"
 # mid-stream `roles` crash (partial stdout + traceback + exit 1) would otherwise
 # leave a truncated ROLLS and the harness would proceed silently on fewer rolls.
 _roles_out="$ART/manifest-roles.txt"
-PYTHONPATH="$ROOT/scripts/analysis" python3 -m nctool manifest roles --asset-root "$A" >"$_roles_out"
-_roles_rc=$?
-if [ "$_roles_rc" -ne 0 ]; then
+if PYTHONPATH="$ROOT/scripts/analysis" python3 -m nctool manifest roles \
+    --asset-root "$A" >"$_roles_out"; then
+  _roles_rc=0
+else
+  _roles_rc=$?
   echo "error: 'nctool manifest roles' exited $_roles_rc (partial/failed read of $A/manifest.json)." >&2
   echo "       regenerate it first: PYTHONPATH=$ROOT/scripts/analysis \\" >&2
   echo "         python3 -m nctool manifest generate --asset-root $A" >&2
@@ -64,6 +66,91 @@ fi
 center_region() { # file -> "X,Y,W,H" for a holder-free center 40% box
   read w h <<<"$($NC inspect "$1" 2>/dev/null | jq -r '"\(.decode.width) \(.decode.height)"')"
   python3 -c "w,h=$w,$h; print(f'{round(0.3*w)},{round(0.3*h)},{round(0.4*w)},{round(0.4*h)}')"
+}
+
+require_file() { # path description
+  if [ ! -f "$1" ]; then
+    echo "error: $2 was not produced: $1" >&2
+    return 1
+  fi
+}
+
+require_tiff() { # path description
+  local magic
+  require_file "$1" "$2"
+  magic=$(od -An -tx1 -N4 "$1" | tr -d ' \n')
+  case "$magic" in
+    49492a00|4d4d002a|49492b00|4d4d002b) ;;
+    *)
+      echo "error: $2 is not a TIFF container (bad magic $magic): $1" >&2
+      return 1
+      ;;
+  esac
+}
+
+require_json_object() { # path description
+  require_file "$1" "$2"
+  if ! jq -e 'type == "object"' "$1" >/dev/null; then
+    echo "error: $2 is not a valid JSON object: $1" >&2
+    return 1
+  fi
+}
+
+require_sidecar() { # path description
+  require_file "$1" "$2"
+  if ! jq -e '
+      type == "object" and
+      (.meta | type == "object") and
+      (.params | type == "object")
+    ' "$1" >/dev/null; then
+    echo "error: $2 is not a valid sidecar envelope with object-valued meta and params: $1" >&2
+    return 1
+  fi
+}
+
+reject_directory_target() { # path description
+  # `-d` follows symlinks, so this rejects both directories and directory
+  # symlinks before `mv` can silently publish the source *inside* one.
+  if [ -d "$1" ]; then
+    echo "error: $2 publication target is a directory: $1" >&2
+    return 1
+  fi
+}
+
+normalize_roll_report() { # report staging-prefix final-dir hdr-suffix(bool)
+  local report=$1 staging=$2 final=$3 hdr=$4 normalized
+  normalized=$(mktemp "$ART/.roll-report.XXXXXX")
+  if [ "$hdr" = true ]; then
+    jq --arg staging "$staging/" --arg final "$final/" '
+      (.frames[] | select(.output | startswith($staging)) | .output) |=
+        ($final + (split("/")[-1] | sub("_positive\\.tiff$"; "_positive_hdr.tiff")))
+    ' "$report" > "$normalized"
+  else
+    jq --arg staging "$staging/" --arg final "$final/" '
+      (.frames[] | select(.output | startswith($staging)) | .output) |=
+        ($final + (split("/")[-1]))
+    ' "$report" > "$normalized"
+  fi
+  mv "$normalized" "$report"
+}
+
+require_report_output() { # report path description
+  if ! jq -e --arg output "$2" \
+      '[.frames[] | select(.status == "ok" and .output == $output)] | length == 1' \
+      "$1" >/dev/null; then
+    echo "error: $3 is not represented exactly once as a successful report frame: $2" >&2
+    return 1
+  fi
+}
+
+require_entry_count() { # directory expected-count description
+  local actual
+  actual=$(find "$1" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+  if [ "$actual" -ne "$2" ]; then
+    echo "error: $3 produced $actual staging entries; expected exactly $2" >&2
+    find "$1" -mindepth 1 -maxdepth 1 -print >&2
+    return 1
+  fi
 }
 
 stage_classify() {
@@ -114,17 +201,78 @@ stage_convert() {
   for row in "${ROLLS[@]}"; do IFS='|' read -r roll uf ff reals <<<"$row"
     ins=(); for fr in $reals; do ins+=("$A/rolls/$roll/$fr"); done
     od="$OUTDIR/$roll"; mkdir -p "$od"
-    # 16-bit -> <stem>_positive.tiff (matrix default)
-    $NC roll --params "$REC/$roll.json"     --out-dir "$od" "${ins[@]}" --report json > "$ART/$roll.roll16.json"  2>"$ART/$roll.roll16.err"
-    # float HDR -> a temp dir, then rename to <stem>_positive_hdr.tiff so both modes coexist
-    htmp="$od/.hdrtmp"; mkdir -p "$htmp"
-    $NC roll --params "$REC/$roll.hdr.json" --out-dir "$htmp" "${ins[@]}" --report json > "$ART/$roll.rollhdr.json" 2>"$ART/$roll.rollhdr.err"
-    for g in "$htmp"/*_positive.tiff; do [ -e "$g" ] || continue
-      b=$(basename "$g" _positive.tiff); mv "$g" "$od/${b}_positive_hdr.tiff"
-      [ -e "$g.json" ] && mv "$g.json" "$od/${b}_positive_hdr.tiff.json"
+    # Both modes render into a fresh staging tree. Persistent outputs from an
+    # earlier run therefore cannot hide a missing/wrong-suffix result, and no
+    # output is published until the complete expected set has been verified.
+    run_tmp=$(mktemp -d "$od/.rsv-$roll.XXXXXX")
+    u16tmp="$run_tmp/u16"; htmp="$run_tmp/hdr"
+    mkdir -p "$u16tmp" "$htmp"
+
+    $NC roll --params "$REC/$roll.json" --out-dir "$u16tmp" "${ins[@]}" \
+      --report json > "$ART/$roll.roll16.json" 2>"$ART/$roll.roll16.err"
+    $NC roll --params "$REC/$roll.hdr.json" --out-dir "$htmp" "${ins[@]}" \
+      --report json > "$ART/$roll.rollhdr.json" 2>"$ART/$roll.rollhdr.err"
+
+    require_json_object "$ART/$roll.roll16.json" "$roll 16-bit roll report"
+    require_json_object "$ART/$roll.rollhdr.json" "$roll float roll report"
+
+    frame_count=0
+    for fr in $reals; do
+      name=$(basename "$fr"); stem=${name%.*}; frame_count=$((frame_count + 1))
+      require_tiff "$u16tmp/${stem}_positive.tiff" "16-bit TIFF for $roll/$fr"
+      require_sidecar "$u16tmp/${stem}_positive.tiff.json" "16-bit sidecar for $roll/$fr"
+      require_tiff "$htmp/${stem}_positive.tiff" "float TIFF for $roll/$fr"
+      require_sidecar "$htmp/${stem}_positive.tiff.json" "float sidecar for $roll/$fr"
     done
-    rmdir "$htmp" 2>/dev/null
-    echo "converted $roll: $(echo $reals | wc -w | tr -d ' ') frames x2 modes"
+    expected_entries=$((frame_count * 2))
+    require_entry_count "$u16tmp" "$expected_entries" "$roll 16-bit conversion"
+    require_entry_count "$htmp" "$expected_entries" "$roll float conversion"
+
+    # Validate raw report provenance before publishing anything. If nc changes
+    # the roll-report schema or omits a successful frame, keep all images staged.
+    for fr in $reals; do
+      name=$(basename "$fr"); stem=${name%.*}
+      require_report_output "$ART/$roll.roll16.json" "$u16tmp/${stem}_positive.tiff" \
+        "staged 16-bit TIFF for $roll/$fr"
+      require_report_output "$ART/$roll.rollhdr.json" "$htmp/${stem}_positive.tiff" \
+        "staged float TIFF for $roll/$fr"
+    done
+
+    # Check every final name before moving anything. `mv src existing-dir` would
+    # otherwise succeed by nesting the source and leave a false-looking result.
+    for fr in $reals; do
+      name=$(basename "$fr"); stem=${name%.*}
+      reject_directory_target "$od/${stem}_positive.tiff" "16-bit TIFF for $roll/$fr"
+      reject_directory_target "$od/${stem}_positive.tiff.json" "16-bit sidecar for $roll/$fr"
+      reject_directory_target "$od/${stem}_positive_hdr.tiff" "float TIFF for $roll/$fr"
+      reject_directory_target "$od/${stem}_positive_hdr.tiff.json" "float sidecar for $roll/$fr"
+    done
+
+    for fr in $reals; do
+      name=$(basename "$fr"); stem=${name%.*}
+      mv "$u16tmp/${stem}_positive.tiff" "$od/${stem}_positive.tiff"
+      mv "$u16tmp/${stem}_positive.tiff.json" "$od/${stem}_positive.tiff.json"
+      mv "$htmp/${stem}_positive.tiff" "$od/${stem}_positive_hdr.tiff"
+      mv "$htmp/${stem}_positive.tiff.json" "$od/${stem}_positive_hdr.tiff.json"
+    done
+
+    # Reports are durable artifacts too: replace their now-deleted staging paths
+    # with the published paths, then revalidate both publication and provenance.
+    normalize_roll_report "$ART/$roll.roll16.json" "$u16tmp" "$od" false
+    normalize_roll_report "$ART/$roll.rollhdr.json" "$htmp" "$od" true
+    for fr in $reals; do
+      name=$(basename "$fr"); stem=${name%.*}
+      require_tiff "$od/${stem}_positive.tiff" "published 16-bit TIFF for $roll/$fr"
+      require_sidecar "$od/${stem}_positive.tiff.json" "published 16-bit sidecar for $roll/$fr"
+      require_tiff "$od/${stem}_positive_hdr.tiff" "published float TIFF for $roll/$fr"
+      require_sidecar "$od/${stem}_positive_hdr.tiff.json" "published float sidecar for $roll/$fr"
+      require_report_output "$ART/$roll.roll16.json" "$od/${stem}_positive.tiff" \
+        "published 16-bit TIFF for $roll/$fr"
+      require_report_output "$ART/$roll.rollhdr.json" "$od/${stem}_positive_hdr.tiff" \
+        "published float TIFF for $roll/$fr"
+    done
+    rmdir "$u16tmp" "$htmp" "$run_tmp"
+    echo "converted $roll: $frame_count frames x2 modes"
   done
 }
 
@@ -135,18 +283,46 @@ stage_ir() {
      -o "$ART/ir-pos-$roll.tiff" "$A/rolls/$roll/$fr" --report json > "$ART/ir.json" 2>"$ART/ir.err"
   echo "IR export ($roll/$fr):"; exiftool -s -s -s -ImageWidth -ImageHeight -BitsPerSample "$ART/ir-$roll.tiff" 2>/dev/null
   echo "--strict on same frame (expect IR-ignored warning -> hard error):"
-  $NC convert --params "$REC/$roll.json" -o "$ART/strict.tiff" "$A/rolls/$roll/$fr" --strict >/dev/null 2>"$ART/strict.err"; echo "  exit=$?"; cat "$ART/strict.err"
+  if $NC convert --params "$REC/$roll.json" -o "$ART/strict.tiff" \
+      "$A/rolls/$roll/$fr" --strict >/dev/null 2>"$ART/strict.err"; then
+    echo "error: --strict unexpectedly succeeded; expected the IR-ignored warning to fail" >&2
+    return 1
+  else
+    strict_rc=$?
+  fi
+  if [ "$strict_rc" -ne 1 ]; then
+    echo "error: --strict exited $strict_rc; expected warning-promotion exit 1" >&2
+    cat "$ART/strict.err" >&2
+    return 1
+  fi
+  if ! grep -Fq 'input carries an IR plane; it is preserved but not used' "$ART/strict.err" ||
+      ! grep -Fq 'error: --strict:' "$ART/strict.err"; then
+    echo "error: --strict exit 1 lacked the expected IR-ignored/strict diagnostic" >&2
+    cat "$ART/strict.err" >&2
+    return 1
+  fi
+  echo "  exit=$strict_rc"; cat "$ART/strict.err"
 }
 
 stage_determinism() {
   IFS='|' read -r roll uf ff reals <<<"${ROLLS[0]}"; fr=$(echo $reals|awk '{print $1}')
   $NC convert --params "$REC/$roll.json" -o "$ART/det-a.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
   $NC convert --params "$REC/$roll.json" -o "$ART/det-b.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
-  cmp -s "$ART/det-a.tiff" "$ART/det-b.tiff" && echo "determinism: re-run BYTE-IDENTICAL" || echo "determinism: DIFFER"
+  if cmp -s "$ART/det-a.tiff" "$ART/det-b.tiff"; then
+    echo "determinism: re-run BYTE-IDENTICAL"
+  else
+    echo "error: determinism re-run differs" >&2
+    return 1
+  fi
   # dump-params reload
   $NC convert --params "$REC/$roll.json" --dump-params "$ART/resolved.json" -o "$ART/det-c.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
   $NC convert --params "$ART/resolved.json" -o "$ART/det-d.tiff" "$A/rolls/$roll/$fr" --report none 2>/dev/null
-  cmp -s "$ART/det-a.tiff" "$ART/det-d.tiff" && echo "determinism: dump-params reload BYTE-IDENTICAL" || echo "determinism: reload DIFFERS"
+  if cmp -s "$ART/det-a.tiff" "$ART/det-d.tiff"; then
+    echo "determinism: dump-params reload BYTE-IDENTICAL"
+  else
+    echo "error: dump-params reload differs" >&2
+    return 1
+  fi
 }
 
 stage_resource() {
