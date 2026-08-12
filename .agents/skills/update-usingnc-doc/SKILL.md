@@ -28,8 +28,14 @@ Any change to what a user can type or read back:
 - an output preset, its container, or its suffix rule
 - an exit code, a report field, or an error message a user acts on
 
-Internal refactors that leave all of the above identical are exempt. So is work
-that has not shipped — the guide documents **what is on `main`**, never a branch.
+Internal refactors that leave all of the above identical are exempt. So is a
+**speculative or unimplemented target** — a design recorded in design-spec's target
+subsection is not current behaviour and must not be documented as if it were.
+
+What is *not* exempt is a user-visible change still on a feature branch: the guide
+update belongs in that same PR, so `main` never gains the change without the
+documentation for it. Describe the behaviour the branch actually ships, verified
+against the binary built from it.
 
 ## Steps
 

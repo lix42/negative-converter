@@ -8,8 +8,9 @@ A practical guide to converting film negative scans to positives with `nc`.
 > *intent* — but this document is verified against the binary, so it wins on
 > *what the CLI currently accepts*.
 >
-> **Verified against:** `nc 0.1.0`, `pipeline_version 3`, commit `291bdefb8607`.
-> Re-verify with `nc --version` and `nc <command> --help` after pulling.
+> **Verified against:** `nc 0.1.0`, `pipeline_version 3`, built at commit
+> `698337e62ef0`. The staleness signal is `pipeline_version`: if `nc --version`
+> reports a different one, treat this document as suspect and re-verify.
 >
 > **Known issue:** under the default render the gain map is inert (no HDR
 > headroom) — see the callout in §8.
@@ -24,9 +25,12 @@ shape every workflow below:
 - **Deterministic.** Same input + same parameters ⇒ byte-identical output (on one
   build and architecture). There is no hidden per-frame adaptation unless you
   explicitly ask for it.
-- **Every knob is a CLI flag *and* a recipe key.** Nothing is reachable only from
-  code, and nothing is silently ignored — passing a flag that doesn't apply to
-  your selected curve or preset is a **loud error**, never a no-op.
+- **Every knob is a CLI flag *and* a recipe key**, and nothing is reachable only
+  from code. Passing a flag that doesn't apply to your selected *curve* or *preset*
+  is a **loud error**, never a no-op. The exception is `--reconstruction simple`,
+  which has no print stage: `--print-exposure`, `--black-point`,
+  `--highlight-compress` and `--white-balance` are accepted there and silently do
+  nothing (verified — the output is byte-identical).
 - **Calibrate once, apply many.** The film base (`Dmin`) and the reference density
   (`Dmax`) are properties of the *roll* — film stock, development, scanner — not
   of an individual frame. You measure them once and reuse them, which is what
@@ -88,15 +92,20 @@ cargo build --release      # → target/release/nc
 
 A fresh machine needs CMake, C and C++ compilers, libclang (bindgen), and NASM —
 the build compiles pinned libultrahdr, libjpeg-turbo, and libaom from vendored
-source. No network access is required.
+source. Only those **native** libraries are vendored: cargo still fetches the Rust
+crates from crates.io, so the build needs network access (or a warm cargo cache).
 
 ```sh
-nc --version
+target/release/nc --version
 ```
 
 prints the version, the **`pipeline_version`** (the render-behavior identity), the
 git commit, and the target triple. Quote it in bug reports — output is only
 guaranteed byte-identical within one build and architecture.
+
+> `cargo build` neither installs the binary nor changes `PATH`, and on most
+> systems a bare **`nc` is netcat**. Examples below write `nc` for brevity; run
+> `target/release/nc`, or put it on your `PATH` under a name you choose.
 
 ---
 
@@ -110,10 +119,16 @@ guaranteed byte-identical within one build and architecture.
 | `nc convert` | Convert one frame. The full parameter surface. | Yes |
 | `nc roll` | Convert many frames from **one shared frozen recipe**. | Yes |
 
-Every command except `params` emits a **JSON report on stdout** by default
+Every command except `params` emits a **JSON report on stdout** on success
 (`--report none` to suppress, `--report-file PATH` to redirect); `params` takes no
 flags at all and just prints the default recipe. Logs and warnings go to
 **stderr**, so stdout stays clean for piping into `jq`.
+
+> **A hard failure emits no report at all** — stdout is empty. A decode error, a
+> memory refusal, or a measurement that fails (`estimate` finding no rebate band)
+> exits non-zero before the report is written. Only `roll` is different: it
+> aggregates per-frame failures into its report and still emits it. So a script
+> must check the exit code, not just parse stdout.
 
 ---
 
@@ -300,7 +315,7 @@ nc params
   },
   "input":     { "transfer": "auto", "meaning": "auto",
                  "film_type": "unknown", "export_ir": null },
-  "film_base": { "source": null },        // no default — you must state it
+  "film_base": { "source": null },
   "print":     { "print_exposure": 0.0, "black_point": 0.0,
                  "white_balance": { "explicit": [1.0, 1.0, 1.0] },
                  "highlight_compress": 0.0, "linear_range": [0.0, 1.0] },
@@ -308,6 +323,10 @@ nc params
                  "output_profile": null, "bigtiff": "auto" }
 }
 ```
+
+`film_base.source` prints as `null` because it has **no default** — this document
+is a template to edit, not a runnable recipe. `convert` and `roll` reject an
+unstated base.
 
 ### Partial recipes are fine
 
@@ -377,7 +396,11 @@ needed:
 }
 ```
 
-`meta` is provenance and is never applied on load; `params` is the recipe body.
+`params` is the recipe body. `meta` is provenance and no part of it changes a
+pixel — but it is not entirely ignored either: the loader parses
+`meta.pipeline_version`, rejects a malformed one (exit 2), and emits a
+`--strict`-promotable warning when it differs from the running build, so an
+archived replay tells you the render may have moved.
 Feed the sidecar straight back to reproduce the conversion exactly:
 
 ```sh
@@ -393,7 +416,7 @@ a tweak on top of the shared recipe:
 ```json
 { "frames": [
     { "input": "a.tif" },
-    { "input": "b.tif", "output": "b-brighter.tiff",
+    { "input": "b.tif", "output": "b-brighter.jpg",
       "params": { "print": { "print_exposure": 1.0 } } }
 ] }
 ```
@@ -401,6 +424,11 @@ a tweak on top of the shared recipe:
 ```sh
 nc roll --frames frames.json --out-dir positives/ --params roll-recipe.json
 ```
+
+An explicit manifest `output` goes through the same suffix rule as `convert`, so
+its extension must match the resolved preset's container — `.jpg` under the
+default, `.tiff` under `legacy`/`display-p3`/`film-master`, `.avif` under
+`hdr-pq`/`hdr-hlg`.
 
 ---
 
@@ -481,9 +509,18 @@ skips the regional pass entirely and is bit-exact with the unbalanced output.
 
 Negative values are common for the balance flags and a leading `-` is accepted.
 
-For **roll consistency**, measure the range once and freeze it: run one frame with
-the default `--auto-balance-range`, read the reported range, then pass it as
-`--balance-range LO,HI` on the rest. Otherwise each frame measures its own.
+For **roll consistency**, measure the range once and freeze it. The range is only
+*measured* when the regional pass runs — that is, when the two balances **differ**
+— so set them first:
+
+```sh
+nc convert scan.tif -o out.jpg --film-base … \
+  --shadow-balance=-0.05,0,0 --highlight-balance 0.05,0,0
+```
+
+Read the reported top-level `balance_range` (e.g. `[-0.368, 0.494]`), then pass it
+as `--balance-range LO,HI` on the rest. With the neutral default the pass
+short-circuits and no range is reported at all.
 
 ### The `Dmax` reference density — four mutually exclusive choices
 
@@ -494,7 +531,7 @@ Where the reference density comes from. (What it *places* is the anchor, above.)
 | *(none)* / `--fixed-d-max` | Fixed nominal reference (1.3 density), reused across the roll. **Default.** Darker frames render darker — faithful relative exposure. |
 | `--d-max D` | Explicit roll-fixed reference — your measured calibration. |
 | `--auto-d-max` | Measure per frame. **Per-frame exposure normalization**: brightens underexposed frames and breaks roll consistency. Grading, not conversion. |
-| `--no-d-max` | No reference — scene-referred output (base → 1.0, detail above). HDR f32 workflows rely on this. |
+| `--no-d-max` | No reference — scene-referred output (base → 1.0, detail above). **Exponential only**: the sigmoid needs an anchor and rejects it (exit 2), so pair it with `--density-curve exponential`. |
 
 > **A caveat on measuring `Dmax` from a leader** (§4 step 3). The baseline report
 > found leader-measured `Dmax` untrustworthy on three independent counts:
@@ -566,9 +603,12 @@ Feed that back as an explicit `--white-balance` to freeze it across a roll.
 > white, and today's default declines to.
 >
 > So HDR is a rendering-intent choice rather than a correctness gap, and it is
-> deliberately deprioritised. If you want real headroom today, use the
-> `exponential` curve, or a display-HDR preset that does not depend on gain-map
-> headroom (`hdr-pq` / `hdr-hlg`).
+> deliberately deprioritised. **Changing container does not help**: `hdr-pq` and
+> `hdr-hlg` consume the same shared display source and the same HDR renderer, so
+> under the default curve they too report their brightest pixel at or below 203
+> nits with none of the 1000-nit headroom used. Real headroom needs a *render*
+> change — the `exponential` curve, or `Dmax`/print controls that push values past
+> reference white.
 
 `--output-preset` (recipe key `output.preset`) is an **atomic** policy choice: a
 named preset resolves container, bit depth, and colour profile itself. `custom` is
@@ -610,9 +650,12 @@ usage: output preset `hdr-pq` requires an output path ending in .avif
 
 ### Preset interaction rules
 
-- An **atomic** preset rejects a non-default `--out-depth` / `--output-profile` /
-  `--bigtiff` (from a flag *or* the recipe), because it resolves those itself. A
-  value equal to the documented default — like `--bigtiff auto` — is accepted.
+- An **atomic** preset rejects `--out-depth` / `--output-profile` / `--bigtiff`
+  (from a flag *or* the recipe), because it resolves those itself. For
+  `--output-profile` and `--bigtiff`, a value equal to the documented default —
+  like `--bigtiff auto` — is accepted. **`--out-depth` is rejected by flag
+  presence**, so even `--out-depth u16`, which *is* the default, errors alongside
+  a named preset.
 - **`custom` is the one named preset that is not atomic.** It accepts the
   depth/profile/container selectors, resolving the same branch and the same bytes
   as `legacy`. Use it to record that the combination was a decision.
@@ -671,7 +714,9 @@ has no validated placement in the pipeline yet.
 The IR plane is decoded and **preserved but not acted on** by default. Two things
 you can do with it:
 
-- `--export-ir PATH` writes the decoded plane out.
+- `--export-ir PATH` writes the decoded plane out. **`convert` only** — `roll`
+  rejects `input.export_ir`, because one path cannot serve every frame, so IR
+  planes have to be exported frame by frame.
 - `--film-type chromogenic` enables **IR-assisted film-holder detection**:
   chromogenic dyes (C-41 colour and C-41-process B&W) are IR-transparent, so the
   holder can be masked off before the rebate search. `silver` (IR-opaque) and the
@@ -700,15 +745,24 @@ Clipping is reported, never silent:
 ["output lost 126296 clipped and 0 non-finite of 695772 samples (18.15%)"]
 ```
 
-This counter belongs to the **u16 encode**, so it is the TIFF presets that report
-it. And under the **default sigmoid you should never see it**: the shoulder
-approaches display white asymptotically and never reaches it, so a finite density
-cannot clip. A clip warning means you are on the `exponential` curve — which hits
-white exactly at `Dmax` and exceeds it above — or that print controls pushed
-samples back over 1.0.
+Every encoder counts this, not just the TIFF ones — the gain-map JPEG and the
+AVIF paths build the same report when they quantize.
 
-`--strict` promotes **any** warning to a hard error (exit 1) after the report is
-emitted — the right default for scripts and CI.
+Under the **default sigmoid the curve alone cannot clip**: its shoulder approaches
+display white asymptotically and never reaches it. So a clip warning means
+something downstream pushed samples past 1.0 — most often a **print control**
+(`--print-exposure 12` clips 100% of a default-curve frame), or the `exponential`
+curve, which hits white exactly at `Dmax` and exceeds it above. Check the print
+controls before reaching for the curve or `Dmax`.
+
+`--strict` promotes warnings **that reach the JSON report** to a hard error
+(exit 1), after the report is emitted — the right default for scripts and CI.
+
+> One deliberate exception: a failure to write an opted-in **telemetry**
+> destination prints `nc: warning:` on stderr but is kept out of the report set, so
+> it stays fail-soft even under `--strict`. Telemetry must never change a
+> conversion's outcome. A script that needs to know telemetry landed has to check
+> the file, not the exit code.
 
 ### Exit codes
 
@@ -735,6 +789,12 @@ perturb a pixel.
 | `--report` / `--report-file` | Report format (`json`, `none`) and destination |
 | `-v` / `-vv` / `--quiet` | stderr verbosity — never pollutes stdout |
 | `--strict` | Promote warnings to errors |
+
+Two more are **`convert` only** — `roll`, `estimate` and `inspect` do not accept
+them and exit 2 if given one:
+
+| Flag | Purpose |
+|---|---|
 | `--telemetry` / `--telemetry-file` | Opt-in, fail-soft performance record (JSONL). Also `NC_TELEMETRY_LOG`. |
 | `--seed N` | Reserved; nothing is stochastic today |
 
@@ -753,9 +813,12 @@ its siblings are still written, and the roll exits **1**, not 6.
 ## 12. Troubleshooting
 
 **"no film base selected"**
-`convert`/`roll` have no default film base. Pass `--film-base R,G,B` (measured once
-per roll), `--base-region X,Y,W,H`, or `--auto-base`. `estimate` still defaults to
-auto, so `nc estimate scan.tif` remains the way to get a value in the first place.
+Neither `convert` nor `roll` has a default film base — but they take it from
+different places. On **`convert`**, pass `--film-base R,G,B` (measured once per
+roll), `--base-region X,Y,W,H`, or `--auto-base`. **`roll` accepts none of those
+flags**: set `film_base.source` in the shared `--params` recipe instead.
+`estimate` still defaults to auto, so `nc estimate scan.tif` remains the way to
+get a value in the first place.
 
 **"auto film-base detection found no uniform unexposed rebate band"**
 The scan has no detectable rebate — it's cropped, or the holder covers it. Measure
@@ -773,12 +836,17 @@ reference density is probably too low, pushing content past display white. Raise
 scene-referred float result.
 
 **"reconstruction.curve is missing `type`"**
-A partial recipe that includes the `curve` object must include its tag. Either add
-`"type": "exponential"` or drop the whole `curve` object.
+A partial recipe that includes the `curve` object must include its tag. Add the
+type you actually intended — normally `"sigmoid"`, the default. Adding
+`"type": "exponential"` also makes it parse, but it silently switches you to the
+other curve and changes your pixels.
 
 **`--strict` fails on every frame of an IR scan**
-Expected — see §9. Either drop `--strict` or engage the IR path with
-`--film-type chromogenic`.
+Expected — see §9: an unconsumed IR plane warns, and `--strict` promotes it.
+`--film-type chromogenic` alone does **not** clear it: the plane is consumed only
+when the base source is `auto` *and* the plane is marker-verified, so a frozen
+explicit `--film-base` — the recommended roll workflow — still warns. Either drop
+`--strict` for those runs, or use `--export-ir` so the plane is consumed.
 
 **Output differs between two machines**
 Determinism is scoped to one build and architecture. Transcendental FP and the

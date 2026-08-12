@@ -5,9 +5,9 @@ images.
 
 It reads high-bit-depth scanner files (SilverFast HDR/HDRi first), runs a
 deterministic negative→positive pipeline in a 32-bit float linear working space,
-and writes TIFF (16-bit or 32-bit float) or, via an explicitly selected output
-preset, an SDR TIFF in Display P3 or sRGB, a legacy Ultra HDR v1 gain-map JPEG,
-a 10-bit HDR AVIF (PQ or HLG), or an HDR TIFF.
+and writes a gain-map HDR JPEG by default. An output preset selects the rest: SDR
+TIFF in Display P3 or sRGB, the legacy Ultra HDR v1 gain-map JPEG, a 10-bit HDR
+AVIF (PQ or HLG), an HDR TIFF, or the transitional 16-bit/float TIFF path.
 
 ## Design goal: built for agents
 
