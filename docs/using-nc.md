@@ -232,19 +232,32 @@ which reports:
 
 The `d_max_recipe` fragment nests under **`reconstruction.curve`**.
 
-### Step 4 — Freeze a recipe
+### Step 4 — Write the recipe
 
-Convert one frame with your measured values and dump the effective parameters:
+`roll` is configured **only** by recipe — it has no `--film-base` — so a roll needs
+a recipe file. Splice `estimate`'s reuse-ready fragments together with your
+parameter choices:
 
-```sh
-nc convert scan.tif -o out.jpg \
-  --film-base 0.163,0.080,0.0377 \
-  --d-max 0.391 \
-  --dump-params roll-recipe.json
+```jsonc
+{
+  "film_base": { "source": { "explicit": [0.163, 0.080, 0.0377] } },
+  "reconstruction": { "curve": { "type": "sigmoid",
+                                 "dmax": { "explicit": 0.391 } } }
+}
 ```
 
-`roll-recipe.json` is now the complete, explicit parameter set — every default
-spelled out. This is the artifact you version-control alongside the roll.
+Omitted sections take their defaults, so a recipe only needs to carry what you
+decided. `nc params` prints the full default document if you want a scaffold to
+edit.
+
+> **`--dump-params` does not freeze your measurements.** It writes the resolved
+> *config*, which for a measured value is the **mode**, not the number — a run
+> with `--auto-base --auto-wb percentile` dumps `"auto"` and `"percentile"`, and
+> the report's measured values are nowhere in it. Two different scans with the
+> same flags produce identical dumps. So a recipe dumped from an auto run
+> **re-measures on every frame of the roll**, which is exactly what `roll` exists
+> to prevent. Only explicit values freeze. (The automatic `<output>.json` sidecar
+> has the same content, and reloads through `--params` unchanged.)
 
 ### Step 5 — Apply to the whole roll
 
@@ -398,7 +411,22 @@ Two reconstruction types, selected with `--reconstruction`:
 | Type | What it does |
 |---|---|
 | `density` *(default)* | Density-domain inversion (Cineon / negadoctor lineage). What you want for colour negative. |
-| `simple` | Direct channel inversion `1 − scan/Dmin`. A debug / B&W baseline with no density correction, curve, or `Dmax`. |
+| `simple` | Direct channel inversion `1 − scan/Dmin` — **a debugging baseline**, not a production path. No density correction, curve, or `Dmax`, so it isolates decode plus film base. |
+
+> **`simple` is not the B&W path**, despite what `--reconstruction`'s help text
+> says. B&W film is still a density medium with its own characteristic curve, so
+> B&W support (`algo/bw-support`) runs through `density` too — what it adds is a
+> *mono colour model* that pools R,G,B into one gray, not a different
+> reconstruction.
+>
+> The difference between the two is which domain the inversion happens in.
+> `simple` is affine in **transmission** (`1 − t/Dmin`); `density` goes through
+> the log domain and, with neutral correction, reduces to a **power law**
+> (`positive ∝ (t/Dmin)^(−gamma)`). Film density is logarithmic in exposure — that
+> is what a characteristic curve *is* — so the power law is the inversion that
+> corresponds to something physical. `1 − t/Dmin` corresponds to none: it
+> saturates toward 1 as the negative gets denser, compressing highlights by
+> accident rather than by a tone decision.
 
 Under `density`, two curves, selected with `--density-curve`:
 
