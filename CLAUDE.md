@@ -29,6 +29,9 @@ explicitly corrected once already.
   an `## Epic summary`. Before starting a task, read your epic's file in full plus
   the `Epic summary` of every epic you depend on; append to your task's section as
   you work. `docs/progress/_unassigned.md` parks log sections that name no task.
+- `docs/using-nc.md` — the **user-facing** guide: what to run, in what order,
+  and why. Verified against the **binary**, so it wins on what the CLI currently
+  accepts; the design spec wins on intent. Keep it current — see Conventions.
 - `docs/reports/<name>.md` — versioned conversion baselines / comparisons.
   `v0-baseline.md` records the current default-output behavior (the reference point
   future versions are measured against; see the `conversion-versioning` task).
@@ -490,6 +493,15 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   for free costs a round-trip instead. `docs/tasks/algo/curve-endpoint-validation.md`
   is the counter-example: ~215 lines of formulas and test bullets took five review
   rounds, the last two spent propagating one correction across four files.
+- **A user-visible change updates `docs/using-nc.md` in the same PR.** If you
+  touch a flag, subcommand, default, recipe key, preset, exit code, or a report
+  field or error message a user acts on, the guide is part of the change — not a
+  follow-up. Internal refactors that leave the surface identical are exempt.
+  **Update it by running the binary, not by reading the diff**: the guide's own
+  contract is that it is verified against `nc`, and every time it has gone stale,
+  re-verification found two or three of *its own examples* had broken in ways the
+  changelog did not mention. The `update-usingnc-doc` skill carries the procedure
+  and the traps.
 - **A plan doc is not code — don't iterate it toward completeness.** Task specs,
   roadmaps and design sketches cannot cover everything, and a gap is cheap when
   execution surfaces it anyway. Reviewing a plan-doc PR, ask of each finding: is it
