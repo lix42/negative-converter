@@ -41,7 +41,8 @@ The deterministic core owns the image science. Any future ML assistance (see
   typed `FilmRgbImage` after inversion/the selected density curve, then typed
   linear ACEScg after NC film RGB v1 mapping.
 - **Tagged reconstruction** architecture (shipped): `simple` (channel
-  inversion — baseline / debug / B&W) or `density` (density-domain
+  inversion — a debugging baseline; **not** the B&W path, which runs through
+  `density`) or `density` (density-domain
   reconstruction, Kodak Cineon / darktable `negadoctor` style — the default),
   where density owns a tagged **sigmoid** (H&D-style S-curve, the default since
   `pipeline_version` 2) or **exponential** (the straight line) density curve.

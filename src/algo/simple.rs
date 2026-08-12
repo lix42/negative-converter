@@ -1,4 +1,5 @@
-//! `simple` — channel-inversion baseline (debug / B&W).
+//! `simple` — channel-inversion baseline. A **debugging** path, not the B&W
+//! one: B&W runs through `density` (`algo/bw-support`).
 //!
 //! A literal per-channel inversion: neutralize the film base, then invert.
 //! Cheap and predictable — the trustworthy reference against which the
