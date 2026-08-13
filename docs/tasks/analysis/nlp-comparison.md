@@ -63,4 +63,4 @@ Observed facts that validate the no-registration design:
 
 ## Dependencies
 
-- [Conversion Metrics & Thumbnails](conversion-metrics.md)
+- [Conversion Metrics & Photographic Analysis](conversion-metrics.md)

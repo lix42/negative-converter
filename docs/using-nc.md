@@ -9,7 +9,7 @@ A practical guide to converting film negative scans to positives with `nc`.
 > *what the CLI currently accepts*.
 >
 > **Verified against:** `nc 0.1.0`, `pipeline_version 3`, built at commit
-> `698337e62ef0`. The staleness signal is `pipeline_version`: if `nc --version`
+> `4c7b39b4e601`. The staleness signal is `pipeline_version`: if `nc --version`
 > reports a different one, treat this document as suspect and re-verify.
 >
 > **Known issue:** under the default render the gain map is inert (no HDR
@@ -246,6 +246,19 @@ which reports:
 ```
 
 The `d_max_recipe` fragment nests under **`reconstruction.curve`**.
+
+> **When a fully-exposed leader is beyond the scanner's visible-light range.**
+> An error saying a channel's transmission is `0` or at/below the scan floor
+> refers to the raw negative scan, before inversion: the film is opaque there,
+> so it would become a bright scene value after conversion. This can be a valid
+> leader whose density exceeds what the scanner recorded, not necessarily a
+> holder-selection mistake. The exact `Dmax` is then unknown—zero transmission
+> establishes only a lower bound—so the current `nc estimate` exits **1** and
+> emits no reuse-ready value. To convert today, either retain the fixed nominal
+> reference (omit `--d-max`, or use `--fixed-d-max`) or supply a deliberately
+> chosen positive `--d-max`; do not pass transmission `0` as a density. A
+> machine-readable clipped-reference handoff and documented fallback policy are
+> tracked in [`film-base/clipped-dmax-reference`](tasks/film-base/clipped-dmax-reference.md).
 
 ### Step 4 — Write the recipe
 
