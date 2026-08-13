@@ -1173,3 +1173,16 @@ Four real findings on PR #56, plus one document-only deferral.
 - The caution to carry: the exposed half of a *transition* is where exposure was
   still ramping, so it may not be the film's maximum. `dmax-anchor-reliability`
   already questions a dedicated leader; a half-leader is weaker evidence still.
+
+## clipped-dmax-reference
+
+**Status:** not started
+**Updated:** 2026-08-12
+
+- Goal: preserve the estimate-to-recipe-to-convert workflow when a confirmed
+  fully-exposed leader is clipped at the scanner's visible-light boundary, while
+  keeping the fallback distinguishable from a measured `Dmax`.
+- 2026-08-12: Provisional fallback decision is `1.3`. A region-only Portra 400
+  sweep across Dmax 1.2–1.9 made 1.2–1.3 look best; 1.3 also matches the shipped
+  nominal roll-fixed Dmax. Keep this provisional until the task evaluates more
+  clipped leaders and output intents.

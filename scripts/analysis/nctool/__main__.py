@@ -1,9 +1,8 @@
 """`python -m nctool` entry point.
 
-Two command groups so far: `manifest` (generate / validate / roles — the
-`asset-manifest` task) and `compare` (run / diff — the version-comparison harness
-of `core/conversion-versioning`). The downstream `conversion-metrics` task adds
-`metrics` / `thumbs` alongside them.
+Three command groups: `manifest` (generate / validate / roles), `compare`
+(build-version run / diff), and `roll` (manifest-driven calibrate / convert /
+deterministic analysis artifacts).
 """
 from __future__ import annotations
 
@@ -12,6 +11,7 @@ import sys
 
 from . import compare as _compare
 from . import manifest as _manifest
+from . import roll as _roll
 
 ASSET_ROOT_HELP = ("asset root (the folder containing manifest.json); defaults to "
                    "$NC_ASSET_ROOT, else ../nc-assets (the machine-local Drive symlink)")
@@ -92,6 +92,48 @@ def build_parser() -> argparse.ArgumentParser:
     cdiff.add_argument("before", help="run record from the baseline build")
     cdiff.add_argument("after", help="run record from the candidate build")
     cdiff.set_defaults(func=_compare.cmd_diff)
+
+    # --- roll: one manifest roll, calibrated once and rendered by configuration
+    roll = sub.add_parser("roll", help="calibrate, convert, and analyze manifest rolls")
+    rsub = roll.add_subparsers(dest="cmd", required=True)
+
+    rconvert = rsub.add_parser(
+        "convert", help="measure Dmin/Dmax, freeze a recipe, and convert one roll")
+    rconvert.add_argument("roll", help="source roll name from manifest.json")
+    _add_root(rconvert)
+    rconvert.add_argument("--nc", required=True, help="path to the nc binary to run")
+    rconvert.add_argument("--config", help="configuration ID (default: hash of frozen recipe)")
+    rconvert.add_argument("--out-dir", help="output directory (default: converted/nc/CONFIG/ROLL)")
+    rconvert.add_argument("--recipe", help="partial recipe or conversion sidecar to extend")
+    rconvert.add_argument("--dmin-region", help="unexposed-frame X,Y,W,H (default: center 80%%)")
+    rconvert.add_argument("--dmax-region", help="leader-frame X,Y,W,H (default: center 80%%)")
+    rconvert.add_argument("--d-max", type=float,
+                          help="explicit Dmax; skips leader estimation (for a known or "
+                               "deliberately chosen fallback value)")
+    rconvert.add_argument("--dmin-mode", choices=("grid", "region"), default="grid",
+                          help="measure Dmin with a five-cell grid or one region "
+                               "aggregate (default: grid)")
+    rconvert.add_argument("--film-type", choices=("unknown", "silver", "chromogenic"),
+                          help="declare film chemistry in estimation and the frozen recipe")
+    rconvert.add_argument("--output-preset", help="override output.preset in the recipe")
+    rconvert.add_argument("--print-exposure", type=float,
+                          help="override print.print_exposure in the recipe")
+    rconvert.add_argument("--max-memory", default="6GiB",
+                          help="memory budget passed to estimate and roll (default: 6GiB)")
+    rconvert.add_argument("--strict-estimate", action="store_true",
+                          help="promote calibration warnings to errors")
+    rconvert.add_argument("--strict-roll", action="store_true",
+                          help="promote conversion warnings to a failing roll exit")
+    rconvert.set_defaults(func=_roll.cmd_convert)
+
+    ranalyze = rsub.add_parser(
+        "analyze", help="normalize one converted roll into a deterministic JSON artifact")
+    ranalyze.add_argument("roll", help="source roll name")
+    ranalyze.add_argument("run", help="configuration ID or path to tags.json")
+    _add_root(ranalyze)
+    ranalyze.add_argument(
+        "--out", help="write analysis JSON here (default: analysis.json beside tags.json)")
+    ranalyze.set_defaults(func=_roll.cmd_analyze)
 
     return ap
 

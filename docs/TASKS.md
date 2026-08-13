@@ -121,6 +121,7 @@ graph TD
   io --> output
   film-base --> algo
   algo --> color
+  color --> algo
   film-base --> color
   color --> output
   algo --> output
@@ -167,6 +168,7 @@ graph TD
     film-base/content-fallback
     film-base/estimate-reuse-output
     film-base/dmax-reference
+    film-base/clipped-dmax-reference
     film-base/dense-base-dmax-plausibility
     film-base/dmax-anchor-reliability
     film-base/dmax-per-channel-reduction
@@ -293,6 +295,7 @@ graph TD
   film-base/auto-base-redesign --> film-base/ir-holder-detection
   film-base/auto-base-redesign --> film-base/auto-base-neutral-stock
   algo/dmax-white-anchor --> film-base/dmax-reference
+  film-base/dmax-reference --> film-base/clipped-dmax-reference
   film-base/dmax-reference --> film-base/dense-base-dmax-plausibility
   core/pipeline-orchestration --> core/roll-conversion
   algo/dmax-white-anchor --> core/roll-conversion
@@ -439,6 +442,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `film-base/content-fallback` (post-MVP): `film-base/estimation`
 - `film-base/estimate-reuse-output` (post-MVP): `core/pipeline-orchestration`
 - `film-base/dmax-reference` (post-MVP): `algo/dmax-white-anchor`
+- `film-base/clipped-dmax-reference` (post-MVP): `film-base/dmax-reference`
+  — preserve the estimate-to-recipe-to-convert workflow when a valid fully-exposed leader is
+  clipped at zero transmission: report a machine-readable out-of-boundary state and resolve a
+  documented conversion fallback without presenting it as a measured density. Provisional
+  fallback: 1.3, pending broader validation
 - `film-base/dense-base-dmax-plausibility` (post-MVP): `film-base/dmax-reference`
 - `film-base/dmax-anchor-reliability` (post-MVP): `film-base/dmax-reference`, `algo/reference-anchored-sigmoid`
   — follow-up on a **completed** task's contract, so a new task rather than an edit: the
@@ -730,6 +738,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Content-based film-base fallback (Tier 3)](tasks/film-base/content-fallback.md) — owns `--base-content`; supersedes the content-source sub-item in `film-base/auto-base-redesign` (tell that task's owner)
 - [x] [Reuse-ready `nc estimate` output](tasks/film-base/estimate-reuse-output.md)
 - [x] [Roll-fixed Dmax from a fully-exposed reference frame](tasks/film-base/dmax-reference.md) — shipped roll-fixed acquisition/default policy; the replacement density-curve stage preserves scalar exponential placement and sigmoid curve shaping
+- [ ] [Clipped Dmax reference handoff](tasks/film-base/clipped-dmax-reference.md) — represent a valid leader beyond the scanner boundary in estimate output and carry it into conversion with an explicit, documented fallback rather than a fabricated measurement; provisional fallback 1.3
 - [ ] [Stock-aware Dmax plausibility (dense-base stocks)](tasks/film-base/dense-base-dmax-plausibility.md) — from real-scan verification (2026-07-23): the reference-Dmax `≳1.0` floor + base-uniformity check are C41-calibrated and false-alarm on Harman Phoenix's dense/non-orange base; make the floor stock-relative while keeping a loud failure on genuinely wrong regions
 - [ ] [Dmax anchor reliability](tasks/film-base/dmax-anchor-reliability.md) — follow-up on a
   **completed** contract: the leader-measured anchor is *uncontrolled* (two rolls of one stock
@@ -926,7 +935,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Display-output acceptance](tasks/analysis/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans
 - [x] [Conversion-analysis tooling (spike)](tasks/analysis/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. **Done 2026-07-23** (spike): scope decided (Python `nctool` toolkit, JSON manifest of rolls+converted, configurable-but-local asset root, NLP global-metrics comparison without registration); split into the four child tasks below; see the task file's "Spike outcome" section.
 - [x] [Asset manifest](tasks/analysis/asset-manifest.md) — tracked JSON manifest of `../nc-assets` (roll frames + roles + derived facts + converted outputs); `generate`/`validate`; retires the hard-coded `ROLLS` array
-- [ ] [Conversion metrics & thumbnails](tasks/analysis/conversion-metrics.md) — the `nctool` Python package + per-image metric set (percentiles, black/white points, contrast, saturation, clip %) + thumbnails → JSON/Markdown; single documented entry point subsuming the harness
+- [ ] [Conversion metrics & photographic analysis](tasks/analysis/conversion-metrics.md) —
+  enrich deterministic per-frame and per-roll analysis with useful color and tone
+  distributions, shadow/highlight occupancy, range and endpoint behavior, plus thumbnails and
+  JSON/Markdown artifacts suitable for standard diff tools
 - [ ] [NLP vs nc comparison](tasks/analysis/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
 - [ ] [Drive asset migration](tasks/analysis/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
 - [x] [Harness regression tests](tasks/analysis/harness-regression-tests.md) — fixture-backed

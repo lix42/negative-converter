@@ -1,11 +1,10 @@
 """nctool — the nc conversion-analysis toolkit (stdlib-only for now).
 
-Two command groups so far: `manifest` (the `asset-manifest` task) and `compare`
-(the version-comparison harness of `core/conversion-versioning`). The rest of the
-package skeleton — `metrics`, `thumbs`, a venv with numpy/tifffile/Pillow —
-arrives with the downstream `conversion-metrics` task. Keep this **dependency-free**
-so `python -m nctool …` runs on the bare system Python; `compare` in particular
-must stay stdlib-only because it reads derived numbers out of JSON, never pixels.
+The command groups are `manifest` (asset inventory), `compare` (the build-version
+harness), and `roll` (manifest-driven calibration, conversion, and deterministic
+analysis artifacts). The future `metrics` / `thumbs` modules require image libraries; the
+current commands stay dependency-free because they read derived JSON and stream
+checksums rather than loading pixels into Python.
 """
 
-__all__ = ["compare", "manifest"]
+__all__ = ["compare", "manifest", "roll"]

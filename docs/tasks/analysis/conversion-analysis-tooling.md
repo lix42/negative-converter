@@ -104,7 +104,7 @@ NLP-converted set of the new `Portra160-2026-07-22` roll). In response:
 
 - [Asset Manifest](asset-manifest.md) — schema + `generate`/`validate`; retire
   `ROLLS`. (Foundational.)
-- [Conversion Metrics & Thumbnails](conversion-metrics.md) — the Python toolkit
+- [Conversion Metrics & Photographic Analysis](conversion-metrics.md) — the Python toolkit
   skeleton + metric set + thumbnails → JSON/Markdown. Folds in the harness-UX /
   single-entry-point item.
 - [NLP vs nc Comparison](nlp-comparison.md) — ingest NLP outputs, global-diff +

@@ -321,9 +321,15 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 ## conversion-metrics
 
 **Status:** not started
-**Updated:** —
+**Updated:** 2026-08-12
 
 - Goal: Formalize the ad-hoc image-library analysis from real-scan verification into the reusable Python toolkit that is the toolkit's single documented entry point.
+- 2026-08-12: Folded the briefly separate `photographic-result-analysis` follow-up into this
+  task rather than creating a false dependency between overlapping work. The trigger was the
+  Portra 400 Dmax 1.2-versus-1.9 comparison: provenance, channel means, and clipping counters
+  establish that the runs differ, but do not explain color and tone distribution,
+  shadow/highlight occupancy, range use, or proximity to the endpoints. Metric definitions and
+  the final artifact design remain opening questions for implementation.
 
 
 ## drive-asset-migration

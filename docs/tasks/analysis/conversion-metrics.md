@@ -1,13 +1,49 @@
-# Conversion Metrics & Thumbnails
+# Conversion Metrics & Photographic Analysis
+
+## Background
+
+The first `nctool roll analyze` artifact normalizes conversion provenance and the
+limited aggregate statistics already present in `nc roll` reports. Comparing the
+Portra 400 Dmax 1.2 and 1.9 runs showed that this is not enough to understand the
+result as an image: channel means reveal a broad brightness change, but not how
+color and tone are distributed, whether highlights or shadows occupy useful
+range, how much of the frame lies in those regions, or how closely the result
+approaches the black and white limits.
 
 ## Goal
 
 Formalize the ad-hoc image-library analysis from real-scan verification into the
 reusable Python toolkit that is the toolkit's single documented entry point.
-Produce a per-image metric set (percentiles, black/white points, contrast,
-saturation, clip %) as pipeable JSON + a Markdown summary, plus downscaled
-thumbnails — computed over the manifest's frames and converted outputs, always
+Make converted-roll analysis describe color, tone, highlights, shadows, range
+use, black/white-limit behavior, and the amount of image area represented by
+those conditions through deterministic per-image and per-roll artifacts, while
+keeping objective measurement separate from aesthetic judgment. Retain the
+original pipeable JSON, Markdown summary, and downscaled-thumbnail goals, always
 respecting the "no full-res pixels in agent context" invariant.
+
+## Opening Questions
+
+- Which color and tone domains make the results meaningful across the supported
+  SDR, HDR, integer, and floating-point outputs?
+- What should “shadow,” “highlight,” “near black,” and “near white” mean for this
+  purpose, and which definitions remain comparable across configurations?
+- Which summaries best distinguish a healthy use of range from clipping,
+  compression, lifted blacks, empty highlights, or a narrowly clustered image?
+- How should per-channel behavior, perceptual brightness, chroma, neutrality,
+  and color casts be represented without implying a subjective quality score?
+- What belongs in each frame's analysis, what belongs in the roll summary, and
+  which differences should a normal text diff make easy to see?
+- How should analysis state its limits when two outputs do not share a directly
+  comparable encoding or display intent?
+
+## Suggested Direction
+
+Begin with the photographic questions the artifact must answer, then select and
+validate measurements against representative converted rolls and deliberately
+different configurations. Retain the existing deterministic, diff-friendly
+provenance from roll analysis. Keep the result factual and inspectable: derived
+measurements can support visual review, but should not be presented as an
+automatic verdict on which rendering looks better.
 
 ## Design
 
@@ -64,6 +100,14 @@ are never read back into an agent context.
 
 ## How to Verify
 
+- Use known same-roll configuration pairs, including the Portra 400 Dmax 1.2 and
+  1.9 runs, and confirm the analysis exposes meaningful color, tone, range,
+  shadow, highlight, and endpoint differences rather than only a change in
+  global means.
+- Check representative SDR and HDR outputs, limit-reaching and non-clipped
+  cases, and repeated analysis of identical inputs. The artifacts should remain
+  deterministic and useful with ordinary diff tools, and their claims should
+  agree with targeted visual inspection.
 - `python -m nctool metrics <converted-frame>` emits valid JSON whose clip % on
   the `2026-07-22` outputs matches the per-frame clip % already recorded in
   `docs/reports/real-scan-verification.md` (u16 clips 4.8–10.3 %, float 0).

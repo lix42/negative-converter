@@ -45,6 +45,8 @@ SEED_ROLES = {
                              "20260722-nikon-1096": "leader"},
     "2026-07-24-Gold200": {"20260724-leica-1130": "unexposed",
                            "20260724-leica-1129": "leader"},
+    "portra400-2026-08-04": {"20260803-film-1230": "unexposed",
+                              "20260803-film-1229": "leader"},
 }
 SEED_STOCK = {
     "Ektar": "Kodak Ektar 100", "phoenix": "Harman Phoenix 200",
