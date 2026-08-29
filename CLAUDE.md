@@ -117,6 +117,12 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `exponential` curve);
   `algo::finish_print` is the stage-4 print bridge. The old `Converter` trait and
   `AlgoParams` are gone.
+  **`AnchorPlacement` (`reconstruction.curve.anchor`) is carried by both curves**,
+  reached by one curve-neutral `--anchor-*` family (`--sigmoid-mid-fraction` /
+  `--sigmoid-white-at-d-max` remain as aliases). Two of its four rules —
+  `black-at-base`, `mid-at-base-offset` — are **reference-free**: they never read the
+  resolved `Dmax`, which is what keeps the leader anchor's roll-to-roll error out of
+  the render. The exponential's default stays `white-at-dmax`.
 - The **IR channel** (HDRi 64-bit input) is decoded and, by default, **preserved
   but not acted on**; carry it through, don't consume it. The one exception is
   **IR-assisted film-holder detection** (`ir-holder-detection`): under an explicit
@@ -184,6 +190,12 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   accepted only by those display presets (legacy ignores it — so it is rejected
   there rather than silently dropped — and film-master rejects it);
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
+  `pipeline/shadow_metrics.rs` (test-only diagnostic harness: `#[cfg(test)]`, every
+  entry `#[ignore]`d and skipping with a message when `../nc-assets` is absent, so
+  `cargo test` is green without assets and CI never needs them; in-crate because the
+  SDR/HDR renderers are not CLI-reachable and nc has no `[lib]` target; prints derived
+  numbers only, never pixels. **`cargo build` does not compile it** — use
+  `cargo test --no-run` or `clippy --all-targets`),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
   implementation — `telemetry::params_hash` delegates to it so the core report
@@ -265,8 +277,11 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   a **rendering** property, not a container defect: the reference-anchored sigmoid
   pins mid-grey at half the reference density and rolls its shoulder so diffuse
   white lands *at* reference white, so nothing exceeds it by construction. The
-  exponential curve on the same frame reaches **4.87x** — it pins white at `Dmax`
-  with no placement rule, so contrast pushes values past reference white.
+  exponential curve on the same frame reaches **4.87x** — it has no shoulder and its
+  default placement pins white at `Dmax`, so contrast pushes values past reference
+  white. Both curves now carry an `AnchorPlacement`; the **shoulder** is what gates
+  whether any headroom exists (`--sigmoid-shoulder 0` also reaches 4.87x), and among
+  shoulder-less configs the anchor sizes it (`--d-max 2.0` drops it to 1.003x).
   **The film is not the limitation.** Negative stock carries wide latitude; the
   *print rendering* decides whether output exceeds diffuse white, and today's
   default declines to. So HDR is a rendering-intent option, not a correctness gap —
@@ -565,6 +580,11 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.
+  - *Validate the resolved value, never a stand-in for it.* The anchor guard once
+    tested a proxy (`MID_GREY_OUTPUT_DECADES / slope`), correct for the placements
+    that existed then; `black-at-base` divides the unbounded `−log10(floor)`, so a
+    finite-looking config derived an infinite anchor and wrote an all-black frame with
+    zero clipped, zero non-finite, no warnings, exit 0.
   - *lcms2 gotcha:* `Transform::transform_in_place` (`cmsDoTransform`) is
     infallible — Little CMS reports runtime transform failures only via the
     process-global `cmsSetLogErrorHandler`. `color.rs` uses the **global**

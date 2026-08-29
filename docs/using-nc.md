@@ -9,7 +9,7 @@ A practical guide to converting film negative scans to positives with `nc`.
 > *what the CLI currently accepts*.
 >
 > **Verified against:** `nc 0.1.0`, `pipeline_version 3`, built at commit
-> `4c7b39b4e601`. The staleness signal is `pipeline_version`: if `nc --version`
+> `524bdde40860`. The staleness signal is `pipeline_version`: if `nc --version`
 > reports a different one, treat this document as suspect and re-verify.
 >
 > **Known issue:** under the default render the gain map is inert (no HDR
@@ -77,7 +77,9 @@ They are not two ends of one scale; don't conflate them.
 > - Under the **sigmoid** curve (the default), `Dmax` and the placement are
 >   deliberately split. The default anchor puts **mid-grey at 0.5·Dmax** and lets
 >   display white float above *that placement* rather than being pinned. See §6.
-> - Under the **exponential** curve, `Dmax` does map to display white directly.
+> - Under the **exponential** curve, `Dmax` maps to display white *by default* — that
+>   curve's default anchor is `white-at-dmax`. The anchor flags apply there too, so it
+>   is a default, not a property of the curve.
 >
 > Some CLI help text still calls `--d-max` a "display-white anchor" — that wording
 > predates the split and is accurate only for the exponential curve.
@@ -363,7 +365,7 @@ The `curve` object above is the **sigmoid** shape. Selecting the exponential cur
 resolves a different, smaller set of keys:
 
 ```json
-{ "type": "exponential", "gamma": 2.0, "dmax": "fixed" }
+{ "type": "exponential", "gamma": 2.0, "dmax": "fixed", "anchor": "white-at-dmax" }
 ```
 
 ### Strictness
@@ -474,31 +476,58 @@ Under `density`, two curves, selected with `--density-curve`:
 | Curve | Knobs | Defaults |
 |---|---|---|
 | `sigmoid` *(default)* | `--sigmoid-contrast` (mid-density slope), `--sigmoid-toe` / `--sigmoid-shoulder` (knee widths in log10 density; `0` disables), plus the anchor flags below | `contrast 2.0686874`, `toe 0.2`, `shoulder 0.6` |
-| `exponential` | `--density-gamma` — the straight line's slope | `gamma 2.0` |
+| `exponential` | `--density-gamma` — the straight line's slope, plus the anchor flags below | `gamma 2.0`, `anchor white-at-dmax` |
 
-The two curves take **different recipe keys**, and mixing them is rejected —
-`anchor` on an exponential curve fails with *"`anchor` is a sigmoid-curve key, but
-the curve type is "exponential" (its knobs are `gamma` and `dmax`)"*.
+The two curves take **different recipe keys**, and mixing them is rejected — a
+sigmoid-only key under an exponential curve fails with *"`toe` is a sigmoid-curve key,
+but the curve type is "exponential" (its knobs are `gamma`, `dmax` and `anchor`)"*.
+`anchor` is **not** one of those: it is shared by both curves (see below).
 
-### Sigmoid anchoring — where the curve pins a tone
+### Anchoring — where a curve pins a tone
 
-The sigmoid curve separates **which density is the reference** (`dmax`) from
-**which tone that reference places** (`anchor`). This split is the substantive
-outcome of [`reports/sigmoid-reference-baseline.md`](reports/sigmoid-reference-baseline.md),
+Both curves separate **which density is the reference** (`dmax`) from **which tone
+gets pinned, and where** (`anchor`). This split is the substantive outcome of
+[`reports/sigmoid-reference-baseline.md`](reports/sigmoid-reference-baseline.md),
 and it exists because the two knobs otherwise fight: raising contrast pivots the
 line *about the pinned point*, so pinning white necessarily drags everything below
 it down.
 
+The `--anchor-*` flags work on **either curve** — placement is independent of curve
+shape:
+
 | Anchor | Flag | Recipe (`reconstruction.curve.anchor`) |
 |---|---|---|
-| Mid-grey at a fraction of the reference *(default, F = 0.5)* | `--sigmoid-mid-fraction F` | `{"mid-at-dmax-fraction": 0.5}` |
-| Display white *at* the reference — the pre-2026-08 rule | `--sigmoid-white-at-d-max` | `"white-at-dmax"` |
+| Mid-grey at a fraction of the reference *(sigmoid default, F = 0.5)* | `--anchor-mid-fraction F` | `{"mid-at-dmax-fraction": 0.5}` |
+| Display white *at* the reference *(exponential default)* | `--anchor-white-at-reference` | `"white-at-dmax"` |
+| The **film base** at output FLOOR | `--anchor-black-floor FLOOR` | `{"black-at-base": 0.005}` |
+| Mid-grey at density D **above the base** | `--anchor-mid-offset D` | `{"mid-at-base-offset": 0.5}` |
 
 Raising `F` renders the roll **darker**; lowering it renders **brighter**.
 
-`--sigmoid-white-at-d-max` is retained as an explicit **diagnostic**, not a
-recommended setting: at a photographic contrast it renders midtones roughly 2.5–3.6
-stops dark. It is kept reachable so the original defect can be reproduced on demand.
+`--sigmoid-mid-fraction` and `--sigmoid-white-at-d-max` are the original spellings of
+the first two and still work.
+
+**Switching curves resets the placement.** `--density-curve` (and a `roll` per-frame
+override that sets `curve.type`) carries the roll-fixed `dmax` across but takes the new
+curve's *default* anchor, because the right placement differs per curve — the two
+defaults in the table are deliberately different, and `white-at-dmax` on the sigmoid is
+the diagnostic described below. If your recipe pinned a non-default placement, that is a
+loud, `--strict`-promotable warning naming what was dropped; restate the rule with an
+`--anchor-*` flag (or a `curve.anchor` key beside the new `type`) to keep it.
+
+**The last two rules never read the reference**, which matters because the reference
+is measured from a fully-exposed leader — film saturation, not a diffuse white — and
+it varies between rolls of the same stock far more than the film base does. Under
+`--anchor-white-at-reference` that variation reaches the picture at full strength;
+under `--anchor-mid-fraction 0.5`, at half; under the two base-derived rules, not at
+all. `FLOOR` is linear light against the reference white, not an sRGB code value:
+`0.005` encodes to about 16/255.
+
+`--anchor-white-at-reference` is retained as an explicit **diagnostic**, not a
+recommended setting on the sigmoid: at a photographic contrast it renders midtones
+roughly 2.5–3.6 stops dark. It is kept reachable so the original defect can be
+reproduced on demand, and it is the exponential's default because that curve's role
+is to be the predictable straight-line reference.
 
 > **Provisional values.** The measurement behind these defaults filters *methods*
 > rather than tuning parameters, so the numbers are not final. The mid fraction
@@ -544,7 +573,7 @@ Where the reference density comes from. (What it *places* is the anchor, above.)
 | *(none)* / `--fixed-d-max` | Fixed nominal reference (1.3 density), reused across the roll. **Default.** Darker frames render darker — faithful relative exposure. |
 | `--d-max D` | Explicit roll-fixed reference — your measured calibration. |
 | `--auto-d-max` | Measure per frame. **Per-frame exposure normalization**: brightens underexposed frames and breaks roll consistency. Grading, not conversion. |
-| `--no-d-max` | No reference — scene-referred output (base → 1.0, detail above). **Exponential only**: the sigmoid needs an anchor and rejects it (exit 2), so pair it with `--density-curve exponential`. |
+| `--no-d-max` | No reference. Scene-referred output (base → 1.0, detail above) **under the default `white-at-dmax` placement** — it resolves the reference to 0, so any other `--anchor-*` rule still derives an anchor from the slope (`--anchor-mid-fraction 0.5` there pins mid-grey 0.37 above the base and clips ~99.9% of the frame). **Exponential only**: the sigmoid needs an anchor and rejects it (exit 2), so pair it with `--density-curve exponential`. |
 
 > **A caveat on measuring `Dmax` from a leader** (§4 step 3). The baseline report
 > found leader-measured `Dmax` untrustworthy on three independent counts:
@@ -610,8 +639,8 @@ Feed that back as an explicit `--white-balance` to freeze it across a roll.
 > reference-anchored sigmoid pins mid-grey at half the reference density and rolls
 > its shoulder so diffuse white lands *at* reference white, so by construction
 > nothing exceeds it. The `exponential` curve on the same frame reaches 4.87x,
-> because it pins white at `Dmax` with no placement rule and lets contrast push
-> values past reference white. The film is not the limitation — negative stock has
+> because its default placement pins white *at* `Dmax` and has no shoulder, so
+> contrast pushes values past reference white. The film is not the limitation — negative stock has
 > wide latitude; the *print rendering* decides whether output exceeds diffuse
 > white, and today's default declines to.
 >
@@ -619,9 +648,45 @@ Feed that back as an explicit `--white-balance` to freeze it across a roll.
 > deliberately deprioritised. **Changing container does not help**: `hdr-pq` and
 > `hdr-hlg` consume the same shared display source and the same HDR renderer, so
 > under the default curve they too report their brightest pixel at or below 203
-> nits with none of the 1000-nit headroom used. Real headroom needs a *render*
-> change — the `exponential` curve, or `Dmax`/print controls that push values past
-> reference white.
+> nits with none of the 1000-nit headroom used.
+>
+> **The shoulder gates whether there is any headroom; the anchor sizes it.** The
+> figures below are `GainMapMax`, measured 2026-08-28 on
+> `tests/fixtures/hdr-48bit.tif` with `--film-base 1,1,1` — a *unity* base, so the
+> reference-derived ones move on a real scan (see the caveat after the table).
+>
+> The sigmoid's shoulder runs during *reconstruction* and removes every above-white
+> value before either display branch sees it, so the two renditions are identical
+> and their ratio is 1.0 by construction. Remove it and headroom appears — and only
+> then does the anchor decide how much content exceeds white:
+>
+> | config (all `--output-preset gain-map-hdr`) | `GainMapMax` |
+> |---|---|
+> | sigmoid, `--sigmoid-shoulder 0.6` (default) or `0.2` | 1.000x |
+> | sigmoid, `--sigmoid-shoulder 0` | 4.866x |
+> | `exponential`, default `white-at-dmax` at the nominal `Dmax` 1.3 | 4.866x |
+> | `exponential --anchor-black-floor 0.005` | 4.866x |
+> | `exponential --anchor-mid-offset 0.5` | 4.866x |
+> | `exponential --d-max 1.5` | 3.738x |
+> | `exponential --d-max 2.0` | 1.003x |
+>
+> The first three shoulder-less rows agree at 4.866x because all three **saturate
+> the ceiling**, not because the anchor is irrelevant — raising it walks the number
+> back, as the last two rows show.
+>
+> **Caveat: a realistic film base moves the reference-derived rows.** Re-measured
+> with `--film-base 0.9,0.55,0.42`, the exponential's default reads **2.620x** and
+> `--d-max 1.5` reads **1.052x**; the two base-derived anchors and `--d-max 2.0` are
+> unchanged, as is every sigmoid row. That is the whole point of the base-derived
+> rules — they carry no reference term — but it means the unity-base numbers above
+> are a controlled comparison, not what your scan will report.
+>
+> **And the 4.87x is not usable headroom.** It is 98.8% of the 4.926x ceiling, with
+> *zero* separation among everything above reference white — the speculars arrive as
+> one flat blob rather than as detail. So do not reach for the `exponential` curve
+> or `--sigmoid-shoulder 0` expecting good HDR; you get a live gain map carrying a
+> clipped highlight. A real fix is tracked in
+> [`output/display-tone-mapping`](tasks/output/display-tone-mapping.md).
 
 `--output-preset` (recipe key `output.preset`) is an **atomic** policy choice: a
 named preset resolves container, bit depth, and colour profile itself. `custom` is
@@ -843,10 +908,13 @@ Your rectangle mixes rebate with image content. Check the coordinates against
 `nc inspect`, or use `estimate --grid` on a genuinely unexposed frame.
 
 **Heavy clipping in the report**
-You are on the `exponential` curve — the default sigmoid cannot clip highlights. The
-reference density is probably too low, pushing content past display white. Raise
-`--d-max`, switch to the default sigmoid, or use `--no-d-max` with an f32 output for a
-scene-referred float result.
+You are on the `exponential` curve — the default sigmoid cannot clip highlights. Display
+white is probably placed too low, pushing content past it. Raise `--d-max`, move the
+anchor up (`--anchor-black-floor` resolves a higher anchor than `--anchor-mid-offset`
+does), switch to the default sigmoid, or use `--no-d-max` with an f32 output for a
+scene-referred float result. Note a *low* anchor on the exponential is severe: measured
+on real frames it blows ~21% of the frame to flat white, because that curve has no
+shoulder to roll highlights off with.
 
 **"reconstruction.curve is missing `type`"**
 A partial recipe that includes the `curve` object must include its tag. Add the

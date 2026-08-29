@@ -1164,6 +1164,17 @@ What other epics need to know about `algo`:
   is likely this effect. The manufacturer-*tabulated* aims (and their difference Δ) are
   the authoritative half; chart reads must not become ground truth for the registry or
   for `io/scanner-density-calibration` until properly integrated or tabulated.
+- 2026-08-13 (**cross-reference from `algo/exponential-anchor-placement`; two consumers
+  of this registry, with different readiness**). Δ and the mid-above-base offset are
+  **not** equally available. Δ can supply the reconstruction **contrast** as soon as this
+  registry exists — candidate 8's rule `0.745/Δ` (where `0.745 = log10(1/0.18)`) gives
+  2.07 at Δ = 0.36, within 3% of the independent film-gamma route `1.2/0.6 = 2.00` — and
+  it is safe because a *difference* cancels base+fog, keeping it inside the tabulated
+  half. The **offset** (`mid aim − D-min`) is not: it consumes a chart-read `D-min`,
+  which Constraint 2 above forbids any render path from doing. So a task planning to
+  ship candidate 8 (mid anchored at `Dmin + offset`) on top of this registry is blocked
+  on spectral integration or a tabulated Status M measurement, not on the registry
+  itself. Full derivation in the `exponential-anchor-placement` section.
 ## reference-anchored-sigmoid (Phase 0)
 
 **Status:** in progress
@@ -1723,6 +1734,20 @@ What other epics need to know about `algo`:
   is scoped to *default* behaviour ("bumps only when default conversion behaviour changes"),
   so nothing currently owns "a non-default path changed and archived recipes for it are
   reinterpreted". The warning covers this instance; the policy question is open.
+- 2026-08-13 (**cross-reference from `algo/exponential-anchor-placement`: the shipped
+  `MidAtDmaxFraction(0.5)` has a quantified error, so this task starts with a number**).
+  The mid patch sits at `D′ = 0.513` where `0.5·Dmax` puts the anchor at 0.650; that
+  0.137 density is **0.91 stops** at contrast 2.0, against candidate 3's measured
+  **0.93 EV** — i.e. the shipped default's whole residual is the fraction, and 0.395
+  would be correct for these rolls. Two cautions before anyone simply re-picks the
+  number. **(a)** 0.395 is only correct *while `Dmax` means the leader*; the fraction has
+  no stable value because the thing it is a fraction **of** is a saturation density, not
+  diffuse white. **(b)** `f` is also the coupling to that unreliable anchor — the two
+  rolls 0.295 apart swing 0.98 stops at `f = 0.5` and zero at `f = 0` — so re-tuning the
+  fraction fixes the systematic half and leaves the roll-to-roll half untouched. The
+  calibrated answer is more likely a change of *reference* (to `Dmin` + offset, `f = 0`)
+  than a better fraction. Full derivation in the `exponential-anchor-placement` section;
+  the offset half is blocked per the note added to `film-stock-profiles`.
 
 
 ## curve-endpoint-validation
@@ -1911,10 +1936,14 @@ What other epics need to know about `algo`:
   anything the moment the default moves.
 
 
-## exponential-mid-grey-anchor
+## exponential-anchor-placement
 
-**Status:** not started
-**Updated:** 2026-08-08
+**Status:** in progress
+**Updated:** 2026-08-28
+
+> Renamed from `exponential-mid-grey-anchor` on 2026-08-12 (see the entry at the end of
+> this section). Entries below predate the rename and are left verbatim; earlier
+> sections elsewhere in this file still cite the old id for the same reason.
 
 - 2026-08-08: Filed. The exponential curve pins display white at `Dmax` and has no
   `AnchorPlacement`, so its contrast knob pivots the line *around white* — measured
@@ -1933,6 +1962,374 @@ What other epics need to know about `algo`:
   improves a non-default path. Depends on
   `algo/negative-reconstruction-density-curves` (the tagged curve schema it would add
   an `anchor` field to).
+- 2026-08-12 (**renamed, re-scoped, started**). `algo/exponential-mid-grey-anchor` →
+  `algo/exponential-anchor-placement`, and the task now tracks the reconstruction-curve
+  work that came out of reviewing `algo/reconstruction-render-curve-split`. The stem
+  changed, so the old id resolves to nothing; live references were repointed
+  (`TASKS.md` node/edge/list/checklist, the split task's open question,
+  `reports/render-defaults-v2.md`, `types::ExponentialParams::default`). Historical
+  progress entries — here and at the `curve-endpoint-validation` and
+  `reconstruction-render-curve-split` sections — keep the old id verbatim under the
+  append-only rule; this entry is the bridge.
+- **Direction changed from mid-grey to the black end.** The filed proposal was to pin
+  mid-grey, copying the sigmoid. The user's proposal is to pin **black at the film
+  base** and let contrast carry white upward, into HDR range if it goes there. Three
+  things support it. (a) It anchors the reliable measurement: the base agrees to
+  **0.0005** across rolls of one stock where the leader `Dmax` is **0.295** apart
+  (`film-base/dmax-anchor-reliability`), so the curve becomes `Dmax`-free. (b) The base
+  is *already* `D′ = 0` — stage 1 divides it out — so Dmin is the black reference
+  today; only the black *value* is unstated, currently falling out as
+  `10^(−contrast·Dmax)`. (c) It is candidate **5b** from `reference-anchored-sigmoid`,
+  which the user ranked "most likely GO" after its first rejection was overturned as a
+  parameter error. The name was widened to the mechanism rather than to `black-anchor`
+  so a third change of placement does not force a third rename.
+- **The code change is a gain swap.** `density.rs` already records that the anchor
+  "factors into `10^(γ·D')` times a constant gain `10^(−γ·Dmax)`"; a black pin replaces
+  that emergent gain with a stated floor. `white-at-dmax` must stay bit-identical.
+- **Two questions deliberately left open rather than decided in discussion.** First,
+  whether contrast should be *derived* from the density range instead of chosen —
+  pinning both ends determines it, and on a 1.3 roll with a 0.0025 floor the formula
+  returns **2.00**, the value the default reached by eye. The `reference-anchored-sigmoid`
+  log calls this "adaptive contrast, already rejected", but a search found only that
+  back-reference, with no recorded rationale, inside a sentence the log itself later
+  retracts as false — so it is *unexamined*, not settled, and recorded that way. The
+  objection that does survive on its own: deriving contrast from `Dmax` routes that
+  anchor's unreliability into the slope. Second, what `DmaxSource` means on this curve
+  once it no longer anchors anything; the user's read is that this matters less here
+  than under white-pinning, and it is not being solved now.
+- **The finding this task owes the split task.** A straight line places two points, not
+  three: with both endpoints pinned, mid-grey is forced to the geometric mean, which
+  arithmetic puts roughly 2 stops under an 18% aim at contrast 2.0. If that survives
+  measurement it explains the whole pale-blacks/dark-midtones history as one constraint
+  seen twice, and it is the quantified case for moving the S-shape to the render stage.
+  Measure it across a roll — per-frame preference is frame optimisation.
+- 2026-08-12 (**the 2.75 EV defect is explained; the cause is the anchor, not the
+  formula**). Worked through against `reports/sigmoid-reference-baseline.md`. The mid
+  patch back-solves to `D′ = 0.513` from the `c=1.0` row and the `c=2.0` row
+  *independently*, so the measurement is internally consistent. A straight line placing
+  mid at 0.18 **and** the base at 8/255 needs mid at **71.4%** of the density range; it
+  sits at **39.5%**. Shortfall **0.415 density**, and `0.415 × 2.0 / log10(2)` = **2.75
+  stops** — the reported number, reproduced from geometry alone.
+- **0.415 is the Dmax-to-diffuse-white gap, reached three independent ways**: this
+  geometric shortfall (0.415), the directly measured diffuse-white gap (0.417), and the
+  median exposure preference (0.452). The defect is therefore neither the mid-patch
+  formula nor patch selection — **display white is pinned about 0.42 density too high**.
+  The mid patches are user-confirmed regions and only approximately mid-grey, but the
+  conclusion survives that because it does not rest on them alone.
+- **Why contrast 1.0 looked right on midtones: two errors cancelling.** Decomposed on the
+  mid patch, starting from a correct configuration (white at `D′ 0.88`, contrast 2.03):
+  moving the anchor to `Dmax` costs **−2.83 stops**; then dropping contrast to 1.0 gives
+  back **+2.69**; net **−0.14**, the reported figure. Contrast 2.0 removes the
+  compensating error and leaves the anchor error standing alone. Neither setting was ever
+  right, and the shipped 0.14 was a coincidence, not a calibration.
+- **`Dmax` is the wrong *quantity* — a stronger claim than "unreliable".** A leader is
+  film **saturation**; diffuse white is a scene object reflecting ~90% of the
+  illumination, with speculars and light sources in between, compressed by the film
+  shoulder (small density gap, large light gap). Anchoring display white to saturation is
+  a category error, independent of `film-base/dmax-anchor-reliability`'s reproducibility
+  complaint. A **better use for the leader, not yet investigated**: a development-
+  variation signal, which is what a fully-exposed reference actually measures. Blocked on
+  explaining why two rolls of one stock sit 0.295 apart while their bases agree to 0.0005.
+- **Contrast is not a scene measurement, and must not become one.** The chain is
+  `scene log-exposure → (× film gamma) → density → (× contrast) → output`, so
+  `contrast = target_system_gamma / film_gamma`. Both terms are constants: C-41 is
+  processed to a film gamma of ≈0.6, and target system gamma is rendering intent
+  (≈1.1–1.25 for a self-luminous display in a dim surround). `1.2 / 0.6 = 2.00`.
+  Equivalently from the datasheet, candidate 8's rule `0.745/Δ` — where `0.745 =
+  log10(1/0.18)` — gives **2.07** at the professional-stock `Δ` of 0.36. Two independent
+  routes within 3%. **The number is well supported; the decomposition is not** — the two
+  disagree on how much is film gamma versus target gamma, which will matter when the
+  value is tuned.
+- **Content-measured contrast is ruled out, on the user's own argument:** a frame of a
+  grey object has no range, and no contrast should invent one. Same failure mode the log
+  already recorded for content-driven *anchoring* (candidates 4/7 forcing P2 fog and P4
+  sign too bright). Measured frame/roll range is a diagnostic, never the default.
+- **The rejected axis is content-measured versus reference-derived, not black versus
+  mid.** Candidate 8 is a *mid* pin and scored best of every shippable form (0.78 EV,
+  27/255) because it anchors at `Dmin + a datasheet offset` — content-free, and
+  Dmin-referenced exactly as the black pin is. The special-case "we do know what white
+  is" modes (snow, and similar) belong to `algo/content-aware-sigmoid-toe`, which already
+  exists for explicit opt-in modes; no new task needed.
+- **Decisions for this task.** Black pin at `Dmin`; contrast hard-coded at **2.0**;
+  per-stock `Δ` deferred to `algo/film-stock-profiles`, which already tabulates it
+  (0.36 Ektar/Portra, 0.40 Gold) and needs no data-model change to serve as the contrast
+  source.
+- **The mechanism is byte-identical under defaults, and that is the point.**
+  `NOMINAL_DMAX = 1.3` with `DmaxSource::Fixed` is the default, so
+  `10^(2.0·(D′ − 1.3))` and `0.00251 · 10^(2.0·D′)` are the same curve. Shipping it
+  therefore needs **no `pipeline_version` bump** and leaves the goldens green. The
+  deliverable is **`Dmax`-independence, not a better picture**: today the floor is
+  `10^(−contrast·Dmax)` and moves with the anchor — 1.4 stops apart on the two rolls
+  measured 0.295 apart — and afterwards it does not move at all. The change is visible
+  only under `Explicit`/`Auto` Dmax or across rolls.
+- **Open, and the sharpest thing left.** Under a black pin at contrast 2.0 diffuse white
+  renders at **0.144 (106/255)**, so the render stage would have to supply a **2.79-stop
+  gain** before its toe does anything. The user's objection: that gain is *fixing*
+  reconstruction, not optimising for a display, and the render curve should only be doing
+  the latter. Two positions to settle, not yet decided:
+  **(A)** reconstruction pins the reliable end (black) and the render stage places white;
+  **(B)** reconstruction places the picture (white or mid, from `Dmin + datasheet
+  offset`) and the render stage only adapts to display limits — a toe pulling a 34/255
+  base down, which *is* display adaptation. **(B) is candidate 8**, the best-measured
+  form, and it matches the user's architectural instinct. Note both are Dmin-referenced
+  and mathematically one free parameter; the disagreement is about which stage owns it.
+- **The user has low confidence in 2.0 and it is deliberately deferred**, not settled
+  here. Related recorded constraint: `algo/sigmoid-parameter-calibration` already
+  establishes that more random frames cannot settle a contrast — it needs a bracketed
+  roll and a grey card, because per-frame exposure preference is frame optimisation.
+- 2026-08-13 (**the same defect is in the shipped sigmoid default, and the report already
+  measured it**). User's inference: if `Dmax` is not white, then pinning mid at
+  `0.5·Dmax` is wrong too. It is, and by a computable amount.
+  `MidAtDmaxFraction(0.5)` puts mid at `D′ = 0.650`; mid sits at **0.513**; the 0.137
+  density error is `0.137 × 2.0 / log10(2)` = **0.91 stops**, against candidate 3's
+  measured **0.93 EV**. So candidate 3's entire residual is the fraction. The value that
+  would be correct for these rolls is **0.395**, and it is 0.395 rather than 0.5
+  precisely because `Dmax` is the leader.
+- **The fraction is also the coupling strength to the unreliable anchor**, which is the
+  more durable point. Across the two rolls of one stock 0.295 apart: white-pin
+  (`f = 1.0`) swings **1.96 stops**, mid-pin (`f = 0.5`) **0.98**, black-pin (`f = 0`)
+  **zero**. So `f = 0` is not merely one option among three — it is the only placement
+  with no roll-to-roll term at all, which is the strongest argument yet for this task's
+  direction.
+- **`0.5` was not arbitrary and should not be read as a mistake.** The earlier entry
+  records `dA/dR = f`, i.e. it was chosen to *halve* the fallback's Dmax error relative
+  to white-pinning. It does that. It just attenuates rather than eliminates, and it
+  introduces a systematic error of its own. Both effects are in the **shipped
+  `pipeline_version` 3 default**, which is worth stating plainly: the current default
+  carries ≈0.9 stops of systematic midtone error plus ≈1.0 stop of roll-to-roll swing.
+- **Constraint that is not written down anywhere else: from the datasheet, `Δ` is usable
+  today and the mid-above-base offset is not.** Candidate 8 needs `mid aim − D-min`, and
+  the registry's `D-min` values are chart-read, not Status M — `algo/film-stock-profiles`
+  Constraint 2 requires a test asserting **no render path consumes one**. The Phase-3 log
+  already traced candidate 8's per-stock residuals (Ektar ≈ +0.6, Portra 160 ≈ 0, Gold 200
+  ≈ −1.0) to exactly that. `Δ` survives because a *difference* cancels base+fog, which is
+  why it can supply contrast now while the offset waits on spectral integration or a
+  tabulated measurement. **Candidate 8 is therefore not buildable the day
+  `film-stock-profiles` lands** — do not plan on it.
+- 2026-08-14 (**the placement vocabulary is shared across both curves; the *rule* must not
+  branch on data availability**). Considered and rejected: "datasheet present → mid-pin,
+  otherwise black-pin". Placement genuinely is curve-independent — the Phase-3 harness
+  established that every anchoring form reduces to one anchor `A` plus a contrast fed to
+  the same curve code, which is why eight candidates needed no new curve — so one
+  vocabulary for exponential and sigmoid is right. Branching the rule is not, for two
+  reasons.
+- **(a) It makes stock selection structural rather than a refinement**, which
+  `algo/film-stock-profiles` explicitly rules out ("a *refinement*, never a
+  precondition"). Naming a stock would change which end of the curve is nailed down, so
+  two frames off one roll would differ in kind, not degree.
+- **(b) The decisive one: black-pin does not escape the missing offset, it defers it.**
+  At contrast 2.0 on the exponential, black-pin at floor 0.0025 resolves `A =
+  −log10(0.0025)/2.0 = 1.301`, while mid-pin at `Dmin + 0.513` resolves `A = 0.513 +
+  0.745/2.0 = 0.886`. The **0.415** between them is exactly the diffuse-white gap, i.e.
+  the picture rendering 2.79 stops dark. So "where does diffuse white sit above the base"
+  is **unavoidable** for correct placement — the only real choice is which stage owns it,
+  which is the A-versus-B question recorded above, reached from a second direction.
+  Black-pin as a *fallback for missing data* is therefore a false economy: it yields a
+  dark picture unless something downstream supplies the same number.
+- **The fallback should be a generic offset, not a different rule.** One mechanism —
+  anchor at `Dmin + offset`, `f = 0`, no Dmax coupling — with the offset degrading:
+  per-stock datasheet (blocked, above) → generic C-41 from the clustered aims (same
+  blocker) → **empirical generic ≈0.51 measured from real rolls, available today and
+  provisional**. That third tier is no worse founded than the shipped `0.5` fraction,
+  which is not measured at all and additionally carries a roll-to-roll term.
+- **Trap on that third tier:** deriving the generic offset from the same ten frames and
+  then scoring it against them is fitting, not prediction. Already a recorded lesson here
+  ("correcting each stock by its mean residual would fit within ~0.3 EV everywhere, but
+  that is fitting … not validation"). It needs held-out frames or a grey card.
+- **Shared vocabulary does not mean shared implementation cost.** Black-pinning the
+  *exponential* is a one-scalar gain swap because the straight line makes the base's
+  rendered value a simple multiply. Black-pinning the *sigmoid* is not: its toe
+  asymptotes, so placing the base's rendered value means inverting the S-curve — the same
+  nonlinearity `algo/curve-endpoint-validation` refers to when it notes the sigmoid's
+  asymptote can sit far below its reachable base. If mid-pin becomes the universal rule,
+  the sigmoid never needs a black-pin variant at all.
+- 2026-08-18 (**mechanism shipped; no pixel change**). `AnchorPlacement` gained
+  `BlackAtBase(floor)` (`A = −log10(floor)/contrast`) and `MidAtBaseOffset(offset)`
+  (`A = offset + 0.745/contrast`), and `ExponentialParams` gained the `anchor` field.
+  Placement is now **shared by both curves** — it was always orthogonal to curve shape,
+  which is what let the 2026-08-03 harness score eight forms through one curve
+  implementation.
+- **Default deliberately left at `white-at-dmax` on the exponential**, so the whole
+  change is a no-op for every existing invocation. Verified rather than assumed: the
+  default `gain-map-hdr` render is **byte-identical** to a build of HEAD (same
+  `params_hash` `55a841428c1e6671`, same SHA-256), and the drift gate is unmoved. The
+  curve's job since v2 is being the debuggable straight line; moving its default is a
+  rendering decision with its own evidence bar, and the floor has not been chosen on
+  this curve's own measurements. No `pipeline_version` bump, and no replay hazard —
+  an archived recipe selecting `exponential` without `anchor` resolves exactly what it
+  always did.
+- **CLI is one curve-neutral family** (user decision: option A):
+  `--anchor-mid-fraction` / `--anchor-white-at-reference` / `--anchor-black-floor` /
+  `--anchor-mid-offset`, mutually exclusive at the clap layer, with
+  `--sigmoid-mid-fraction` and `--sigmoid-white-at-d-max` kept as aliases since they
+  appear in committed recipes. Validation moved out of the sigmoid arm to a shared
+  block — the bounds now apply to *both* curves, which a per-arm check would have
+  silently skipped on the exponential.
+- **Verified end to end against the binary**, not the diff: all four placements resolve
+  through `nc convert` on both curves, the emitted recipe replays **byte-identically**
+  through `--params`, and `--anchor-black-floor 0.005` at contrast 2.0 resolves
+  `anchor_value` **1.150515** — matching the 1.151 the 2026-08-03 retest recorded, which
+  is the arithmetic checking itself against an independent source.
+- **Tests pin properties, not captured bits**, for a rule introduced in the same commit:
+  the film base renders to exactly the stated floor across three floors × three slopes,
+  and `BlackAtBase` is bit-identical to `WhiteAtDmax` at the derived anchor (so the
+  straight line cannot fork). `white-at-dmax` bit-identity needed no new golden — the
+  existing `frozen_reference_*` vectors already pin it and pass untouched.
+- **One documentation error caught by computing it:** the floor's sRGB equivalent was
+  written as "0.005 ≈ 20/255" in the help text and both docs. It is **16/255**. The
+  20/255 in the candidate-5b report row is a different quantity — the darkest confirmed
+  *shadow patch*, which legitimately sits just above the base.
+- Gate: `fmt`, `clippy -D warnings`, `build`, the stdlib analysis suite (112), and
+  645 binary + 153 integration tests all green.
+- 2026-08-28 (**experiments run on ten real frames; the rendering direction this task was
+  pointing at is NOT supported, and the mechanism stays as shipped**). `../nc-assets` was
+  linked and `pipeline::shadow_metrics` extended: per-candidate curve (it hardcoded
+  sigmoid, so this task's own curve had never been through it), per-candidate
+  toe/shoulder/`black_point`, a film-base probe, and highlight metrics. Visual review
+  pages under `../temp/tier{2,3}-review/`.
+- **The harness arithmetic validates against the frozen report** — white@Dmax 2.74 EV /
+  12/255 against a recorded 2.75 / 12, black@0.005 1.79 / 19 against 1.71 / 20,
+  black@0.002 3.11 / 8 against 3.04 / 9, mid@0.5·Dmax 0.95 / 27 against 0.93 / 30. Worth
+  trusting the numbers below on that basis.
+- **The trade is three-way and every single-anchor form sits on one frontier.** Anchor
+  height trades midtone placement against black *and* against highlights, monotonically:
+  anchor 1.293 → 0.906 gives |EV| 2.75 → 0.03, base 10 → 38, and highlight separation
+  (p90→p99, code values) 122 → 19. Ten frames, nineteen configs, no exceptions. This is
+  the two-points-not-three constraint measured rather than argued.
+- **The toe does NOT pull the film base down — refuted, not merely unsupported.** Widening
+  it 0.2 → 0.4 → 0.6 moved the base **38 → 41 → 44**. A toe is a soft approach to black
+  *from above*, so it necessarily raises the floor. Any future proposal of the form
+  "reconstruction places mid, a toe recovers black" is dead on arrival.
+- **A black point does what the toe cannot.** `print.black_point = 0.019` on top of
+  mid@base+0.508 gives |EV| 0.13 with the base at **1/255** — dominating every other form
+  on both axes at once, where the best previous pairing was 0.78 EV at base 24. It costs
+  0.16 stops of midtone (the subtraction moves mid 0.1834 → 0.1644), and it lands in the
+  **display** stage, so `film-master` keeps the unclipped rendering.
+- **`GainMapMax` is controlled by the shoulder and by nothing else.** Measured on the
+  shipped container: shoulder 0.6 → **1.000x**, shoulder 0.2 → **1.000x**, shoulder 0.0 →
+  **4.866x**; the exponential (which has no shoulder) → 4.866x under `white-at-dmax` *and*
+  under `black-at-base`, i.e. **identical across completely different anchors**. So the
+  anchor is ruled out directly and the earlier 1.0x-vs-4.87x observation is explained: the
+  sigmoid's shoulder runs during *reconstruction* and removes every above-white value
+  before either display branch sees it, so SDR and HDR receive identical input and their
+  ratio is 1.0 by construction. Note 4.866x is 98.8% of the 4.926 declared headroom —
+  turning the shoulder off does not give graceful HDR, it saturates the ceiling.
+  `GainMapMax` lives in the **second MPF image's** XMP, not the baseline's; `exiftool -b
+  -GainMapImage` then read its XMP.
+- **The exponential is not competitive at any anchor — the task's own rendering premise
+  fails.** With the *same* anchor as the sigmoid (0.875) it blows **21.4%** of every frame
+  to absolute white with **zero** separation in the top decile, against 6.9% / 19 code
+  values for the sigmoid: no shoulder, so the top hard-clips wherever the anchor is put.
+  At high anchors it converges on the sigmoid (white@Dmax 122.5 code sep against the
+  sigmoid's 122.6) because the S-curve is straight up there. User verdict on renders:
+  **X1 (white@Dmax) has the best highlights in the whole set but is 2.75 EV too dark; X2
+  (black@0.005) is *dominated* by the shipped default — darker AND worse highlights.** X2
+  is candidate 5b, which had ranked "most likely GO" on shadow numbers alone; judged as a
+  whole picture it loses. The exponential's problem was never the anchor.
+- **Therefore no default moves.** `white-at-dmax` stays the exponential's default — the
+  call made when the mechanism shipped, now supported by evidence rather than caution.
+- **Three metric traps, all of which misled me, all in a committed harness.**
+  **(a)** `sat%` counts samples above a fixed 0.999, so any `black_point` shift deflates it
+  — it read 0.13% for a config whose highlights were exactly as flattened as the 6.4% one
+  it was compared against. Unusable across black points.
+  **(b)** `flat%` measured against each frame's *own* maximum, which for a config too dark
+  to reach 1.0 is a cluster in the upper midtones, not clipping.
+  **(c)** Highlight separation as a **linear ratio** (p99/p90 in stops) inverted against
+  visual review: sRGB spends more code values per stop at higher levels, so a darker config
+  scores better in stops and looks worse. Measuring the same percentiles in **code values**
+  reproduced the user's ranking. The surviving pair is `blown%` (samples ≥ 0.999 absolute)
+  and `code sep`; neither alone matches the eye, both together do.
+- **Still unmeasured:** hard clip versus soft roll-off. The exponential clips abruptly and
+  the sigmoid gradates into white; X2 and the default differ by only 1.6pp of blown pixels
+  but read further apart than that, which is likely the missing term.
+- **The shoulder is now implicated in all three findings** — inert gain maps, highlight
+  loss at low anchors, and the exponential's clipping — which is a much stronger case for
+  `algo/reconstruction-render-curve-split` than the single observation that filed it.
+- **User decision: the exponential is not retired.** It stays a supported path.
+- 2026-08-28 (**two-engine review: twelve verified findings in round 1, four
+  comment/doc items in round 2; no default moved**). Three were real behaviour:
+  - **A non-finite derived anchor escaped `validate` and rendered an all-black frame at
+    exit 0** — no clip count, no warning, which the fail-loudly rule forbids. The guard
+    tested the proxy `MID_GREY_OUTPUT_DECADES / slope`, which bounds only the mid-grey
+    rules; `black-at-base` divides `−log10(floor)`, unbounded as the floor shrinks, so
+    `--anchor-black-floor 1e-45 --density-gamma 1e-37` passed a finite proxy with a real
+    anchor of `inf`. `validate` now resolves `placement.anchor(reference, slope)` and
+    rejects a non-finite result, and `density::reconstruct` carries the same guard for
+    programmatic callers (mirroring the sigmoid's). **The lesson generalises: validate
+    the resolved value, never a stand-in for it.** The proxy was correct when written and
+    silently stopped covering the rule set it guarded when the set grew.
+  - **Ordering that guard above the slope-positivity checks regressed two diagnostics.**
+    `--sigmoid-contrast 0` and `nan` both read "too small to place the anchor" — neither
+    is small — and recommended `--anchor-white-at-reference`, which then failed on the
+    positivity rule the message had just steered the user away from. Rule: diagnose the
+    *more specific* fault first, and never offer a remedy that does not work.
+  - **`master_places_dmax` keyed on `curve.dmax()` alone**, so a stated base-derived
+    anchor and a genuinely unanchored run emitted identical `film-master` provenance,
+    and a render that never read `Dmax` claimed the roll-fixed placement. Replaced by
+    `MasterAnchor` (roll-fixed / base-derived / none), which keys on whether the
+    placement *reads* the reference rather than on whether a reference resolved.
+  Report shape: `curve.anchor` is now emitted for **both** curves — it was sigmoid-only,
+  so a consumer could not tell a roll-invariant base-derived placement from a
+  reference-pinned one — and `unpinned_curve` warns on an exponential recipe missing
+  `anchor`, since `--dump-params` writes that key now and its absence marks a foreign
+  build. Docs: design-spec §7.3/§8/§9, `using-nc.md` and `CLAUDE.md` all still carried
+  the pre-placement claim that this curve "pins white at `Dmax` with no placement rule";
+  six such statements were corrected.
+- 2026-08-28 (**HDR-headroom figures are film-base-dependent, and the first write-up did
+  not say so**). `GainMapMax` on `tests/fixtures/hdr-48bit.tif`, measured at two bases:
+  the exponential's default reads **4.866x** at `--film-base 1,1,1` but **2.620x** at
+  `0.9,0.55,0.42`, and `--d-max 1.5` reads **3.738x** versus **1.052x**. The two
+  base-derived anchors, `--d-max 2.0` and every sigmoid row are identical under both —
+  the reference-free property doing exactly what it claims. The two review engines
+  reported 2.620 and 4.866 for the same config purely because neither stated its base.
+  `using-nc.md` now names the fixture and the base and gives both columns. **A headroom
+  figure quoted without its film base is not reproducible.**
+- **The default render stayed byte-identical to the merge base across both rounds** —
+  verified by building `HEAD` in a throwaway worktree and diffing the artifact
+  (`md5 8cb9cb143c6aad615a4be90fe5925498`, `params_hash 55a841428c1e6671`), not by
+  inspection.
+- 2026-08-28 (**round 3: a curve switch silently discarded a stated `anchor`; found by a
+  third review engine after two missed it**). Both switch sites — `merge`'s
+  `--density-curve` arm and `internally_tagged_switch` for `roll`'s per-frame overrides —
+  carry `dmax` and reset every other field. That was exactly right while `dmax` was the
+  only field the two curve variants shared, and this task made `anchor` a **second** one
+  (by dropping it from the exponential's rejected-key list in the deserializer) without
+  revisiting either. A roll pinning `{"anchor":{"black-at-base":0.005}}` with a per-frame
+  override of only `{"curve":{"type":"exponential"}}` rendered that frame on
+  `white-at-dmax` — a different tonal rule from the rest of the roll — and **none of the
+  four roll-consistency warnings fired**, because `sets_curve_anchor` probes for an
+  `anchor` *key* and the override has none. Nothing in the report showed it.
+  - **Chose to keep the reset and make it loud, not to carry the anchor.** Carrying it is
+    the tempting symmetry with `dmax` and it is wrong: `dmax` is a *measured roll
+    calibration*, curve-independent by construction, while `anchor` is a *rendering rule*
+    whose right value is per-curve — the two variants have deliberately different
+    defaults. Carrying would make `--density-curve sigmoid` over an exponential recipe
+    resolve `white-at-dmax`, the placement the docs warn renders midtones 2.5–3.6 stops
+    dark, and would strip the exponential of the `white-at-dmax` straight line that is its
+    whole reason to exist. It would also break each curve's documented default. So:
+    `curve_switch_dropped_anchor` warns (roll-level, `--strict`-promotable, in the report)
+    when a switch discards a placement that was **not the base curve's own default** —
+    that last qualifier is what keeps an ordinary `--density-curve exponential` on a
+    default recipe silent, the same false-positive trap `unpinned_curve` records.
+  - Covered on **both** paths, not just `roll`: the CLI drop is equally silent on stderr,
+    and the shared helper made the second call site one line. Suppressed where the user
+    restated a placement (`--anchor-*`, or an overlay `anchor` key, which has its own
+    warning).
+  - **The durable lesson: making a field shared between two variants means revisiting
+    every site that treats "shared" as a closed set.** Both switch sites *documented* the
+    assumption in prose — "the one field the curve variants deliberately share", "`dmax`
+    is the single field the curve variants share by design … the deserializer would
+    loudly reject the union" — and those comments were the only record of it. Neither was
+    updated with the change, so the comments went from true to actively misleading, and
+    the stated justification (a union the deserializer rejects) silently stopped applying
+    to the one field it now accepts. **A comment asserting a closed set is a maintenance
+    obligation**; grep for the assumption's *wording*, not just its identifier.
+  - Also corrected here: `sigmoid.rs`'s runtime anchor guard still explained the overflow
+    as "the mid-grey placement adds 0.745/contrast", now one of three dividing rules on
+    that curve, and `reconstruction-render-curve-split.md` still said the exponential has
+    no `AnchorPlacement`.
+  - Default render still byte-identical (`md5 8cb9cb143c6aad615a4be90fe5925498`,
+    `params_hash 55a841428c1e6671`); the new behaviour is a warning, not a pixel change.
 ## negative-reconstruction-density-curves (review follow-up)
 
 **Status:** done

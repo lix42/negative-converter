@@ -133,10 +133,12 @@ pub struct ReconstructionReport {
     /// The **derived** anchor the curve used — the corrected density that rendered to
     /// `1.0`, and therefore what sets the black floor at `10^(−contrast·anchor)`.
     ///
-    /// Equal to [`Self::dmax`] for the exponential curve (no placement rule sits between
-    /// them) and for the sigmoid under `AnchorPlacement::WhiteAtDmax`; larger than it under
-    /// the default mid-grey placement, which is why reporting only the reference would
-    /// document a number the render did not use. `None` for `simple`.
+    /// Equal to [`Self::dmax`] under `AnchorPlacement::WhiteAtDmax` on **either** curve —
+    /// the placement rule is shared, so the exponential no longer implies the identity
+    /// (`algo/exponential-anchor-placement`). Every other rule derives an anchor that
+    /// differs from the reference, which is why reporting only the reference would
+    /// document a number the render did not use. `None` for `simple`, and for the
+    /// exponential's `dmax = none` under `WhiteAtDmax` (no anchor placed).
     pub curve_anchor: Option<f32>,
     /// The resolved regional-balance tone-ramp range `[lo, hi]` (corrected
     /// density), when a shadow/highlight balance was applied. `None` for

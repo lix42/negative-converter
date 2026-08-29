@@ -401,6 +401,7 @@ mod tests {
             curve: DensityCurve::Exponential(ExponentialParams {
                 gamma: 1.0,
                 dmax: DmaxSource::Explicit(2.0),
+                anchor: crate::types::AnchorPlacement::WhiteAtDmax,
             }),
         }
     }
@@ -894,6 +895,7 @@ pub(crate) mod golden {
         DensityCurve::Exponential(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(2.0),
+            anchor: AnchorPlacement::WhiteAtDmax,
         })
     }
 
@@ -902,6 +904,86 @@ pub(crate) mod golden {
         Reconstruction::Density {
             density: DensityParams::default(),
             curve: frozen_reference_curve(),
+        }
+    }
+
+    /// The defining property of `BlackAtBase`: the film base renders to exactly the
+    /// stated floor, whatever the slope.
+    ///
+    /// Asserted as a property rather than as captured bits, because captured bits for a
+    /// rule introduced in the same commit only re-describe the build. Pixel 5 of
+    /// [`pixels`] *is* the base, so its corrected density is exactly 0 and its rendered
+    /// value is the floor by construction — which is what makes this falsifiable: a sign
+    /// error in `−log10(floor)/contrast` moves it immediately.
+    #[test]
+    fn black_at_base_renders_the_film_base_to_the_stated_floor() {
+        for floor in [0.002f32, 0.005, 0.05] {
+            for gamma in [1.0f32, 2.0, 2.5] {
+                let reconstruction = Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve: DensityCurve::Exponential(ExponentialParams {
+                        gamma,
+                        dmax: DmaxSource::Fixed,
+                        anchor: AnchorPlacement::BlackAtBase(floor),
+                    }),
+                };
+                let (out, _) = reconstruct_and_print(
+                    &pixels(),
+                    &base(),
+                    &reconstruction,
+                    &PrintParams::default(),
+                )
+                .unwrap();
+                // Pixel 5 (rgb offsets 12..15) is exactly the base.
+                for c in 0..3 {
+                    let got = out.rgb[12 + c];
+                    assert!(
+                        (got - floor).abs() <= floor * 1e-5,
+                        "floor {floor} gamma {gamma} channel {c}: rendered {got}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `BlackAtBase` is not a new curve — it is the same straight line at a derived
+    /// anchor, so it must be **bit-identical** to `WhiteAtDmax` at that anchor.
+    ///
+    /// This is what keeps the exponential usable as the debuggable reference: the two
+    /// spellings cannot diverge. It also pins the anchors the 2026-08-03 candidate retest
+    /// recorded (floor 0.002 → 1.349, 0.005 → 1.151 at contrast 2.0).
+    #[test]
+    fn black_at_base_equals_white_at_dmax_at_the_derived_anchor() {
+        let gamma = 2.0f32;
+        for floor in [0.002f32, 0.005] {
+            let derived = -floor.log10() / gamma;
+            let render = |anchor| {
+                let reconstruction = Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve: DensityCurve::Exponential(ExponentialParams {
+                        gamma,
+                        dmax: if matches!(anchor, AnchorPlacement::WhiteAtDmax) {
+                            DmaxSource::Explicit(derived)
+                        } else {
+                            DmaxSource::Fixed
+                        },
+                        anchor,
+                    }),
+                };
+                let (out, _) = reconstruct_and_print(
+                    &pixels(),
+                    &base(),
+                    &reconstruction,
+                    &PrintParams::default(),
+                )
+                .unwrap();
+                out.rgb.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                render(AnchorPlacement::BlackAtBase(floor)),
+                render(AnchorPlacement::WhiteAtDmax),
+                "floor {floor} (derived anchor {derived})"
+            );
         }
     }
 
@@ -961,6 +1043,7 @@ pub(crate) mod golden {
                 curve: DensityCurve::Exponential(ExponentialParams {
                     gamma: 1.4,
                     dmax: DmaxSource::Explicit(1.8),
+                    anchor: AnchorPlacement::WhiteAtDmax,
                 }),
             },
             custom_print(),
@@ -984,6 +1067,7 @@ pub(crate) mod golden {
                 curve: DensityCurve::Exponential(ExponentialParams {
                     gamma: 1.0,
                     dmax: DmaxSource::None,
+                    anchor: AnchorPlacement::WhiteAtDmax,
                 }),
             },
             PrintParams::default(),
@@ -1007,6 +1091,7 @@ pub(crate) mod golden {
                 curve: DensityCurve::Exponential(ExponentialParams {
                     gamma: 1.0,
                     dmax: DmaxSource::Auto,
+                    anchor: AnchorPlacement::WhiteAtDmax,
                 }),
             },
             PrintParams::default(),

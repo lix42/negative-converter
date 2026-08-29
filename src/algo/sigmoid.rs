@@ -322,10 +322,10 @@ pub(super) fn apply_curve(
     if !anchor.is_finite() || anchor <= 0.0 {
         return Err(NcError::Other(format!(
             "the sigmoid anchor placement derived a non-usable anchor ({anchor}) from a \
-             valid reference density ({reference}) at contrast {contrast}: the mid-grey \
-             placement adds {}/contrast to the reference, which overflows for a very small \
-             contrast. Use a photographic contrast, or the white-at-dmax placement",
-            crate::types::MID_GREY_OUTPUT_DECADES
+             valid reference density ({reference}) at contrast {contrast}: every placement \
+             but white-at-dmax divides by the contrast, which overflows for a very small \
+             one. Use a photographic contrast, or the white-at-dmax placement, which needs \
+             no such division"
         )));
     }
     let film = super::density::apply_curve(density, move |d| {
@@ -623,7 +623,11 @@ mod tests {
             &img,
             &base,
             DensityParams::default(),
-            DensityCurve::Exponential(ExponentialParams { gamma, dmax }),
+            DensityCurve::Exponential(ExponentialParams {
+                gamma,
+                dmax,
+                anchor: AnchorPlacement::WhiteAtDmax,
+            }),
             PrintParams::default(),
         )
         .unwrap()
@@ -718,7 +722,11 @@ mod tests {
             &img,
             &base,
             density,
-            DensityCurve::Exponential(ExponentialParams { gamma, dmax }),
+            DensityCurve::Exponential(ExponentialParams {
+                gamma,
+                dmax,
+                anchor: AnchorPlacement::WhiteAtDmax,
+            }),
             PrintParams::default(),
         )
         .unwrap()

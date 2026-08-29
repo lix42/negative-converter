@@ -35,12 +35,16 @@ wide latitude. The print rendering decides whether output exceeds diffuse white.
 
 ## Open questions
 
-- **What does "modified exponential" have to change?** The plain exponential has
-  no `AnchorPlacement`, so raising contrast pivots around white — measured at 2.75
-  EV of midtone displacement for the floor fix `gamma = 2.0` buys. That is the
-  problem `algo/exponential-mid-grey-anchor` already exists for; this task may
-  subsume it, depend on it, or want something different. Settle that early rather
-  than duplicating it.
+- **What does "modified exponential" have to change?** Settled 2026-08-12: it is being
+  worked in `algo/exponential-anchor-placement` (renamed from
+  `algo/exponential-mid-grey-anchor` when the direction moved from pinning mid-grey to
+  **pinning the black end at the film base**). The exponential now carries an
+  `AnchorPlacement`, but still defaults to `white-at-dmax`, so at that default raising
+  contrast pivots around white — measured at 2.75 EV of midtone displacement for the
+  floor fix `gamma = 2.0` buys. This task takes that
+  task's outcome as its reconstruction curve rather than defining a second one; the
+  measurement it most needs back is **where mid-grey lands once both endpoints are
+  pinned**, which sizes the render curve's job.
 - **What should reconstruction still own?** The floor and the `Dmax` anchoring are
   plausible keepers even if the S-shape moves. "Everything" and "nothing" are both
   probably wrong.

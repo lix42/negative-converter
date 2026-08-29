@@ -647,6 +647,7 @@ fn datasheet_delta(roll: &str) -> f32 {
 }
 
 /// One candidate: a label, whether it could ever ship, and the resolved (anchor, contrast).
+#[derive(Clone, Copy)]
 struct Candidate {
     label: &'static str,
     /// Whether this form could be the *default*. A `false` here does not mean "rejected" —
@@ -660,8 +661,30 @@ struct Candidate {
     /// computed here.
     anchor: AnchorRule,
     contrast: f32,
+    /// Toe and shoulder knee widths. The Phase-3 candidates all used `0.2`/`0.2`; the
+    /// Tier-2 forms added for `algo/exponential-anchor-placement` vary the toe (the
+    /// question is whether a toe can pull the film base to black without moving mid or
+    /// white) and use the shipped `0.6` shoulder.
+    toe: f32,
+    shoulder: f32,
+    /// `print.black_point` — a constant subtracted by the shared display stage. Zero for
+    /// every Phase-3 form. Added because the Tier-2 run showed a **wider toe raises the
+    /// floor** (it softens the approach to black from above), so the toe cannot be what
+    /// pulls the film base down; a black-point subtraction can, and it is display
+    /// adaptation rather than a change to the film rendering.
+    black_point: f32,
+    /// `true` renders the **exponential** straight line instead of the sigmoid. Added for
+    /// `algo/exponential-anchor-placement`: the Phase-3 set was sigmoid-only, so the task's
+    /// own curve had never been through this harness. The exponential has no toe or
+    /// shoulder, so `toe`/`shoulder` are ignored for these entries.
+    exponential: bool,
+    /// `print.highlight_compress` — moves the display shoulder's knee. `shoulder_start` is
+    /// `0.5 + 0.25/(1+hc)`, so hc=0 puts it at 0.75 (latest, least compression) and large
+    /// hc drives it toward 0.5 (earliest, most room for over-range content).
+    hc: f32,
 }
 
+#[derive(Clone, Copy)]
 enum AnchorRule {
     Explicit(f32),
     Auto,
@@ -692,50 +715,287 @@ fn candidates(roll: &str, roll_dmax: f32) -> Vec<Candidate> {
             default_eligible: true,
             anchor: AnchorRule::Explicit(roll_dmax),
             contrast: 1.0,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "2  white@Dmax, c=2.0",
             default_eligible: true,
             anchor: AnchorRule::Explicit(roll_dmax),
             contrast: 2.0,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "3  mid@0.5*Dmax, c=2.0",
             default_eligible: true,
             anchor: mid(0.5 * roll_dmax, 2.0),
             contrast: 2.0,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "4  auto (content-driven), c=2.0",
             default_eligible: false,
             anchor: AnchorRule::Auto,
             contrast: 2.0,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "5a black@0.002, c=2.0",
             default_eligible: true,
             anchor: black(0.002, 2.0),
             contrast: 2.0,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "5b black@0.005, c=2.0",
             default_eligible: true,
             anchor: black(0.005, 2.0),
             contrast: 2.0,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "7  auto (content-driven), c=0.745/D",
             default_eligible: false,
             anchor: AnchorRule::Auto,
             contrast: ds_c,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
         },
         Candidate {
             label: "8  mid@Dmin+datasheet, c=0.745/D",
             default_eligible: true,
             anchor: mid(datasheet_mid_above_base(roll), ds_c),
             contrast: ds_c,
+            toe: 0.2,
+            shoulder: 0.2,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
+        },
+        // ---- Tier 2, `algo/exponential-anchor-placement` (2026-08-27) ----
+        // These use the **shipped** shoulder (0.6), unlike the Phase-3 set above, because
+        // the question is no longer "which anchoring form" but "can a toe close the black
+        // gap a correctly-placed mid leaves behind". `D` is the shipped default for
+        // reference; `M` varies the toe; `F` tests the corrected mid fraction.
+        Candidate {
+            label: "D  SHIPPED: mid@0.5*Dmax, c=2.069, toe .2",
+            default_eligible: true,
+            anchor: mid(0.5 * roll_dmax, crate::types::REFERENCE_CONTRAST),
+            contrast: crate::types::REFERENCE_CONTRAST,
+            toe: 0.2,
+            shoulder: 0.6,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "F  mid@0.393*Dmax, c=2.069, toe .2",
+            default_eligible: true,
+            anchor: mid(0.393 * roll_dmax, crate::types::REFERENCE_CONTRAST),
+            contrast: crate::types::REFERENCE_CONTRAST,
+            toe: 0.2,
+            shoulder: 0.6,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "M1 mid@base+0.508, c=2.03, toe .2",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.2,
+            shoulder: 0.6,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "M2 mid@base+0.508, c=2.03, toe .4",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.4,
+            shoulder: 0.6,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "M3 mid@base+0.508, c=2.03, toe .6",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.6,
+            shoulder: 0.6,
+            black_point: 0.0,
+            exponential: false,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "B1 mid@base+0.508, toe .2, blackpt .019",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.2,
+            shoulder: 0.6,
+            black_point: 0.019,
+            exponential: false,
+            hc: 0.0,
+        },
+        // ---- the exponential, this task's own curve. No toe or shoulder exists on it,
+        // so highlights are not compressed — they run past 1.0 and the SDR renderer
+        // refuses them, which is itself a result worth seeing.
+        Candidate {
+            label: "X1 EXPO white@Dmax, g=2.0",
+            default_eligible: true,
+            anchor: AnchorRule::Explicit(roll_dmax),
+            contrast: 2.0,
+            toe: 0.0,
+            shoulder: 0.0,
+            black_point: 0.0,
+            exponential: true,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "X2 EXPO black@0.005, g=2.0",
+            default_eligible: true,
+            anchor: black(0.005, 2.0),
+            contrast: 2.0,
+            toe: 0.0,
+            shoulder: 0.0,
+            black_point: 0.0,
+            exponential: true,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "X3 EXPO mid@base+0.508, g=2.03",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.0,
+            shoulder: 0.0,
+            black_point: 0.0,
+            exponential: true,
+            hc: 0.0,
+        },
+        Candidate {
+            label: "X4 EXPO mid@base+0.508 + blackpt .019",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.0,
+            shoulder: 0.0,
+            black_point: 0.019,
+            exponential: true,
+            hc: 0.0,
+        },
+        // Does moving the *display* shoulder's knee rescue a shoulder-less reconstruction?
+        Candidate {
+            label: "Y1 EXPO mid@base+0.508, hc=1 (knee .625)",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.0,
+            shoulder: 0.0,
+            black_point: 0.0,
+            exponential: true,
+            hc: 1.0,
+        },
+        Candidate {
+            label: "Y2 EXPO mid@base+0.508, hc=4 (knee .55)",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.0,
+            shoulder: 0.0,
+            black_point: 0.0,
+            exponential: true,
+            hc: 4.0,
+        },
+        Candidate {
+            label: "Y3 SIGMOID default + hc=1",
+            default_eligible: true,
+            anchor: mid(0.5 * roll_dmax, crate::types::REFERENCE_CONTRAST),
+            contrast: crate::types::REFERENCE_CONTRAST,
+            toe: 0.2,
+            shoulder: 0.6,
+            black_point: 0.0,
+            exponential: false,
+            hc: 1.0,
+        },
+        Candidate {
+            label: "B2 mid@base+0.508, toe 0, blackpt .019",
+            default_eligible: true,
+            anchor: mid(0.508, 2.03),
+            contrast: 2.03,
+            toe: 0.0,
+            shoulder: 0.6,
+            black_point: 0.019,
+            exponential: false,
+            hc: 0.0,
         },
     ]
+}
+
+/// Median of a sample vector, for the summary table.
+fn med3(v: &[f32]) -> f32 {
+    let mut t = v.to_vec();
+    t.sort_by(f32::total_cmp);
+    pct(&t, 0.5)
+}
+
+/// Build the tagged curve for a candidate at a resolved contrast.
+///
+/// The harness computes each candidate's anchor itself, so the value it passes is taken
+/// literally (`WhiteAtDmax` over an explicit reference) rather than re-derived by a
+/// placement rule — otherwise every measurement in the report would shift.
+fn curve_for(cand: &Candidate, contrast: f32) -> DensityCurve {
+    let dmax = match cand.anchor {
+        AnchorRule::Explicit(a) => DmaxSource::Explicit(a),
+        AnchorRule::Auto => DmaxSource::Auto,
+    };
+    if cand.exponential {
+        DensityCurve::Exponential(crate::types::ExponentialParams {
+            gamma: contrast,
+            dmax,
+            anchor: crate::types::AnchorPlacement::WhiteAtDmax,
+        })
+    } else {
+        DensityCurve::Sigmoid(SigmoidParams {
+            contrast,
+            toe: cand.toe,
+            shoulder: cand.shoulder,
+            dmax,
+            anchor: crate::types::AnchorPlacement::WhiteAtDmax,
+        })
+    }
 }
 
 /// Luminance of a rendered-linear Display P3 pixel, using the **pinned** luma vector.
@@ -784,6 +1044,36 @@ struct Gate {
     mids: Vec<f32>,
     shadows: Vec<f32>,
     sats: Vec<f32>,
+    /// Where the **film base itself** renders, as an 8-bit code. The shadow patch is only
+    /// a proxy for "reaches black" — it is the darkest *confirmed content*, which on some
+    /// frames sits well above the base. `D′ = 0` is the true floor the curve produces, and
+    /// it is what decides whether a toe is doing its job.
+    bases: Vec<f32>,
+    /// **Shift-invariant** highlight separation: `p99.9 − p99` of rendered luma, in stops.
+    ///
+    /// `sats` cannot compare configs that differ in `print.black_point` — it counts samples
+    /// above a fixed 0.999, so any downward shift deflates it even when separation is
+    /// untouched. A ratio between two high percentiles cancels a uniform gain or offset,
+    /// so it measures what the shoulder actually did to highlight detail. Larger = more
+    /// separation surviving.
+    hisep: Vec<f32>,
+    /// Share of samples merged onto the frame's own maximum luma — highlight detail the
+    /// shoulder destroyed. Unlike `sats` this survives a black-point shift.
+    flat: Vec<f32>,
+    /// Share of samples at or above 0.999 **absolute** — highlights blown to white.
+    blown: Vec<f32>,
+    /// p90 -> p99 separation in 8-bit **code** values rather than linear stops.
+    csep: Vec<f32>,
+    /// HDR: share of samples that exceed reference white, i.e. that actually use the
+    /// headroom. Zero means the HDR rendition is the SDR one and a gain map is inert.
+    hdr_above: Vec<f32>,
+    /// HDR: the frame's peak, in multiples of reference white. The ceiling is 1000/203
+    /// = 4.926; a value pinned there means content is slammed against the top rather
+    /// than separated below it.
+    hdr_peak: Vec<f32>,
+    /// HDR: separation *within* the above-white content, p99.9/p99 in stops. This is the
+    /// question "do the speculars survive as detail, or as one flat blob".
+    hdr_sep: Vec<f32>,
 }
 
 /// Phase 3: for each fixture frame and candidate, report the qualitative gates.
@@ -857,8 +1147,8 @@ fn measure_candidates() {
             rect("white").is_some()
         );
         println!(
-            "    {:<42}{:>10}{:>12}{:>11}{:>10}{:>9}",
-            "candidate", "anchor", "contrast", "mid->0.18", "shadow", "sat%"
+            "    {:<42}{:>10}{:>12}{:>11}{:>10}{:>8}{:>9}",
+            "candidate", "anchor", "contrast", "mid->0.18", "shadow", "base", "sat%"
         );
 
         for cand in candidates(roll, dmax) {
@@ -872,33 +1162,41 @@ fn measure_candidates() {
             let contrast = cand.contrast;
             let recon = Reconstruction::Density {
                 density: DensityParams::default(),
-                curve: DensityCurve::Sigmoid(SigmoidParams {
-                    contrast,
-                    toe: 0.2,
-                    shoulder: 0.2,
-                    dmax: match cand.anchor {
-                        AnchorRule::Explicit(a) => DmaxSource::Explicit(a),
-                        AnchorRule::Auto => DmaxSource::Auto,
-                    },
-                    // The harness computes each candidate's anchor itself, so the value it
-                    // passes must be taken literally rather than re-derived by a placement
-                    // rule — otherwise every measurement in the report would shift.
-                    anchor: crate::types::AnchorPlacement::WhiteAtDmax,
-                }),
+                curve: curve_for(&cand, contrast),
             };
-            let print = PrintParams::default();
+            let print = PrintParams {
+                black_point: cand.black_point,
+                highlight_compress: cand.hc,
+                ..PrintParams::default()
+            };
             let (film, report) = crate::algo::reconstruct(&image, &base, &recon).unwrap();
             // For `Auto` the anchor is measured inside `reconstruct`; read it back so the
             // printed value is the one actually used rather than a guess.
             let anchor = report.dmax.unwrap_or(f32::NAN);
             let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
             let shared = crate::pipeline::render_split::display_source(aces, &print).unwrap();
-            let sdr = crate::pipeline::sdr::render(
+            let sdr = match crate::pipeline::sdr::render(
                 &shared,
                 crate::pipeline::sdr::SdrGamut::DisplayP3,
-                0.0,
-            )
-            .unwrap();
+                cand.hc,
+            ) {
+                Ok(v) => v,
+                // `sdr::render` errors on any sample outside [0, 1]. A shoulder-less curve
+                // can legitimately produce them, so report rather than panic — "this form
+                // cannot reach the SDR renderer at all" is a finding, not a harness bug.
+                Err(e) => {
+                    println!(
+                        "    {:<42}{:>10.4}{:>12.3}   SDR REFUSED: {e}",
+                        cand.label,
+                        match cand.anchor {
+                            AnchorRule::Explicit(a) => a,
+                            AnchorRule::Auto => f32::NAN,
+                        },
+                        contrast
+                    );
+                    continue;
+                }
+            };
             let img = sdr.image();
 
             // Saturation, not clipping — see this test's doc comment for why a clip count
@@ -907,6 +1205,95 @@ fn measure_candidates() {
             // even though it is still in range.
             let saturated = img.rgb.iter().filter(|v| **v >= SATURATED_AT).count();
             let sat_pct = 100.0 * saturated as f32 / img.rgb.len() as f32;
+
+            // Highlight separation, shift-invariant (see `Gate::hisep`).
+            let hi_sep = {
+                let mut lum: Vec<f32> = (0..img.rgb.len() / 3)
+                    .map(|i| p3_luma(&img.rgb[i * 3..i * 3 + 3]))
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .collect();
+                lum.sort_by(f32::total_cmp);
+                // p90 -> p99, not p99 -> p99.9: with 6-9% of samples flattened against
+                // white, both of the higher percentiles land *inside* the flat region and
+                // the ratio is identically 1.0, which measures nothing.
+                let (a, b) = (pct(&lum, 0.90), pct(&lum, 0.99));
+                let sep = if a > 0.0 { (b / a).log2() } else { f32::NAN };
+                // Share of samples merged onto the frame's own maximum. Immune to the
+                // fixed 0.999 threshold that made `sat%` unusable across black points:
+                // if the shoulder collapsed highlights onto one value they stay merged
+                // however far the black point later shifts them.
+                let mx = *lum.last().unwrap_or(&0.0);
+                let flat = lum.iter().filter(|v| (mx - **v) <= 1e-4 * mx).count();
+                // Blown to **absolute** white. `flat` above is relative to the frame's own
+                // maximum, which for a config dark enough never to reach 1.0 measures a
+                // cluster somewhere in the upper midtones instead of clipping — the reason
+                // it disagreed with visual review. This one is what "lost the highlight"
+                // actually means.
+                let blown = lum.iter().filter(|v| **v >= 0.999).count();
+                // Separation in **code** space, not linear stops. sRGB's slope in
+                // code-per-log-luminance rises with level, so an equal linear ratio is
+                // worth fewer visible code values when the highlights sit lower — which is
+                // why a darker config can score better in stops and look worse.
+                let csep =
+                    srgb_encode(pct(&lum, 0.99)) * 255.0 - srgb_encode(pct(&lum, 0.90)) * 255.0;
+                (
+                    sep,
+                    100.0 * flat as f32 / lum.len() as f32,
+                    100.0 * blown as f32 / lum.len() as f32,
+                    csep,
+                )
+            };
+
+            // Where does the film base land? Push a 1x1 image whose sample *is* the base
+            // (so `D′ = 0` exactly) through the identical chain. Measured rather than
+            // derived, because the chain is not a closed form — the working-space map and
+            // the SDR renderer both sit between the curve and the code value.
+            let base_level = {
+                let probe = LinearImage::new(1, 1, vec![base.r, base.g, base.b], None).unwrap();
+                // Pin the anchor the *frame* resolved. A one-pixel image sitting exactly on
+                // the base has `D′ = 0` everywhere, so a content-driven `DmaxSource::Auto`
+                // would re-measure it as 0 and the sigmoid would rightly refuse to run.
+                let mut pinned = cand;
+                pinned.anchor = AnchorRule::Explicit(anchor);
+                let probe_recon = Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve: curve_for(&pinned, contrast),
+                };
+                let (bf, _) = crate::algo::reconstruct(&probe, &base, &probe_recon).unwrap();
+                let ba = crate::pipeline::working_space::map_nc_film_rgb_v1(bf);
+                let bs = crate::pipeline::render_split::display_source(ba, &print).unwrap();
+                let br = crate::pipeline::sdr::render(
+                    &bs,
+                    crate::pipeline::sdr::SdrGamut::DisplayP3,
+                    cand.hc,
+                )
+                .unwrap();
+                srgb_encode(p3_luma(&br.image().rgb[0..3])) * 255.0
+            };
+
+            // The HDR half. Every metric above is SDR, but "speculars live in the
+            // headroom" is a claim about *this* rendition — so measure it directly.
+            let hdr_stats = crate::pipeline::hdr::render_linear(&shared, cand.hc)
+                .ok()
+                .map(|hdr| {
+                    let him = hdr.image();
+                    let mut hl: Vec<f32> = (0..him.rgb.len() / 3)
+                        .map(|i| {
+                            use crate::pipeline::colorimetry::pinned::BT2020_LUMA as L;
+                            let p = &him.rgb[i * 3..i * 3 + 3];
+                            L[0] * p[0] + L[1] * p[1] + L[2] * p[2]
+                        })
+                        .filter(|v| v.is_finite())
+                        .collect();
+                    hl.sort_by(f32::total_cmp);
+                    let above = hl.iter().filter(|v| **v > 1.0).count();
+                    let (a, b) = (pct(&hl, 0.990), pct(&hl, 0.9999));
+                    (
+                        100.0 * above as f32 / hl.len() as f32,
+                        *hl.last().unwrap_or(&0.0),
+                        if a > 0.0 { (b / a).log2() } else { 0.0 },
+                    )
+                });
 
             let mid_s = rect("mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
             let sh_s = rect("shadow").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
@@ -920,9 +1307,21 @@ fn measure_candidates() {
             }
             // Whole-frame, so it needs no valid patch — recorded for every frame.
             e.sats.push(sat_pct);
+            e.bases.push(base_level);
+            if hi_sep.0.is_finite() {
+                e.hisep.push(hi_sep.0);
+            }
+            e.flat.push(hi_sep.1);
+            e.blown.push(hi_sep.2);
+            e.csep.push(hi_sep.3);
+            if let Some((above, peak, sep)) = hdr_stats {
+                e.hdr_above.push(above);
+                e.hdr_peak.push(peak);
+                e.hdr_sep.push(sep);
+            }
 
             println!(
-                "    {:<42}{:>10.4}{:>12.3}{:>11}{:>10}{:>9.2}",
+                "    {:<42}{:>10.4}{:>12.3}{:>11}{:>10}{:>8}{:>9.2}",
                 cand.label,
                 anchor,
                 contrast,
@@ -931,6 +1330,7 @@ fn measure_candidates() {
                     .unwrap_or_else(|| "-".into()),
                 sh_s.map(|s| format!("{:.0}/255", srgb_encode(s) * 255.0))
                     .unwrap_or_else(|| "-".into()),
+                format!("{base_level:.0}"),
                 sat_pct
             );
         }
@@ -938,15 +1338,36 @@ fn measure_candidates() {
 
     println!("\n\n=== GATES ACROSS FRAMES (mid target 0.18; shadow wants a low code value) ===");
     println!(
-        "{:<42}{:>9}{:>9}{:>11}{:>12}{:>11}{:>9}",
-        "candidate", "mid med", "mid sd", "|EV| to .18", "shadow med", "shadow max", "sat med"
+        "{:<42}{:>11}{:>12}{:>10}{:>9}{:>11}{:>9}{:>10}{:>9}",
+        "candidate",
+        "|EV| to .18",
+        "shadow med",
+        "BASE med",
+        "blown%",
+        "code sep",
+        "HDR>1%",
+        "HDR peak",
+        "HDR sep"
     );
     for (
         label,
         Gate {
             mids,
             shadows,
-            sats,
+            bases,
+            blown,
+            csep,
+            hdr_above,
+            hdr_peak,
+            hdr_sep,
+            // Recorded per candidate but not columns of this table: `sats` and `flat`
+            // both shift with `print.black_point`, so they cannot compare candidates
+            // that differ in it, and `hisep` was superseded by the shift-invariant
+            // `csep`. Kept in `Gate` because the per-frame table still prints `sat%`
+            // and a rerun should not have to re-measure to bring a column back.
+            sats: _,
+            flat: _,
+            hisep: _,
         },
     ) in &agg
     {
@@ -956,33 +1377,271 @@ fn measure_candidates() {
         let mut m = mids.clone();
         m.sort_by(f32::total_cmp);
         let med = pct(&m, 0.5);
-        let mean = mids.iter().sum::<f32>() / mids.len() as f32;
-        let sd = (mids.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / mids.len() as f32).sqrt();
         let ev = (0.18f32 / med).log2().abs();
         let mut s = shadows.clone();
         s.sort_by(f32::total_cmp);
         println!(
-            "{:<42}{:>9.4}{:>9.4}{:>11.2}{:>12.0}{:>11.0}{:>8.2}%",
+            "{:<42}{:>11.2}{:>12.0}{:>10.0}{:>8.2}%{:>11.3}{:>8.2}%{:>10.3}{:>9.3}",
             label,
-            med,
-            sd,
             ev,
             pct(&s, 0.5),
-            s.last().copied().unwrap_or(f32::NAN),
             {
-                let mut t = sats.clone();
+                let mut b = bases.clone();
+                b.sort_by(f32::total_cmp);
+                pct(&b, 0.5)
+            },
+            {
+                let mut t = blown.clone();
                 t.sort_by(f32::total_cmp);
                 pct(&t, 0.5)
-            }
+            },
+            {
+                let mut h = csep.clone();
+                h.sort_by(f32::total_cmp);
+                pct(&h, 0.5)
+            },
+            med3(hdr_above),
+            med3(hdr_peak),
+            med3(hdr_sep)
         );
     }
-    println!("\nRead: 'mid sd' is the between-frame spread a FIXED anchor leaves — lower is more");
     println!(
-        "reference-driven. '|EV| to .18' is the residual fixed offset the default would need."
+        "\n'BASE med' is where the film base itself renders (D' = 0), the true floor — the\n\
+         shadow columns are the darkest *confirmed content*, which can sit well above it."
     );
     println!(
-        "'sat med' is the median share of rendered samples at or above {SATURATED_AT} — \
-         highlight\nseparation the shoulder has compressed against display white. It is NOT \
-         a clip count; see the doc comment."
+        "\nRead: '|EV| to .18' is the residual fixed offset the default would need — lower is\n\
+         more reference-driven."
     );
+    println!(
+        "The per-frame 'sat%' column above is the share of rendered samples at or above \
+         {SATURATED_AT}\n— highlight separation the shoulder has compressed against display \
+         white. It is NOT a clip\ncount; see the doc comment."
+    );
+}
+
+/// Tone-mapping shape probe for `algo/reconstruction-render-curve-split`.
+///
+/// The display renderers compress with a **fixed-ceiling Hermite knee**, which cannot
+/// hold content that overshoots by orders of magnitude: measured 2026-08-28, an
+/// unbounded exponential reconstruction put 20.8% of the frame above reference white and
+/// every one of those samples landed on the ceiling with *zero* separation, on both the
+/// SDR and the HDR rendition. Moving the knee did not help (21.38% -> 21.58%).
+///
+/// This probe asks the next question: can a tone-mapping **operator** hold that content?
+/// It composes candidate operators into the reconstruction curve rather than editing the
+/// shipped renderers — mathematically the same shape question, and it keeps the
+/// experiment out of the product. Where such an operator should eventually live is an
+/// architecture decision this probe does not make.
+///
+/// It writes one downsampled PPM per operator to `../temp/tonemap-probe/` — a sibling
+/// of the checkout, like `../nc-assets`, so nothing lands in the repo. If that
+/// directory cannot be created the probe skips rather than failing.
+///
+/// ```text
+/// NC_TONEMAP_FRAME=P3 cargo test --release shadow_metrics::tone_map_probe \
+///   -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires ../nc-assets; run with --ignored --nocapture"]
+fn tone_map_probe() {
+    let Some(assets) = assets_root() else {
+        eprintln!("SKIP: no ../nc-assets/manifest.json");
+        return;
+    };
+    let fx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/sigmoid-baseline/fixtures.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let mk = std::env::var("NC_TONEMAP_FRAME").unwrap_or_else(|_| "P3".into());
+    let f = &fx["frames"][&mk];
+    let roll = f["roll"].as_str().unwrap();
+    let base_arr = fx["rolls"][roll]["dmin"].as_array().unwrap();
+    let base = FilmBase {
+        r: base_arr[0].as_f64().unwrap() as f32,
+        g: base_arr[1].as_f64().unwrap() as f32,
+        b: base_arr[2].as_f64().unwrap() as f32,
+    };
+    let path = assets
+        .join("rolls")
+        .join(roll)
+        .join(f["file"].as_str().unwrap());
+    let (image, _) = crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES).unwrap();
+
+    // X3's reconstruction: exponential, mid pinned 0.508 above the base, unbounded.
+    let contrast = 2.03f32;
+    let anchor = 0.508 + MID_OUTPUT_DECADES / contrast;
+    // Outside the checkout (see the doc comment). Not writable everywhere, and this is
+    // an `--ignored` probe, so a missing sibling directory is a skip, not a failure.
+    let outdir = repo_root().join("../temp/tonemap-probe");
+    if let Err(e) = std::fs::create_dir_all(&outdir) {
+        eprintln!("SKIP: cannot create {}: {e}", outdir.display());
+        return;
+    }
+
+    // Extended Reinhard: maps input `w` exactly to 1.0, slope 1 at the origin, and
+    // approaches the ceiling asymptotically instead of reaching it with zero slope.
+    let reinhard = |w: f32| move |v: f32| v * (1.0 + v / (w * w)) / (1.0 + v);
+    // Hyperbolic shoulder: identity below `t`, then asymptotic to 1.0 — see its `ops`
+    // entry below for why never reaching the ceiling is the point.
+    let hyper = |t: f32| {
+        move |v: f32| {
+            if v <= t {
+                v
+            } else {
+                let w = 1.0 - t;
+                t + w * (v - t) / ((v - t) + w)
+            }
+        }
+    };
+    // The shipped display shape, for reference: linear to `t`, then a Hermite that hits
+    // 1.0 with zero slope — the operator whose ceiling is the problem.
+    let hermite = |t: f32| {
+        move |v: f32| {
+            if v <= t {
+                v
+            } else {
+                let peak = 1.0f32;
+                let x = ((v - t) / (peak - t)).min(1.0);
+                t + (peak - t) * (x * (1.0 - x * x / 3.0) * 1.5).min(1.0)
+            }
+        }
+    };
+
+    type Op = (String, Box<dyn Fn(f32) -> f32 + Sync>);
+    let ops: Vec<Op> = vec![
+        ("none (X3 baseline)".into(), Box::new(|v: f32| v)),
+        (
+            "hermite t=0.75 (shipped shape)".into(),
+            Box::new(hermite(0.75)),
+        ),
+        ("reinhard W=2".into(), Box::new(reinhard(2.0))),
+        ("reinhard W=4".into(), Box::new(reinhard(4.0))),
+        ("reinhard W=8".into(), Box::new(reinhard(8.0))),
+        ("reinhard W=16".into(), Box::new(reinhard(16.0))),
+        ("reinhard W=64".into(), Box::new(reinhard(64.0))),
+        // Hyperbolic shoulder: identity below `t`, then asymptotic to 1.0 with the width
+        // chosen for C1 continuity (`w = 1-t`, so the slope matches at the knee). Unlike
+        // the Hermite this never reaches the ceiling, so it keeps spreading content over
+        // decades instead of flattening it after one stop; unlike Reinhard it leaves
+        // everything below the knee untouched, so midtones do not move.
+        ("hyperbolic t=0.5".into(), Box::new(hyper(0.5))),
+        ("hyperbolic t=0.7".into(), Box::new(hyper(0.7))),
+        ("hyperbolic t=0.85".into(), Box::new(hyper(0.85))),
+    ];
+
+    println!("\nframe {mk}  {roll}  {}", f["file"].as_str().unwrap());
+    println!("exponential reconstruction, contrast {contrast}, anchor {anchor:.4} (unbounded)");
+    println!(
+        "\n{:<32}{:>9}{:>10}{:>11}{:>10}",
+        "tone map", "mid", "blown%", "code sep", "peak"
+    );
+    for (label, op) in &ops {
+        let mut density = to_density(&image, &base, &DensityParams::default());
+        let _ = crate::algo::density::regional_balance(&mut density, &DensityParams::default());
+        let film =
+            crate::algo::density::apply_curve(density, |d| op(10f32.powf(contrast * (d - anchor))));
+        let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
+        let shared =
+            crate::pipeline::render_split::display_source(aces, &PrintParams::default()).unwrap();
+        let Ok(sdr) =
+            crate::pipeline::sdr::render(&shared, crate::pipeline::sdr::SdrGamut::DisplayP3, 0.0)
+        else {
+            println!("{label:<32}   SDR REFUSED (samples outside [0,1])");
+            continue;
+        };
+        let img = sdr.image();
+        let mut lum: Vec<f32> = (0..img.rgb.len() / 3)
+            .map(|i| p3_luma(&img.rgb[i * 3..i * 3 + 3]))
+            .filter(|v| v.is_finite())
+            .collect();
+        lum.sort_by(f32::total_cmp);
+        let blown = 100.0 * lum.iter().filter(|v| **v >= 0.999).count() as f32 / lum.len() as f32;
+        let csep = srgb_encode(pct(&lum, 0.99)) * 255.0 - srgb_encode(pct(&lum, 0.90)) * 255.0;
+        let mid = rect_of(f, "mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
+        println!(
+            "{label:<32}{:>9}{blown:>9.2}%{csep:>11.1}{:>10.3}",
+            mid.map(|m| format!("{m:.4}")).unwrap_or_else(|| "-".into()),
+            lum.last().copied().unwrap_or(0.0)
+        );
+        write_ppm(&outdir.join(format!("{mk}-{}.ppm", slug(label))), img, 4);
+    }
+    // Benchmark: the shipped sigmoid on this same frame, for scale. It is a different
+    // reconstruction, not a tone map, so it is printed apart from the table above.
+    {
+        let dmax = f["roll_dmax"].as_f64().unwrap() as f32;
+        let recon = Reconstruction::Density {
+            density: DensityParams::default(),
+            curve: DensityCurve::Sigmoid(SigmoidParams {
+                contrast: crate::types::REFERENCE_CONTRAST,
+                toe: 0.2,
+                shoulder: 0.6,
+                dmax: DmaxSource::Explicit(
+                    0.5 * dmax + MID_OUTPUT_DECADES / crate::types::REFERENCE_CONTRAST,
+                ),
+                anchor: crate::types::AnchorPlacement::WhiteAtDmax,
+            }),
+        };
+        let (film, _) = crate::algo::reconstruct(&image, &base, &recon).unwrap();
+        let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
+        let shared =
+            crate::pipeline::render_split::display_source(aces, &PrintParams::default()).unwrap();
+        let sdr =
+            crate::pipeline::sdr::render(&shared, crate::pipeline::sdr::SdrGamut::DisplayP3, 0.0)
+                .unwrap();
+        let img = sdr.image();
+        let mut lum: Vec<f32> = (0..img.rgb.len() / 3)
+            .map(|i| p3_luma(&img.rgb[i * 3..i * 3 + 3]))
+            .filter(|v| v.is_finite())
+            .collect();
+        lum.sort_by(f32::total_cmp);
+        let blown = 100.0 * lum.iter().filter(|v| **v >= 0.999).count() as f32 / lum.len() as f32;
+        let csep = srgb_encode(pct(&lum, 0.99)) * 255.0 - srgb_encode(pct(&lum, 0.90)) * 255.0;
+        let mid = rect_of(f, "mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
+        println!(
+            "{:<32}{:>9}{blown:>9.2}%{csep:>11.1}{:>10.3}   <- BENCHMARK (shipped sigmoid)",
+            "[sigmoid D]",
+            mid.map(|m| format!("{m:.4}")).unwrap_or_else(|| "-".into()),
+            lum.last().copied().unwrap_or(0.0)
+        );
+        write_ppm(&outdir.join(format!("{mk}-sigmoid-D.ppm")), img, 4);
+    }
+    println!("\nimages (every 4th pixel) -> {}", outdir.display());
+}
+
+fn slug(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn rect_of(f: &serde_json::Value, c: &str) -> Option<(u32, u32, u32, u32)> {
+    let p = &f["patches"][c];
+    p["valid"].as_bool().unwrap_or(false).then(|| {
+        (
+            p["x"].as_u64().unwrap() as u32,
+            p["y"].as_u64().unwrap() as u32,
+            p["w"].as_u64().unwrap() as u32,
+            p["h"].as_u64().unwrap() as u32,
+        )
+    })
+}
+
+/// Write a decimated 8-bit PPM so the probe's renders can be looked at. Presentation
+/// only — the numbers above are the measurement.
+fn write_ppm(path: &Path, img: &LinearImage, step: u32) {
+    let (w, h) = (img.width / step, img.height / step);
+    let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+    for y in 0..h {
+        for x in 0..w {
+            let i = (((y * step) as usize * img.width as usize) + (x * step) as usize) * 3;
+            for c in 0..3 {
+                out.push((srgb_encode(img.rgb[i + c].clamp(0.0, 1.0)) * 255.0).round() as u8);
+            }
+        }
+    }
+    let _ = std::fs::write(path, out);
 }

@@ -229,6 +229,8 @@ pub struct ConvertArgs {
     #[command(flatten)]
     pub sigmoid: SigmoidOverrides,
     #[command(flatten)]
+    pub anchor: AnchorOverrides,
+    #[command(flatten)]
     pub print: PrintOverrides,
     #[command(flatten)]
     pub simple: SimpleOverrides,
@@ -471,24 +473,56 @@ pub struct SigmoidOverrides {
     /// Shoulder (highlight) knee width in log10 density units; 0 disables it.
     #[arg(long)]
     pub sigmoid_shoulder: Option<f32>,
+}
+
+/// Anchor-placement overrides (design-spec §7.3/§9,
+/// `reconstruction.curve.anchor`) — **curve-neutral**, unlike the `--sigmoid-*`
+/// family above.
+///
+/// Placement is orthogonal to curve shape and both curves carry the same
+/// [`AnchorPlacement`], so one flag family serves both rather than two parallel
+/// prefixed sets. The two original spellings stay as aliases: `--sigmoid-mid-fraction`
+/// and `--sigmoid-white-at-d-max` predate the sharing and appear in recipes and docs.
+///
+/// The four are mutually exclusive — a placement is one rule, not a set of fields.
+#[derive(Args, Debug, Default)]
+pub struct AnchorOverrides {
     /// Pin mid-grey (18%) at fraction F of the reference density, letting display
-    /// white fall above it — the default anchoring rule, F 0.5. Raising F renders
-    /// the roll darker, lowering it brighter. Mutually exclusive with
-    /// `--sigmoid-white-at-d-max`.
+    /// white fall above it — the sigmoid's default rule, F 0.5. Raising F renders
+    /// the roll darker, lowering it brighter.
     #[arg(
-        long = "sigmoid-mid-fraction",
+        long = "anchor-mid-fraction",
+        alias = "sigmoid-mid-fraction",
         value_name = "F",
-        conflicts_with = "sigmoid_white_at_d_max"
+        conflicts_with_all = ["anchor_white_at_reference", "anchor_black_floor", "anchor_mid_offset"]
     )]
-    pub sigmoid_mid_fraction: Option<f32>,
-    /// Pin display white *at* the reference density instead of placing mid-grey
-    /// (the pre-2026-08 rule). Kept as an explicit diagnostic: at a photographic
-    /// contrast it renders midtones 2.5–3.6 stops dark, because steepening the
-    /// slope pivots the line about white. Sensible only when the reference is
-    /// itself a diffuse white — and measuring that off frame content is
+    pub anchor_mid_fraction: Option<f32>,
+    /// Pin display white *at* the reference density (the exponential's default and
+    /// the pre-2026-08 sigmoid rule). Kept as an explicit diagnostic: at a
+    /// photographic contrast it renders midtones 2.5–3.6 stops dark, because
+    /// steepening the slope pivots the line about white. Sensible only when the
+    /// reference is itself a diffuse white — and measuring that off frame content is
     /// per-frame exposure correction, which the default must not do.
-    #[arg(long = "sigmoid-white-at-d-max")]
-    pub sigmoid_white_at_d_max: bool,
+    #[arg(
+        long = "anchor-white-at-reference",
+        alias = "sigmoid-white-at-d-max",
+        conflicts_with_all = ["anchor_black_floor", "anchor_mid_offset"]
+    )]
+    pub anchor_white_at_reference: bool,
+    /// Pin the film base to output FLOOR, letting white fall where the slope puts
+    /// it. Reference-free, so unlike the two rules above it carries no roll-to-roll
+    /// error from the leader-measured reference. FLOOR is linear light against the
+    /// 203-nit reference white, not an sRGB code value (0.005 encodes to about 16/255).
+    #[arg(
+        long = "anchor-black-floor",
+        value_name = "FLOOR",
+        conflicts_with = "anchor_mid_offset"
+    )]
+    pub anchor_black_floor: Option<f32>,
+    /// Pin mid-grey (18%) at density D *above the film base* rather than at a
+    /// fraction of the reference. Reference-free, like `--anchor-black-floor`.
+    #[arg(long = "anchor-mid-offset", value_name = "D")]
+    pub anchor_mid_offset: Option<f32>,
 }
 
 /// Auto white-balance modes for `--auto-wb` — the CLI face of the two
@@ -756,14 +790,21 @@ pub struct CurveResult {
     /// `algo/reference-anchored-sigmoid` this is not necessarily the density that rendered
     /// to `1.0`; see `anchor` / `anchor_value`.
     pub dmax: DmaxResolution,
-    /// The sigmoid's anchor **placement rule** — which tone the reference pins
-    /// (design-spec §7.3). `null` for the exponential curve, which has no such rule.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub anchor: Option<AnchorPlacement>,
+    /// The curve's anchor **placement rule** — which tone the reference pins
+    /// (design-spec §7.3). Always emitted: both curves carry a rule since
+    /// `algo/exponential-anchor-placement`, and a base-derived placement is exactly
+    /// what a consumer cannot infer from `dmax` alone.
+    pub anchor: AnchorPlacement,
     /// The **derived** anchor: the corrected density this render mapped to `1.0`, which
-    /// sets the black floor at `10^(−contrast·anchor_value)`. Equal to `dmax.value` for the
-    /// exponential curve and for the sigmoid's `white-at-dmax` placement; larger under the
-    /// default mid-grey placement. Always emitted so the block is self-contained.
+    /// sets the black floor at `10^(−contrast·anchor_value)`. Equal to `dmax.value` under
+    /// the `white-at-dmax` placement on either curve; larger under the sigmoid's default
+    /// mid-grey placement, and independent of it under the base-derived rules.
+    ///
+    /// The key is always present, but its value is `null` for the exponential's
+    /// `dmax = none` under `white-at-dmax` — the render applies exactly `A = 0.0` there,
+    /// and reporting the reference's `None` verbatim is the shape that predates this
+    /// curve having a placement rule. Every other combination reports the derived
+    /// number.
     pub anchor_value: Option<f32>,
 }
 
@@ -857,11 +898,10 @@ fn reconstruction_result(
                     // for the default sigmoid placement the density that actually rendered
                     // to 1.0 is a *different* number. Without them a consumer has to
                     // re-derive the anchor from the echoed recipe to know what the render
-                    // did — which is what "diagnostics" is supposed to spare them.
-                    anchor: match curve {
-                        DensityCurve::Sigmoid(sig) => Some(sig.anchor),
-                        DensityCurve::Exponential(_) => None,
-                    },
+                    // did — which is what "diagnostics" is supposed to spare them. Both
+                    // curves report it: under a base-derived rule the render never read
+                    // `dmax` at all, and nothing else in the block says so.
+                    anchor: curve.anchor(),
                     anchor_value: curve_anchor,
                 },
             }
@@ -1030,9 +1070,9 @@ pub struct OutputRenderResult {
     /// The encoding the preset resolved to, as a stable identifier.
     pub encoding: &'static str,
     /// What the pixels contain. For `film-master` this states the intentional-film
-    /// content and explicitly disclaims physical scene recovery; it names the
-    /// roll-fixed `Dmax` placement only when the run actually made one (`simple` and
-    /// exponential `dmax = none` make none).
+    /// content and explicitly disclaims physical scene recovery, and names which
+    /// anchor placement the run actually made — roll-fixed `Dmax`, film-base-derived,
+    /// or none at all (see [`MasterAnchor`]).
     pub content: &'static str,
     /// The pinned working-space mapping identifier the pixels crossed
     /// (`"nc-film-rgb-v1"`), repeated inside this block so a master's provenance
@@ -1046,16 +1086,44 @@ pub struct OutputRenderResult {
     pub reconstruction_schema_version: u32,
 }
 
-/// Whether this reconstruction places a display-white anchor the master's report
-/// may claim. `simple` has no curve stage, and the exponential curve's `dmax =
-/// none` is the scene-referred unity placement — neither anchors anything.
-/// (`auto` cannot appear here: `validate_output_preset` rejects it under the
-/// preset.)
-fn master_places_dmax(reconstruction: &Reconstruction) -> bool {
-    matches!(
-        reconstruction,
-        Reconstruction::Density { curve, .. } if curve.dmax() != DmaxSource::None
-    )
+/// Which anchor placement the master's report may claim as provenance.
+///
+/// Two independent facts decide it — whether a reference (`curve.dmax`) resolved, and
+/// whether the placement rule *reads* that reference. Keying on the reference alone
+/// made two renders with different pixels — one carrying a stated roll-level
+/// base-derived anchor, one genuinely unanchored — emit the identical string, and
+/// symmetrically let a base-derived render claim a `Dmax` placement it never read.
+/// (`auto` cannot appear here: `validate_output_preset` rejects it under the preset.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MasterAnchor {
+    /// The anchor was derived from the resolved roll-fixed reference.
+    RollFixedDmax,
+    /// An anchor was placed, but from the film base — no reference was read.
+    BaseDerived,
+    /// No anchor at all: `simple` has no curve stage, and `white-at-dmax` over
+    /// `dmax = none` is the scene-referred unity placement (`A = 0` exactly).
+    NoAnchor,
+}
+
+fn master_anchor(reconstruction: &Reconstruction) -> MasterAnchor {
+    let Reconstruction::Density { curve, .. } = reconstruction else {
+        return MasterAnchor::NoAnchor;
+    };
+    let unreferenced = curve.dmax() == DmaxSource::None;
+    match curve.anchor() {
+        // Reference-free by construction, whatever `dmax` resolved to.
+        AnchorPlacement::BlackAtBase(_) | AnchorPlacement::MidAtBaseOffset(_) => {
+            MasterAnchor::BaseDerived
+        }
+        // `none` resolves the reference to 0, which leaves `white-at-dmax` placing
+        // nothing — while the mid-grey rule still places `0.745/slope` above the film
+        // base, an anchor with no `Dmax` in it.
+        AnchorPlacement::WhiteAtDmax if unreferenced => MasterAnchor::NoAnchor,
+        AnchorPlacement::MidAtDmaxFraction(_) if unreferenced => MasterAnchor::BaseDerived,
+        AnchorPlacement::WhiteAtDmax | AnchorPlacement::MidAtDmaxFraction(_) => {
+            MasterAnchor::RollFixedDmax
+        }
+    }
 }
 
 /// Build the report's `output_render` from the resolved config. Pure derivation
@@ -1070,17 +1138,26 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
             "unclamped-linear-acescg-float-tiff",
             // A `Dmax` placement is *supported*, not guaranteed: validation
             // deliberately accepts `dmax = none` for the exponential curve (the
-            // scene-referred unity placement) and `simple` has no anchor at all, so
-            // claiming one unconditionally would be a false provenance statement on
-            // exactly the runs a consumer most needs to distinguish.
-            if master_places_dmax(&cfg.reconstruction) {
-                "intentional film rendering (film, lens, development, scanner, \
-                 reconstruction, density curve, and the resolved roll-fixed Dmax \
-                 placement); not a physical scene-linear recovery"
-            } else {
-                "intentional film rendering (film, lens, development, scanner, and \
-                 reconstruction; this run placed no Dmax anchor); not a physical \
-                 scene-linear recovery"
+            // scene-referred unity placement), `simple` has no anchor at all, and a
+            // base-derived placement anchors without reading `Dmax`. Claiming one
+            // unconditionally would be a false provenance statement on exactly the runs
+            // a consumer most needs to distinguish.
+            match master_anchor(&cfg.reconstruction) {
+                MasterAnchor::RollFixedDmax => {
+                    "intentional film rendering (film, lens, development, scanner, \
+                     reconstruction, density curve, and the resolved roll-fixed Dmax \
+                     placement); not a physical scene-linear recovery"
+                }
+                MasterAnchor::BaseDerived => {
+                    "intentional film rendering (film, lens, development, scanner, \
+                     reconstruction, density curve, and a film-base-derived anchor \
+                     placement that read no Dmax); not a physical scene-linear recovery"
+                }
+                MasterAnchor::NoAnchor => {
+                    "intentional film rendering (film, lens, development, scanner, and \
+                     reconstruction; this run placed no Dmax anchor); not a physical \
+                     scene-linear recovery"
+                }
             },
         ),
         // `custom` resolves the same legacy branch and the same bytes; only the
@@ -1716,9 +1793,11 @@ enum UnpinnedCurve {
     /// The recipe omits `reconstruction.curve` entirely, so the **curve itself**
     /// floats — and it moved on 2026-08-08.
     WholeCurve,
-    /// The recipe pins the curve *type* but omits a scalar whose default moved in
-    /// `pipeline_version` 2: the exponential's `gamma` (1.0 → 2.0) or either
-    /// curve's `dmax` (nominal 2.0 → 1.3).
+    /// The recipe pins the curve *type* but leaves a value to this build's default:
+    /// the exponential's `gamma` (1.0 → 2.0 in `pipeline_version` 2), either curve's
+    /// `dmax` (nominal 2.0 → 1.3, same version), or the exponential's `anchor`, which
+    /// this build always writes and which is a rendering decision that can move
+    /// (`algo/exponential-anchor-placement`).
     ///
     /// Narrower than [`WholeCurve`](Self::WholeCurve) — the curve is the one the
     /// author chose — and easy to miss for exactly that reason: the recipe *looks*
@@ -1728,7 +1807,7 @@ enum UnpinnedCurve {
     MovedDefaults,
 }
 
-/// Whether a loaded recipe resolves to a sigmoid curve it never fully pinned — the
+/// Whether a loaded recipe resolves to a density curve it never fully pinned — the
 /// witness behind [`curve_default_warning`].
 ///
 /// Probed on the raw JSON because that is the only witness: once serde has filled
@@ -1758,8 +1837,8 @@ enum UnpinnedCurve {
 /// exchange for a one-time migration aid.
 ///
 /// Otherwise `None` only where the recipe rules the case out: `simple`
-/// reconstruction (no curve stage exists), a tagged non-sigmoid curve, or an
-/// explicit `anchor`.
+/// reconstruction (no curve stage exists), or a curve that pins every value this
+/// build would otherwise supply — including its `anchor`, on **either** curve.
 fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
     let reconstruction = v.get("reconstruction")?;
     // `simple` runs no curve stage, so no curve default can reach it. An absent
@@ -1803,8 +1882,14 @@ fn unpinned_curve(v: &serde_json::Value) -> Option<UnpinnedCurve> {
                 dmax_floats.then_some(UnpinnedCurve::MovedDefaults)
             }
         }
+        // `anchor` counts here for the same reason it does under `sigmoid`: since
+        // `algo/exponential-anchor-placement` this build writes one for the exponential
+        // too, so a recipe without it is a shape this build cannot produce. It lands in
+        // `MovedDefaults` rather than `AnchorOnly` because that variant's message is
+        // about the 2026-08-03 sigmoid placement move, which never touched this curve.
         Some("exponential") => {
-            (curve.get("gamma").is_none() || dmax_floats).then_some(UnpinnedCurve::MovedDefaults)
+            (curve.get("gamma").is_none() || dmax_floats || curve.get("anchor").is_none())
+                .then_some(UnpinnedCurve::MovedDefaults)
         }
         // An untagged or unknown curve object never parses, so it cannot reach a
         // render to be warned about.
@@ -1872,11 +1957,13 @@ fn curve_default_warning(
          `reconstruction.curve` to pin the curve, its anchor and its Dmax."
             .to_string(),
         UnpinnedCurve::MovedDefaults => "the loaded recipe pins `reconstruction.curve.type` \
-         but leaves a value to this build's default that moved on 2026-08-08 \
-         (`pipeline_version` 2): the exponential's `gamma` went 1.0 → 2.0 and the nominal \
-         `dmax` went 2.0 → 1.3. A recipe that pins only the curve type therefore looks \
-         pinned and is not — the same file renders differently than it did. Write the \
-         curve's `gamma` (exponential) and its `dmax` explicitly to pin them."
+         but leaves a value to this build's default: the exponential's `gamma` went 1.0 → \
+         2.0 and the nominal `dmax` went 2.0 → 1.3 on 2026-08-08 (`pipeline_version` 2), \
+         and the exponential later gained an `anchor` placement rule whose default \
+         (`white-at-dmax`) is behaviour-preserving today but is itself a rendering \
+         decision. A recipe that pins only the curve type therefore looks pinned and is \
+         not — the same file can render differently than it did. Write the curve's \
+         `gamma` (exponential), its `dmax` and its `anchor` explicitly to pin them."
             .to_string(),
     })
 }
@@ -1989,6 +2076,68 @@ fn sets_curve_anchor(v: &serde_json::Value) -> bool {
         .is_some()
 }
 
+/// The recipe spelling of a placement (`"white-at-dmax"`, `{"black-at-base":0.005}`) for
+/// a diagnostic message — what the user would have to write to restate it.
+fn anchor_spelling(a: AnchorPlacement) -> String {
+    serde_json::to_string(&a).unwrap_or_else(|_| format!("{a:?}"))
+}
+
+/// The warning for a **curve-type switch that discards a deliberately-chosen anchor
+/// placement**. `None` when nothing was lost.
+///
+/// Both curve variants carry `dmax` *and* `anchor` since
+/// `algo/exponential-anchor-placement`, but only `dmax` is shared in **meaning**: it is a
+/// measured roll calibration, curve-independent by construction, which is why both switch
+/// sites carry it across. `anchor` is a *rendering rule* whose right value is per-curve —
+/// the exponential defaults to `white-at-dmax` (its bit-compatible diagnostic straight
+/// line) precisely where the sigmoid has moved off it, and `white-at-dmax` on the sigmoid
+/// is a documented diagnostic that renders midtones 2.5–3.6 stops dark. Carrying it would
+/// turn each curve's documented default into the other's accident, so a switch **resets**
+/// it — and now says so rather than dropping it in silence.
+///
+/// It fires only when the base placement was **not its own curve's default**. A plain
+/// `--density-curve exponential` over a default sigmoid recipe swaps one documented
+/// default for the other and loses nothing chosen; warning there would fire on nearly
+/// every switch, which is the false-positive trap [`unpinned_curve`] records at length.
+/// Callers suppress it when the user restated a placement themselves (an `--anchor-*` flag
+/// or an overlay `anchor` key) — that is not a silent drop, and on `roll` it already has
+/// its own warning.
+fn curve_switch_dropped_anchor(before: &Reconstruction, after: &Reconstruction) -> Option<String> {
+    let (
+        Reconstruction::Density { curve: before, .. },
+        Reconstruction::Density { curve: after, .. },
+    ) = (before, after)
+    else {
+        return None;
+    };
+    if before.curve_type() == after.curve_type() {
+        return None;
+    }
+    let (dropped, now) = (before.anchor(), after.anchor());
+    let was_default = match before {
+        DensityCurve::Exponential(_) => {
+            dropped == crate::types::ExponentialParams::default().anchor
+        }
+        DensityCurve::Sigmoid(_) => dropped == crate::types::SigmoidParams::default().anchor,
+    };
+    if was_default || dropped == now {
+        return None;
+    }
+    let target = match after.curve_type() {
+        DensityCurveType::Exponential => "exponential",
+        DensityCurveType::Sigmoid => "sigmoid",
+    };
+    Some(format!(
+        "the switch to the {target} curve reset `reconstruction.curve.anchor` from {} to \
+         that curve's default {}. Unlike the roll-fixed `dmax`, the anchor placement is \
+         per-curve and is not carried across a curve switch, so this render pins a \
+         different tone than the recipe asked for. Restate it (an `--anchor-*` flag, or a \
+         `curve.anchor` key alongside the new `type`) to keep the placement.",
+        anchor_spelling(dropped),
+        anchor_spelling(now)
+    ))
+}
+
 /// Whether a recipe/override JSON object explicitly carries `output.preset` — the
 /// witness behind `roll`'s roll-consistency warning for the output policy, and behind
 /// `convert`'s suffix diagnosis ([`SuffixContext`]). A raw-JSON probe like
@@ -2013,6 +2162,7 @@ fn active_density_domain_flag(args: &ConvertArgs) -> Option<&'static str> {
     let d = &args.density;
     let s = &args.sigmoid;
     let x = &args.dmax;
+    let a = &args.anchor;
     [
         ("--density-scale", d.density_scale.is_some()),
         ("--density-offset", d.density_offset.is_some()),
@@ -2024,8 +2174,10 @@ fn active_density_domain_flag(args: &ConvertArgs) -> Option<&'static str> {
         ("--sigmoid-contrast", s.sigmoid_contrast.is_some()),
         ("--sigmoid-toe", s.sigmoid_toe.is_some()),
         ("--sigmoid-shoulder", s.sigmoid_shoulder.is_some()),
-        ("--sigmoid-mid-fraction", s.sigmoid_mid_fraction.is_some()),
-        ("--sigmoid-white-at-d-max", s.sigmoid_white_at_d_max),
+        ("--anchor-mid-fraction", a.anchor_mid_fraction.is_some()),
+        ("--anchor-white-at-reference", a.anchor_white_at_reference),
+        ("--anchor-black-floor", a.anchor_black_floor.is_some()),
+        ("--anchor-mid-offset", a.anchor_mid_offset.is_some()),
         ("--d-max", x.d_max.is_some()),
         ("--fixed-d-max", x.fixed_d_max),
         ("--auto-d-max", x.auto_d_max),
@@ -2033,6 +2185,24 @@ fn active_density_domain_flag(args: &ConvertArgs) -> Option<&'static str> {
     ]
     .into_iter()
     .find_map(|(name, present)| present.then_some(name))
+}
+
+/// Resolve the `--anchor-*` family into a placement, or `None` if no flag was given.
+///
+/// One mutually-exclusive rule (like `dmax`), so whichever flag is present replaces the
+/// resolved placement entirely rather than editing a field of it — clap enforces the
+/// exclusivity. Shared by both curve arms of [`merge`]: placement is orthogonal to curve
+/// shape, so the same flags mean the same thing under either curve.
+fn anchor_flag_placement(a: &AnchorOverrides) -> Option<AnchorPlacement> {
+    if let Some(f) = a.anchor_mid_fraction {
+        Some(AnchorPlacement::MidAtDmaxFraction(f))
+    } else if a.anchor_white_at_reference {
+        Some(AnchorPlacement::WhiteAtDmax)
+    } else if let Some(f) = a.anchor_black_floor {
+        Some(AnchorPlacement::BlackAtBase(f))
+    } else {
+        a.anchor_mid_offset.map(AnchorPlacement::MidAtBaseOffset)
+    }
 }
 
 /// Apply CLI overrides on top of a (recipe or default) config; flags win.
@@ -2070,7 +2240,9 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
     // Same-type is a no-op (keeps the recipe's curve knobs); a switch carries
     // the roll-fixed `dmax` calibration over (it is curve-independent, exactly
     // as it was algorithm-independent before) and takes the new variant's
-    // defaults for the curve-specific knobs.
+    // defaults for every other knob — `anchor` included, even though both
+    // variants carry one. `curve_switch_dropped_anchor` explains why placement is
+    // not curve-independent and warns when the reset discards a stated rule.
     if let Some(c) = args.density_curve {
         match &mut cfg.reconstruction {
             Reconstruction::Simple => {
@@ -2181,16 +2353,15 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
                 }
             }
 
-            // sigmoid flags ⇒ `reconstruction.curve.{contrast, toe, shoulder,
-            // anchor}` — sigmoid only; under exponential they are invalid, not
-            // inert.
+            // sigmoid flags ⇒ `reconstruction.curve.{contrast, toe, shoulder}` —
+            // sigmoid only; under exponential they are invalid, not inert. The
+            // `--anchor-*` family is **not** in this set: placement is shared by both
+            // curves (`AnchorPlacement`), so it is applied in both arms below.
             let sig = &args.sigmoid;
             let sigmoid_flag = [
                 ("--sigmoid-contrast", sig.sigmoid_contrast.is_some()),
                 ("--sigmoid-toe", sig.sigmoid_toe.is_some()),
                 ("--sigmoid-shoulder", sig.sigmoid_shoulder.is_some()),
-                ("--sigmoid-mid-fraction", sig.sigmoid_mid_fraction.is_some()),
-                ("--sigmoid-white-at-d-max", sig.sigmoid_white_at_d_max),
             ]
             .into_iter()
             .find_map(|(name, present)| present.then_some(name));
@@ -2205,17 +2376,14 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
                     if let Some(v) = sig.sigmoid_shoulder {
                         s.shoulder = v;
                     }
-                    // Anchor placement is one mutually-exclusive rule (like
-                    // `dmax` below), so whichever flag is given replaces the
-                    // resolved placement entirely rather than editing a field of
-                    // it. clap enforces the exclusivity.
-                    if let Some(f) = sig.sigmoid_mid_fraction {
-                        s.anchor = AnchorPlacement::MidAtDmaxFraction(f);
-                    } else if sig.sigmoid_white_at_d_max {
-                        s.anchor = AnchorPlacement::WhiteAtDmax;
+                    if let Some(p) = anchor_flag_placement(&args.anchor) {
+                        s.anchor = p;
                     }
                 }
-                DensityCurve::Exponential(_) => {
+                DensityCurve::Exponential(e) => {
+                    if let Some(p) = anchor_flag_placement(&args.anchor) {
+                        e.anchor = p;
+                    }
                     if let Some(flag) = sigmoid_flag {
                         return Err(usage(format!(
                             "{flag} configures the sigmoid curve, but the resolved \
@@ -2701,46 +2869,91 @@ pub fn validate_with_remedy(cfg: &ResolvedConfig, remedy: FilmBaseRemedy) -> Res
                         s.toe, s.shoulder
                     )));
                 }
-                // Mid-grey's placement fraction: finite and in (0, 1]. At 0 the
-                // anchor stops depending on the reference at all (mid-grey pinned
-                // at the density origin — the film base — rendering the whole
-                // frame above mid-grey); negative pushes it below the base, where
-                // no sample exists. Above 1 mid-grey sits *past* the roll's
-                // display-white reference, which is not a photographic rendering
-                // of anything. F = 1 is the legal edge: mid-grey lands on the
-                // reference and white above it.
-                if let AnchorPlacement::MidAtDmaxFraction(f) = s.anchor {
-                    finite("--sigmoid-mid-fraction", &[f])?;
-                    // The placement adds `MID_GREY_OUTPUT_DECADES / contrast` to the
-                    // reference, so a positive-but-tiny contrast overflows that quotient to
-                    // +inf and the derived anchor is non-finite — which `apply_curve` can
-                    // only report at runtime, and which a debug build turned into a panic
-                    // (exit 101) rather than a usage error. Reject the slope here, where the
-                    // message can name the flag. The bound is far below any photographic
-                    // slope (the shipped default is ≈2.07) and exists only to keep the
-                    // derivation finite.
-                    if !(crate::types::MID_GREY_OUTPUT_DECADES / s.contrast).is_finite() {
-                        return Err(usage(format!(
-                            "--sigmoid-contrast ({}) is too small to place the mid-grey \
-                             anchor: the placement adds {}/contrast to the reference \
-                             density, and that quotient overflows to a non-finite anchor. \
-                             Use a photographic slope (the default is {:.4}), or \
-                             --sigmoid-white-at-d-max, which needs no such division",
-                            s.contrast,
-                            crate::types::MID_GREY_OUTPUT_DECADES,
-                            crate::types::REFERENCE_CONTRAST
-                        )));
-                    }
-                    if f <= 0.0 || f > 1.0 {
-                        return Err(usage(format!(
-                            "--sigmoid-mid-fraction ({f}) must be in (0, 1] — it \
-                             places mid-grey at that fraction of the roll's \
-                             reference density (0.5 renders mid-grey halfway up \
-                             the roll's range; 1 puts it on the reference itself)"
-                        )));
-                    }
+            }
+        }
+
+        // Anchor placement — shared by both curves, so validated once here rather than
+        // in either arm.
+        //
+        // **Ordered after the slope checks above, deliberately.** Every rule but
+        // `white-at-reference` divides by the slope, and diagnosing that division first
+        // reported `--sigmoid-contrast 0` (and `nan`) as "too small to place the anchor"
+        // — neither is small — while steering the user to `--anchor-white-at-reference`,
+        // a remedy that then failed anyway on the positivity rule the message had just
+        // talked them out of. Slope positivity is the more specific diagnosis, so it wins.
+        let (slope, slope_flag) = match curve {
+            DensityCurve::Exponential(e) => (e.gamma, "--density-gamma"),
+            DensityCurve::Sigmoid(s) => (s.contrast, "--sigmoid-contrast"),
+        };
+        let placement = curve.anchor();
+        match placement {
+            AnchorPlacement::WhiteAtDmax => {}
+            // Finite and in (0, 1]. At 0 the anchor stops depending on the reference at
+            // all (mid-grey pinned at the density origin — the film base — rendering the
+            // whole frame above mid-grey); negative pushes it below the base, where no
+            // sample exists. Above 1 mid-grey sits *past* the roll's display-white
+            // reference, which is not a photographic rendering of anything. F = 1 is the
+            // legal edge: mid-grey lands on the reference and white above it.
+            AnchorPlacement::MidAtDmaxFraction(f) => {
+                finite("--anchor-mid-fraction", &[f])?;
+                if f <= 0.0 || f > 1.0 {
+                    return Err(usage(format!(
+                        "--anchor-mid-fraction ({f}) must be in (0, 1] — it places \
+                         mid-grey at that fraction of the roll's reference density (0.5 \
+                         renders mid-grey halfway up the roll's range; 1 puts it on the \
+                         reference itself)"
+                    )));
                 }
             }
+            // A linear output value in (0, 1). Zero or negative has no logarithm, so the
+            // anchor would be non-finite; at 1 the film base renders *at* display white
+            // and the whole frame is white. The bound is the domain of the rule, not a
+            // taste judgement — 0.5 is legal and simply very pale.
+            AnchorPlacement::BlackAtBase(floor) => {
+                finite("--anchor-black-floor", &[floor])?;
+                if floor <= 0.0 || floor >= 1.0 {
+                    return Err(usage(format!(
+                        "--anchor-black-floor ({floor}) must be in (0, 1) — it is the \
+                         linear output the film base renders to, against the reference \
+                         white (0.005 encodes to about 16/255). At 0 there is no \
+                         logarithm to take; at 1 the base renders as display white"
+                    )));
+                }
+            }
+            // A density above the base, so strictly positive: at 0 mid-grey is pinned on
+            // the base itself (the base renders as mid-grey — the whole frame above it),
+            // and negative places it below the base where no sample exists.
+            AnchorPlacement::MidAtBaseOffset(offset) => {
+                positive("--anchor-mid-offset", &[offset])?;
+            }
+        }
+        // The guard is on the **resolved** anchor, not on a proxy quotient. Each rule
+        // divides something different by the slope, and `MID_GREY_OUTPUT_DECADES /
+        // slope` bounds only one of them: `black-at-base` divides `−log10(floor)`, which
+        // is unbounded as the floor shrinks, so a floor of 1e-45 at gamma 1e-37 passed
+        // the proxy (0.745/1e-37 is finite) with a real anchor of `inf` — and rendered
+        // an all-black frame at exit 0 with no warning at all. Resolving the rule is the
+        // only check that cannot drift from what the render will do.
+        //
+        // `Auto` measures the reference per frame, so it is unknown here; `0.0` stands
+        // in. That does not weaken the check — the base-derived rules ignore the
+        // reference outright and the reference-derived ones only scale it by `f ≤ 1`, so
+        // every overflow this guard is about comes from the slope division.
+        let reference = match curve.dmax() {
+            DmaxSource::Explicit(d) => d,
+            DmaxSource::Fixed => crate::algo::density::NOMINAL_DMAX,
+            DmaxSource::Auto | DmaxSource::None => 0.0,
+        };
+        let anchor = placement.anchor(reference, slope);
+        if !anchor.is_finite() {
+            return Err(usage(format!(
+                "the resolved anchor placement is not usable: it derives a non-finite \
+                 anchor ({anchor}) at {slope_flag} {slope:e}. Every placement but \
+                 --anchor-white-at-reference divides by the slope, and that quotient \
+                 overflows f32 for a very small slope (or, under --anchor-black-floor, a \
+                 very small floor). Use a photographic slope, or \
+                 --anchor-white-at-reference, which needs no such division"
+            )));
         }
     }
 
@@ -4595,6 +4808,9 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     } else {
         RecipePreset::Unstated
     };
+    // Kept across the merge (which consumes the recipe) only to diagnose a
+    // `--density-curve` switch that discards a stated anchor placement.
+    let recipe_reconstruction = loaded.cfg.reconstruction.clone();
     let cfg = merge(loaded.cfg, &args)?;
     // The *complete* convert gate: `validate`'s resolved-config rules plus the two
     // provenance-sensitive rules that cannot live there (see `validate_convert`).
@@ -4662,6 +4878,15 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
         push_warning_buf(&mut warnings, &log, msg);
     }
     if let Some(msg) = curve_default_warning(loaded.unpinned_curve, loaded.meta_pipeline_version) {
+        push_warning_buf(&mut warnings, &log, msg);
+    }
+    // A `--density-curve` switch takes the target curve's default placement, so a
+    // recipe that pinned a non-default one loses it. Suppressed when an `--anchor-*`
+    // flag restated a placement — the resolved rule is then the user's own choice,
+    // not a silent drop.
+    if anchor_flag_placement(&args.anchor).is_none()
+        && let Some(msg) = curve_switch_dropped_anchor(&recipe_reconstruction, &cfg.reconstruction)
+    {
         push_warning_buf(&mut warnings, &log, msg);
     }
     let frame = convert_frame(
@@ -5068,9 +5293,12 @@ fn resolve_frame_output(
 ///   `gamma` under a switch to `sigmoid`) and the fail-loud deserializer would
 ///   reject the union. [`internally_tagged_switch`] replaces the object with
 ///   the overlay, carrying the base's `dmax` when the overlay doesn't set it —
-///   the one field the curve variants deliberately share (a roll-fixed anchor
-///   survives an exponential↔sigmoid switch), mirroring the CLI [`merge`],
-///   which carries `curve.dmax()` across a `--density-curve` switch.
+///   the one field the curve variants share *in meaning* (a roll-fixed reference
+///   density survives an exponential↔sigmoid switch), mirroring the CLI [`merge`],
+///   which carries `curve.dmax()` across a `--density-curve` switch. `anchor` is
+///   carried by both variants too but is deliberately **not** carried across
+///   ([`curve_switch_dropped_anchor`] explains why, and warns when the reset
+///   discards a stated placement).
 ///
 /// A malformed override is still rejected loudly by the `from_value` in
 /// [`resolve_frames`], never applied half-merged.
@@ -5117,12 +5345,17 @@ fn is_variant_switch(base: &serde_json::Value, overlay: &serde_json::Value) -> b
 /// same-variant partial override still keeps its siblings).
 ///
 /// The replacement is the overlay itself, plus the base's `dmax` when the
-/// overlay doesn't set one: `dmax` is the single field the curve variants
-/// share by design — a roll-fixed display-white anchor is curve-independent
-/// calibration, so a per-frame `{"curve":{"type":"sigmoid"}}` override keeps
-/// the roll's frozen anchor exactly as the CLI's `--density-curve` switch does
-/// ([`merge`]). Every other base field is variant-specific and must not
-/// survive (the deserializer would loudly reject the union). The
+/// overlay doesn't set one: `dmax` is the roll-fixed *reference density*, a
+/// curve-independent calibration, so a per-frame `{"curve":{"type":"sigmoid"}}`
+/// override keeps the roll's frozen reference exactly as the CLI's
+/// `--density-curve` switch does ([`merge`]).
+///
+/// **`anchor` is the other field both variants accept, and it is deliberately not
+/// carried.** Being shared in the *schema* is not being shared in *meaning*: the
+/// placement's right value is per-curve (see [`curve_switch_dropped_anchor`]), so
+/// the switch takes the target curve's default and the caller warns when that
+/// discards a stated one. Every remaining base field is variant-specific and must
+/// not survive — for those the deserializer really would reject the union. The
 /// `reconstruction`-level switch has no `dmax` key, so the carry is simply
 /// inert there (`schema_version` needs no carry — omitted input defaults to
 /// the one supported version).
@@ -5363,6 +5596,28 @@ fn resolve_frames(
                         reject_roll_unsupported(&cfg)?;
                         reject_roll_unsupported_input(&cfg)?;
                         validate_with_remedy(&cfg, FilmBaseRemedy::SharedRecipe)?;
+                        // The fifth roll-consistency break, and the only one reachable
+                        // *without* naming the key: an override that switches only
+                        // `curve.type` takes the new curve's default placement, so a
+                        // roll-level `anchor` the overlay does not restate is dropped and
+                        // `sets_curve_anchor` above — a key probe — never sees it. Same
+                        // shape as its siblings: apply, warn loudly, never reject. Skipped
+                        // when the overlay does state an `anchor`, which the warning above
+                        // already covers.
+                        if !sets_curve_anchor(&ov)
+                            && let Some(why) = curve_switch_dropped_anchor(
+                                &shared.reconstruction,
+                                &cfg.reconstruction,
+                            )
+                        {
+                            let msg = format!(
+                                "frame {}: a per-frame `params` override switches \
+                                 `reconstruction.curve.type`, and {why}",
+                                mf.input.display()
+                            );
+                            log.warn(&msg);
+                            roll_warnings.push(msg);
+                        }
                         (cfg, Some(ov), setting)
                     }
                     None => (shared.clone(), None, shared_setting),
@@ -6518,6 +6773,7 @@ mod tests {
         let recipe = exponential_cfg(ExponentialParams {
             gamma: 1.8,
             dmax: DmaxSource::Explicit(1.6),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         let cfg = merge(
             recipe.clone(),
@@ -6549,6 +6805,7 @@ mod tests {
             DensityCurve::Exponential(ExponentialParams {
                 gamma: 2.0,
                 dmax: DmaxSource::Auto,
+                anchor: AnchorPlacement::WhiteAtDmax,
             })
         );
 
@@ -6836,6 +7093,7 @@ mod tests {
         let recipe = exponential_cfg(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(2.0),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         assert_eq!(
             curve_of(&merge(recipe.clone(), &parse_convert(&[])).unwrap()).dmax(),
@@ -6939,19 +7197,75 @@ mod tests {
             AnchorPlacement::WhiteAtDmax
         );
 
-        // Both placement flags are sigmoid-only: under a resolved exponential
-        // curve they are a usage error naming the offending flag, not inert.
-        for flag in [
-            ["--sigmoid-mid-fraction", "0.6"].as_slice(),
-            ["--sigmoid-white-at-d-max"].as_slice(),
+        // Placement is **curve-neutral** since `algo/exponential-anchor-placement`:
+        // the same flags reach the exponential's `anchor` field rather than being
+        // rejected as sigmoid-only. This is the inverse of the assertion that stood
+        // here before, so it is written as an equality on the resolved placement —
+        // a "does not error" check would still pass if the flag were silently inert,
+        // which is the failure mode the four-coupled-spots rule exists to catch.
+        for (argv, want) in [
+            (
+                ["--anchor-mid-fraction", "0.6"].as_slice(),
+                AnchorPlacement::MidAtDmaxFraction(0.6),
+            ),
+            (
+                ["--anchor-white-at-reference"].as_slice(),
+                AnchorPlacement::WhiteAtDmax,
+            ),
+            (
+                ["--anchor-black-floor", "0.005"].as_slice(),
+                AnchorPlacement::BlackAtBase(0.005),
+            ),
+            (
+                ["--anchor-mid-offset", "0.5"].as_slice(),
+                AnchorPlacement::MidAtBaseOffset(0.5),
+            ),
         ] {
-            // The exponential curve is selected explicitly: it is no longer the
-            // default, so without this the flags would resolve against a sigmoid
-            // and be perfectly valid — the rejection under test would vanish.
-            let argv = [&["--density-curve", "exponential"][..], flag].concat();
-            let err = merge(base_cfg(), &parse_convert(&argv)).unwrap_err();
-            assert!(err.to_string().contains(flag[0]), "{err}");
+            let full = [&["--density-curve", "exponential"][..], argv].concat();
+            let cfg = merge(base_cfg(), &parse_convert(&full)).unwrap();
+            let DensityCurve::Exponential(e) = curve_of(&cfg) else {
+                panic!("expected exponential");
+            };
+            assert_eq!(e.anchor, want, "{argv:?}");
         }
+        // The two original spellings stay accepted as aliases: they appear in
+        // committed recipes and in the docs, and the rename must not break them.
+        for (argv, want) in [
+            (
+                ["--sigmoid-mid-fraction", "0.6"].as_slice(),
+                AnchorPlacement::MidAtDmaxFraction(0.6),
+            ),
+            (
+                ["--sigmoid-white-at-d-max"].as_slice(),
+                AnchorPlacement::WhiteAtDmax,
+            ),
+        ] {
+            let cfg = merge(base_cfg(), &parse_convert(argv)).unwrap();
+            assert_eq!(sigmoid_of(&cfg).anchor, want, "{argv:?}");
+        }
+        // A flag must beat a **recipe-supplied** placement, not just a defaulted one.
+        // The loops above start from this build's default, so a merge arm that never
+        // ran would still look right there; only a recipe that states a *different*
+        // rule can tell "the flag won" from "the default happened to match".
+        let recipe = exponential_cfg(ExponentialParams {
+            anchor: AnchorPlacement::MidAtBaseOffset(0.25),
+            ..ExponentialParams::default()
+        });
+        let cfg = merge(
+            recipe.clone(),
+            &parse_convert(&["--anchor-black-floor", "0.005"]),
+        )
+        .unwrap();
+        let DensityCurve::Exponential(e) = curve_of(&cfg) else {
+            panic!("expected exponential");
+        };
+        assert_eq!(e.anchor, AnchorPlacement::BlackAtBase(0.005));
+        // …and with no flag the recipe's own placement survives untouched.
+        let cfg = merge(recipe, &parse_convert(&[])).unwrap();
+        let DensityCurve::Exponential(e) = curve_of(&cfg) else {
+            panic!("expected exponential");
+        };
+        assert_eq!(e.anchor, AnchorPlacement::MidAtBaseOffset(0.25));
         // And they are mutually exclusive at the clap layer.
         assert!(
             Cli::try_parse_from([
@@ -7010,6 +7324,82 @@ mod tests {
         .unwrap();
     }
 
+    /// The guard is on the **resolved** anchor, not on `MID_GREY_OUTPUT_DECADES / slope`.
+    /// That proxy bounds only the mid-grey rules: `black-at-base` divides
+    /// `−log10(floor)`, which is unbounded as the floor shrinks, so a floor of 1e-45 at
+    /// gamma 1e-37 passed the proxy (`0.745/1e-37` is finite) with a real anchor of `inf`
+    /// — and rendered an all-black frame at exit 0, no clip count, no warning.
+    #[test]
+    fn validate_rejects_an_overflowing_anchor_the_slope_quotient_does_not_catch() {
+        let cfg = exponential_cfg(ExponentialParams {
+            gamma: 1e-37,
+            anchor: AnchorPlacement::BlackAtBase(1e-45),
+            ..ExponentialParams::default()
+        });
+        // The proxy the guard replaced would have accepted this: it is finite.
+        assert!((crate::types::MID_GREY_OUTPUT_DECADES / 1e-37f32).is_finite());
+        let Err(err) = validate(&cfg) else {
+            panic!("an infinite derived anchor must be rejected")
+        };
+        assert!(matches!(err, NcError::Usage(_)), "{err}");
+        assert!(err.to_string().contains("non-finite anchor"), "{err}");
+        // Falsifiable: the same tiny gamma with a floor whose logarithm the quotient can
+        // carry stays accepted — the rule bounds the overflow, not small gammas.
+        validate(&exponential_cfg(ExponentialParams {
+            gamma: 1e-2,
+            anchor: AnchorPlacement::BlackAtBase(1e-45),
+            ..ExponentialParams::default()
+        }))
+        .unwrap();
+    }
+
+    /// Slope positivity is diagnosed **before** the anchor's division by it. Ordering
+    /// the division first called `0` and `nan` "too small to place the anchor" — neither
+    /// is small — and pointed at `--anchor-white-at-reference`, a remedy that then failed
+    /// anyway on the positivity rule the message had steered the user away from.
+    #[test]
+    fn validate_diagnoses_a_non_positive_slope_before_the_anchor_division() {
+        for bad in [0.0, f32::NAN, -1.0] {
+            for (label, cfg) in [
+                (
+                    "--sigmoid-contrast",
+                    sigmoid_cfg(SigmoidParams {
+                        contrast: bad,
+                        anchor: AnchorPlacement::MidAtDmaxFraction(0.5),
+                        ..SigmoidParams::default()
+                    }),
+                ),
+                (
+                    "--density-gamma",
+                    exponential_cfg(ExponentialParams {
+                        gamma: bad,
+                        anchor: AnchorPlacement::MidAtBaseOffset(0.5),
+                        ..ExponentialParams::default()
+                    }),
+                ),
+            ] {
+                let Err(err) = validate(&cfg) else {
+                    panic!("{label} {bad} must be rejected")
+                };
+                let msg = err.to_string();
+                assert!(msg.contains(label), "{bad}: {msg}");
+                assert!(msg.contains("must be finite and > 0"), "{bad}: {msg}");
+                // Not the anchor-division diagnosis, whose remedy does not apply here.
+                assert!(!msg.contains("non-finite anchor"), "{bad}: {msg}");
+            }
+        }
+        // And the remedy the old message offered really is no remedy: white-at-reference
+        // does not rescue a zero slope, which is why positivity must be diagnosed first.
+        assert!(matches!(
+            validate(&sigmoid_cfg(SigmoidParams {
+                contrast: 0.0,
+                anchor: AnchorPlacement::WhiteAtDmax,
+                ..SigmoidParams::default()
+            })),
+            Err(NcError::Usage(_))
+        ));
+    }
+
     #[test]
     fn curve_default_warning_fires_for_every_recipe_that_leaves_the_curve_unpinned() {
         // The witness is a raw-JSON probe, so test it that way.
@@ -7041,18 +7431,24 @@ mod tests {
             probe(r#"{"reconstruction":{"curve":{"type":"exponential"}}}"#),
             Some(UnpinnedCurve::MovedDefaults)
         );
-        // Pinning both moved scalars silences it — the falsifiable half.
+        // Pinning every value this build would supply silences it — the falsifiable
+        // half. `anchor` is one of them since `algo/exponential-anchor-placement`:
+        // `--dump-params` writes it for this curve too, so a recipe without it was
+        // written by some other build.
         assert_eq!(
             probe(
-                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0,"dmax":{"explicit":2.0}}}}"#
+                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0,"dmax":{"explicit":2.0},"anchor":"white-at-dmax"}}}"#
             ),
             None
         );
-        // Either one alone still floats the other.
-        assert_eq!(
-            probe(r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0}}}"#),
-            Some(UnpinnedCurve::MovedDefaults)
-        );
+        // Any one of the three alone still floats the others.
+        for json in [
+            r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0}}}"#,
+            r#"{"reconstruction":{"curve":{"type":"exponential","gamma":1.0,"dmax":{"explicit":2.0}}}}"#,
+            r#"{"reconstruction":{"curve":{"type":"exponential","dmax":{"explicit":2.0},"anchor":"white-at-dmax"}}}"#,
+        ] {
+            assert_eq!(probe(json), Some(UnpinnedCurve::MovedDefaults), "{json}");
+        }
         // A sigmoid that pins its placement but not its dmax: the anchor rule is
         // settled, the reference density it is measured against is not.
         assert_eq!(
@@ -7073,7 +7469,7 @@ mod tests {
         );
         assert_eq!(
             probe(
-                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":2.0,"dmax":"fixed"}}}"#
+                r#"{"reconstruction":{"curve":{"type":"exponential","gamma":2.0,"dmax":"fixed","anchor":"white-at-dmax"}}}"#
             ),
             None
         );
@@ -7138,6 +7534,205 @@ mod tests {
         // that touches only non-placement keys does not.
         assert!(!probe(r#"{"reconstruction":{"curve":{"contrast":2.0}}}"#));
         assert!(!probe(r#"{"print":{"print_exposure":0.5}}"#));
+    }
+
+    /// A curve-type switch **resets** the anchor placement to the target curve's default
+    /// rather than carrying it, and says so when that discards a stated one.
+    ///
+    /// Both switch sites carry `dmax` and reset everything else. Since
+    /// `algo/exponential-anchor-placement` made `anchor` a *second* field both variants
+    /// accept, "everything else" silently includes a placement the user pinned — and on
+    /// `roll` the key-probe `sets_curve_anchor` cannot see it, because the overlay that
+    /// causes the drop names only `type`. This pins the chosen behaviour (reset, warned)
+    /// on both paths so neither can drift back to a silent drop.
+    #[test]
+    fn a_curve_switch_resets_the_anchor_and_says_so() {
+        let stated = |anchor| {
+            sigmoid_cfg(SigmoidParams {
+                anchor,
+                ..SigmoidParams::default()
+            })
+            .reconstruction
+        };
+        let exponential = |anchor| {
+            exponential_cfg(ExponentialParams {
+                anchor,
+                ..ExponentialParams::default()
+            })
+            .reconstruction
+        };
+
+        // The reported case: a stated non-default placement is dropped by the switch.
+        let msg = curve_switch_dropped_anchor(
+            &stated(AnchorPlacement::BlackAtBase(0.005)),
+            &exponential(AnchorPlacement::WhiteAtDmax),
+        )
+        .expect("dropping a stated placement must warn");
+        assert!(msg.contains("black-at-base"), "{msg}");
+        assert!(msg.contains("white-at-dmax"), "{msg}");
+        assert!(msg.contains("exponential"), "{msg}");
+
+        // …and the same in the other direction, so neither curve is the special case.
+        assert!(
+            curve_switch_dropped_anchor(
+                &exponential(AnchorPlacement::MidAtBaseOffset(0.5)),
+                &stated(AnchorPlacement::MidAtDmaxFraction(0.5)),
+            )
+            .is_some()
+        );
+
+        // Silent where nothing chosen is lost — the false-positive half, and the reason
+        // this is not a blanket "the placement changed" warning. A plain
+        // `--density-curve exponential` over a *default* sigmoid recipe swaps one
+        // documented default for the other, which is every ordinary switch.
+        assert_eq!(
+            curve_switch_dropped_anchor(
+                &stated(SigmoidParams::default().anchor),
+                &exponential(ExponentialParams::default().anchor),
+            ),
+            None
+        );
+        // Same curve type on both sides is not a switch at all.
+        assert_eq!(
+            curve_switch_dropped_anchor(
+                &stated(AnchorPlacement::BlackAtBase(0.005)),
+                &stated(AnchorPlacement::WhiteAtDmax),
+            ),
+            None
+        );
+        // A restated placement that survives the switch lost nothing.
+        assert_eq!(
+            curve_switch_dropped_anchor(
+                &stated(AnchorPlacement::BlackAtBase(0.005)),
+                &exponential(AnchorPlacement::BlackAtBase(0.005)),
+            ),
+            None
+        );
+        // `simple` has no curve stage, so there is no placement to drop.
+        assert_eq!(
+            curve_switch_dropped_anchor(
+                &Reconstruction::Simple,
+                &exponential(AnchorPlacement::WhiteAtDmax)
+            ),
+            None
+        );
+
+        // The JSON switch site really does reset it — the behaviour the warning
+        // describes. `dmax` is carried; `anchor` is not.
+        let mut base = serde_json::json!({"curve": {
+            "type": "sigmoid", "contrast": 2.0, "dmax": {"explicit": 1.3},
+            "anchor": {"black-at-base": 0.005}}});
+        merge_json(
+            &mut base,
+            &serde_json::json!({"curve": {"type": "exponential"}}),
+        );
+        assert_eq!(
+            base,
+            serde_json::json!({"curve": {"type": "exponential", "dmax": {"explicit": 1.3}}}),
+            "the switch must carry `dmax` and drop `anchor`"
+        );
+
+        // And so does the CLI switch: `--density-curve exponential` over a recipe that
+        // pinned `black-at-base` resolves the exponential's default placement.
+        let cfg = merge(
+            sigmoid_cfg(SigmoidParams {
+                anchor: AnchorPlacement::BlackAtBase(0.005),
+                ..SigmoidParams::default()
+            }),
+            &parse_convert(&["--density-curve", "exponential"]),
+        )
+        .unwrap();
+        let DensityCurve::Exponential(e) = curve_of(&cfg) else {
+            panic!("expected exponential");
+        };
+        assert_eq!(e.anchor, ExponentialParams::default().anchor);
+    }
+
+    /// Bounds for the two base-derived placements, on **both** curves — the rule is
+    /// shared, so validating it on only one would let the other through unchecked.
+    #[test]
+    fn validate_bounds_the_base_derived_placements_on_both_curves() {
+        // `BlackAtBase` is a linear output value in (0, 1): at or below 0 there is no
+        // logarithm to take, and at 1 the film base renders as display white.
+        for bad in [0.0, -0.005, 1.0, 1.5, f32::NAN, f32::INFINITY] {
+            for cfg in [
+                exponential_cfg(ExponentialParams {
+                    anchor: AnchorPlacement::BlackAtBase(bad),
+                    ..ExponentialParams::default()
+                }),
+                sigmoid_cfg(SigmoidParams {
+                    anchor: AnchorPlacement::BlackAtBase(bad),
+                    ..SigmoidParams::default()
+                }),
+            ] {
+                assert!(
+                    matches!(validate(&cfg), Err(NcError::Usage(_))),
+                    "floor {bad} should fail"
+                );
+            }
+        }
+        // `MidAtBaseOffset` is a density above the base, so strictly positive.
+        for bad in [0.0, -0.5, f32::NAN, f32::INFINITY] {
+            for cfg in [
+                exponential_cfg(ExponentialParams {
+                    anchor: AnchorPlacement::MidAtBaseOffset(bad),
+                    ..ExponentialParams::default()
+                }),
+                sigmoid_cfg(SigmoidParams {
+                    anchor: AnchorPlacement::MidAtBaseOffset(bad),
+                    ..SigmoidParams::default()
+                }),
+            ] {
+                assert!(
+                    matches!(validate(&cfg), Err(NcError::Usage(_))),
+                    "offset {bad} should fail"
+                );
+            }
+        }
+        // Representative good values pass on both curves.
+        for cfg in [
+            exponential_cfg(ExponentialParams {
+                anchor: AnchorPlacement::BlackAtBase(0.005),
+                ..ExponentialParams::default()
+            }),
+            exponential_cfg(ExponentialParams {
+                anchor: AnchorPlacement::MidAtBaseOffset(0.5),
+                ..ExponentialParams::default()
+            }),
+            sigmoid_cfg(SigmoidParams {
+                anchor: AnchorPlacement::BlackAtBase(0.005),
+                ..SigmoidParams::default()
+            }),
+            sigmoid_cfg(SigmoidParams {
+                anchor: AnchorPlacement::MidAtBaseOffset(0.5),
+                ..SigmoidParams::default()
+            }),
+        ] {
+            validate(&cfg).unwrap();
+        }
+    }
+
+    /// The mid-fraction rule now also applies to the **exponential** curve, since
+    /// placement is shared. Its bounds must hold there too.
+    #[test]
+    fn validate_bounds_mid_fraction_on_the_exponential_curve() {
+        for bad in [0.0, -0.5, 1.01, f32::NAN] {
+            assert!(
+                matches!(
+                    validate(&exponential_cfg(ExponentialParams {
+                        anchor: AnchorPlacement::MidAtDmaxFraction(bad),
+                        ..ExponentialParams::default()
+                    })),
+                    Err(NcError::Usage(_))
+                ),
+                "fraction {bad} should fail on exponential"
+            );
+        }
+        validate(&exponential_cfg(ExponentialParams {
+            anchor: AnchorPlacement::MidAtDmaxFraction(0.5),
+            ..ExponentialParams::default()
+        }))
+        .unwrap();
     }
 
     #[test]
@@ -7262,6 +7857,7 @@ mod tests {
         validate(&exponential_cfg(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::None,
+            anchor: AnchorPlacement::WhiteAtDmax,
         }))
         .unwrap();
     }
@@ -7483,6 +8079,7 @@ mod tests {
             let cfg = exponential_cfg(ExponentialParams {
                 gamma: 1.0,
                 dmax: DmaxSource::Explicit(bad),
+                anchor: AnchorPlacement::WhiteAtDmax,
             });
             assert!(
                 matches!(validate(&cfg), Err(NcError::Usage(_))),
@@ -7508,6 +8105,7 @@ mod tests {
             validate(&exponential_cfg(ExponentialParams {
                 gamma: 1.0,
                 dmax: src,
+                anchor: AnchorPlacement::WhiteAtDmax,
             }))
             .unwrap();
         }
@@ -7599,9 +8197,10 @@ mod tests {
         assert_eq!(v, serde_json::json!({"type": "simple"}));
 
         // The exponential curve, named explicitly since it is no longer the
-        // default: no placement rule exists for it, so `anchor` is omitted
-        // entirely rather than reported as a null rule; the reference *is* the
-        // anchor, so `anchor_value` mirrors it.
+        // default. It reports its placement rule like the sigmoid does — both curves
+        // carry one since `algo/exponential-anchor-placement` — and under the
+        // `white-at-dmax` default the reference *is* the anchor, so `anchor_value`
+        // mirrors `dmax.value`.
         let v = serde_json::to_value(reconstruction_result(
             &exponential_cfg(ExponentialParams::default()).reconstruction,
             Some(2.0),
@@ -7616,6 +8215,7 @@ mod tests {
                 "curve": {
                     "type": "exponential",
                     "dmax": {"policy": "fixed", "value": 2.0, "provenance": "default"},
+                    "anchor": "white-at-dmax",
                     "anchor_value": 2.0
                 }
             })
@@ -7640,6 +8240,7 @@ mod tests {
         let cfg = exponential_cfg(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::None,
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         let v = serde_json::to_value(reconstruction_result(
             &cfg.reconstruction,
@@ -7692,6 +8293,7 @@ mod tests {
         let cfg = exponential_cfg(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(1.64),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         let v = serde_json::to_value(reconstruction_result(
             &cfg.reconstruction,
@@ -8982,6 +9584,40 @@ mod tests {
             "the default fixed anchor must be claimed: {content}"
         );
 
+        // A base-derived placement is its own provenance, on both sides. Keying only on
+        // `curve.dmax` made a stated roll-level base-derived anchor read identically to
+        // a genuinely unanchored run, and symmetrically let a render that never touched
+        // `Dmax` claim the roll-fixed placement.
+        for (name, dmax) in [
+            ("base-derived, no reference", DmaxSource::None),
+            (
+                "base-derived, reference present but unread",
+                DmaxSource::Fixed,
+            ),
+        ] {
+            let base_derived = value(&ResolvedConfig {
+                reconstruction: Reconstruction::Density {
+                    density: DensityParams::default(),
+                    curve: DensityCurve::Exponential(ExponentialParams {
+                        dmax,
+                        anchor: AnchorPlacement::BlackAtBase(0.005),
+                        ..ExponentialParams::default()
+                    }),
+                },
+                ..film_master_cfg()
+            });
+            let content = base_derived["content"].as_str().unwrap();
+            assert!(
+                content.contains("film-base-derived anchor placement"),
+                "{name}: {content}"
+            );
+            assert!(!content.contains("roll-fixed Dmax"), "{name}: {content}");
+            assert!(
+                !content.contains("placed no Dmax anchor"),
+                "{name}: {content}"
+            );
+        }
+
         // legacy u16 (no longer the default, so stated explicitly): the print stage
         // runs for a density reconstruction and the working→output ICC transform
         // always runs.
@@ -9267,6 +9903,7 @@ mod tests {
         let cfg = exponential_cfg(ExponentialParams {
             gamma: 0.0,
             dmax: DmaxSource::Fixed,
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         assert!(matches!(validate(&cfg), Err(NcError::Usage(_))));
 
@@ -9603,6 +10240,7 @@ mod tests {
                 DensityCurve::Exponential(ExponentialParams {
                     gamma: 1.0,
                     dmax: DmaxSource::Explicit(2.0),
+                    anchor: AnchorPlacement::WhiteAtDmax,
                 }),
             )
         };
@@ -10132,9 +10770,10 @@ mod tests {
         // `reconstruction` object and its `curve` carry a `type` discriminator
         // beside variant-specific fields, so a per-frame type switch must
         // replace those fields (a deep merge would leave a union the fail-loud
-        // deserializer rejects) while carrying the one deliberately-shared
-        // field, the roll-fixed `dmax` — the same semantics the CLI merge gives
-        // `--density-curve`.
+        // deserializer rejects) while carrying `dmax`, the roll-fixed reference
+        // density — the same semantics the CLI merge gives `--density-curve`.
+        // `anchor` is accepted by both variants but is **not** carried; the
+        // `curve_switch_*` tests below pin that and the warning it earns.
 
         // Curve exponential → sigmoid: `gamma` dropped, `dmax` carried.
         let mut base = serde_json::json!({"reconstruction": {"curve":
@@ -10212,6 +10851,7 @@ mod tests {
         let mut shared = exponential_cfg(ExponentialParams {
             gamma: 1.8,
             dmax: DmaxSource::Explicit(1.6),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         shared.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]));
         let mut warnings = Vec::new();
@@ -10301,6 +10941,7 @@ mod tests {
         let mut shared = exponential_cfg(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(1.6),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         shared.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]));
         let mut v = serde_json::to_value(&shared).unwrap();
@@ -10566,6 +11207,7 @@ mod tests {
         let mut shared = exponential_cfg(ExponentialParams {
             gamma: 1.0,
             dmax: DmaxSource::Explicit(1.6),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         shared.film_base.source = Some(FilmBaseSource::Explicit([0.9, 0.55, 0.42]));
         let roll = RollReport {

@@ -100,8 +100,8 @@ use rayon::prelude::*;
 
 use crate::algo::{FilmRgbImage, ReconstructionReport, sigmoid};
 use crate::types::{
-    BalanceRange, DensityCurve, DensityParams, DmaxSource, FilmBase, LinearImage, NcError,
-    PrintParams, Result, WbSource,
+    AnchorPlacement, BalanceRange, DensityCurve, DensityParams, DmaxSource, FilmBase, LinearImage,
+    NcError, PrintParams, Result, WbSource,
 };
 
 /// Floor applied to the scan transmission before the `log10`, so a zero / negative
@@ -170,13 +170,39 @@ pub(super) fn reconstruct(
             // exactly `0.0`, so it reproduces the unanchored render bit-for-bit
             // (`d − 0.0 == d` for every `f32`).
             let dmax = resolve_dmax(&density.density, exp.dmax);
-            let anchor = dmax.unwrap_or(0.0);
             let gamma = exp.gamma;
+            // `WhiteAtDmax` over a `None` reference resolves `A = 0.0`, reproducing the
+            // unanchored render bit-for-bit exactly as `dmax.unwrap_or(0.0)` did before
+            // this curve had a placement rule. The base-derived placements ignore the
+            // reference, so a `None` there is not a missing input.
+            let anchor = exp.anchor.anchor(dmax.unwrap_or(0.0), gamma);
+            // Defense in depth, mirroring the sigmoid's guard. Every placement but
+            // `WhiteAtDmax` divides by the slope, so a positive-but-tiny gamma overflows
+            // the quotient to a non-finite anchor. `validate` rejects that at the CLI
+            // boundary (naming the flag), but a programmatic caller reaches here first —
+            // and `10^(gamma·(d − inf))` is `0.0` for every sample, an all-black frame
+            // that trips neither the clip nor the non-finite counter. Only finiteness is
+            // checked: `A = 0.0` is the legitimate unity placement on this curve.
+            if !anchor.is_finite() {
+                return Err(NcError::Other(format!(
+                    "the exponential anchor placement derived a non-usable anchor \
+                     ({anchor}) from reference {} at gamma {gamma}: the placement divides \
+                     by the slope, which overflows for a very small gamma. Use a \
+                     photographic gamma, or the white-at-dmax placement, which needs no \
+                     such division",
+                    dmax.unwrap_or(0.0)
+                )));
+            }
             let film = apply_curve(density, move |d| 10f32.powf(gamma * (d - anchor)));
-            // For the exponential curve the reference *is* the anchor — there is no
-            // placement rule between them — so both fields carry the same value rather
-            // than leaving the derived one null and making consumers special-case it.
-            (film, dmax, dmax)
+            // Under `WhiteAtDmax` the reference *is* the anchor, so `curve_anchor`
+            // carries the reference verbatim — including its `None` — which is what the
+            // report emitted before placement existed. Any other rule derives an anchor
+            // that differs from the reference, and the report must show the derived one.
+            let curve_anchor = match exp.anchor {
+                AnchorPlacement::WhiteAtDmax => dmax,
+                _ => Some(anchor),
+            };
+            (film, dmax, curve_anchor)
         }
         DensityCurve::Sigmoid(sig) => sigmoid::apply_curve(density, sig)?,
     };
@@ -945,7 +971,11 @@ mod tests {
 
     /// The exponential curve carrying `gamma` and a dmax source.
     fn exponential(gamma: f32, dmax: DmaxSource) -> DensityCurve {
-        DensityCurve::Exponential(ExponentialParams { gamma, dmax })
+        DensityCurve::Exponential(ExponentialParams {
+            gamma,
+            dmax,
+            anchor: AnchorPlacement::WhiteAtDmax,
+        })
     }
 
     /// The result of a full density-path conversion (reconstruct + legacy print).

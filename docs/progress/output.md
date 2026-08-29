@@ -2663,3 +2663,62 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   `output.hdr`; `run()`'s doc claimed `convert`/`roll` when it matches `convert`
   only, now with the standing trap stated; and `TASKS.md` still referenced
   `--output-hdr`.
+
+## linear-render
+
+**Status:** not started
+**Updated:** 2026-08-28
+
+- Filed 2026-08-28 out of the `algo/exponential-anchor-placement` experiments. Both display
+  renderers apply a fixed Hermite shoulder that cannot be switched off — `shoulder_start` is
+  `0.5 + 0.25/(1+highlight_compress)`, so hc=0 puts the knee at 0.75 and no value puts it
+  later. `algo::sigmoid` guarantees stage-3 output **≤ 1.0** for `shoulder > 0`, so under the
+  shipped default SDR is shouldered twice: once in density space, once again from 0.75 up.
+- **Measured motivation, not a hunch.** `highlight_compress` was tried at 1 and 4 on the
+  fixture frames: the shipped default went 6.45% → 6.64% blown (code separation 44.05 →
+  43.81), and on a shoulder-less reconstruction it moved 21.38% → 21.58%. It made every
+  config *worse* and rescued none. A knob that can only cost is a sign the stage wants to be
+  skippable rather than tuned.
+- **Why the knee cannot rescue over-range content**, recorded so it is not retried: the
+  Hermite's ceiling is fixed at 1.0, so moving the knee earlier only trades away in-range
+  contrast — content sitting several times over still lands within a hair of 1.0. Restoring
+  separation there needs a tone-mapping operator with a movable ceiling, which is a
+  different task, not a tweak to this one.
+- **No curve-type gate.** The ≤1.0 guarantee is a property of `shoulder > 0` plus neutral
+  print gains, not of the curve being a sigmoid (`shoulder = 0` reduces to the straight line;
+  `print_exposure` can lift samples afterwards). `sdr::render` already errors on any sample
+  outside `[0, 1]`, so the mode polices itself and a config-time gate would test a proxy
+  instead of the real condition.
+
+## display-tone-mapping
+
+**Status:** not started
+**Updated:** 2026-08-28
+
+- Filed 2026-08-28 from the `algo/exponential-anchor-placement` tone-map probe
+  (`shadow_metrics::tone_map_probe`, `#[ignore]`d, `NC_TONEMAP_FRAME` selects the frame).
+- **The shipped knee is the constraint, not its position.** Both renderers use a Hermite
+  that reaches a fixed ceiling with zero slope, so content overshooting by more than about
+  a stop lands on the ceiling: 20.8% of the frame on SDR, and on HDR a peak pinned at
+  exactly 4.926 with zero separation among everything above reference white. Moving the
+  knee via `highlight_compress` made the default 6.45% → 6.64% blown and a shoulder-less
+  reconstruction 21.38% → 21.58% — worse in every config tried.
+- **Extended Reinhard `v(1 + v/W²)/(1 + v)` beat the shipped sigmoid on both metrics on
+  both probe frames** at `W = 64`: Ektar 971 6.24% blown / 21.4 code separation against
+  6.86 / 11.6, Portra 1121 6.08 / 3.0 against 6.30 / 0.6. `W = 16` was close behind. The
+  user picked both out of the visual review independently of the numbers.
+- **`W` is a white point**, not a strength: `reinhard(W, W) = 1.0` exactly. In density,
+  `D′ = A + log10(W)/contrast` — `W = 16` puts display white at `D′ 1.468` and `W = 64` at
+  `1.765`, both *above* the roll's leader Dmax of 1.28–1.38 and ~2–3 stops above diffuse
+  white. That is the reserved specular room, and it is why they hold highlights.
+- **Global compression beats knee-based**, measured: the knee forms reserve only `1 − t` of
+  output for everything above it, and hyperbolic `t = 0.85` left 27.7% blown where Reinhard
+  left 6.1%. Do not re-try a knee.
+- **Reinhard's midtone cost is a property of the operator, not of `W`**: 0.18 → 0.153
+  (0.24 stops) at *both* `W = 16` and `W = 64`. So the anchor can absorb it and `W` stays a
+  pure highlight control — but it also means the probe's metrics flatter these operators,
+  since a brighter midtone raises `code sep`. **Matched-midtone comparison is required
+  before this is called a win.**
+- Content above `W` still exceeds 1.0 (`reinhard(200, 64) = 1.04`), which is the residual
+  ~6% blown and why larger `W` kept helping; the turning point was not found.
+
