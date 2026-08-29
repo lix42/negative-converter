@@ -922,7 +922,7 @@ mod tests {
             .unwrap();
             let gains = converted.white_balance.expect("gains reported");
             assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
-            for px in converted.out.rgb.chunks_exact(3) {
+            for px in converted.out.rgb.as_chunks::<3>().0 {
                 assert!(approx(px[0], px[1], 1e-4), "{mode:?}: {px:?}");
                 assert!(approx(px[1], px[2], 1e-4), "{mode:?}: {px:?}");
             }

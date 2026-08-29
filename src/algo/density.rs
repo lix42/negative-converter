@@ -341,9 +341,11 @@ fn measure_balance_range(density: &[f32]) -> Option<[f32; 2]> {
     let mut tones: Vec<f32> = Vec::with_capacity(pixels.div_ceil(stride));
     tones.extend(
         density
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .step_by(stride)
-            .filter_map(pixel_tone),
+            .filter_map(|px| pixel_tone(px.as_slice())),
     );
     if tones.is_empty() {
         return None;
@@ -798,7 +800,7 @@ pub(crate) fn sample_positive(rgb: &[f32]) -> Vec<f32> {
     let pixels = rgb.len() / 3;
     let stride = auto_wb_stride(pixels);
     let mut sampled = Vec::with_capacity(pixels.div_ceil(stride) * 3);
-    for px in rgb.chunks_exact(3).step_by(stride) {
+    for px in rgb.as_chunks::<3>().0.iter().step_by(stride) {
         sampled.extend_from_slice(px);
     }
     sampled
@@ -817,7 +819,7 @@ fn wb_channel_samples(rgb: &[f32]) -> [Vec<f32>; 3] {
         Vec::with_capacity(cap),
         Vec::with_capacity(cap),
     ];
-    for px in rgb.chunks_exact(3) {
+    for px in rgb.as_chunks::<3>().0 {
         for (c, channel) in channels.iter_mut().enumerate() {
             if px[c].is_finite() {
                 channel.push(px[c]);
@@ -2273,7 +2275,7 @@ mod tests {
         assert!(approx(gains[0], 0.5 / 0.4, 1e-5), "r gain {}", gains[0]);
         assert_eq!(gains[1], 1.0, "green-anchored");
         assert!(approx(gains[2], 0.5 / 0.8, 1e-5), "b gain {}", gains[2]);
-        for px in rgb.chunks_exact(3) {
+        for px in rgb.as_chunks::<3>().0 {
             let balanced = [px[0] * gains[0], px[1] * gains[1], px[2] * gains[2]];
             assert!(approx(balanced[0], balanced[1], 1e-5));
             assert!(approx(balanced[1], balanced[2], 1e-5));
@@ -2400,7 +2402,7 @@ mod tests {
             .unwrap();
             let gains = converted.white_balance.expect("gains reported");
             assert_eq!(gains[1], 1.0, "{mode:?} green-anchored");
-            for px in converted.out.rgb.chunks_exact(3) {
+            for px in converted.out.rgb.as_chunks::<3>().0 {
                 assert!(approx(px[0], px[1], 1e-4), "{mode:?}: {px:?}");
                 assert!(approx(px[1], px[2], 1e-4), "{mode:?}: {px:?}");
             }
@@ -2516,7 +2518,7 @@ mod tests {
             for g in gains {
                 assert!(g.is_finite() && g > 0.0, "{mode:?}: gain {g} not usable");
             }
-            for px in converted.out.rgb.chunks_exact(3) {
+            for px in converted.out.rgb.as_chunks::<3>().0 {
                 assert!(
                     px.iter().all(|v| v.is_finite()),
                     "{mode:?}: non-finite output {px:?}"
