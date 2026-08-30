@@ -4473,6 +4473,65 @@ fn roll_warns_when_film_base_is_not_frozen() {
 }
 
 #[test]
+fn roll_does_not_call_dmax_unfrozen_when_the_placement_reads_no_reference() {
+    // `dmax: "auto"` measures the reference per frame, but `black-at-base` discards it:
+    // every frame still renders on one roll-level rule, so the roll IS consistent and the
+    // not-frozen warning is a false alarm (and, under `--strict`, a false failure).
+    let tmp = TempDir::new("roll-auto-basederived");
+    let recipe = |name: &str, anchor: &str| {
+        write_file(
+            &tmp.path(name),
+            &format!(
+                r#"{{ "reconstruction": {{ "type": "density",
+                       "curve": {{ "type": "exponential", "gamma": 2.0,
+                                   "dmax": "auto", "anchor": {anchor} }} }},
+                     "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }},
+                     "output": {{ "preset": "legacy" }} }}"#
+            ),
+        )
+    };
+    let roll = |params: &std::path::Path, out: &str| {
+        run(&[
+            "roll",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "--out-dir",
+            tmp.path(out).to_str().unwrap(),
+            "--params",
+            params.to_str().unwrap(),
+        ])
+    };
+    let unfrozen = "Dmax is NOT frozen";
+
+    // Reference-free: no not-frozen warning anywhere.
+    let base_derived = recipe("base.json", r#"{ "black-at-base": 0.005 }"#);
+    let (code, stdout, err) = roll(&base_derived, "out-base");
+    assert_eq!(code, 0, "the roll converts:\n{stdout}\n{err}");
+    let report = json(&stdout);
+    assert_eq!(report["summary"]["succeeded"], 1);
+    assert!(
+        !report["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|m| m.as_str().unwrap().contains(unfrozen))),
+        "a base-derived placement reads no reference, so the roll is frozen: {report}"
+    );
+    assert!(!err.contains(unfrozen), "stderr: {err}");
+
+    // Falsifiable control: the identical recipe with a reference-*reading* placement
+    // still warns — otherwise this would pass against a deleted gate.
+    let reference_reading = recipe("ref.json", r#""white-at-dmax""#);
+    let (code, stdout, err) = roll(&reference_reading, "out-ref");
+    assert_eq!(code, 0, "the control roll converts:\n{stdout}\n{err}");
+    let report = json(&stdout);
+    assert!(
+        report["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|m| m.as_str().unwrap().contains(unfrozen))),
+        "a reference-reading placement under `auto` is genuinely not frozen: {report}"
+    );
+    assert!(err.contains(unfrozen), "control stderr: {err}");
+}
+
+#[test]
 fn roll_strict_promotes_a_warning_while_still_emitting_the_report() {
     // `--strict` turns the not-frozen roll-level warning into a non-zero exit, but
     // the machine-readable report still lands on stdout first (pairs with the

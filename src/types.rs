@@ -910,6 +910,24 @@ impl AnchorPlacement {
             AnchorPlacement::MidAtBaseOffset(offset) => offset + MID_GREY_OUTPUT_DECADES / contrast,
         }
     }
+
+    /// Whether resolving this placement **consumes** the reference density
+    /// (`curve.dmax`). The base-derived pair does not: hand [`Self::anchor`] any
+    /// reference at all and they return the same number.
+    ///
+    /// **This, not [`DmaxSource`] alone, is the question every `Dmax`-policy gate must
+    /// ask.** `auto` measures the reference per frame, which is frame-local adaptation
+    /// only if something *reads* it — under `black-at-base` / `mid-at-base-offset` the
+    /// measurement is computed and discarded, so the render is deterministic and
+    /// roll-consistent. Gating on the source alone made `film-master` hard-reject a valid
+    /// config and made `roll` warn (and `--strict` fail) about a consistency break that
+    /// cannot happen.
+    pub fn reads_reference(self) -> bool {
+        match self {
+            AnchorPlacement::WhiteAtDmax | AnchorPlacement::MidAtDmaxFraction(_) => true,
+            AnchorPlacement::BlackAtBase(_) | AnchorPlacement::MidAtBaseOffset(_) => false,
+        }
+    }
 }
 
 /// Sigmoid-curve knobs (design-spec §7.3/§9,
@@ -1980,6 +1998,24 @@ mod tests {
             (off - (0.5 + MID_GREY_OUTPUT_DECADES / c)).abs() < 1e-6,
             "{off}"
         );
+    }
+
+    /// `reads_reference` must agree with [`AnchorPlacement::anchor`] rather than restate
+    /// it — it is what the `Dmax`-policy gates consult, so a rule that drifts from the
+    /// arithmetic would silently re-admit the false `film-master` rejection and the false
+    /// roll not-frozen warning it was introduced to remove.
+    #[test]
+    fn reads_reference_matches_whether_the_reference_moves_the_anchor() {
+        let c = 2.0f32;
+        for p in [
+            AnchorPlacement::WhiteAtDmax,
+            AnchorPlacement::MidAtDmaxFraction(0.5),
+            AnchorPlacement::BlackAtBase(0.005),
+            AnchorPlacement::MidAtBaseOffset(0.5),
+        ] {
+            let moves = p.anchor(1.3, c) != p.anchor(1.3 + 0.295, c);
+            assert_eq!(p.reads_reference(), moves, "{p:?}");
+        }
     }
 
     #[test]

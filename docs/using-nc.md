@@ -572,7 +572,7 @@ Where the reference density comes from. (What it *places* is the anchor, above.)
 |---|---|
 | *(none)* / `--fixed-d-max` | Fixed nominal reference (1.3 density), reused across the roll. **Default.** Darker frames render darker — faithful relative exposure. |
 | `--d-max D` | Explicit roll-fixed reference — your measured calibration. |
-| `--auto-d-max` | Measure per frame. **Per-frame exposure normalization**: brightens underexposed frames and breaks roll consistency. Grading, not conversion. |
+| `--auto-d-max` | Measure per frame. **Per-frame exposure normalization**: brightens underexposed frames and breaks roll consistency. Grading, not conversion. Inert under the two base-derived anchors, which never read the reference — so it is neither warned about nor rejected there. |
 | `--no-d-max` | No reference. Scene-referred output (base → 1.0, detail above) **under the default `white-at-dmax` placement** — it resolves the reference to 0, so any other `--anchor-*` rule still derives an anchor from the slope (`--anchor-mid-fraction 0.5` there pins mid-grey 0.37 above the base and clips ~99.9% of the frame). **Exponential only**: the sigmoid needs an anchor and rejects it (exit 2), so pair it with `--density-curve exponential`. |
 
 > **A caveat on measuring `Dmax` from a leader** (§4 step 3). The baseline report
@@ -745,7 +745,10 @@ usage: output preset `hdr-pq` requires an output path ending in .avif
   f32 TIFFs.
 - `film-master` additionally rejects `--auto-d-max` / `--auto-balance-range` and
   every non-default downstream control — it bypasses them, so accepting them
-  would be a lie.
+  would be a lie. The `--auto-d-max` half is **conditional on the anchor**: under
+  `--anchor-black-floor` / `--anchor-mid-offset` the measured reference is discarded,
+  so nothing frame-local reaches the master and the combination is accepted. Same rule
+  for `roll`: it does not call such a recipe "Dmax not frozen", because it is.
 - `--linear-range` is consumed **only** by a display preset — which the default
   now is, so it works out of the box. On `legacy` / `custom` it stays a loud error
   rather than a silently ignored knob.

@@ -2330,6 +2330,40 @@ What other epics need to know about `algo`:
     no `AnchorPlacement`.
   - Default render still byte-identical (`md5 8cb9cb143c6aad615a4be90fe5925498`,
     `params_hash 55a841428c1e6671`); the new behaviour is a warning, not a pixel change.
+- 2026-08-29 (**round 4: two P2s from the PR bot on #98; the first is a miss in round 1's
+  own fix**).
+  - **A finite anchor can still overflow the *product*, and that is the same silent
+    all-black frame.** Round 1 rejected a non-finite *anchor*; the curve evaluates
+    `slope · (density − anchor)`, and `--anchor-mid-offset 2e38` keeps the anchor finite
+    (2e38) while the product overflows to `−inf`, whose `10^` is exactly `0.0`. Exit 0,
+    mean `[0,0,0]`, `clipped_high 0`, `non_finite 0`, no warning — and it needs **no
+    exotic slope**, the shipped default gamma of 2.0 reaches it. Fixed by checking
+    `slope · anchor` in `validate` and at both render sites.
+    **The lesson, which is the round-1 lesson sharpened: "validate the resolved value"
+    was still too narrow — the line is "does any intermediate overflow".** Round 1
+    replaced a proxy quotient with the resolved anchor and stopped there, because the
+    anchor was the value the failing case produced. The anchor is not the last
+    intermediate before the pixel; the exponent is. When a guard is written against a
+    reproduction, walk the arithmetic *forward* to the output and check every step, not
+    just the one the reproduction happened to break.
+    Scope held deliberately: a large offset whose product stays *finite* (3e38 at gamma
+    1e-37 is −3e1) is honest arithmetic on absurd input and still validates — bounding
+    that is `algo/density-safety-bounds`' job, and a test pins the boundary so a later
+    tightening is a deliberate act.
+  - **Reference-free placements were blocked by a `Dmax` setting they never read.**
+    `film-master` hard-rejected `--auto-d-max --anchor-black-floor 0.005` and `roll`
+    warned "Dmax is NOT frozen" (exit 1 under `--strict`) for the same shape. Both
+    diagnostics are false: `auto` measures a reference the base-derived rules discard, so
+    the render is deterministic and roll-consistent. Both gates now ask
+    `AnchorPlacement::reads_reference()` — a new shared predicate in `types.rs`, which
+    `master_anchor` (round 1's three-way provenance classifier) also routes through, so
+    there is one answer to "is this placement reference-free" instead of three.
+    **`DmaxSource` describes the *policy*; whether it reaches the pixels is a property of
+    the placement.** Every gate keyed on the source alone was asking the wrong object,
+    and each read plausibly in isolation — the bug only shows when a second axis
+    (placement) gains the power to nullify the first.
+  - Both fixes are refusals and gate-relaxations, not rendering changes: default render
+    byte-identical (`params_hash 55a841428c1e6671`).
 ## negative-reconstruction-density-curves (review follow-up)
 
 **Status:** done

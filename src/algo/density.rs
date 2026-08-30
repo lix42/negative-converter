@@ -176,20 +176,23 @@ pub(super) fn reconstruct(
             // this curve had a placement rule. The base-derived placements ignore the
             // reference, so a `None` there is not a missing input.
             let anchor = exp.anchor.anchor(dmax.unwrap_or(0.0), gamma);
-            // Defense in depth, mirroring the sigmoid's guard. Every placement but
-            // `WhiteAtDmax` divides by the slope, so a positive-but-tiny gamma overflows
-            // the quotient to a non-finite anchor. `validate` rejects that at the CLI
-            // boundary (naming the flag), but a programmatic caller reaches here first —
-            // and `10^(gamma·(d − inf))` is `0.0` for every sample, an all-black frame
-            // that trips neither the clip nor the non-finite counter. Only finiteness is
-            // checked: `A = 0.0` is the legitimate unity placement on this curve.
-            if !anchor.is_finite() {
+            // Defense in depth, mirroring the sigmoid's guard. Two ways the exponent
+            // goes non-finite, and **both** render `10^(−inf) = 0.0` for every sample —
+            // an all-black frame that trips neither the clip nor the non-finite counter:
+            // the placement's division by the slope can overflow the *anchor* (a
+            // positive-but-tiny gamma), and a large-but-finite anchor can overflow the
+            // *product* `gamma · anchor` (reachable at the shipped default gamma). Only
+            // those two: `A = 0.0` is the legitimate unity placement on this curve, and a
+            // finite product is honest arithmetic whatever it renders.
+            // `validate` rejects both at the CLI boundary, naming the flag; a
+            // programmatic caller reaches here first.
+            if !anchor.is_finite() || !(gamma * anchor).is_finite() {
                 return Err(NcError::Other(format!(
                     "the exponential anchor placement derived a non-usable anchor \
-                     ({anchor}) from reference {} at gamma {gamma}: the placement divides \
-                     by the slope, which overflows for a very small gamma. Use a \
-                     photographic gamma, or the white-at-dmax placement, which needs no \
-                     such division",
+                     ({anchor:e}) from reference {} at gamma {gamma}: the curve's exponent \
+                     `gamma · (density − anchor)` is not finite, so every sample would \
+                     render as exactly 0.0. Use a photographic gamma and a smaller anchor \
+                     placement",
                     dmax.unwrap_or(0.0)
                 )));
             }

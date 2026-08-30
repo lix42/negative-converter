@@ -875,6 +875,15 @@ down. The four rules are:
 `0.745 = −log10(0.18)` is mid-grey's fixed distance below white on the *output*
 axis. Every rule is a **roll-level** placement, never derived from frame content.
 
+**A `Dmax` policy is only frame-local if the placement reads it.** `black-at-base` and
+`mid-at-base-offset` discard the resolved reference, so `dmax = "auto"` under either is
+computed and thrown away: the render is deterministic and identical across frames. Every
+`Dmax`-policy gate therefore tests the *placement*, not the `DmaxSource` — `film-master`
+accepts `auto` under a reference-free rule (its rejection exists to keep frame-local
+adaptation out of a master, and there is none), and `roll` does not call such a recipe
+"not frozen". Gating on the source alone hard-rejected a valid master and made `--strict`
+fail a consistent roll.
+
 **A curve-type switch resets `curve.anchor`; it does not carry it.** Both variants
 accept the key, but only `curve.dmax` is shared in *meaning* — a measured reference
 density is curve-independent, so `--density-curve` and a `roll` per-frame `type`
@@ -1944,6 +1953,14 @@ render use `reconstruction.density` and `print`. The exact recipe keys are
   positivity/finiteness is diagnosed **first** — "the slope is 0" is the more specific
   fault than "the anchor derived from it overflowed", and the division's remedy does not
   apply to it.
+
+  A **finite** anchor is separately checked against the slope: the curve evaluates
+  `slope · (density − anchor)`, so a large finite anchor overflows that *product* to
+  `−inf` and `10^(−inf)` is exactly `0.0` — a silently black frame with no clip and no
+  non-finite count. `--anchor-mid-offset 2e38` reaches it at the shipped default gamma.
+  The rule is that no intermediate may overflow, not merely that the anchor is finite;
+  a large anchor whose product stays finite is honest arithmetic on absurd input and is
+  accepted (bounding *that* belongs to `algo/density-safety-bounds`).
 
 These caps reject only *nonsense / degenerate-asymptote* values (a knee of `10000`
 that flattens the frame); within them, aggressive-but-valid contrast/knees produce

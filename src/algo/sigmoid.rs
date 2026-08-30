@@ -313,19 +313,22 @@ pub(super) fn apply_curve(
     // form places the anchor *above* the reference, so white lands beyond it and the shoulder
     // compresses what exceeds it — which is what a print shoulder is for.
     let anchor = placement.anchor(reference, contrast);
-    // Defense in depth, and a real error rather than an assertion: the derivation divides
-    // by `contrast`, so a positive-but-tiny slope overflows the quotient and yields a
-    // non-finite anchor. `validate` rejects that at the CLI boundary (naming the flag), but
-    // a programmatic caller or a future placement rule reaches here first — and a
-    // `debug_assert` made it a panic (exit 101) in debug and fed `inf` into `s_curve` in
-    // release, which is the quietly-wrong image this guard exists to prevent.
-    if !anchor.is_finite() || anchor <= 0.0 {
+    // Defense in depth, and a real error rather than an assertion. Two ways the exponent
+    // `contrast · (d − anchor)` goes non-finite: the derivation divides by `contrast`, so a
+    // positive-but-tiny slope overflows the quotient to a non-finite *anchor*; and a
+    // large-but-finite anchor overflows the *product* instead. `validate` rejects both at
+    // the CLI boundary (naming the flag), but a programmatic caller or a future placement
+    // rule reaches here first — and a `debug_assert` made it a panic (exit 101) in debug
+    // and fed `inf` into `s_curve` in release, which is the quietly-wrong image this guard
+    // exists to prevent.
+    if !anchor.is_finite() || anchor <= 0.0 || !(contrast * anchor).is_finite() {
         return Err(NcError::Other(format!(
-            "the sigmoid anchor placement derived a non-usable anchor ({anchor}) from a \
-             valid reference density ({reference}) at contrast {contrast}: every placement \
-             but white-at-dmax divides by the contrast, which overflows for a very small \
-             one. Use a photographic contrast, or the white-at-dmax placement, which needs \
-             no such division"
+            "the sigmoid anchor placement derived a non-usable anchor ({anchor:e}) from a \
+             valid reference density ({reference}) at contrast {contrast}: the curve's \
+             exponent `contrast · (density − anchor)` is not finite. Every placement but \
+             white-at-dmax divides by the contrast, which overflows the anchor for a very \
+             small contrast; a large finite anchor overflows the product instead. Use a \
+             photographic contrast and a smaller anchor placement"
         )));
     }
     let film = super::density::apply_curve(density, move |d| {

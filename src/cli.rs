@@ -1109,20 +1109,21 @@ fn master_anchor(reconstruction: &Reconstruction) -> MasterAnchor {
     let Reconstruction::Density { curve, .. } = reconstruction else {
         return MasterAnchor::NoAnchor;
     };
-    let unreferenced = curve.dmax() == DmaxSource::None;
+    // Reference-free by construction, whatever `dmax` resolved to. One predicate, shared
+    // with the two `Dmax`-policy gates, so a fifth placement cannot be classified here
+    // and forgotten there.
+    if !curve.anchor().reads_reference() {
+        return MasterAnchor::BaseDerived;
+    }
+    // The rest distinguishes the two reference-*reading* rules. `none` resolves the
+    // reference to 0, which leaves `white-at-dmax` placing nothing — while the mid-grey
+    // rule still places `0.745/slope` above the film base, an anchor with no `Dmax` in
+    // it. A future reference-reading rule falls to `RollFixedDmax`, the conservative
+    // answer for anything that does consult the reference.
     match curve.anchor() {
-        // Reference-free by construction, whatever `dmax` resolved to.
-        AnchorPlacement::BlackAtBase(_) | AnchorPlacement::MidAtBaseOffset(_) => {
-            MasterAnchor::BaseDerived
-        }
-        // `none` resolves the reference to 0, which leaves `white-at-dmax` placing
-        // nothing — while the mid-grey rule still places `0.745/slope` above the film
-        // base, an anchor with no `Dmax` in it.
-        AnchorPlacement::WhiteAtDmax if unreferenced => MasterAnchor::NoAnchor,
-        AnchorPlacement::MidAtDmaxFraction(_) if unreferenced => MasterAnchor::BaseDerived,
-        AnchorPlacement::WhiteAtDmax | AnchorPlacement::MidAtDmaxFraction(_) => {
-            MasterAnchor::RollFixedDmax
-        }
+        AnchorPlacement::WhiteAtDmax if curve.dmax() == DmaxSource::None => MasterAnchor::NoAnchor,
+        _ if curve.dmax() == DmaxSource::None => MasterAnchor::BaseDerived,
+        _ => MasterAnchor::RollFixedDmax,
     }
 }
 
@@ -2955,6 +2956,23 @@ pub fn validate_with_remedy(cfg: &ResolvedConfig, remedy: FilmBaseRemedy) -> Res
                  --anchor-white-at-reference, which needs no such division"
             )));
         }
+        // A finite anchor is not enough. The curve evaluates `slope · (density − anchor)`,
+        // and a large *finite* anchor overflows that **product** to −inf, whose `10^` is
+        // exactly 0.0 — an all-black frame at exit 0 with no clip and no non-finite
+        // count, the same laundering the check above exists to stop.
+        // `--anchor-mid-offset 2e38` reaches it at the shipped default gamma, so it needs
+        // no exotic slope. The bound is on the *overflow* only: a large offset whose
+        // product stays finite (offset 3e38 at gamma 1e-37 is −3e1) is honest arithmetic
+        // on absurd input and belongs to `algo/density-safety-bounds`, not here.
+        if !(slope * anchor).is_finite() {
+            return Err(usage(format!(
+                "the resolved anchor placement is not usable: the anchor ({anchor:e}) is \
+                 finite, but the curve's exponent (slope × (density − anchor)) overflows \
+                 f32 at {slope_flag} {slope:e}, so every sample would render as exactly \
+                 0.0 — a silently black frame. Use a smaller anchor placement, or a \
+                 smaller slope"
+            )));
+        }
     }
 
     // Print: exposure / black point finite; gains positive. Highlight roll-off is a
@@ -3143,8 +3161,14 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
 
     // Rule 2a — frame-local auto Dmax. Checked before the control sweep because it
     // is the master-specific reason, not a generic "non-default" complaint.
+    //
+    // Gated on `reads_reference`, not on the source alone: `auto` is frame-local
+    // adaptation only if the placement consumes what it measures. Under a base-derived
+    // rule the measurement is discarded, so the master *is* cross-frame consistent and
+    // rejecting it refuses a valid config.
     if let Reconstruction::Density { curve, .. } = &cfg.reconstruction
         && curve.dmax() == DmaxSource::Auto
+        && curve.anchor().reads_reference()
     {
         return Err(usage(
             "--output-preset film-master rejects a frame-local auto display-white \
@@ -5817,8 +5841,13 @@ fn run_roll(args: RollArgs) -> Result<()> {
     // identically. Only `Auto` (`--auto-d-max`) re-measures the display-white
     // anchor from each frame's own pixels, so a shared recipe carrying it is not
     // truly frozen — same warn-and-continue treatment as the base.
+    //
+    // …and only when the placement *reads* the reference. A base-derived rule discards
+    // the per-frame measurement, so every frame still renders on one roll-level rule;
+    // warning there is a false alarm, and under `--strict` a false failure.
     if let Reconstruction::Density { curve, .. } = &shared.reconstruction
         && curve.dmax() == DmaxSource::Auto
+        && curve.anchor().reads_reference()
     {
         let msg = "roll Dmax is NOT frozen: reconstruction.curve.dmax is `auto`, so every \
              frame measures its own display-white anchor — the roll is not \
@@ -7351,6 +7380,90 @@ mod tests {
             ..ExponentialParams::default()
         }))
         .unwrap();
+    }
+
+    /// A **finite** anchor can still overflow the exponent's *product*, and that renders
+    /// exactly as silently as a non-finite anchor did.
+    ///
+    /// `10^(gamma·(d − 2e38))` is `10^(−inf)` = `0.0` for every sample: exit 0, mean
+    /// `[0,0,0]`, `clipped_high 0`, `non_finite 0`, no warning. It needs no exotic slope —
+    /// the shipped default gamma of 2.0 reaches it — which is why finiteness of the anchor
+    /// was the wrong line to draw. The line is "does any intermediate overflow".
+    #[test]
+    fn validate_rejects_an_anchor_whose_product_with_the_slope_overflows() {
+        let cfg = exponential_cfg(ExponentialParams {
+            anchor: AnchorPlacement::MidAtBaseOffset(2e38),
+            ..ExponentialParams::default()
+        });
+        // The round-1 guard passes this: the anchor itself is perfectly finite.
+        let anchor = AnchorPlacement::MidAtBaseOffset(2e38).anchor(
+            crate::algo::density::NOMINAL_DMAX,
+            ExponentialParams::default().gamma,
+        );
+        assert!(anchor.is_finite(), "{anchor}");
+        let Err(err) = validate(&cfg) else {
+            panic!("an overflowing exponent must be rejected")
+        };
+        assert!(matches!(err, NcError::Usage(_)), "{err}");
+        assert!(err.to_string().contains("silently black"), "{err}");
+        // Shared by both curves, like every other placement rule.
+        assert!(matches!(
+            validate(&sigmoid_cfg(SigmoidParams {
+                anchor: AnchorPlacement::MidAtBaseOffset(2e38),
+                ..SigmoidParams::default()
+            })),
+            Err(NcError::Usage(_))
+        ));
+        // Falsifiable, and the scope boundary: the same absurd offset against a slope
+        // small enough to keep the product finite (`3e38 × 1e-37` = 3e1) is honest
+        // arithmetic, and bounding *that* is `algo/density-safety-bounds`' job, not this
+        // guard's. It must still validate.
+        validate(&exponential_cfg(ExponentialParams {
+            gamma: 1e-37,
+            anchor: AnchorPlacement::MidAtBaseOffset(3e38),
+            ..ExponentialParams::default()
+        }))
+        .unwrap();
+    }
+
+    /// The two `Dmax`-policy gates must ask whether the placement *reads* the reference,
+    /// not what `DmaxSource` says. A base-derived placement discards the per-frame
+    /// measurement, so `auto` under it is deterministic and cross-frame consistent —
+    /// `film-master` rejecting it refuses a valid config.
+    #[test]
+    fn film_master_accepts_auto_dmax_under_a_reference_free_placement() {
+        let master = |anchor| ResolvedConfig {
+            reconstruction: Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Exponential(ExponentialParams {
+                    dmax: DmaxSource::Auto,
+                    anchor,
+                    ..ExponentialParams::default()
+                }),
+            },
+            ..film_master_cfg()
+        };
+        for anchor in [
+            AnchorPlacement::BlackAtBase(0.005),
+            AnchorPlacement::MidAtBaseOffset(0.5),
+        ] {
+            validate_output_preset(&master(anchor))
+                .unwrap_or_else(|e| panic!("{anchor:?} reads no reference: {e}"));
+        }
+        // Falsifiable: the rejection still stands for the rules that do read it —
+        // otherwise this would pass against a gate that had simply been deleted.
+        for anchor in [
+            AnchorPlacement::WhiteAtDmax,
+            AnchorPlacement::MidAtDmaxFraction(0.5),
+        ] {
+            assert!(
+                matches!(
+                    validate_output_preset(&master(anchor)),
+                    Err(NcError::Usage(_))
+                ),
+                "{anchor:?} does read the reference and must still be rejected"
+            );
+        }
     }
 
     /// Slope positivity is diagnosed **before** the anchor's division by it. Ordering
