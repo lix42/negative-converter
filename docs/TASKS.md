@@ -184,7 +184,7 @@ graph TD
     algo/sigmoid
     algo/negative-reconstruction-density-curves
     algo/reference-anchored-sigmoid
-    algo/exponential-mid-grey-anchor
+    algo/exponential-anchor-placement
     algo/content-aware-sigmoid-toe
     algo/dmax-white-anchor
     algo/density-safety-bounds
@@ -217,6 +217,8 @@ graph TD
     output/mp-container-conformance
     output/gain-map-dialect-activation
     output/sdr-preset-followups
+    output/linear-render
+    output/display-tone-mapping
     output/output-path-suffix
     output/hdr-avif-output
     output/hdr-avif-windows-packaging
@@ -309,7 +311,7 @@ graph TD
   film-base/dmax-reference --> algo/negative-reconstruction-density-curves
   algo/sigmoid --> algo/negative-reconstruction-density-curves
   algo/negative-reconstruction-density-curves --> algo/reference-anchored-sigmoid
-  algo/negative-reconstruction-density-curves --> algo/exponential-mid-grey-anchor
+  algo/negative-reconstruction-density-curves --> algo/exponential-anchor-placement
   film-base/dmax-reference --> algo/reference-anchored-sigmoid
   algo/reference-anchored-sigmoid --> algo/film-stock-profiles
   algo/reference-anchored-sigmoid --> algo/auto-anchor-interior-measurement
@@ -372,6 +374,9 @@ graph TD
   output/iso-gain-map-metadata --> output/mp-container-conformance
   output/iso-gain-map-metadata --> output/gain-map-dialect-activation
   output/presets --> output/sdr-preset-followups
+  output/sdr-display-rendering --> output/linear-render
+  output/sdr-display-rendering --> output/display-tone-mapping
+  output/hdr-display-rendering --> output/display-tone-mapping
   output/gain-map-hdr-output --> color/colorimetry-source-of-truth
   output/hdr-display-rendering --> output/hdr-avif-output
   output/hdr-display-rendering --> output/lossless-hdr-tiff
@@ -503,10 +508,17 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
 - `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
-- `algo/exponential-mid-grey-anchor` (post-MVP): `algo/negative-reconstruction-density-curves`
-  — the exponential pins white at `Dmax` with no placement rule, so contrast pivots around
-  white; measured at 2.75 EV of midtone offset for the floor fix `gamma = 2.0` buys. Give it
-  the sigmoid's `AnchorPlacement`. Blocks nothing (non-default path since v2)
+- `algo/exponential-anchor-placement` (post-MVP, **in progress**): `algo/negative-reconstruction-density-curves`
+  — renamed from `algo/exponential-mid-grey-anchor` on 2026-08-12 when the direction changed
+  from pinning mid-grey to **pinning the black end at the film base**; the name now tracks the
+  mechanism (`AnchorPlacement` on the exponential) rather than one placement. The exponential
+  pins white at `Dmax` with no placement rule, so contrast pivots around white — measured at
+  2.75 EV of midtone offset for the floor fix `gamma = 2.0` buys. A black pin is `Dmax`-free
+  and anchors the measurement that is reliable (base agrees to 0.0005 across rolls where the
+  leader `Dmax` is 0.295 apart), and it reviewed as candidate 5b, "most likely GO", in
+  `algo/reference-anchored-sigmoid`. Blocks nothing formally (non-default path since v2), but
+  `algo/reconstruction-render-curve-split` waits on its outcome for what "modified
+  exponential" means
 - `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`, `algo/auto-anchor-interior-measurement`; no downstream blockers
   — the last is a hard prerequisite, not a nicety: content-driven anchoring is currently
   unusable because `DmaxSource::Auto` measures the whole frame and the opaque holder owns the
@@ -539,8 +551,9 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   and print rendering are separate sub-stages" rule the current curve partly collapses.
   Same frame, same base/`Dmax`: sigmoid peaks at exactly reference white
   (`GainMapMax` 1.0x), exponential reaches 4.87x — so this task and the HDR-headroom
-  question are one question. May subsume `algo/exponential-mid-grey-anchor`; settle that
-  early. Sharpest constraint is `film-master`, whose definition *includes* the curve
+  question are one question. What "modified" means is being settled in
+  `algo/exponential-anchor-placement` (a black pin at the film base) rather than duplicated
+  here. Sharpest constraint is `film-master`, whose definition *includes* the curve
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
@@ -595,6 +608,19 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   tagging it), and a **machine-readable SDR contract** in the report (the
   `hdr_coded_tiff` block is the shape to follow). `RunProfile::SdrTiff` is no longer
   one of them: it was measured against peak on two frame sizes on 2026-08-09.
+- `output/linear-render` (post-MVP; no downstream blockers): `output/sdr-display-rendering`
+  — let a display render skip its tone curve. Both renderers apply a fixed Hermite shoulder
+  today and neither can disable it (`highlight_compress` only moves the knee, 0.75 at the
+  default and never later), so under the shipped sigmoid — which guarantees output ≤ 1.0 —
+  SDR is shouldered twice. No curve-type gate: `sdr::render` already errors on out-of-range
+  samples, so the mode is self-policing
+- `output/display-tone-mapping` (post-MVP; no downstream blockers): `output/sdr-display-rendering`, `output/hdr-display-rendering`
+  — replace the fixed-ceiling Hermite knee with a real tone-mapping operator carrying a
+  stated **white point**. Measured 2026-08-28: the knee cannot hold content overshooting by
+  more than ~a stop (20.8% of the frame pinned at the ceiling with zero separation, on both
+  outputs), moving the knee makes it worse, and extended Reinhard at `W = 64` beat the
+  shipped sigmoid on both metrics on both probe frames. Per-output ceilings (1.0 / 4.926)
+  are what would make a gain map non-inert
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
 - `output/hdr-avif-windows-packaging` (post-MVP): `output/hdr-avif-output`
 - `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`, `io/transactional-output-writes`
@@ -788,11 +814,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo/sigmoid.md)
 - [x] [Negative reconstruction and density curves](tasks/algo/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
 - [x] [Reference-anchored sigmoid calibration and redesign](tasks/algo/reference-anchored-sigmoid.md) — reproduce and quantify the shipped sigmoid's raised, narrow real-roll shadow spread, then choose the least invasive defaults/semantics/equation remedy against frozen film-master/SDR/HDR metrics
-- [ ] [Mid-grey anchor for the exponential curve](tasks/algo/exponential-mid-grey-anchor.md) — the
+- [~] [Anchor placement for the exponential curve](tasks/algo/exponential-anchor-placement.md) — the
   exponential pins display white at `Dmax` and has no `AnchorPlacement`, so raising contrast
   pivots the line *around white*: `gamma = 2.0` fixes the black floor (72 → 12/255) but costs
-  **2.75 EV of midtone placement**. Give it the sigmoid's anchor rule so the two knobs stop
-  fighting. Non-default path since v2, so it blocks nothing
+  **2.75 EV of midtone placement**. Give it an anchor rule so the two knobs stop fighting —
+  **pinning the black end at the film base**, which is `Dmax`-free and anchors the reliably
+  measured end. Renamed from `exponential-mid-grey-anchor` 2026-08-12 with that change of
+  direction. Non-default path since v2, so it blocks nothing formally, but
+  `algo/reconstruction-render-curve-split` waits on its outcome
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [ ] [Curve endpoint validation](tasks/algo/curve-endpoint-validation.md) — warn **before decode**
   when a resolved curve places its tonal endpoints so badly the render cannot approach white or
@@ -869,6 +898,19 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [MP container conformance (CIPA DC-007)](tasks/output/mp-container-conformance.md) — **deferred conformance**, split out of `iso-gain-map-metadata` on 2026-08-06 after reading the free CIPA text. Three gaps, none functional: the gain map carries MP Type `000000` (Undefined) where DC-007 Table 4 assigns `050000` and marks `000000` "shall not be used" in a Baseline MP File — inherited from libultrahdr, whose own output does the same — the baseline is JFIF with no Exif APP1 where §4.2.1/§5.1 specify an Exif file (§7's *tag* requirements are only "should"), and in the gain-map image libultrahdr's prepended XMP puts `APP1` before `APP0 JFIF`, so JFIF is not first in the dependent image (found by review, not in the CIPA read). The type code is a masked 4-byte MPEntry patch but **changes shipped `ultra-hdr-v1` bytes**; the Exif half must be probed against `package()` and re-run through the ImageIO oracle, since a marker-layout change is exactly what silently disabled the ISO metadata once. Blocks nothing
 - [ ] [Gain-map dialect activation](tasks/output/gain-map-dialect-activation.md) — the two items `iso-gain-map-metadata` shipped without: **Android 15+** decoder verification (the only platform reading *both* dialects, so the only place coexistence is observable — record whichever it prefers as *observed behaviour*, never a conformance property) and a **CLI path** for `Dialects::LegacyPlusIso`, which is implemented, Apple-verified, and reachable only from an `#[ignore]` test. Removing its `#[allow(dead_code)]` is the mechanical definition of done. Blocks nothing; **not** a dependency of `output/presets` — per the `hdr-avif-output` boundary rule, whichever task ships the CLI surface owns the `gain-map-hdr` name, so coordinate rather than race. `ultra-hdr-v1` must stay byte-identical
 - [ ] [SDR preset follow-ups](tasks/output/sdr-preset-followups.md) — the three questions the `display-p3` / `compatibility` presets deliberately left open: **making `display-p3` the default** (decided 2026-08-09; a pixel *and* container change against the incumbent `gain-map-hdr`, so it needs its own version bump + report, and it is what finally lets `legacy` be deleted), **Adobe RGB** as a first-class gamut (the one notable omission for a photography tool — usable today only via `--output-profile <icc>`, and a real addition because the modern renderer *gamut-maps* rather than tags), and a **machine-readable SDR contract** in the report (today the preset's tone/gamut/transfer contract is prose only, where `hdr-pq-tiff` emits an `hdr_coded_tiff` block). `RunProfile::SdrTiff` was one of the three and is now settled — measured against peak on two frame sizes on 2026-08-09. Blocks nothing
+- [ ] [Linear display render](tasks/output/linear-render.md) — let a display render skip its
+  tone curve. The shipped sigmoid guarantees stage-3 output ≤ 1.0, so the fixed Hermite
+  shoulder then compresses already-rolled-off highlights a second time; `highlight_compress`
+  can only move the knee earlier, never disable it, and measured **worse** in every config
+  tried (6.45% → 6.64% blown on the default). Needs no curve-type gate — `sdr::render`
+  already errors on out-of-range samples
+- [ ] [Display tone mapping](tasks/output/display-tone-mapping.md) — give each display
+  renderer a real tone-mapping operator with a stated **white point**, replacing the
+  fixed-ceiling Hermite. Measured: the knee pins over-range content at the ceiling with zero
+  separation on both outputs and moving it only hurts, while extended Reinhard at `W = 64`
+  beat the shipped sigmoid on both metrics on both probe frames. State `W` as a **density**,
+  so it is contrast-independent and roll-measurable; per-output ceilings are what make a
+  gain map carry information
 - [ ] [Derive the output suffix from the resolved preset](tasks/output/output-path-suffix.md) — let `-o out` name the output without its container and take the suffix from the resolved preset; an explicit matching suffix is honoured verbatim (`.jpeg` stays `.jpeg`), a mismatched one still fails. Follow-up to completing the suffix table, which closed the `-o out.jpg` writing a TIFF hole but left the user needing to know each preset's container. Open: canonical spellings, when a dotted stem is a suffix, and how it meets `output/presets`' roll naming
 - [x] [HDR AVIF output](tasks/output/hdr-avif-output.md) — 10-bit 4:4:4 Rec.2100 PQ/HLG AVIF via published `libaom-sys` plus an **nc-written MIAF container** (no libavif: no published crate ships ≥ 1.4.2, and `avif-serialize` cannot emit `MA1A`). `hdr-pq`/`hdr-hlg` are live as explicit `convert`-only presets; `av1C` is parsed back out of the codestream; `MA1A` only inside the published Advanced-Profile limits, else general-brand-only **with the reason reported**; `cq_level` and codec bounds calibrated and pinned by equality against `avifdec`/dav1d; `RunProfile::HdrAvif` calibrated on two real scans. Windows deferred → `output/hdr-avif-windows-packaging`; counsel review of the AOM patent grant stays with release
 - [ ] [HDR AVIF Windows packaging](tasks/output/hdr-avif-windows-packaging.md) — add the missing `windows-latest` CI job and prove the static libaom build under MSVC; encoding behavior unchanged, and cross-build byte identity is explicitly not required

@@ -4473,6 +4473,65 @@ fn roll_warns_when_film_base_is_not_frozen() {
 }
 
 #[test]
+fn roll_does_not_call_dmax_unfrozen_when_the_placement_reads_no_reference() {
+    // `dmax: "auto"` measures the reference per frame, but `black-at-base` discards it:
+    // every frame still renders on one roll-level rule, so the roll IS consistent and the
+    // not-frozen warning is a false alarm (and, under `--strict`, a false failure).
+    let tmp = TempDir::new("roll-auto-basederived");
+    let recipe = |name: &str, anchor: &str| {
+        write_file(
+            &tmp.path(name),
+            &format!(
+                r#"{{ "reconstruction": {{ "type": "density",
+                       "curve": {{ "type": "exponential", "gamma": 2.0,
+                                   "dmax": "auto", "anchor": {anchor} }} }},
+                     "film_base": {{ "source": {{ "explicit": [0.9, 0.55, 0.42] }} }},
+                     "output": {{ "preset": "legacy" }} }}"#
+            ),
+        )
+    };
+    let roll = |params: &std::path::Path, out: &str| {
+        run(&[
+            "roll",
+            fixture("hdr-48bit.tif").to_str().unwrap(),
+            "--out-dir",
+            tmp.path(out).to_str().unwrap(),
+            "--params",
+            params.to_str().unwrap(),
+        ])
+    };
+    let unfrozen = "Dmax is NOT frozen";
+
+    // Reference-free: no not-frozen warning anywhere.
+    let base_derived = recipe("base.json", r#"{ "black-at-base": 0.005 }"#);
+    let (code, stdout, err) = roll(&base_derived, "out-base");
+    assert_eq!(code, 0, "the roll converts:\n{stdout}\n{err}");
+    let report = json(&stdout);
+    assert_eq!(report["summary"]["succeeded"], 1);
+    assert!(
+        !report["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|m| m.as_str().unwrap().contains(unfrozen))),
+        "a base-derived placement reads no reference, so the roll is frozen: {report}"
+    );
+    assert!(!err.contains(unfrozen), "stderr: {err}");
+
+    // Falsifiable control: the identical recipe with a reference-*reading* placement
+    // still warns — otherwise this would pass against a deleted gate.
+    let reference_reading = recipe("ref.json", r#""white-at-dmax""#);
+    let (code, stdout, err) = roll(&reference_reading, "out-ref");
+    assert_eq!(code, 0, "the control roll converts:\n{stdout}\n{err}");
+    let report = json(&stdout);
+    assert!(
+        report["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|m| m.as_str().unwrap().contains(unfrozen))),
+        "a reference-reading placement under `auto` is genuinely not frozen: {report}"
+    );
+    assert!(err.contains(unfrozen), "control stderr: {err}");
+}
+
+#[test]
 fn roll_strict_promotes_a_warning_while_still_emitting_the_report() {
     // `--strict` turns the not-frozen roll-level warning into a non-zero exit, but
     // the machine-readable report still lands on stdout first (pairs with the
@@ -4650,6 +4709,95 @@ fn roll_warns_on_per_frame_dmax_override() {
     );
     assert!(!report["warnings"].as_array().unwrap().is_empty());
     assert!(err.contains("strict"), "stderr should explain: {err}");
+}
+
+#[test]
+fn roll_warns_when_a_per_frame_curve_switch_drops_the_roll_anchor() {
+    // The break reachable **without naming the key**: an override that sets only
+    // `curve.type` takes the new curve's default placement, so the roll's stated
+    // `anchor` is discarded — and `sets_curve_anchor`, a key probe, never sees it. Before
+    // this warning the frame rendered on a different tonal rule than the rest of the roll
+    // with nothing in the report to show it. `hdr-48bit.tif` is IR-free so the `--strict`
+    // half is about *this* warning and not the IR one.
+    let tmp = TempDir::new("roll-curve-switch-anchor");
+    let hdr = fixture("hdr-48bit.tif");
+    let manifest_txt = format!(
+        r#"{{ "frames": [
+             {{ "input": {hdr:?},
+                "params": {{ "reconstruction": {{ "curve": {{ "type": "exponential" }} }} }} }}
+           ] }}"#,
+        hdr = hdr.to_str().unwrap(),
+    );
+    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
+    let roll_args = |recipe: &std::path::Path, out: &str, strict: bool| -> Vec<String> {
+        let mut a = vec![
+            "roll".to_string(),
+            "--frames".to_string(),
+            manifest.to_str().unwrap().to_string(),
+            "--out-dir".to_string(),
+            tmp.path(out).to_str().unwrap().to_string(),
+            "--params".to_string(),
+            recipe.to_str().unwrap().to_string(),
+        ];
+        if strict {
+            a.push("--strict".to_string());
+        }
+        a
+    };
+    let dropped = "reset `reconstruction.curve.anchor`";
+
+    // A roll that pinned a non-default placement: the switch drops it, loudly.
+    let stated = write_file(
+        &tmp.path("stated.json"),
+        r#"{ "reconstruction": {
+               "type": "density",
+               "curve": { "type": "sigmoid", "dmax": { "explicit": 1.3 },
+                          "anchor": { "black-at-base": 0.005 } } },
+             "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+             "output": { "preset": "legacy" } }"#,
+    );
+    let args = roll_args(&stated, "out", false);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 0, "a dropped anchor warns, it does not fail:\n{err}");
+    let report = json(&stdout);
+    assert_eq!(
+        report["summary"]["succeeded"], 1,
+        "the frame still converts"
+    );
+    let w = report["warnings"]
+        .as_array()
+        .expect("roll-level warnings array");
+    assert!(
+        w.iter().any(|m| m.as_str().unwrap().contains(dropped)),
+        "the dropped roll anchor must reach the report: {report}"
+    );
+    assert!(err.contains(dropped), "warning echoed to stderr: {err}");
+
+    // Falsifiable control: the identical switch over a roll whose placement is the
+    // sigmoid's own default loses nothing chosen, so it must stay silent — otherwise
+    // every ordinary `type` override would warn and `--strict` would fail for all of
+    // them. Not run under `--strict`: this frame also clips, so a strict exit would
+    // prove nothing about *this* warning.
+    let defaulted = write_file(
+        &tmp.path("defaulted.json"),
+        r#"{ "reconstruction": {
+               "type": "density",
+               "curve": { "type": "sigmoid", "dmax": { "explicit": 1.3 },
+                          "anchor": { "mid-at-dmax-fraction": 0.5 } } },
+             "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+             "output": { "preset": "legacy" } }"#,
+    );
+    let args = roll_args(&defaulted, "out-control", false);
+    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 0, "the control must convert:\n{stdout}\n{err}");
+    let control = json(&stdout);
+    assert!(
+        !control["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|m| m.as_str().unwrap().contains(dropped))),
+        "the control must not report a dropped anchor: {control}"
+    );
+    assert!(!err.contains(dropped), "control stderr: {err}");
 }
 
 #[test]

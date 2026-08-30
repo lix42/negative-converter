@@ -104,8 +104,9 @@ testability default rather than a photographic one.
 **`ExponentialParams::gamma` 1.0 → 2.0.** For anyone who still selects the
 exponential explicitly, 2.0 is the measured improvement above (floor 72 → 12/255).
 It remains a *partial* fix, because that curve cannot place the floor and the
-midtones at once — the residual 2.75 EV midtone offset stands until it gets a
-mid-grey anchor ([`algo/exponential-mid-grey-anchor`](../tasks/algo/exponential-mid-grey-anchor.md)).
+midtones at once — the residual 2.75 EV midtone offset stands until it gets an anchor
+rule ([`algo/exponential-anchor-placement`](../tasks/algo/exponential-anchor-placement.md),
+renamed from `algo/exponential-mid-grey-anchor` after this report was written).
 
 ## Consequences worth knowing
 

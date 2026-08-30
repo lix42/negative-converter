@@ -704,10 +704,35 @@ impl Default for PrintParams {
 pub struct ExponentialParams {
     /// Film/print curve gamma (the straight line's slope).
     pub gamma: f32,
-    /// Display-white anchor source (default `fixed`). `"none"` (unity
-    /// placement) is valid only for this curve — the sigmoid is anchored on
-    /// `[0, Dmax]` and cannot run without one.
+    /// Reference density source (default `fixed`). `"none"` (unity placement) is valid
+    /// only for this curve — the sigmoid is anchored on `[0, Dmax]` and cannot run
+    /// without one.
+    ///
+    /// Note this is the *reference*, not necessarily the anchor: [`AnchorPlacement`]
+    /// derives the anchor from it, and the base-derived placements do not read it at all.
+    /// `"none"` plus a base-derived placement is therefore a coherent combination — no
+    /// reference exists and none is wanted.
+    ///
+    /// `"none"` resolves the reference to `0`, which reproduces the historical unity
+    /// anchor `A = 0` only under [`AnchorPlacement::WhiteAtDmax`]. Under
+    /// [`AnchorPlacement::MidAtDmaxFraction`] the reference term vanishes but the
+    /// `0.745/slope` term does not, so mid-grey ends up pinned that far above the base —
+    /// legal, and drastic: at the default gamma it renders essentially the whole frame
+    /// clipped. That is the same degeneracy [`AnchorPlacement::MidAtBaseOffset`] rejects
+    /// at `offset = 0`; the reference-derived spelling of it validates clean because the
+    /// bound there is on the fraction, not on the resolved anchor.
     pub dmax: DmaxSource,
+    /// Which tone is pinned, and at what density (default: display white at the
+    /// reference — this curve's historical and only behaviour before 2026-08).
+    ///
+    /// Kept at `white-at-dmax` deliberately rather than moved to a base-derived rule.
+    /// Since `pipeline_version` 2 this curve is the explicit diagnostic straight line, and
+    /// its value there is being the *debuggable reference*: `white-at-dmax` renders
+    /// bit-identically to every build before this field existed, which a golden pins.
+    /// Moving the default is a rendering decision with its own evidence bar — the floor
+    /// value for [`AnchorPlacement::BlackAtBase`] has not been chosen on this curve's own
+    /// measurements — and it is tracked in `algo/exponential-anchor-placement`.
+    pub anchor: AnchorPlacement,
 }
 
 impl Default for ExponentialParams {
@@ -721,17 +746,21 @@ impl Default for ExponentialParams {
             // remedy on user-confirmed shadow patches: contrast 2.0 takes the
             // floor 72 → 12/255.
             //
-            // It is a partial fix and the report says so. Because this curve pins
-            // white at `Dmax` and has **no anchor placement** (unlike the sigmoid's
-            // `AnchorPlacement`), steepening pivots the line *around white* and
-            // drags everything below it down — costing 2.75 EV of midtone
-            // placement. The two knobs fight, which is exactly what an anchor other
-            // than white avoids, and why the sigmoid is now the default curve.
-            // Giving this curve a mid-grey anchor is filed as
-            // `algo/exponential-mid-grey-anchor`; until then this is the better of
-            // two imperfect slopes, not a calibrated value.
+            // It is a partial fix and the report says so — and which fix it is depends
+            // on `anchor` (below). Under this curve's *default* placement,
+            // `WhiteAtDmax`, white is pinned at `Dmax`, so steepening pivots the line
+            // *around white* and drags everything below it down, costing 2.75 EV of
+            // midtone placement. The two knobs fight, which is exactly what an anchor
+            // other than white avoids, and why the sigmoid is the default curve; at this
+            // default the slope is therefore the better of two imperfect slopes rather
+            // than a calibrated value. Under either base-derived placement they stop
+            // fighting and 2.0 is no longer a compromise — it is roughly what
+            // `target_system_gamma / film_gamma` asks for (`1.2 / 0.6`), and within 3% of
+            // the datasheet route
+            // `MID_GREY_OUTPUT_DECADES / REFERENCE_MID_TO_WHITE_DELTA` ≈ 2.07.
             gamma: 2.0,
             dmax: DmaxSource::Fixed,
+            anchor: AnchorPlacement::WhiteAtDmax,
         }
     }
 }
@@ -782,16 +811,35 @@ pub const REFERENCE_CONTRAST: f32 = MID_GREY_OUTPUT_DECADES / REFERENCE_MID_TO_W
 /// mid-grey placement costs 0.1799 → 0.1740 → 0.1525.
 pub const REFERENCE_SHOULDER: f32 = 0.6;
 
-/// Which tone the sigmoid pins, and at what density (design-spec §7.3/§9,
+/// Which tone a density curve pins, and at what density (design-spec §7.3/§9,
 /// `reconstruction.curve.anchor`).
 ///
-/// The curve is an affine map in log space: a slope ([`SigmoidParams::contrast`]) plus **one**
-/// pinned `(density, output)` pair, from which everything else follows. This enum is that
-/// choice — a single mutually-exclusive rule, like [`DmaxSource`], not independent fields.
+/// The curve is an affine map in log space: a slope ([`SigmoidParams::contrast`], or the
+/// exponential's [`ExponentialParams::gamma`]) plus **one** pinned `(density, output)` pair,
+/// from which everything else follows. This enum is that choice — a single
+/// mutually-exclusive rule, like [`DmaxSource`], not independent fields. **Both curves share
+/// it**: placement is orthogonal to curve shape, which is what let the 2026-08-03 candidate
+/// harness score eight anchoring forms through one curve implementation.
 ///
 /// Why it exists: pinning white at the reference density placed midtones 2.5–3.6 stops too
 /// dark once the contrast became photographic, because steepening the line pivots it *around
 /// white* and drags everything below down. Pinning a mid-tone instead removes that conflict.
+///
+/// # Reference-derived versus base-derived
+///
+/// The first two variants scale with the resolved reference density; the last two do not.
+/// That distinction is the load-bearing one, because the reference is a **leader** density —
+/// film saturation, not diffuse white — and two rolls of one stock have measured 0.295 apart
+/// while their bases agreed to 0.0005 (`film-base/dmax-anchor-reliability`). Since
+/// `dAnchor/dReference` is the reference's coefficient, that spread reaches the render
+/// multiplied by it: 1.96 stops at [`Self::WhiteAtDmax`], 0.98 at a
+/// [`Self::MidAtDmaxFraction`] of 0.5, and **zero** for the base-derived pair, which never
+/// read the reference at all. Base-derived placement is the only form with no roll-to-roll
+/// term.
+///
+/// The base needs no measurement here: stage 1 divides it out
+/// (`D = −log10(scan / base)`), so the film base *is* `D′ = 0` by construction, modulo the
+/// `density.offset` and regional balance the user asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AnchorPlacement {
@@ -809,6 +857,33 @@ pub enum AnchorPlacement {
     /// 0.046 density disagreement seen between two rolls of one stock costs 0.15 stop rather
     /// than 0.31.
     MidAtDmaxFraction(f32),
+    /// Pin the **film base** to a stated output `floor`, letting white fall where the
+    /// contrast puts it. Reference-free, so it carries no roll-to-roll term at all.
+    ///
+    /// The base is `D′ = 0`, so `10^(contrast·(0 − A)) = floor` gives
+    /// `A = −log10(floor)/contrast`. That reproduces the anchors the 2026-08-03 candidate
+    /// retest recorded — floor 0.002 → 1.349, floor 0.005 → 1.151 at contrast 2.0 — which
+    /// is a free check on this arithmetic.
+    ///
+    /// `floor` is **linear light against the 203-nit reference white**, not an sRGB code
+    /// value; 0.005 encodes to about 16/255, not 5/255. (The candidate-5b row in
+    /// `reports/sigmoid-reference-baseline.md` reads 20/255 for this floor — that is the
+    /// darkest confirmed *shadow patch*, which sits just above the base, not the base.)
+    ///
+    /// On the **sigmoid** this places the straight-line-extrapolated base, not the rendered
+    /// one — the toe carries the actual base below `floor`. That is the same approximation
+    /// [`Self::MidAtDmaxFraction`] already makes on that curve, not a new one.
+    BlackAtBase(f32),
+    /// Pin **mid-grey** (output 0.18) at `offset` density *above the film base*, rather
+    /// than at a fraction of the reference. Reference-free, like [`Self::BlackAtBase`].
+    ///
+    /// `A = offset + 0.745/contrast`. This is the shape of the leading candidate from
+    /// `algo/reference-anchored-sigmoid` (mid at `Dmin` + a per-stock datasheet offset,
+    /// which scored best of every shippable form). The per-stock offset itself is **not**
+    /// available yet — it needs `mid aim − D-min`, and the registry's `D-min` figures are
+    /// chart reads that `algo/film-stock-profiles` forbids any render path from consuming.
+    /// Until then this variant takes the offset explicitly.
+    MidAtBaseOffset(f32),
 }
 
 impl Default for AnchorPlacement {
@@ -822,12 +897,35 @@ impl AnchorPlacement {
     ///
     /// `A` is the density that maps to display white, so pinning mid-grey at `M` means
     /// solving `10^(contrast·(M − A)) = 0.18`, i.e. `A = M + 0.745/contrast`.
+    ///
+    /// The base-derived variants ignore `reference` entirely — that is the whole point of
+    /// them, not an oversight.
     pub fn anchor(self, reference: f32, contrast: f32) -> f32 {
         match self {
             AnchorPlacement::WhiteAtDmax => reference,
             AnchorPlacement::MidAtDmaxFraction(f) => {
                 f * reference + MID_GREY_OUTPUT_DECADES / contrast
             }
+            AnchorPlacement::BlackAtBase(floor) => -floor.log10() / contrast,
+            AnchorPlacement::MidAtBaseOffset(offset) => offset + MID_GREY_OUTPUT_DECADES / contrast,
+        }
+    }
+
+    /// Whether resolving this placement **consumes** the reference density
+    /// (`curve.dmax`). The base-derived pair does not: hand [`Self::anchor`] any
+    /// reference at all and they return the same number.
+    ///
+    /// **This, not [`DmaxSource`] alone, is the question every `Dmax`-policy gate must
+    /// ask.** `auto` measures the reference per frame, which is frame-local adaptation
+    /// only if something *reads* it — under `black-at-base` / `mid-at-base-offset` the
+    /// measurement is computed and discarded, so the render is deterministic and
+    /// roll-consistent. Gating on the source alone made `film-master` hard-reject a valid
+    /// config and made `roll` warn (and `--strict` fail) about a consistency break that
+    /// cannot happen.
+    pub fn reads_reference(self) -> bool {
+        match self {
+            AnchorPlacement::WhiteAtDmax | AnchorPlacement::MidAtDmaxFraction(_) => true,
+            AnchorPlacement::BlackAtBase(_) | AnchorPlacement::MidAtBaseOffset(_) => false,
         }
     }
 }
@@ -929,6 +1027,16 @@ impl DensityCurve {
         }
     }
 
+    /// The anchor-placement rule this curve carries. Shared by both variants since
+    /// `algo/exponential-anchor-placement`, so placement-aware code (reports,
+    /// provenance) stays variant-agnostic like [`Self::dmax`].
+    pub fn anchor(&self) -> AnchorPlacement {
+        match self {
+            DensityCurve::Exponential(e) => e.anchor,
+            DensityCurve::Sigmoid(s) => s.anchor,
+        }
+    }
+
     /// Mutable access to the anchor source — the single write point the merge
     /// uses for the four `--*d-max` flags, whichever variant is resolved.
     pub fn dmax_mut(&mut self) -> &mut DmaxSource {
@@ -997,13 +1105,16 @@ impl<'de> Deserialize<'de> for DensityCurve {
 
         match curve_type {
             DensityCurveType::Exponential => {
-                if let Some(key) = ["contrast", "toe", "shoulder", "anchor"]
+                // `anchor` is deliberately absent from this list: since
+                // `algo/exponential-anchor-placement` the placement rule is shared by
+                // both curves, so it is a cross-curve key rather than a sigmoid one.
+                if let Some(key) = ["contrast", "toe", "shoulder"]
                     .into_iter()
                     .find(|k| obj.contains_key(*k))
                 {
                     return Err(D::Error::custom(format!(
                         "`{key}` is a sigmoid-curve key, but the curve type is \
-                         \"exponential\" (its knobs are `gamma` and `dmax`)"
+                         \"exponential\" (its knobs are `gamma`, `dmax` and `anchor`)"
                     )));
                 }
                 let d = ExponentialParams::default();
@@ -1012,6 +1123,9 @@ impl<'de> Deserialize<'de> for DensityCurve {
                         .map_err(D::Error::custom)?
                         .unwrap_or(d.gamma),
                     dmax: dmax.unwrap_or(d.dmax),
+                    anchor: take_recipe_field(obj, "anchor")
+                        .map_err(D::Error::custom)?
+                        .unwrap_or(d.anchor),
                 }))
             }
             DensityCurveType::Sigmoid => {
@@ -1847,11 +1961,69 @@ mod tests {
         assert_eq!(float.depth(), OutDepth::F32);
     }
 
+    /// The anchor arithmetic for each placement, including the values the 2026-08-03
+    /// candidate retest recorded — floor 0.002 → 1.349 and 0.005 → 1.151 at contrast 2.0.
+    /// Those two are why candidate 5's first rejection was overturned: the original run
+    /// paired a floor with an inconsistent anchor (1.607, above every roll's Dmax), so
+    /// nothing reached white and the frame rendered dark.
+    #[test]
+    fn anchor_placement_resolves_each_rule() {
+        let c = 2.0f32;
+        let r = 1.3f32;
+        assert_eq!(AnchorPlacement::WhiteAtDmax.anchor(r, c), r);
+        // Mid-grey `f` of the way up the reference, plus 0.745/contrast.
+        let mid = AnchorPlacement::MidAtDmaxFraction(0.5).anchor(r, c);
+        assert!(
+            (mid - (0.5 * r + MID_GREY_OUTPUT_DECADES / c)).abs() < 1e-6,
+            "{mid}"
+        );
+        // Base-derived rules ignore the reference entirely — the property that removes
+        // the roll-to-roll term. Passing a wildly different reference must not move them.
+        for placement in [
+            AnchorPlacement::BlackAtBase(0.005),
+            AnchorPlacement::MidAtBaseOffset(0.5),
+        ] {
+            assert_eq!(
+                placement.anchor(r, c),
+                placement.anchor(r + 0.295, c),
+                "{placement:?} moved with the reference"
+            );
+        }
+        for (floor, want) in [(0.002f32, 1.349f32), (0.005, 1.151)] {
+            let got = AnchorPlacement::BlackAtBase(floor).anchor(r, c);
+            assert!((got - want).abs() < 5e-4, "floor {floor}: {got} vs {want}");
+        }
+        let off = AnchorPlacement::MidAtBaseOffset(0.5).anchor(r, c);
+        assert!(
+            (off - (0.5 + MID_GREY_OUTPUT_DECADES / c)).abs() < 1e-6,
+            "{off}"
+        );
+    }
+
+    /// `reads_reference` must agree with [`AnchorPlacement::anchor`] rather than restate
+    /// it — it is what the `Dmax`-policy gates consult, so a rule that drifts from the
+    /// arithmetic would silently re-admit the false `film-master` rejection and the false
+    /// roll not-frozen warning it was introduced to remove.
+    #[test]
+    fn reads_reference_matches_whether_the_reference_moves_the_anchor() {
+        let c = 2.0f32;
+        for p in [
+            AnchorPlacement::WhiteAtDmax,
+            AnchorPlacement::MidAtDmaxFraction(0.5),
+            AnchorPlacement::BlackAtBase(0.005),
+            AnchorPlacement::MidAtBaseOffset(0.5),
+        ] {
+            let moves = p.anchor(1.3, c) != p.anchor(1.3 + 0.295, c);
+            assert_eq!(p.reads_reference(), moves, "{p:?}");
+        }
+    }
+
     #[test]
     fn curve_json_round_trips_both_tagged_variants() {
         let exponential = DensityCurve::Exponential(ExponentialParams {
             gamma: 1.4,
             dmax: DmaxSource::Explicit(1.8),
+            anchor: AnchorPlacement::WhiteAtDmax,
         });
         let sigmoid = DensityCurve::Sigmoid(SigmoidParams {
             contrast: 1.3,
@@ -1870,7 +2042,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&DensityCurve::Exponential(ExponentialParams::default()))
                 .unwrap(),
-            r#"{"type":"exponential","gamma":2.0,"dmax":"fixed"}"#
+            r#"{"type":"exponential","gamma":2.0,"dmax":"fixed","anchor":"white-at-dmax"}"#
         );
         assert_eq!(
             serde_json::to_string(&DensityCurve::default()).unwrap(),

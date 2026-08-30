@@ -716,9 +716,11 @@ brighter print).
 
 **Curve-stage Dmax.** In the shipped curve stage, `Dmax` is the corrected
 density of scene white and the exponential expression `10^(gamma·(D'−Dmax))`
-guarantees that `D' = Dmax` maps to `1.0`. The base maps to
-`10^(−gamma·Dmax) ≈ 0`; with `none`, the exponential curve reproduces its
-unanchored output bit-for-bit (base `1.0`, detail above). Current
+guarantees that `D' = Dmax` maps to `1.0` under the `white-at-dmax` placement. The
+base maps to `10^(−gamma·Dmax) ≈ 0`; with `none` *and that placement*, the
+exponential curve reproduces its unanchored output bit-for-bit (base `1.0`, detail
+above). `none` resolves the reference to `0`, so any other placement still derives a
+non-zero anchor from the slope and renders differently. Current
 `--out-depth f32` is still a rendered float TIFF, not the target `film-master`
 branch.
 
@@ -855,37 +857,75 @@ curve. `curve.dmax` resolves by the same fixed, explicit/reference-derived, or
 opt-in auto policy as the exponential curve.
 
 **`curve.dmax` supplies the roll's *reference* density `R`; `curve.anchor` decides
-which tone that reference places.** For the exponential curve the two are the
-same thing — `Dmax` *is* the density rendering to `1.0`. The sigmoid separates
-them, because pinning display white at a reference measured from a fully-exposed
-leader put midtones 2.5–3.6 stops too dark once the contrast became photographic:
-steepening the slope pivots the line about whatever point is pinned, so pinning
-the top end drags everything below it down. The two rules are:
+which tone that reference places.** Placement is **shared by both curves** — it is
+orthogonal to curve shape — so `curve.anchor` is a key of the exponential variant as
+well as the sigmoid, and one `--anchor-*` CLI family serves both. Pinning display
+white at a reference measured from a fully-exposed leader put midtones 2.5–3.6 stops
+too dark once the contrast became photographic: steepening the slope pivots the line
+about whatever point is pinned, so pinning the top end drags everything below it
+down. The four rules are:
 
 | `curve.anchor` | anchor `A` | meaning |
 |---|---|---|
-| `{"mid-at-dmax-fraction": f}` (default, `f = 0.5`) | `f·R + 0.745/contrast` | mid-grey (18%) renders at fraction `f` of the reference; display white lands `0.745/contrast` above it, and densities beyond it are compressed by the shoulder rather than clipped |
-| `"white-at-dmax"` | `R` | display white renders *at* the reference — the pre-2026-08 rule, retained as an explicit diagnostic |
+| `{"mid-at-dmax-fraction": f}` (sigmoid default, `f = 0.5`) | `f·R + 0.745/contrast` | mid-grey (18%) renders at fraction `f` of the reference; display white lands `0.745/contrast` above it, and densities beyond it are compressed by the shoulder rather than clipped |
+| `"white-at-dmax"` (exponential default) | `R` | display white renders *at* the reference — the pre-2026-08 rule, retained as an explicit diagnostic and as the exponential's debuggable straight line |
+| `{"black-at-base": floor}` | `−log10(floor)/contrast` | the **film base** renders to `floor`, a linear output value against the 203-nit reference white; display white falls where the slope puts it |
+| `{"mid-at-base-offset": d}` | `d + 0.745/contrast` | mid-grey renders at density `d` *above the film base* rather than at a fraction of the reference |
 
 `0.745 = −log10(0.18)` is mid-grey's fixed distance below white on the *output*
-axis, so `f` is the only free number and it is a **roll-level** placement, never
-derived from frame content.
+axis. Every rule is a **roll-level** placement, never derived from frame content.
+
+**A `Dmax` policy is only frame-local if the placement reads it.** `black-at-base` and
+`mid-at-base-offset` discard the resolved reference, so `dmax = "auto"` under either is
+computed and thrown away: the render is deterministic and identical across frames. Every
+`Dmax`-policy gate therefore tests the *placement*, not the `DmaxSource` — `film-master`
+accepts `auto` under a reference-free rule (its rejection exists to keep frame-local
+adaptation out of a master, and there is none), and `roll` does not call such a recipe
+"not frozen". Gating on the source alone hard-rejected a valid master and made `--strict`
+fail a consistent roll.
+
+**A curve-type switch resets `curve.anchor`; it does not carry it.** Both variants
+accept the key, but only `curve.dmax` is shared in *meaning* — a measured reference
+density is curve-independent, so `--density-curve` and a `roll` per-frame `type`
+override both carry it. Placement is not: each curve's default is chosen for that curve
+(`white-at-dmax` is the exponential's diagnostic straight line and the sigmoid's
+warned-against setting), so carrying it would make one curve's default the other's
+accident. A switch that discards a **non-default** placement emits a loud,
+`--strict`-promotable warning naming it — silence would be a different tonal rule with
+nothing in the report to show it, and on `roll` the override that causes it names only
+`type`, so no key-presence check can see it.
+
+**The last two are reference-free, and that is their point.** `R` is a leader
+density — film saturation rather than diffuse white — and two rolls of one stock have
+measured 0.295 apart while their bases agreed to 0.0005. Since `dA/dR` is the
+reference's coefficient, that spread reaches the render multiplied by it: 1.96 stops
+at `white-at-dmax`, 0.98 at `mid-at-dmax-fraction` with `f = 0.5`, and **zero** for
+the base-derived pair. The base needs no separate measurement — step 1 divides it out,
+so the film base *is* `D′ = 0` by construction, modulo `density.offset` and any
+regional balance. On the sigmoid, `black-at-base` places the straight-line-extrapolated
+base rather than the toe-rendered one, the same approximation `mid-at-dmax-fraction`
+already makes there.
 
 **Archived recipes are warned about, not silently reinterpreted.** `curve.anchor` did not
 exist before 2026-08-03, so a recipe frozen earlier omits it and picks up this build's
 default placement — a different render even with `contrast`, `toe`, `shoulder` and `dmax`
 all pinned. Loading a recipe that selects `sigmoid` without an `anchor` therefore emits a
 loud, `--strict`-promotable warning naming `"white-at-dmax"` as the way to reproduce the
-old placement. This is deliberately *not* a `reconstruction.schema_version` bump: that
+old placement. An `exponential` recipe without an `anchor` warns too, in the
+moved-defaults form it shares with a floating `gamma`/`dmax`: this build always writes the
+key, so its absence marks a file some other build wrote. The exponential's default
+placement is behaviour-preserving *today*, which is why it is the milder warning and not
+the placement-moved one. This is deliberately *not* a `reconstruction.schema_version` bump: that
 constant versions the schema **shape** and is checked for exact equality, so bumping it
 would reject every archived recipe outright, including the majority that select the
 exponential curve and are unaffected. Preserving per-version semantics instead (a
 historical default table, which would also have to cover `contrast` and `shoulder`) is
 policy owned by `core/conversion-versioning`. Mid-placement is also half as sensitive to a
 reference error (`dA/dR = f`), which matters because a leader's density records
-how the roll was loaded, not the film. `f` must be in `(0, 1]` (§9). Both rules
+how the roll was loaded, not the film. `f` must be in `(0, 1]` (§9). Those two rules
 keep `curve.dmax` as the normalisation reference, so the roll-fixed invariant
-holds. Gamma exists only in the exponential variant. Supplying
+holds; the base-derived pair never reads it, which is what removes their
+roll-to-roll term entirely. Gamma exists only in the exponential variant. Supplying
 `--density-gamma` while the resolved curve is sigmoid is an invalid combination
 after merge (exit 2), never a warning or ignored value (the pre-reconstruction
 implementation's ignored-gamma warning is gone).
@@ -1036,7 +1076,8 @@ density block and a calibrated anchor, to show the other fields too):
     "curve": {
       "type": "exponential",
       "gamma": 2.0,
-      "dmax": {"explicit": 1.29}
+      "dmax": {"explicit": 1.29},
+      "anchor": "white-at-dmax"
     }
   }
 }
@@ -1046,8 +1087,11 @@ density block and a calibrated anchor, to show the other fields too):
 defaults to 1; resolved recipes always emit it. `curve.dmax` accepts
 `"fixed"`, `"auto"`, `"none"`, or
 `{"explicit": <density>}`; `"none"` is valid only for exponential. `curve.anchor`
-(sigmoid only) accepts `"white-at-dmax"` or `{"mid-at-dmax-fraction": <f>}` with
-`f` in `(0, 1]`, defaulting to `{"mid-at-dmax-fraction": 0.5}` (§7.3). Omitted
+(**both curves**) accepts `"white-at-dmax"`, `{"mid-at-dmax-fraction": <f>}` with `f`
+in `(0, 1]`, `{"black-at-base": <floor>}` with `floor` in `(0, 1)`, or
+`{"mid-at-base-offset": <d>}` with `d > 0`. It defaults to
+`{"mid-at-dmax-fraction": 0.5}` under sigmoid and `"white-at-dmax"` under exponential
+(§7.3). Omitted
 density fields take the displayed defaults. Partial input may omit
 `reconstruction.curve`, which selects the default curve (sigmoid) with its defaults; every
 resolved recipe/report emits exactly one tagged curve. Partial objects are
@@ -1316,10 +1360,12 @@ pre-transfer, and `transitional-rendered-float-tiff` is print-rendered in the
 selected output space. `content` states what
 the pixels contain; for `film-master` it names the intentional
 film/lens/development/scanner/reconstruction/curve rendering and explicitly
-disclaims physical scene recovery. It names the resolved roll-fixed `Dmax` placement
-only when the run actually made one — `simple` has no anchor and exponential
-`dmax = none` places none, and claiming one there would be a false provenance
-statement. `working_mapping` is repeated inside the block
+disclaims physical scene recovery. It names *which* anchor placement the run made:
+the resolved roll-fixed `Dmax` one, a film-base-derived one that read no `Dmax`, or
+none at all — `simple` has no anchor, and exponential `dmax = none` under
+`white-at-dmax` places none. Keying that only on `curve.dmax` would give a stated
+base-derived anchor and a genuinely unanchored run the same provenance, and let a
+render that never read `Dmax` claim the roll-fixed placement. `working_mapping` is repeated inside the block
 so a master's provenance is self-contained, and
 `reconstruction_schema_version` mirrors `reconstruction.schema_version`. The
 behavioral `pipeline_version` is a **separate** field owned by
@@ -1328,13 +1374,15 @@ guessed.
 
 The block above is the **default** (sigmoid) shape: `curve.type` is `"sigmoid"` with
 the resolved `dmax` object plus two
-placement fields: `anchor` (the resolved placement *rule*, omitted entirely for the
-exponential curve, which has none) and `anchor_value` (the **derived** anchor — the
+placement fields: `anchor` (the resolved placement *rule*, emitted for **both** curves
+— they share the rule) and `anchor_value` (the **derived** anchor — the
 corrected density this render mapped to `1.0`, hence the black floor at
 `10^(−contrast·anchor_value)`). `dmax.value` is the *reference*; under the default
 mid-grey placement the two differ, so reporting only the reference would document a
-number the render did not use. For the exponential curve, and for the sigmoid's
-`white-at-dmax` placement, `anchor_value` equals `dmax.value`;
+number the render did not use. Under `white-at-dmax` on either curve `anchor_value`
+equals `dmax.value`; under any other rule it does not, and under the base-derived pair
+it does not depend on `dmax.value` at all — which is precisely why `anchor` has to be
+reported alongside it;
 for exponential `"none"`, `dmax` is
 `{"policy":"none","value":null,"provenance":"recipe"}`; for simple,
 `reconstruction_result` is exactly `{"type":"simple"}`. `policy` is one of
@@ -1792,12 +1840,17 @@ crossover.
 - `--sigmoid-contrast <f>`, `--sigmoid-toe <f>`, and
   `--sigmoid-shoulder <f>` ⇒ `reconstruction.curve.contrast`, `.toe`, and
   `.shoulder`, valid only when the resolved curve type is `sigmoid`.
-- `--sigmoid-mid-fraction <f>` ⇒
-  `reconstruction.curve.anchor = {"mid-at-dmax-fraction": f}` and
-  `--sigmoid-white-at-d-max` ⇒ `reconstruction.curve.anchor = "white-at-dmax"`,
-  likewise sigmoid-only. The two flags conflict (the placement is one rule, not
-  two independent fields); whichever is given replaces a recipe's `anchor`
-  entirely.
+- The `--anchor-*` family ⇒ `reconstruction.curve.anchor`, and unlike the
+  `--sigmoid-*` flags above it is **curve-neutral** — placement is orthogonal to
+  curve shape, so the same flags apply under either curve:
+  `--anchor-mid-fraction <f>` ⇒ `{"mid-at-dmax-fraction": f}`,
+  `--anchor-white-at-reference` ⇒ `"white-at-dmax"`,
+  `--anchor-black-floor <floor>` ⇒ `{"black-at-base": floor}`, and
+  `--anchor-mid-offset <d>` ⇒ `{"mid-at-base-offset": d}`. All four conflict (the
+  placement is one rule, not four independent fields); whichever is given replaces a
+  recipe's `anchor` entirely. `--sigmoid-mid-fraction` and
+  `--sigmoid-white-at-d-max` remain accepted as **aliases** of the first two: they
+  predate the sharing and appear in committed recipes and docs.
 - `Dmax` is owned by the tagged curve. Its target recipe key is
   `reconstruction.curve.dmax` (default `"fixed"`; see §7.2). It is a
   **roll-fixed
@@ -1819,7 +1872,9 @@ crossover.
     former default — not the faithful-conversion default.
   - `--no-d-max` ⇒ `"none"` — choose unity exponential placement (base `1.0`,
     detail above), reproducing the current pre-anchor film rendering
-    bit-for-bit. This is an unanchored film rendering, not a physical-scene
+    bit-for-bit **under the default `white-at-dmax` placement**; `none` resolves the
+    reference to `0`, and the other rules still derive an anchor from the slope. This
+    is an unanchored film rendering, not a physical-scene
     Current `--out-depth f32` remains a rendered float TIFF,
     not the target `film-master`.
     The sigmoid curve is anchored on `[0, Dmax]`, so `sigmoid` + `none` is a
@@ -1880,15 +1935,32 @@ render use `reconstruction.density` and `print`. The exact recipe keys are
   what makes the anchor's headroom above white a roll-off rather than a clip.
   Narrower widths (`0.2`) give visibly crisper midtones at a measurable cost in
   highlight separation.
-- `--sigmoid-mid-fraction <f>` / `--sigmoid-white-at-d-max` — which tone the
-  reference density places (§7.3). `f` is finite and in `(0, 1]`; default
-  `0.5`. Under the mid-grey placement `contrast` additionally has a **lower** bound: the
-  anchor adds `0.745/contrast` to the reference, so a slope below ~`2.2e-39` overflows that
-  quotient to a non-finite anchor and is a usage error naming the flag (the bound applies
-  only to this placement — `--sigmoid-white-at-d-max` performs no division). Outside that range the anchor either detaches from the reference
-  entirely (`f ≤ 0` pins mid-grey at or below the film base, rendering the whole
-  frame above mid-grey) or places mid-grey past display white (`f > 1`), so both
-  are usage errors rather than clamped values.
+- The `--anchor-*` family — which tone the curve pins, and where (§7.3).
+  `--anchor-mid-fraction <f>` is finite and in `(0, 1]` (sigmoid default `0.5`);
+  outside it the anchor either detaches from the reference entirely (`f ≤ 0` pins
+  mid-grey at or below the film base, rendering the whole frame above mid-grey) or
+  places mid-grey past display white (`f > 1`). `--anchor-black-floor <floor>` is in
+  `(0, 1)`: at or below 0 there is no logarithm to take, and at 1 the film base
+  renders as display white. `--anchor-mid-offset <d>` is strictly positive — it is a
+  density *above* the base, and 0 would pin mid-grey on the base itself. All are
+  usage errors rather than clamped values. Every placement but
+  `--anchor-white-at-reference` divides by the slope, so validation **resolves the rule**
+  and rejects a non-finite anchor, naming the slope flag (`--density-gamma` or
+  `--sigmoid-contrast`). There is no single slope bound to quote: the mid-grey rules
+  divide the fixed `0.745`, which overflows below ~`2.2e-39`, while
+  `--anchor-black-floor` divides `−log10(floor)`, which is unbounded as the floor
+  shrinks. `--anchor-white-at-reference` performs no division and is exempt. Slope
+  positivity/finiteness is diagnosed **first** — "the slope is 0" is the more specific
+  fault than "the anchor derived from it overflowed", and the division's remedy does not
+  apply to it.
+
+  A **finite** anchor is separately checked against the slope: the curve evaluates
+  `slope · (density − anchor)`, so a large finite anchor overflows that *product* to
+  `−inf` and `10^(−inf)` is exactly `0.0` — a silently black frame with no clip and no
+  non-finite count. `--anchor-mid-offset 2e38` reaches it at the shipped default gamma.
+  The rule is that no intermediate may overflow, not merely that the anchor is finite;
+  a large anchor whose product stays finite is honest arithmetic on absurd input and is
+  accepted (bounding *that* belongs to `algo/density-safety-bounds`).
 
 These caps reject only *nonsense / degenerate-asymptote* values (a knee of `10000`
 that flattens the frame); within them, aggressive-but-valid contrast/knees produce
