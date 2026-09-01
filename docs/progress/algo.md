@@ -53,6 +53,23 @@ What other epics need to know about `algo`:
   `gamma` became `2.0`, recorded as `pipeline_version` 2 with its own
   `PIPELINE_FINGERPRINTS` row. `output/presets` owns the default *preset*
   migration; it no longer owes the curve bump.
+- **`AnchorPlacement` is carried by *both* curves, and reference-freeness is a property of
+  the placement, not of `DmaxSource`** (since `exponential-anchor-placement`, 2026-08-29).
+  One curve-neutral `--anchor-*` flag family covers all four placements on both curves
+  (`--sigmoid-mid-fraction` / `--sigmoid-white-at-d-max` survive as aliases). Two of the four —
+  `black-at-base`, `mid-at-base-offset` — never read the resolved `Dmax`, which is what keeps
+  the leader anchor's roll-to-roll error out of the render. Consequences other epics must key
+  on: **`AnchorPlacement::reads_reference()` is the single shared predicate** for "does this
+  render actually consume the reference", and every gate that asked `DmaxSource` alone was
+  asking the wrong object — `film-master`'s provenance (`MasterAnchor`: roll-fixed /
+  base-derived / none) and roll's "Dmax is NOT frozen" warning both route through it, so
+  `--auto-d-max` with a base-derived placement is correctly neither refused nor warned.
+  `curve.anchor` is emitted in the report for both curves. Defaults are unchanged and
+  deliberately per-curve: sigmoid `MidAtDmaxFraction(0.5)`, exponential `WhiteAtDmax`.
+- **A curve switch resets `anchor` and says so.** `dmax` is a measured roll calibration and
+  carries across a `--density-curve` switch; `anchor` is a rendering rule whose right value is
+  per-curve, so it resets — and `curve_switch_dropped_anchor` warns (roll-level,
+  `--strict`-promotable) when the discarded placement was not the base curve's own default.
 - **Mutually exclusive knobs are one enum, never parallel fields** — `WbSource`,
   `BalanceRange`, `DmaxSource`, the tagged `Reconstruction`/`DensityCurve`. This
   is what makes the flags-win merge sound and provenance representable.
@@ -1938,8 +1955,8 @@ What other epics need to know about `algo`:
 
 ## exponential-anchor-placement
 
-**Status:** in progress
-**Updated:** 2026-08-28
+**Status:** done
+**Updated:** 2026-08-31
 
 > Renamed from `exponential-mid-grey-anchor` on 2026-08-12 (see the entry at the end of
 > this section). Entries below predate the rename and are left verbatim; earlier
@@ -2364,6 +2381,32 @@ What other epics need to know about `algo`:
     (placement) gains the power to nullify the first.
   - Both fixes are refusals and gate-relaxations, not rendering changes: default render
     byte-identical (`params_hash 55a841428c1e6671`).
+- 2026-08-31 (**closed**). Merged as #98 (`b44427e`) after four review rounds. Every
+  acceptance bullet is met: `white-at-dmax` is bit-identical (the existing
+  `frozen_reference_*` goldens covered it, no new vector needed), the black-pin trade was
+  measured on the same frozen shadow patches the baseline report used, mid-grey was measured
+  **across a roll** rather than judged on a frame, and no default moved — so no
+  `pipeline_version` bump was owed and the drift gate never fired.
+- **What the task set out to do and what it actually delivered are different things, and the
+  second is the more useful one.** It was filed to fix the exponential's 2.75 EV midtone
+  defect by pinning the black end. The mechanism shipped and works, but the *rendering*
+  premise failed: the exponential is not competitive at any anchor, so the black pin it was
+  filed for is not a better default and `white-at-dmax` stays. What the work actually
+  produced is a measured map of the trade — anchor height moves midtone, black **and**
+  highlights monotonically; a toe raises the floor rather than lowering it; a display-stage
+  black point does what the toe cannot; and `GainMapMax` answers to the shoulder alone.
+  **A task whose stated fix is refuted but whose measurements redirect two downstream tasks
+  is a success, not a failure** — provided the negative result is written down as loudly as a
+  positive one would have been.
+- **Handed to `algo/reconstruction-render-curve-split`** (see the new entry in its section):
+  its reconstruction curve is open again, and its HDR-headroom question is already answered.
+- Left deliberately unresolved, and *not* refiled as a task: the A-versus-B question of which
+  stage places the picture. It belongs to the split task, which owns the stage boundary; the
+  `AnchorPlacement` enum carries both positions, so the comparison needs no further knob work.
+- Also still unmeasured, recorded so it is not rediscovered: **hard clip versus soft roll-off.**
+  X2 and the shipped default differ by only 1.6pp of blown pixels but read further apart than
+  that, so a term is missing from the metric pair (`blown%` + code separation).
+
 ## negative-reconstruction-density-curves (review follow-up)
 
 **Status:** done
@@ -2479,3 +2522,45 @@ What other epics need to know about `algo`:
   the existing display shoulder suffices, and **what happens to `film-master`**,
   whose definition includes the curve. That last one is likely the sharpest
   constraint.
+- 2026-08-31 (**the handoff from `algo/exponential-anchor-placement` arrived, and it is a
+  "no"**). That task shipped its mechanism and then measured the rendering question on ten
+  real frames / nineteen configs. Five results land directly on this task:
+  - **The modified exponential cannot be this task's reconstruction curve.** Given the *same*
+    anchor as the sigmoid (0.875) it blows **21.4%** of every frame to absolute white with
+    **zero** separation in the top decile, against 6.9% / 19 code values for the sigmoid — it
+    has no shoulder, so the top hard-clips wherever the anchor is put. At high anchors it
+    simply converges on the sigmoid (122.5 code separation against 122.6), because the S-curve
+    is straight up there. So the open question this task recorded as "settled — it is being
+    worked in `exponential-anchor-placement`" is answered in the negative, and the curve is
+    **open again**.
+  - **The HDR-headroom half is already decided, and it was never about the anchor.**
+    `GainMapMax` answers to the **shoulder** and nothing else: shoulder 0.6 → 1.000x,
+    shoulder 0.2 → 1.000x, shoulder 0.0 → 4.866x, and the exponential reads 4.866x under
+    `white-at-dmax` *and* under `black-at-base` — identical across completely different
+    anchors. The sigmoid's shoulder runs during **reconstruction** and removes every
+    above-white value before either display branch sees it, so SDR and HDR receive identical
+    input and their ratio is 1.0 by construction. That is this task's premise stated
+    mechanically, and it is a far stronger case for the split than the single 1.0x-vs-4.87x
+    observation that filed it. Note 4.866x is 98.8% of the declared 4.926 headroom — turning
+    the shoulder off does not buy graceful HDR, it saturates the ceiling.
+  - **"Reconstruction places mid, a toe recovers black" is refuted, not merely unsupported.**
+    Widening the toe 0.2 → 0.4 → 0.6 moved the film base **38 → 41 → 44**. A toe is a soft
+    approach to black *from above*, so it necessarily raises the floor. Any future proposal of
+    that shape is dead on arrival.
+  - **A display-stage black point does what the toe cannot**, which is evidence for the split
+    rather than against it: `print.black_point = 0.019` over mid@base+0.508 gives |EV| 0.13
+    with the base at **1/255**, dominating every single-anchor form on both axes at once (the
+    best previous pairing was 0.78 EV at base 24). It costs 0.16 stops of midtone and lands in
+    the **display** stage, so `film-master` keeps the unclipped rendering — a partial answer to
+    this task's sharpest constraint.
+  - **Two-points-not-three is now measured, not argued.** Anchor 1.293 → 0.906 moves |EV|
+    2.75 → 0.03, base 10 → 38, and highlight separation 122 → 19 code values, monotonically,
+    with no exceptions across the set. Every single-anchor form sits on one frontier, which is
+    the quantified case that a second stage is needed at all.
+- **Metric warning for whoever picks this up** — three measures in the committed
+  `pipeline::shadow_metrics` harness actively mislead, and all three fooled the previous author:
+  `sat%` (fixed 0.999 threshold, so any `black_point` shift deflates it), `flat%` (measured
+  against each frame's *own* maximum, meaningless for a config too dark to reach 1.0), and
+  highlight separation as a **linear ratio** (inverts against visual review, because sRGB
+  spends more code values per stop higher up). The surviving pair is `blown%` (absolute
+  ≥ 0.999) and separation in **code values**; neither alone matches the eye, both together do.

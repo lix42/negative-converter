@@ -508,17 +508,16 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `algo/sigmoid` (post-MVP): `algo/interface`, `algo/dmax-white-anchor`
 - `algo/negative-reconstruction-density-curves` (post-MVP): `io/input-data-semantics`, `film-base/dmax-reference`, `algo/sigmoid`
 - `algo/reference-anchored-sigmoid` (post-MVP): `algo/negative-reconstruction-density-curves`, `film-base/dmax-reference`
-- `algo/exponential-anchor-placement` (post-MVP, **in progress**): `algo/negative-reconstruction-density-curves`
+- `algo/exponential-anchor-placement` (post-MVP): `algo/negative-reconstruction-density-curves`
   — renamed from `algo/exponential-mid-grey-anchor` on 2026-08-12 when the direction changed
   from pinning mid-grey to **pinning the black end at the film base**; the name now tracks the
-  mechanism (`AnchorPlacement` on the exponential) rather than one placement. The exponential
-  pins white at `Dmax` with no placement rule, so contrast pivots around white — measured at
-  2.75 EV of midtone offset for the floor fix `gamma = 2.0` buys. A black pin is `Dmax`-free
-  and anchors the measurement that is reliable (base agrees to 0.0005 across rolls where the
-  leader `Dmax` is 0.295 apart), and it reviewed as candidate 5b, "most likely GO", in
-  `algo/reference-anchored-sigmoid`. Blocks nothing formally (non-default path since v2), but
-  `algo/reconstruction-render-curve-split` waits on its outcome for what "modified
-  exponential" means
+  mechanism (`AnchorPlacement`, now carried by **both** curves) rather than one placement.
+  Shipped 2026-08-29 with **no default moved**: measured on ten real frames, the exponential is
+  not competitive at any anchor — at the sigmoid's own anchor it blows 21.4% of the frame to
+  white with zero top-decile separation, because it has no shoulder. Its problem was never the
+  anchor, so `white-at-dmax` stays its default on evidence rather than caution. The black pin
+  (candidate 5b, "most likely GO" on shadow numbers) is *dominated* by the shipped default when
+  judged as a whole picture
 - `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`, `algo/auto-anchor-interior-measurement`; no downstream blockers
   — the last is a hard prerequisite, not a nicety: content-driven anchoring is currently
   unusable because `DmaxSource::Auto` measures the whole frame and the opaque holder owns the
@@ -546,14 +545,15 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   solved twice
 - `algo/reconstruction-render-curve-split` (post-MVP, **experiment with a verdict**):
   `algo/reference-anchored-sigmoid`, `color/film-master-render-pipeline`
-  — filed 2026-08-10. Try a modified exponential as the density→linear reconstruction with
-  the sigmoid character applied by the *display* stage, restoring the "density conversion
-  and print rendering are separate sub-stages" rule the current curve partly collapses.
-  Same frame, same base/`Dmax`: sigmoid peaks at exactly reference white
-  (`GainMapMax` 1.0x), exponential reaches 4.87x — so this task and the HDR-headroom
-  question are one question. What "modified" means is being settled in
-  `algo/exponential-anchor-placement` (a black pin at the film base) rather than duplicated
-  here. Sharpest constraint is `film-master`, whose definition *includes* the curve
+  — filed 2026-08-10 to move the sigmoid character to the *display* stage, restoring the
+  "density conversion and print rendering are separate sub-stages" rule the current curve
+  partly collapses. **The goal stands; the proposed curve does not.**
+  `algo/exponential-anchor-placement` settled what "modified exponential" meant on 2026-08-29
+  and the answer is negative — it is not competitive at any anchor — so the reconstruction
+  curve is open again. The HDR-headroom half is already decided: `GainMapMax` answers to the
+  **shoulder** alone, which runs during reconstruction and strips above-white values before
+  either display branch sees them, which is this task's premise stated mechanically. Sharpest
+  constraint is `film-master`, whose definition *includes* the curve
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
@@ -814,14 +814,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Sigmoid / H&D-curve tone algorithm](tasks/algo/sigmoid.md)
 - [x] [Negative reconstruction and density curves](tasks/algo/negative-reconstruction-density-curves.md) — adopt tagged simple/density reconstruction, make exponential/sigmoid tagged density curves, and produce typed `FilmRgbImage`
 - [x] [Reference-anchored sigmoid calibration and redesign](tasks/algo/reference-anchored-sigmoid.md) — reproduce and quantify the shipped sigmoid's raised, narrow real-roll shadow spread, then choose the least invasive defaults/semantics/equation remedy against frozen film-master/SDR/HDR metrics
-- [~] [Anchor placement for the exponential curve](tasks/algo/exponential-anchor-placement.md) — the
-  exponential pins display white at `Dmax` and has no `AnchorPlacement`, so raising contrast
-  pivots the line *around white*: `gamma = 2.0` fixes the black floor (72 → 12/255) but costs
-  **2.75 EV of midtone placement**. Give it an anchor rule so the two knobs stop fighting —
-  **pinning the black end at the film base**, which is `Dmax`-free and anchors the reliably
-  measured end. Renamed from `exponential-mid-grey-anchor` 2026-08-12 with that change of
-  direction. Non-default path since v2, so it blocks nothing formally, but
-  `algo/reconstruction-render-curve-split` waits on its outcome
+- [x] [Anchor placement for the exponential curve](tasks/algo/exponential-anchor-placement.md) —
+  all four placements now exist on **both** curves behind one curve-neutral `--anchor-*` family,
+  so contrast and endpoint placement stop fighting. The **rendering** verdict is negative and is
+  the durable result: on ten real frames the exponential is not competitive at any anchor (21.4%
+  blown with zero top-decile separation at the sigmoid's anchor — no shoulder), so **no default
+  moved** and the default render is byte-identical. Also measured here: the anchor trades
+  midtone against black *and* highlights monotonically, a toe *raises* the black floor rather
+  than pulling it down, and `GainMapMax` is controlled by the shoulder alone
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
 - [ ] [Curve endpoint validation](tasks/algo/curve-endpoint-validation.md) — warn **before decode**
   when a resolved curve places its tonal endpoints so badly the render cannot approach white or
@@ -849,11 +849,13 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   measurement to the picture area; an implausible anchor must fail loudly, not render a black
   image. Blocks every content-driven rendering mode.
 - [ ] [Reconstruction / render curve split](tasks/algo/reconstruction-render-curve-split.md) —
-  **the next rendering step (2026-08-10).** Try a modified exponential at reconstruction with
-  the sigmoid character moved to the render stage. Restores the separate-sub-stages rule, and
-  decides the HDR-headroom question as a side effect: the sigmoid places diffuse white *at*
-  reference white by construction (`GainMapMax` 1.0x), the exponential reaches 4.87x on the
-  same frame. A verdict either way is a complete outcome
+  **the next rendering step (2026-08-10).** Move the sigmoid character to the render stage,
+  restoring the separate-sub-stages rule. The reconstruction curve is **open again**: the
+  modified exponential this task assumed was ruled out on measurement by
+  `algo/exponential-anchor-placement` (2026-08-29). The HDR-headroom half is already decided —
+  `GainMapMax` is controlled by the **shoulder** alone, which runs during reconstruction and
+  strips above-white values before either display branch sees them. A verdict either way is a
+  complete outcome
 - [ ] [Sigmoid parameter calibration](tasks/algo/sigmoid-parameter-calibration.md) — turn the
   provisional contrast (≈2.07), shoulder (≈0.6) and per-stock anchor offsets into calibrated
   values. Needs a **bracketed roll** (so exposure labels are true by construction) and a **grey

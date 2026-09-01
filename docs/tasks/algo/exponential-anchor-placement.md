@@ -122,12 +122,24 @@ pinned on real frames.
 
 ## Status
 
-**Mechanism shipped 2026-08-18** (see `docs/progress/algo.md`): all four placements
+**Done — merged 2026-08-29 as #98** (see `docs/progress/algo.md`). All four placements
 exist on both curves behind one curve-neutral `--anchor-*` flag family, the exponential
 default stays `white-at-dmax`, and the default render is byte-identical to the previous
-build. What remains is the *rendering* decision — the floor value, whether the
-exponential's default should move, and the A/B question above — none of which is
-mechanism work.
+build — so no `pipeline_version` bump was owed.
+
+**The rendering question above is closed, and the answer is negative.** Measured on ten
+real frames: the exponential is not competitive at *any* anchor — given the sigmoid's own
+anchor it blows 21.4% of the frame to white with zero top-decile separation, because it
+has no shoulder. Its problem was never the anchor, so no default moves, and the black pin
+this task was filed for (candidate 5b) is *dominated* by the shipped default when judged
+as a whole picture rather than on shadow numbers. The floor therefore stays a
+user-supplied parameter with no default to pick.
+
+The A/B question — which stage places the picture — is deliberately **not** answered here
+and is **not** refiled. It belongs to
+[`algo/reconstruction-render-curve-split`](reconstruction-render-curve-split.md), which
+owns the stage boundary; the enum carries both positions, so the comparison needs no
+further knob work.
 
 ## How to Verify
 
