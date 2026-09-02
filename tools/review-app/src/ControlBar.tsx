@@ -23,7 +23,7 @@ const styles = stylex.create({
     borderBottomStyle: "solid",
     borderBottomColor: "var(--edge)",
   },
-  group: { display: "flex", gap: 6, alignItems: "center" },
+  group: { display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" },
   spacer: { marginInlineStart: "auto" },
   button: {
     display: "inline-flex",

@@ -9,7 +9,13 @@ const styles = stylex.create({
   label: { fontWeight: 600 },
   note: { color: "var(--accent)", fontVariantNumeric: "tabular-nums" },
 
-  strip: { display: "flex", gap: 8, alignItems: "center", marginBottom: 10 },
+  strip: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 8,
+    alignItems: "center",
+    marginBottom: 10,
+  },
   preview: {
     padding: 0,
     borderRadius: 6,
@@ -230,7 +236,11 @@ export function ImageSection(props: Props) {
   // absent there.
   createEffect(
     on(
-      () => props.zoom,
+      // The active index matters as much as the zoom mode: `reservation()` is taken
+      // from the *active* rendition, so switching to one that declares different
+      // dimensions changes the stage's scroll size. Watching only the zoom left the
+      // pan controls and mini-map stale until the next load, resize or toggle.
+      () => [props.zoom, props.activeIndex] as const,
       () => {
         measureOverflow();
         requestAnimationFrame(measureOverflow);
