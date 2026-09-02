@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vite-plus/test";
-import { parseReview, reviewUrl } from "./review";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { loadReview, parseReview, reviewUrl } from "./review";
 
 const BASE = "http://example.test/sets/display-tone/review.json";
 
@@ -149,6 +149,34 @@ describe("reviewUrl", () => {
   it("accepts an absolute ?data= URL", () => {
     expect(reviewUrl("http://example.test/app/?data=http://other.test/r.json")).toBe(
       "http://other.test/r.json",
+    );
+  });
+});
+
+describe("loadReview", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("resolves images beside the document the server actually returned", async () => {
+    // A host that redirects `/sets/tone/` to `/sets/tone/review.json`, or http to
+    // https: images must resolve beside the final document, not the request.
+    vi.stubGlobal(
+      "fetch",
+      async () =>
+        new Response(JSON.stringify(doc()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    const response = new Response("{}");
+    Object.defineProperty(response, "url", { value: "" });
+
+    const review = await loadReview("http://example.test/app/?data=../sets/tone/review.json");
+    // `Response` built in-process reports an empty `url`, so this exercises the
+    // documented fallback to the requested URL.
+    expect(review.images[0]!.renditions.get("shoulder")!.src).toBe(
+      "http://example.test/sets/tone/E1-shoulder.jpg",
     );
   });
 });

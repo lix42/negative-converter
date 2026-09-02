@@ -255,6 +255,31 @@ export function ImageSection(props: Props) {
   };
 
   const activeId = () => props.configs[props.activeIndex]?.id;
+  const activeRendition = () => {
+    const id = activeId();
+    return id === undefined ? undefined : props.image.renditions.get(id);
+  };
+
+  /**
+   * Reserve the declared box in `fullsize`, before the image has loaded.
+   *
+   * A **floor**, not a size: the image still renders at its natural dimensions, so
+   * a stale declared value cannot scale the picture (which is why `fullsize` sets
+   * `width`/`height: auto` in the first place). Without this the stage is 0x0 until
+   * the first decode and the whole section jumps when it lands. Not applied in
+   * `fit`, where a 2400px floor would force horizontal overflow on a column that
+   * is meant to shrink the image to fit.
+   */
+  const reservation = () => {
+    const rendition = activeRendition();
+    if (props.zoom !== "fullsize" || !rendition?.width || !rendition.height) {
+      return undefined;
+    }
+    return {
+      "min-width": `${rendition.width}px`,
+      "min-height": `${rendition.height}px`,
+    };
+  };
   const hasActive = () => {
     const id = activeId();
     return id !== undefined && props.image.renditions.has(id);
@@ -325,7 +350,7 @@ export function ImageSection(props: Props) {
 
       <div class={cls(styles.frame)}>
         <div class={cls(styles.viewport)} ref={setViewport} onScroll={paintMap}>
-          <div class={cls(styles.stage)}>
+          <div class={cls(styles.stage)} style={reservation()}>
             <For each={props.configs}>
               {(config) => (
                 <Show when={props.image.renditions.get(config.id)}>

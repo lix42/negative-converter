@@ -62,6 +62,16 @@ Package management is **pnpm**, pinned by `packageManager` in `package.json`;
 you run `vp install`. Run `vp` built-ins directly (`vp check`); use `vpr <name>`
 if you ever need the npm _script_ of the same name.
 
+## Known limits
+
+- **Every rendition of every image is fetched eagerly.** The stacking that makes
+  switching instant requires the inactive renditions to be laid out, and
+  `loading="lazy"` on them would collapse a section to zero height whenever a set
+  omits `width`/`height` — which the schema permits. So a large set (many frames x
+  many configs of full-size JPEGs) downloads everything up front. Fixing it
+  properly means making dimensions mandatory, which is the generator's job when
+  that half is built. Downsize the images meanwhile; the previews reuse them.
+
 ## Notes for the next person
 
 - **`vp migrate --full` writes to `CLAUDE.md`/`AGENTS.md`.** Its `--agent` step

@@ -247,5 +247,9 @@ export async function loadReview(pageUrl: string): Promise<Review> {
       `${url} is not valid JSON: ${cause instanceof Error ? cause.message : String(cause)}`,
     );
   }
-  return parseReview(json, url);
+  // Resolve against the URL the document actually came from, not the one asked
+  // for: `fetch` follows redirects, and a static host or CDN that redirects
+  // (a directory to its `index`, http to https, a rewritten path) would otherwise
+  // have every image resolved beside the pre-redirect location.
+  return parseReview(json, response.url || url);
 }
