@@ -7573,6 +7573,87 @@ fn sdr_presets_write_lossless_16_bit_tiffs_through_the_modern_pipeline() {
 }
 
 #[test]
+fn the_reinhard_display_tone_reaches_the_pixels_and_zero_headroom_is_the_identity() {
+    let tmp = TempDir::new("reinhard-tone");
+    let scan = fixture("hdr-48bit.tif");
+    let render = |tag: &str, extra: &[&str]| {
+        let out = tmp.path(&format!("{tag}.tiff"));
+        let mut argv = vec![
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            "display-p3",
+            "--film-base",
+            "0.9,0.6,0.5",
+        ];
+        argv.extend_from_slice(extra);
+        let (code, _stdout, err) = run_exact(&argv);
+        assert_eq!(code, 0, "{tag}: {err}");
+        std::fs::read(&out).unwrap()
+    };
+
+    // Opt-in: naming the shipped tone is byte-identical to naming nothing.
+    let default = render("default", &[]);
+    assert_eq!(default, render("shoulder", &["--display-tone", "shoulder"]));
+
+    // The operator reaches the pixels, and the headroom reaches the operator.
+    let w64 = render("w64", &["--display-tone", "reinhard"]);
+    let w16 = render(
+        "w16",
+        &["--display-tone", "reinhard", "--display-tone-headroom", "4"],
+    );
+    assert_ne!(default, w64, "reinhard produced the shoulder's bytes");
+    assert_ne!(w64, w16, "the headroom did not reach the render");
+
+    // Zero stops is `W = 1`, where extended Reinhard is exactly `v` — so it must
+    // produce the *same pixels* as applying no tone curve at all. The two still differ
+    // in range policy (`none` refuses an overshoot, reinhard counts it), which is
+    // precisely why this identity is worth pinning rather than assuming.
+    assert_eq!(
+        render("none", &["--display-tone", "none"]),
+        render(
+            "zero",
+            &["--display-tone", "reinhard", "--display-tone-headroom", "0"]
+        ),
+        "zero headroom is not the identity"
+    );
+}
+
+#[test]
+fn the_reinhard_display_tone_is_refused_where_the_render_cannot_carry_it() {
+    let tmp = TempDir::new("reinhard-reject");
+    let scan = fixture("hdr-48bit.tif");
+    // The gain-map default and the HDR presets are display presets that take the other
+    // two tones but not this one — the narrower rule, distinct from the legacy branch
+    // check that refuses every `display_tone`.
+    for (preset, ext) in [
+        ("gain-map-hdr", "jpg"),
+        ("hdr-pq", "avif"),
+        ("hdr-linear-tiff", "tiff"),
+        ("legacy", "tiff"),
+    ] {
+        let out = tmp.path(&format!("{preset}.{ext}"));
+        let (code, _stdout, err) = run_exact(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "0.9,0.6,0.5",
+            "--display-tone",
+            "reinhard",
+        ]);
+        assert_eq!(code, 2, "{preset} should refuse: {err}");
+        assert!(err.contains("display-tone"), "{preset}: {err}");
+        assert!(!out.exists(), "{preset} wrote a file before refusing");
+    }
+}
+
+#[test]
 fn the_two_sdr_presets_differ_only_in_gamut() {
     // They share a render and differ in destination gamut, so the files must not
     // be identical — the falsifiable half of "same render, different gamut". If

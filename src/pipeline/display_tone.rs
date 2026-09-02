@@ -33,6 +33,57 @@ pub enum DisplayTone {
     HermiteShoulder(KneeWidth),
     /// No display tone curve at all — `print.display_tone = none`.
     None,
+    /// Extended Reinhard against a checked white point.
+    ///
+    /// The one variant whose output is **not** bounded by the branch's ceiling, which
+    /// is why [`Self::bounds_output`] exists: content above the white point still
+    /// exceeds it, and that loss is counted at the encode boundary rather than refused.
+    /// [`Self::None`] takes the opposite policy deliberately — it *relies* on the range
+    /// check — because it is for a reconstruction that is already bounded, while this is
+    /// for one that deliberately overshoots.
+    ExtendedReinhard(Headroom),
+}
+
+/// A finite, non-negative specular headroom in stops, bounded above.
+///
+/// Same enforcement argument as [`KneeWidth`]: an enum variant's fields are as public
+/// as the enum, so a bare `f32` payload would let any module build a Reinhard tone that
+/// skipped this check. A negative headroom is not loud on its own — `2^-40` is a white
+/// point of ~9e-13, which maps essentially every sample past the ceiling and turns the
+/// render into a solid white field at exit 0 with the clip merely *counted*.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Headroom(f32);
+
+impl Headroom {
+    /// Beyond this the operator is indistinguishable from plain `v/(1 + v)` and the
+    /// number only looks like a setting. The measured useful range is 4–8 stops.
+    pub const MAX_STOPS: f32 = 24.0;
+
+    /// Check a headroom, or refuse it.
+    pub fn new(stops: f32) -> Result<Self> {
+        if !stops.is_finite() || stops < 0.0 {
+            return Err(NcError::Usage(format!(
+                "print.display_tone reinhard headroom must be finite and non-negative \
+                 (got {stops}). It is specular headroom above reference white in stops; \
+                 `0` is the identity."
+            )));
+        }
+        if stops > Self::MAX_STOPS {
+            return Err(NcError::Usage(format!(
+                "print.display_tone reinhard headroom is {stops} stops, beyond the \
+                 supported maximum of {}. Above ~8 stops the operator converges on plain \
+                 Reinhard and the extra headroom buys nothing; the measured useful range \
+                 is 4–8 (the default 6 is a white point of 64).",
+                Self::MAX_STOPS
+            )));
+        }
+        Ok(Self(stops))
+    }
+
+    /// The white point the operator maps to the branch's reference white: `2^stops`.
+    pub fn white_point(self) -> f32 {
+        self.0.exp2()
+    }
 }
 
 /// A finite, non-negative `print.highlight_compress`.
@@ -71,6 +122,35 @@ impl KneeWidth {
 /// happened rather than carrying a shoulder name with null parameters.
 pub const NO_TONE_CURVE: &str = "no-tone-curve-v1";
 
+/// Pinned identifier for a rendition tone-mapped by extended Reinhard.
+pub const EXTENDED_REINHARD: &str = "extended-reinhard-white-point-v1";
+
+/// Extended Reinhard: `v · (1 + v/W²) / (1 + v)`.
+///
+/// `white_point` is the input mapping **exactly** to `1.0`. Two properties shape every
+/// caller: it is **not bounded** (the value tends to `v/W²`, so `f(200)` at `W = 64` is
+/// `1.04`), and it is **global rather than a knee** — `f(0.18) = 0.153` and
+/// `f(1.0) = 0.500` at `W = 64`, so it moves the whole curve. That fixed ≈0.24-stop
+/// midtone cost belongs to the operator (identical at `W = 16` and `W = 64`), which is
+/// why comparing it against another operator requires matching brightness first.
+///
+/// Monotonic for every `W > 0` over `v >= 0`: the derivative is
+/// `[1 + (2v + v²)/W²] / (1 + v)²`, positive throughout. Monotonic is not the same as
+/// representable — the f64 result tends to `v/W²`, so a tiny white point overflows f32
+/// on bright input. [`Headroom`] bounds `W` from below at `2^0 = 1`, which keeps it in
+/// range; the renderers' non-finite checks are the backstop.
+pub fn extended_reinhard(value: f32, white_point: f32) -> f32 {
+    if value <= 0.0 {
+        return 0.0;
+    }
+    // Binary64 so a large `v` cannot lose the `v/W²` term to rounding before the
+    // division. Multiply and divide are IEEE-exact, so this is bit-reproducible across
+    // targets — unlike a transcendental, which is why no `powf` appears here.
+    let v = f64::from(value);
+    let w = f64::from(white_point);
+    (v * (1.0 + v / (w * w)) / (1.0 + v)) as f32
+}
+
 impl DisplayTone {
     /// The baseline shoulder (`highlight_compress = 0`) — what the shipped default
     /// resolves to, and the value every test that is not *about* the tone curve
@@ -102,7 +182,32 @@ impl DisplayTone {
                 }
                 Ok(Self::None)
             }
+            DisplayToneCurve::Reinhard { headroom_stops } => {
+                // Same refusal as `None`, for the same reason: this operator has no
+                // knee to place, so a stated width would be silently ignored.
+                let default = PrintParams::default().highlight_compress;
+                if print.highlight_compress != default {
+                    return Err(NcError::Usage(format!(
+                        "print.highlight_compress ({}) places the shoulder's knee, but \
+                         print.display_tone = reinhard has no knee — its shape is set by \
+                         --display-tone-headroom",
+                        print.highlight_compress
+                    )));
+                }
+                Ok(Self::ExtendedReinhard(Headroom::new(headroom_stops)?))
+            }
         }
+    }
+
+    /// Whether the branch's ceiling bounds this tone's output, so a sample above it is
+    /// a **bug** rather than an expected loss.
+    ///
+    /// `true` for the shoulder (bounded by its plateau) and for [`Self::None`], whose
+    /// whole policy *is* the range check. `false` only for
+    /// [`Self::ExtendedReinhard`], which exists to carry content past the ceiling — so
+    /// there the overshoot rides to `io::encode`, which counts every clamped sample.
+    pub fn bounds_output(self) -> bool {
+        !matches!(self, Self::ExtendedReinhard(_))
     }
 
     /// Resolve a shouldered tone from a knee width, rejecting a width the knee
@@ -120,7 +225,7 @@ impl DisplayTone {
     pub fn highlight_compress(self) -> Option<f32> {
         match self {
             Self::HermiteShoulder(width) => Some(width.amount()),
-            Self::None => Option::None,
+            Self::None | Self::ExtendedReinhard(_) => Option::None,
         }
     }
 

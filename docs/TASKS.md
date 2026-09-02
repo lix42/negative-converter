@@ -910,7 +910,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   mode self-policing. Default unchanged, so `pipeline_version` stays 3 (only the `recipe`
   fingerprint moved). The residual ~4–5% blown is the *reconstruction's*, which sizes
   `output/display-tone-mapping`
-- [ ] [Display tone mapping](tasks/output/display-tone-mapping.md) — give each display
+- [~] [Display tone mapping](tasks/output/display-tone-mapping.md) — give each display
   renderer a real tone-mapping operator with a stated **white point**, replacing the
   fixed-ceiling Hermite. Measured: the knee pins over-range content at the ceiling with zero
   separation on both outputs and moving it only hurts, while extended Reinhard at `W = 64`

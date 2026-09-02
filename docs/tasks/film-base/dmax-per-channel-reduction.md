@@ -143,3 +143,34 @@ different axis (its *level* rather than its per-channel *ratio*) and will read t
 same leader measurements — coordinate if both run at once, but neither blocks the
 other. [Film-stock profiles](../algo/film-stock-profiles.md) is the likely home if
 the ratio proves stock-stable.
+
+---
+
+**2026-08-31 — the premise below shifted.** This task's "why it may not matter" argument
+rests on the per-channel term being redundant under the **exponential** but not under the
+**sigmoid, which is the intended default**. `output/display-tone-mapping` is measuring a
+shoulder-less exponential reconstruction paired with a real display tone mapper, and the
+user's visual review preferred it. If that direction lands, the redundancy argument applies
+to the *default* path, and this task changes from "investigate whether the scalar is
+justified" to "the correction the default render needs" — the sigmoid's shoulder is what
+was washing the error toward white and hiding it. The measured leader spread here
+(0.05–0.14 density, inconsistent direction) becomes **17–83% off neutral** on a grey target
+at that path's `gamma = 2.03`. Worth re-reading before either task starts.
+
+**User's objection, and it is the crux of whether this can work at all (2026-08-31):** the
+per-channel numbers come from the leader, and *the leader `Dmax` is not accurate* —
+`film-base/dmax-anchor-reliability` records two rolls of one stock **0.295 density apart**
+while their bases agree to 0.0005. At `gamma = 2.03` a 0.295 error is a **4x** render
+error, so a correction derived from an unreliable anchor could be worse than no correction.
+
+That does not sink the task, but it renames its central question. The measured quantity is
+a **difference between channels** (`D_b − D_g`), not an absolute level, and a difference can
+be stable while the level it is measured from drifts — the two rolls disagreeing on *where*
+the leader sits says nothing yet about whether they disagree on the *spread*. **Is the
+per-channel spread reproducible across rolls of one stock, when the absolute `Dmax` is
+not?** If yes, the spread is usable and the unreliable level cancels. If no, the leader
+cannot source this correction and a different reference is needed. Answer that first; it is
+cheap, and every other question here is downstream of it.
+
+User's framing: this stays an **investigation with a verdict**, not a presumed fix — decide
+when the number is in.

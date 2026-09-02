@@ -618,7 +618,8 @@ This is deliberate: a flag that quietly did nothing would be worse than a failur
 | `--white-balance R,G,B` | Explicit highlight / neutral gains |
 | `--auto-wb MODE` | Estimate gains per frame — `gray-world` (≈ NLP Auto-AVG) or `percentile` (≈ NLP Auto-Neutral, more robust to a dominant scene colour) |
 | `--highlight-compress F` | Highlight roll-off — where the display shoulder's knee sits |
-| `--display-tone MODE` | `shoulder` (default) or `none` — see below. **Display presets only** |
+| `--display-tone MODE` | `shoulder` (default), `none`, or `reinhard` — see below. **Display presets only**; `reinhard` is narrower still |
+| `--display-tone-headroom STOPS` | Specular headroom above reference white, `reinhard` only (default `6` = a white point of 64) |
 | `--linear-range LOW,HIGH` | Affine black/white placement, applied last — **display presets only**, which includes the default (see §8) |
 
 `--white-balance` and `--auto-wb` are the two faces of one setting and are mutually
@@ -632,7 +633,7 @@ nc convert scan.tif -o out.jpg --film-base … --auto-wb percentile \
 
 Feed that back as an explicit `--white-balance` to freeze it across a roll.
 
-### `--display-tone` — skipping the display shoulder
+### `--display-tone` — choosing the display tone curve
 
 Display presets normally apply a Hermite shoulder that rolls highlights off to
 display white, with `--highlight-compress` moving its knee earlier. The default
@@ -649,9 +650,10 @@ reduced the share of the frame at absolute white on **every** frame (mean 6.5% �
 4.9%) and improved highlight separation most on the frames where it was worst.
 Midtones and shadows are untouched — only values above the knee change.
 
-The report says which of the two ran, in a block every preset emits:
-`.output_render.display_tone` is `"shoulder"` or `"none"` on a display preset, and
-absent on `legacy` / `custom` / `film-master`, which have no display tone stage.
+The report says which one ran, in a block every preset emits:
+`.output_render.display_tone` is `"shoulder"`, `"none"`, or an object like
+`{"reinhard":{"headroom_stops":6.0}}` on a display preset, and absent on
+`legacy` / `custom` / `film-master`, which have no display tone stage.
 
 What it does *not* skip: gamut mapping and the transfer encode still run, so this
 is "no tone curve", not "raw pixels out". And it needs a reconstruction bounded by
@@ -683,6 +685,45 @@ Two rules follow from the knob being display-only: `legacy`, `custom` and
 *non-default* `--highlight-compress` beside `none` is a usage error — a knee width
 describes nothing when there is no knee. `--highlight-compress 0` is the default
 and asks for nothing, so it is accepted.
+
+#### `reinhard` — a real operator for a reconstruction that overshoots
+
+`none` suits a reconstruction already bounded at the render's ceiling. `reinhard`
+is for the opposite case: it compresses *globally* against a stated white point, so
+content several stops above diffuse white stays distinguishable instead of landing
+flat on the ceiling.
+
+```sh
+nc convert scan.tif -o out.tiff --output-preset display-p3 \
+  --film-base … --display-tone reinhard --display-tone-headroom 6
+```
+
+`--display-tone-headroom` is **display-referred**: how many stops above reference
+white content may sit and still be told apart, so `W = 2^stops`. `6` stops is a
+white point of 64 — the value measured to beat the shipped sigmoid on both clipped
+fraction *and* highlight separation on all seven reference frames, with brightness
+matched so the comparison is not just "one render is darker".
+
+Three things to know:
+
+- **It is not bounded, by design.** Content above the white point still exceeds the
+  ceiling; that loss is *counted* at the encode step and reported in `.loss`, rather
+  than refused. This is the opposite policy from `none`, which relies on the range
+  check being the whole rule — and the difference is deliberate: `none` is for a
+  bounded reconstruction, `reinhard` for one that deliberately overshoots.
+- **`0` stops is the exact identity.** `W = 1` makes the operator `v`, so
+  `--display-tone reinhard --display-tone-headroom 0` renders **byte-identically**
+  to `--display-tone none`. The two still differ in range policy, which is the only
+  reason both exist at that setting.
+- **SDR only for now** — `display-p3` and `compatibility`. The HDR branches would
+  need a ceiling-parameterized form that keeps their midtones matched with SDR, and
+  that has not been derived; the gain-map presets pin a bounded tone because gain
+  ratios are only meaningful while both renditions stay inside their declared
+  ranges. Every other preset rejects it by name rather than silently applying the
+  wrong shape.
+
+`--highlight-compress` is a *knee* width, so it is a usage error beside `reinhard`
+for the same reason it is beside `none`: there is no knee to place.
 
 **On the default `gain-map-hdr` preset, `none` makes the gain map inert by
 construction.** The examples above use `display-p3`, but the default renders *both*
@@ -757,6 +798,12 @@ reference white exists to fill it.
 > or `--sigmoid-shoulder 0` expecting good HDR; you get a live gain map carrying a
 > clipped highlight. A real fix is tracked in
 > [`output/display-tone-mapping`](tasks/output/display-tone-mapping.md).
+>
+> **`--display-tone reinhard` (§7) is the first half of that fix, and it does not
+> apply here yet.** It is what holds content several stops over diffuse white instead
+> of flattening it — but it is consumed only by the two SDR presets today, so it
+> changes no gain-map or AVIF output. Pairing it with per-output ceilings, which is
+> what would make a gain map carry information, is the remaining work.
 
 `--output-preset` (recipe key `output.preset`) is an **atomic** policy choice: a
 named preset resolves container, bit depth, and colour profile itself. `custom` is

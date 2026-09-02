@@ -89,12 +89,9 @@ pub fn render(
     gamut: SdrGamut,
     tone: DisplayTone,
 ) -> Result<RenderedSdr> {
-    // In this domain the normalized knee position *is* the shoulder start: SDR
-    // rolls off within `[0, 1]`, so no scaling separates the two.
-    let shoulder_start = tone.knee_position();
     let mut rgb = Vec::with_capacity(shared.source.rgb().len());
     for (index, px) in shared.source.rgb().as_chunks::<3>().0.iter().enumerate() {
-        let rendered = render_pixel_checked(*px, index, gamut, shoulder_start)?;
+        let rendered = render_pixel_checked(*px, index, gamut, tone)?;
         rgb.extend_from_slice(&rendered);
     }
     let image = LinearImage::new(shared.source.width(), shared.source.height(), rgb, None)?;
@@ -104,10 +101,14 @@ pub fn render(
             gamut,
             reference_white_nits: 203.0,
             highlight_compress: tone.highlight_compress(),
-            shoulder_start,
+            // In this domain the normalized knee position *is* the shoulder start:
+            // SDR rolls off within `[0, 1]`, so no scaling separates the two. Absent
+            // for any tone without a knee.
+            shoulder_start: tone.knee_position(),
             tone_curve: match tone {
                 DisplayTone::HermiteShoulder(_) => "reference-white-hermite-shoulder-v1",
                 DisplayTone::None => display_tone::NO_TONE_CURVE,
+                DisplayTone::ExtendedReinhard(_) => display_tone::EXTENDED_REINHARD,
             },
             gamut_mapping: "neutral-axis-radial-boundary-v1",
             linear_domain: "display-linear-relative-to-203-nit-reference-white",
@@ -124,7 +125,7 @@ fn render_pixel_checked(
     aces: [f32; 3],
     index: usize,
     gamut: SdrGamut,
-    shoulder_start: Option<f32>,
+    tone: DisplayTone,
 ) -> Result<[f32; 3]> {
     if !aces.iter().all(|value| value.is_finite()) {
         return Err(NcError::Other(format!(
@@ -142,18 +143,30 @@ fn render_pixel_checked(
     // curve nothing pulls luminance down, and the gamut map holds it constant, so
     // the cube violation the range check would report is a *consequence* — this
     // says which sample was already over reference white before rendering.
-    if shoulder_start.is_none() && luminance > 1.0 {
+    if matches!(tone, DisplayTone::None) && luminance > 1.0 {
         return Err(above_range_error(index, luminance));
     }
-    let rendered = render_destination_pixel(rgb, luminance, shoulder_start);
+    let rendered = render_destination_pixel(rgb, luminance, tone);
     if !rendered.iter().all(|value| value.is_finite()) {
         return Err(NcError::Other(format!(
             "SDR display rendering produced a non-finite sample at pixel {index}"
         )));
     }
-    if !rendered.iter().all(|value| (0.0..=1.0).contains(value)) {
+    // The bound is a property of the resolved tone, not of SDR. A tone that bounds its
+    // own output escaping the ceiling is a renderer bug and must fail loudly — that is
+    // what makes `--display-tone none` self-policing. Extended Reinhard is *expected*
+    // past the ceiling, so there the loss rides to `io::encode`, which counts every
+    // clamped sample into `EncodeReport`; only negativity stays a hard error, since
+    // nothing downstream is defined below black.
+    if tone.bounds_output() {
+        if !rendered.iter().all(|value| (0.0..=1.0).contains(value)) {
+            return Err(NcError::Other(format!(
+                "SDR display rendering produced an out-of-range sample at pixel {index}"
+            )));
+        }
+    } else if !rendered.iter().all(|value| *value >= 0.0) {
         return Err(NcError::Other(format!(
-            "SDR display rendering produced an out-of-range sample at pixel {index}"
+            "SDR display rendering produced a negative sample at pixel {index}"
         )));
     }
     Ok(rendered)
@@ -181,9 +194,9 @@ fn above_range_error(index: usize, luminance: f32) -> NcError {
 }
 
 #[cfg(test)]
-fn render_pixel(aces: [f32; 3], gamut: SdrGamut, shoulder_start: f32) -> [f32; 3] {
+fn render_pixel(aces: [f32; 3], gamut: SdrGamut, tone: DisplayTone) -> [f32; 3] {
     let (rgb, weights) = destination_rgb(aces, gamut);
-    render_destination_pixel(rgb, dot(rgb, weights), Some(shoulder_start))
+    render_destination_pixel(rgb, dot(rgb, weights), tone)
 }
 
 fn destination_rgb(aces: [f32; 3], gamut: SdrGamut) -> ([f32; 3], [f32; 3]) {
@@ -201,23 +214,42 @@ fn destination_rgb(aces: [f32; 3], gamut: SdrGamut) -> ([f32; 3], [f32; 3]) {
     (mul(matrix, aces), weights)
 }
 
-fn render_destination_pixel(
-    mut rgb: [f32; 3],
-    luminance: f32,
-    shoulder_start: Option<f32>,
-) -> [f32; 3] {
+fn render_destination_pixel(mut rgb: [f32; 3], luminance: f32, tone: DisplayTone) -> [f32; 3] {
     if luminance <= 0.0 {
         return [0.0; 3];
     }
-    let rendered_luminance = match shoulder_start {
-        Some(start) => shoulder(luminance, start),
-        None => luminance,
+    let rendered_luminance = match tone {
+        DisplayTone::HermiteShoulder(_) => shoulder(
+            luminance,
+            tone.knee_position().expect("a shoulder has a knee"),
+        ),
+        DisplayTone::None => luminance,
+        DisplayTone::ExtendedReinhard(headroom) => {
+            display_tone::extended_reinhard(luminance, headroom.white_point())
+        }
     };
     let scale = rendered_luminance / luminance;
     for channel in &mut rgb {
         *channel *= scale;
     }
-    gamut_map(rgb, rendered_luminance)
+    // The radial intersection is taken against `[0, max(display white, this pixel's
+    // rendered luminance)]`, which matters only for a tone that can exceed the ceiling.
+    //
+    // Constant-luminance radial mapping already squeezes chroma out as luminance
+    // approaches the cube's top — at luminance 1.0 the only in-gamut colour *is* white —
+    // so the boundary reaches `neutral` continuously. Letting the ceiling follow the
+    // pixel keeps that continuous above display white: the intersection degenerates to
+    // the neutral axis and highlights desaturate toward white, which is what film and
+    // print do anyway.
+    //
+    // Gating the ceiling on `rendered_luminance <= 1` instead looked equivalent and is
+    // not: it restores full chroma in one step. Measured on the shipped arithmetic
+    // (reinhard `W = 2`, sRGB direction `[3, 1, 0.1]`), rendered luminance 0.9998 gives
+    // `[1.000, 1.000, 1.000]` and 1.0000 gives `[2.913, 0.532, 0.000]` — green and blue
+    // *fall* as scene luminance rises, a hard ring around every bright saturated
+    // highlight. Under the two bounded tones the `max` is always `1.0`, so their path is
+    // unchanged.
+    gamut_map(rgb, rendered_luminance, rendered_luminance.max(1.0))
 }
 
 /// C¹-continuous cubic shoulder from `(start, start, slope=1)` to
@@ -241,17 +273,17 @@ fn shoulder(value: f32, start: f32) -> f32 {
 /// Same-luminance radial mapping to the RGB cube boundary. Because every
 /// channel receives one common chroma scale, hue direction and the neutral axis
 /// are preserved; no per-channel clip is used as the gamut policy.
-fn gamut_map(rgb: [f32; 3], luminance: f32) -> [f32; 3] {
+fn gamut_map(rgb: [f32; 3], luminance: f32, ceiling: f32) -> [f32; 3] {
     let neutral = f64::from(luminance);
     let delta = rgb.map(|channel| f64::from(channel) - neutral);
     let mut chroma_scale = 1.0_f64;
     let mut limiting_boundary = None;
     for (channel, d) in delta.into_iter().enumerate() {
         if d > 0.0 {
-            let candidate = (1.0 - neutral) / d;
+            let candidate = (f64::from(ceiling) - neutral) / d;
             if candidate < chroma_scale {
                 chroma_scale = candidate;
-                limiting_boundary = Some((channel, 1.0_f32));
+                limiting_boundary = Some((channel, ceiling));
             }
         } else if d < 0.0 {
             let candidate = -neutral / d;
@@ -315,14 +347,14 @@ mod tests {
         for gamut in [SdrGamut::DisplayP3, SdrGamut::SRgb] {
             let mut previous = 0.0;
             for value in [0.0, 0.18, 0.5, 0.75, 0.9, 1.0, 2.0] {
-                let px = render_pixel([value; 3], gamut, 0.75);
+                let px = render_pixel([value; 3], gamut, DisplayTone::DEFAULT);
                 close(px[0], px[1]);
                 close(px[1], px[2]);
                 assert!(px[0] >= previous);
                 previous = px[0];
             }
-            close(render_pixel([0.0; 3], gamut, 0.75)[0], 0.0);
-            close(render_pixel([1.0; 3], gamut, 0.75)[0], 1.0);
+            close(render_pixel([0.0; 3], gamut, DisplayTone::DEFAULT)[0], 0.0);
+            close(render_pixel([1.0; 3], gamut, DisplayTone::DEFAULT)[0], 1.0);
         }
     }
 
@@ -339,7 +371,7 @@ mod tests {
     fn synthetic_out_of_gamut_vectors_are_finite_and_reach_boundary_radially() {
         for gamut in [SdrGamut::DisplayP3, SdrGamut::SRgb] {
             for input in [[1.0, 0.0, 0.0], [0.0, 1.2, -0.2], [4.0, 0.1, 2.0]] {
-                let out = render_pixel(input, gamut, 0.75);
+                let out = render_pixel(input, gamut, DisplayTone::DEFAULT);
                 assert!(out.iter().all(|v| v.is_finite()));
                 assert!(out.iter().all(|v| (0.0..=1.0).contains(v)));
                 assert!(out.iter().any(|v| *v == 0.0 || *v == 1.0));
@@ -352,7 +384,7 @@ mod tests {
         let weights = [0.212_639, 0.715_169, 0.072_192];
         let input = [-0.2, 0.4, 1.1];
         let luminance = dot(input, weights);
-        let output = gamut_map(input, luminance);
+        let output = gamut_map(input, luminance, 1.0);
 
         close(dot(output, weights), luminance);
         let in_delta = input.map(|channel| channel - luminance);
@@ -375,8 +407,8 @@ mod tests {
     #[test]
     fn golden_vectors_pin_both_destination_gamuts() {
         let aces = [0.42, 0.18, 0.07];
-        let p3 = render_pixel(aces, SdrGamut::DisplayP3, 0.75);
-        let srgb = render_pixel(aces, SdrGamut::SRgb, 0.75);
+        let p3 = render_pixel(aces, SdrGamut::DisplayP3, DisplayTone::DEFAULT);
+        let srgb = render_pixel(aces, SdrGamut::SRgb, DisplayTone::DEFAULT);
         for (actual, expected) in p3
             .into_iter()
             .zip([0.518_749_9, 0.164_785_43, 0.064_243_82])
@@ -556,8 +588,8 @@ mod tests {
     #[test]
     fn extreme_finite_input_fails_if_render_arithmetic_overflows() {
         for (index, input) in [(17, [f32::MAX; 3]), (23, [-f32::MAX; 3])] {
-            let err =
-                render_pixel_checked(input, index, SdrGamut::DisplayP3, Some(0.75)).unwrap_err();
+            let err = render_pixel_checked(input, index, SdrGamut::DisplayP3, DisplayTone::DEFAULT)
+                .unwrap_err();
             assert!(err.to_string().contains(&format!("pixel {index}")), "{err}");
             assert!(err.to_string().contains("produced a non-finite"), "{err}");
         }
@@ -566,7 +598,7 @@ mod tests {
     #[test]
     fn finite_non_positive_luminance_maps_to_black() {
         assert_eq!(
-            render_pixel_checked([-1.0; 3], 0, SdrGamut::DisplayP3, Some(0.75)).unwrap(),
+            render_pixel_checked([-1.0; 3], 0, SdrGamut::DisplayP3, DisplayTone::DEFAULT).unwrap(),
             [0.0; 3]
         );
     }

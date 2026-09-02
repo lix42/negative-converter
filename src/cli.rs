@@ -582,8 +582,20 @@ pub struct PrintOverrides {
     /// width: a *non-default* `--highlight-compress` is rejected beside `none`
     /// rather than silently ignored (the default `0` asks for nothing and is
     /// accepted).
-    #[arg(long = "display-tone", value_enum, value_name = "MODE")]
-    pub display_tone: Option<DisplayToneCurve>,
+    /// `reinhard` compresses globally against a white point set by
+    /// `--display-tone-headroom` and can hold content several stops over diffuse
+    /// white; it is SDR-only for now (`display-p3` / `compatibility`).
+    ///
+    /// A plain string rather than a `value_enum`: `reinhard` carries a payload, which
+    /// `clap::ValueEnum` cannot derive over, so the selector parses through
+    /// `DisplayToneCurve::parse`.
+    #[arg(long = "display-tone", value_name = "MODE")]
+    pub display_tone: Option<String>,
+    /// Specular headroom above reference white, in stops — `--display-tone reinhard`
+    /// only (recipe key `print.display_tone.reinhard.headroom_stops`, default 6 = a
+    /// white point of 64).
+    #[arg(long = "display-tone-headroom", value_name = "STOPS")]
+    pub display_tone_headroom: Option<f32>,
     /// Highlight roll-off amount; named SDR/HDR branches resolve their own knee.
     #[arg(long)]
     pub highlight_compress: Option<f32>,
@@ -2495,8 +2507,34 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
     } else if let Some(mode) = args.print.auto_wb {
         cfg.print.white_balance = mode.into();
     }
-    if let Some(v) = args.print.display_tone {
-        cfg.print.display_tone = v;
+    // `--display-tone` / `--display-tone-headroom` ⇒ `print.display_tone`. Naming the
+    // operator resolves that variant's own default rather than carrying another's
+    // parameter across; the headroom flag alone refines a reinhard the recipe already
+    // selected. Same shape as the density curve's switch.
+    if let Some(name) = args.print.display_tone.as_deref() {
+        let selected = DisplayToneCurve::parse(name)?;
+        cfg.print.display_tone = match (selected, args.print.display_tone_headroom) {
+            (DisplayToneCurve::Reinhard { .. }, Some(stops)) => DisplayToneCurve::Reinhard {
+                headroom_stops: stops,
+            },
+            // Re-naming the operator the recipe already selected must not silently reset
+            // a stated headroom to the default.
+            (DisplayToneCurve::Reinhard { headroom_stops }, None) => DisplayToneCurve::Reinhard {
+                headroom_stops: match cfg.print.display_tone {
+                    DisplayToneCurve::Reinhard { headroom_stops } => headroom_stops,
+                    _ => headroom_stops,
+                },
+            },
+            (other, _) => other,
+        };
+    } else if let Some(stops) = args.print.display_tone_headroom {
+        // No operator named: refine the recipe's reinhard. Against any other curve this
+        // is a usage error rather than an implicit switch — `validate_convert` says so.
+        if let DisplayToneCurve::Reinhard { .. } = cfg.print.display_tone {
+            cfg.print.display_tone = DisplayToneCurve::Reinhard {
+                headroom_stops: stops,
+            };
+        }
     }
     if let Some(v) = args.print.highlight_compress {
         cfg.print.highlight_compress = v;
@@ -2584,6 +2622,20 @@ pub fn validate_convert(
     // Flag-shape first: "these two requests contradict each other" is a clearer
     // diagnosis than whatever value rule the same config might also trip.
     reject_out_depth_with_atomic_preset(cfg, args)?;
+    // A headroom given while the resolved tone has no white point is silently dropped by
+    // `merge` — the one shape a value rule cannot see, since the resolved config keeps no
+    // trace of it. It also passes the presence-rule tiebreaker: unlike an identity value
+    // that asks for nothing, a headroom *forces* a white point the named tone has no way
+    // to produce.
+    if args.print.display_tone_headroom.is_some() && cfg.print.display_tone.white_point().is_none()
+    {
+        return Err(NcError::Usage(format!(
+            "--display-tone-headroom sets the white point of the `reinhard` display \
+             tone, but the resolved tone is `{}`. Add `--display-tone reinhard`, or drop \
+             the headroom.",
+            cfg.print.display_tone
+        )));
+    }
     // The output path's suffix is likewise a property of *this invocation*, so it
     // outranks `validate`'s value rules — and specifically outranks the
     // missing-base rule, which `validate` deliberately reports last because an
@@ -3213,6 +3265,27 @@ fn linear_range_is_default(cfg: &ResolvedConfig) -> bool {
 fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
     let usage = NcError::Usage;
     let preset = cfg.output.preset;
+
+    // Rule 4 — the **extended-Reinhard** tone is narrower than the other two: it is the
+    // one that deliberately overshoots the branch's ceiling, so it needs a render that
+    // can carry the overshoot to the encode boundary. Rule 3 above already refuses every
+    // `display_tone` on the legacy branch; this refuses the one operator the *display*
+    // branches cannot all apply, rather than letting an HDR preset silently render the
+    // SDR shape at the wrong ceiling.
+    if matches!(cfg.print.display_tone, DisplayToneCurve::Reinhard { .. })
+        && !preset.accepts_reinhard_tone()
+    {
+        return Err(usage(format!(
+            "--display-tone reinhard is applied only by a preset whose render carries an \
+             unbounded tone to the encode boundary — today `display-p3` and \
+             `compatibility`. The `{}` path cannot: the HDR branches would need a \
+             ceiling-parameterized form that keeps their midtones matched with SDR, which \
+             has not been derived, and the gain-map presets pin a bounded tone because \
+             gain ratios are only meaningful while both renditions stay inside their \
+             declared ranges. Use `--display-tone shoulder` or `none` there.",
+            preset.name()
+        )));
+    }
 
     // Gated on **which branch renders**, not on one preset name: `custom` routes
     // through `render_legacy` exactly as `legacy` does (`stages::render`), so it

@@ -2806,8 +2806,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 ## display-tone-mapping
 
-**Status:** not started
-**Updated:** 2026-08-28
+**Status:** in progress
+**Updated:** 2026-09-01
 
 - Filed 2026-08-28 from the `algo/exponential-anchor-placement` tone-map probe
   (`shadow_metrics::tone_map_probe`, `#[ignore]`d, `NC_TONEMAP_FRAME` selects the frame).
@@ -2835,4 +2835,452 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   before this is called a win.**
 - Content above `W` still exceeds 1.0 (`reinhard(200, 64) = 1.04`), which is the residual
   ~6% blown and why larger `W` kept helping; the turning point was not found.
+- 2026-08-31 (**started; chunk 1: the operator, in the render stage**). Scope for this chunk
+  was the operator and its seam only — no CLI surface, no default change, HDR left on its
+  Hermite (that needs a ceiling-C form nothing has derived yet). `pipeline/tone_map.rs` now
+  holds both operators as pure functions; `hdr.rs`'s copy of the Hermite is gone, since the
+  two differed only in the ceiling argument. Verified byte-neutral: the SDR golden vectors and
+  the PQ/HLG goldens pass untouched, and `x * 1.0f32 == x` exactly, so folding SDR's
+  hardcoded `1.0` into the shared `ceiling` parameter cannot move a bit.
+- **`SdrToneMap` is one enum, not a parameter bag.** `highlight_compress` means nothing under
+  Reinhard and a white point means nothing under the Hermite, so parallel fields could encode
+  a combination the renderer would have to silently ignore — the same rule `WbSource` and
+  `DmaxSource` follow. It resolves to a `ResolvedSdrToneMap` that both applies and reports.
+- **The range guard is mode-aware, keyed on the operator rather than on SDR** (user decision):
+  `bounded_ceiling()` returns `Some(1.0)` for the Hermite and `None` for Reinhard. A bounded
+  operator escaping its ceiling stays a loud renderer bug — `output/linear-render` depends on
+  exactly that — while an unbounded one is *expected* past display white and has its loss
+  counted by `io::encode`, which is the documented clamping site.
+- **A first attempt skipped gamut mapping above display white, and that was a real defect** —
+  caught by a test whose own premise was wrong, which is why it is worth recording. Radial
+  mapping intersects the `[0, 1]` cube, so above display white the upper boundary is
+  undefined (`1 - neutral` collapses to zero, which *desaturates the pixel to neutral* rather
+  than clipping it). Skipping the mapping entirely looked like the fix, but it also drops the
+  **floor** — and ACEScg green is a large *negative* red in sRGB (`[0, 40, 0]` → red −24.87 at
+  luminance 26.97), so a bright saturated colour would have failed the render outright. The
+  boundaries are not symmetric: **the floor is an invariant, the ceiling is a counted loss.**
+  `gamut_map` now takes `ceiling: Option<f32>` and enforces the floor either way.
+- **The recorded `6.24% / 21.4` figures were measured through double compression** — inside
+  the probe that was filed to remove it. `tone_map_probe` folds the operator into
+  `apply_curve` and *then* calls `sdr::render`, which still applied its Hermite shoulder at
+  the 0.75 knee. So those numbers are Reinhard **plus** the shipped knee, not Reinhard as the
+  render operator, and they are not the figures this task should be judged against. New
+  `tone_map_stage_probe` applies the operator in the stage; it is the acceptance harness.
+- **Its metric had to clamp to display range.** `srgb_encode` is only defined on display-range
+  values, so a code separation taken over unclamped samples is unbounded — `W = 2` scored
+  **1855** on a pre-clamp peak of 308, pure artefact. Measuring `clamp(render)` is also the
+  honest comparison, because that is what `io::encode` writes and an unbounded operator's
+  over-range content is a loss, not retained separation. That is a **fourth** metric trap in
+  this harness; the shipped `sat%` / `flat%` / linear-ratio cautions now have company.
+- **Result: the operator survives the move to the stage, the direction holds, and a third
+  frame breaks the recorded conclusion.** Benchmark reproduces exactly (E1 sigmoid
+  6.86% / 11.6, matching the figure on file), so the harness is trustworthy. Against it,
+  Reinhard `W = 64` applied in the stage:
 
+  | frame | sigmoid blown% / sep | reinhard W=64 blown% / sep | verdict |
+  | --- | --- | --- | --- |
+  | E1 Ektar 971 | 6.86 / 11.6 | 5.90 / 20.4 | better on both |
+  | P3 Portra 1121 | 6.30 / 0.6 | 5.98 / 6.8 | better on both |
+  | G1 Gold 1137 | 6.19 / **101.7** | 5.32 / **87.2** | **worse on separation** |
+
+  G1 is a new counter-example: the task was filed on E1 and P3 only, both of which favour
+  Reinhard. "Beats the sigmoid on both metrics" does **not** generalise to a third frame —
+  the shipped sigmoid retains more highlight separation on Gold 200. Blown% improves on all
+  three, monotonically in `W`, and the turning point is still not found (`W = 256` is best
+  everywhere on blown%).
+- **This is not yet a win, by the task's own gate: midtones are not matched.** On P3 the
+  Reinhard render sits at mid **0.4155** against the sigmoid's **0.2805** — ~0.57 stops
+  brighter — so part of every number above is a different exposure, not a better operator.
+  Note the direction is *not* the usual flattery (brighter would normally raise blown% and
+  lower separation in sRGB, and both moved the other way), but the comparison still has to be
+  redone at matched midtones before the verdict means anything. X3's `0.508` offset is itself
+  the provisional, fitted value `algo/exponential-anchor-placement` flagged.
+- **As `W` grows the operator converges on classic Reinhard `v/(1 + v)` and becomes
+  effectively bounded** — pre-clamp peak is 1.016 at `W = 256` against 308 at `W = 2`. So
+  large `W` is not "more headroom preserved", it is global compression with almost nothing
+  left over-range, and the midtone cost saturates (mid is identical at `W = 64` and `W = 256`
+  on P3). Worth settling what `W` is *for* before tuning it.
+- 2026-08-31 (**review round on chunk 1: seven findings, all real; one was a visible
+  rendering defect in the chunk's central decision**).
+  - **The gamut ceiling must *follow the pixel*, not switch off above display white.** The
+    chunk shipped `ceiling = (rendered_luminance <= 1).then_some(1.0)`, reasoning that the
+    upper boundary is undefined once the pixel is over-range. It is — but gating it there is
+    a **step discontinuity**, because constant-luminance radial mapping squeezes chroma to
+    zero as luminance approaches the cube's top and then the gate restores it in full.
+    Reproduced on the shipped arithmetic (Reinhard `W = 2`, sRGB direction `[3, 1, 0.1]`):
+    rendered luminance 0.9998 gives `[1.000, 1.000, 1.000]` and 1.0000 gives
+    `[2.913, 0.532, 0.000]` — **green and blue fall while scene luminance rises**, a hard
+    ring around every bright saturated highlight. Fixed by intersecting against
+    `[0, max(display white, rendered luminance)]`: the intersection then degenerates to the
+    neutral axis continuously, so highlights desaturate toward white — which is what film and
+    print do anyway — and the over-range neutral rides to encode to be counted. `Option` is
+    gone from `gamut_map`; nothing is ever dropped.
+    **The durable lesson: "this boundary is undefined here" is not a licence to remove the
+    constraint.** The question is what the constraint *degenerates to*, and the answer has to
+    be continuous with the regime next door.
+  - The same finding retired the "floor is an invariant, ceiling is a counted loss"
+    asymmetry recorded above as the *mechanism*. The asymmetry is still true of the **encode
+    boundary**; it was the wrong tool for the gamut stage.
+  - **The regression test was written, then verified to fail without the fix.** Worth noting
+    because the check nearly didn't happen: the first attempt patched a call `cargo fmt` had
+    since wrapped across lines, so the `str.replace` silently matched nothing and the test
+    "passed" against a defect that was never actually reintroduced. Falsifiability has to be
+    *observed*, not assumed — and a no-op patch looks exactly like a passing test.
+  - **A second place had begun to encode "the display ceiling"**, and would have failed
+    loudly later: `render_destination_pixel` compared against the module constant while the
+    postcondition asked the operator. They agreed only because the one bounded operator's
+    ceiling happens to equal display white; a bounded operator with a ceiling above 1 — which
+    is exactly what the HDR half needs — would have dropped the gamut ceiling for every pixel
+    over 1.0 while the postcondition still demanded `[0, C]`, turning ordinary saturated
+    highlights into a render error. The ceiling now follows the pixel, and the comment states
+    why it is deliberately *not* keyed on `bounded_ceiling()`: that describes the operator,
+    this describes the destination cube.
+  - **One canonical name for the operator.** `tone_curve: &'static str` and the tagged
+    `tone_map` object were spelling the same operator two ways
+    (`reference-white-hermite-shoulder-v1` against `hermite-shoulder`). The flat field is
+    gone and the enum's serde tag now carries the versioned name, so a report consumer gets
+    one name and no precedence rule to guess. `output/sdr-preset-followups` item 3 was
+    updated: its premise that `SdrRenderMetadata` and the HDR blocks share a field set no
+    longer holds, and mirroring HDR's flat `shoulder_start` cannot represent an operator with
+    no shoulder — so the tagged form is the likelier target and the HDR blocks are the ones
+    that would move.
+  - Two documentation claims were false and are corrected: `extended_reinhard`'s "the ratio
+    is well inside f32 range" (it tends to `v/W²`, so `W = 1e-3` overflows to `+inf` above
+    `v ≈ 3.4e32` — caught by the non-finite guard, but the comment asserted it could not
+    happen), and `tone_map_stage_probe`'s claim that the Hermite "cannot render" X3 at all.
+    It can: the plateau caps luminance and the gamut stage intersects the cube, so that row
+    prints a real fully-pinned measurement, which the probe's own output had already shown.
+  - Re-verified after the fixes: all five gates green (666 unit + 155 integration, 112
+    Python), default render still **byte-identical to `main`** on `display-p3`,
+    `compatibility` and the default preset, and every probe figure in the table above
+    unchanged — the ceiling fix moves only over-range chroma, which the luminance metrics do
+    not measure.
+- 2026-08-31 (**chunk 2: the matched-midtone comparison, and it overturns chunk 1's
+  counter-example**). New `tone_map_matched_probe` removes the exposure confound the task
+  gates its verdict on. Still measurement only — no CLI surface, no default moved, HDR
+  untouched.
+- **Matching is done by moving the reconstruction anchor, and that is exact rather than
+  fitted.** The exponential renders `10^(c·(D − A))`, so shifting `A` by `ΔA` multiplies every
+  linear value by `10^(−c·ΔA)` — a pure gain. The shared print controls are linear at their
+  defaults and constant-luminance gamut mapping preserves luma, so the rendered mid patch is
+  `operator(gain · L_mid)` with `L_mid` measured once; the gain that lands the mid on the
+  benchmark's is then solved on a **scalar** by bisection instead of re-rendering the frame
+  per candidate. It is also the division of labour the task assumes — the anchor absorbs the
+  operator's fixed midtone cost while `W` stays a pure highlight control — so this measures
+  the configuration the premise describes rather than an approximation of it.
+- **The model is verified against a real render on every row** (`mid err`, which reads
+  `0.0000` throughout) and the probe *asserts* it. A solved gain the render does not confirm
+  fails the test rather than producing a quietly meaningless comparison.
+- **Only 7 of 10 fixture frames can be matched at all**: G1, E1 and P1 have no valid mid
+  patch. That is not a detail — **both frames chunk 1 drew its headline from (E1, G1) are in
+  that group**, which is why its numbers were unmatched.
+- **Result: at matched midtone, extended Reinhard at `W = 64` beats the shipped sigmoid on
+  *both* metrics on *all seven* frames.**
+
+  | frame | sigmoid blown% / sep | reinhard W=64 | matched anchor |
+  | --- | --- | --- | --- |
+  | E2 Ektar 989 | 6.11 / 43.0 | 4.16 / 64.8 | 1.0078 |
+  | E3 Ektar 991 | 6.45 / 37.9 | 4.06 / 60.0 | 0.9981 |
+  | G2 Gold 1144 | 6.53 / 67.2 | 4.88 / 81.1 | 0.9758 |
+  | G3 Gold 1151 | 6.87 / 4.5 | 5.77 / 26.8 | 0.9971 |
+  | P2 Portra 1111 | 7.22 / 75.7 | 4.85 / 86.3 | 1.0294 |
+  | P3 Portra 1121 | 6.30 / 0.6 | 5.71 / 12.4 | 1.0034 |
+  | P4 Portra 1127 | 6.15 / 114.0 | 3.72 / 122.5 | 1.0452 |
+
+- **Chunk 1's Gold counter-example does not survive matching, and it was an artefact.** G1
+  had Reinhard *losing* on separation (87.2 against 101.7); G2 and G3 — the Gold frames that
+  actually have a mid patch — both favour Reinhard on both metrics. So "the sigmoid holds
+  more highlight separation on Gold 200" was a property of the unmatched exposure, not of the
+  stock. Recorded because the wrong conclusion was stated confidently one entry above:
+  **an unmatched comparison is not weak evidence, it is evidence for a different claim.**
+- **`W` has a floor, a sweet spot, and a point where it stops meaning anything.** Across the
+  28 rows: `W = 8` loses on blown% on **all seven** frames; `W = 16` wins on six and loses
+  marginally on G2 (6.58 against 6.53); `W = 64` wins everywhere; `W = 256` also wins
+  everywhere but is effectively classic Reinhard `v/(1 + v)` (pre-clamp peak 1.016), i.e.
+  global compression with nothing left over-range — so its win says little about headroom.
+  `W = 64` is the defensible candidate and `W = 8` is disqualified.
+- **The Hermite control is the reason this reads as an operator result rather than a
+  reconstruction result.** The shipped operator on the *same* X3 source at the *same* matched
+  midtone measures 7.37%–29.07% blown with **zero** separation on four of the seven frames.
+  Reconstruction is held fixed across the comparison; only the operator moves.
+- **Design consequence for the CLI surface: X3's `0.508` offset is not the offset that pairs
+  with Reinhard.** Every frame needed a *higher* anchor to match — 0.976 to 1.045 against the
+  reference 0.8749, clustering near 1.00 — which corresponds to an offset near **0.38**. The
+  0.508 was fitted under a different render, so the reconstruction offset and the render's
+  white point have to be chosen together, not inherited.
+- **Not yet claimed:** these are metrics, and the highlight metrics in this harness have
+  disagreed with the eye twice. Visual review on the fixture frames is still owed before any
+  default moves, and the three unmatchable frames stay unmeasured.
+- 2026-08-31 (**visual review generated; the metrics are not enough to move a default and
+  this is what the eye gets to look at**). New `tone_map_visual_review` writes the
+  matched-midtone configs as colour-managed TIFFs to `../temp/tonemap-review/`, with a
+  README carrying the config table, the per-frame crop coordinates and what to judge.
+- **Five configs on four frames, chosen to span the *sigmoid's own* performance** rather
+  than to sample stocks: P3 (its worst case, separation 0.6), P4 (its best, 114.0), G2 (the
+  frame where `W = 16` loses by 0.05pp), E2 (mid-range, third stock). `W = 8` is left out —
+  disqualified on blown% on all seven measured frames, so it needs no eye time. The Hermite
+  on X3 is included as the control: same source, same matched midtone, so a visible
+  difference is the operator alone.
+- **Two views per config, because they answer different questions.** A decimated overview
+  for overall look, colour and midtone rendering; a **1:1** 640×640 crop for hard clip
+  versus soft roll-off, which decimation would average away — and that is the term the
+  anchor task left explicitly unmeasured. The crop window is located once per frame from the
+  benchmark render and reused for every config, so crops are pixel-aligned across a frame.
+- Files go through the shipped `encode_rendered_sdr` → `io::encode` path with the Display P3
+  profile embedded (verified: Display-class, red colorant `0.51512, 0.2412, -0.00105`, the
+  registry values — lcms2's `ProfileDescription` reads "RGB built-in", which is its default
+  string and not a sign the profile is generic). Decimation and cropping act on the
+  *encoded* image the shipped path returns, so no pipeline stage is re-implemented.
+- **The first run put two of four crops on the film holder, and the reason generalises: in a
+  positive render the opaque holder inverts to *white*.** Scans are laid out `dark holder →
+  thin inset rebate → picture`, so an unrestricted brightest-region search returns the
+  holder — it produced windows at `x = 0` on P4 and E2. Same trap
+  `algo/auto-anchor-interior-measurement` records for `DmaxSource::Auto`, arrived at from the
+  opposite end of the tonal range. The search is now restricted to the picture interior.
+- **The inset constant already existed in this harness and I re-declared it**, which only
+  failed to compile because the names collided. `INTERIOR_INSET` was introduced for the
+  tiling patch proposal to avoid the rebate at the *floor*; the holder is the same geometry
+  seen at the *ceiling*. Collapsed to the one constant with both reasons in its doc.
+  Worth remembering: a second use of an existing guard is a reason to extend its
+  documentation, not to invent a sibling.
+- **Both new guards were verified falsifiable, and the first attempt at each was not.** The
+  holder test's synthetic bright band was initially 30 px against a 64 px window, so the
+  interior peak outscored it anyway and the test passed with the inset set to zero —
+  exercising nothing. Widened to 40 px, it now fails without the guard and passes with it.
+  (Chunk 1's ceiling test had the same near-miss for a different reason.) **A guard test that
+  has not been observed to fail is not evidence.**
+- Gates green after the review work: 667 unit + 155 integration, 112 Python, clippy clean.
+  No production behaviour touched — the review generator is `#[cfg(test)]` and `#[ignore]`d,
+  like the rest of the harness.
+- 2026-08-31 (**review page**). The probe now also writes `index.html` from
+  `src/pipeline/tone_map_review.html` (an `include_str!` template) with the measured data
+  inlined: frame tabs, crop/full toggle, five configs on keys `1`–`5`, and **hold-space to
+  flash back to the shipped sigmoid**, which is the interaction that actually reveals small
+  differences — side-by-side does not.
+- **The page's numbers are emitted by the same `measure` closure that prints them**, never
+  transcribed, so the table beside an image cannot drift from the render it describes.
+  Inlined rather than fetched because `fetch` of a sibling JSON is blocked under `file://`,
+  and this review is a local file by design — it references local images, so it could not be
+  a hosted page without uploading them.
+- **Browsers cannot display TIFF**, so the TIFFs are converted with `sips -s format png`,
+  which **preserves the embedded Display P3 profile** (verified: red colorant unchanged at
+  `0.51512, 0.2412, -0.00105`). The TIFFs stay as the authoritative artefact.
+- **A layout defect was found by reasoning rather than by looking, and it would have shown an
+  empty frame.** The first attempt stacked configs with `position: absolute` on all but the
+  first — so the container was sized by the *first* image alone, and hiding it (which happens
+  for every config except #1) collapses the stack to zero height. Replaced with a CSS grid
+  where every image occupies one cell; all images for a frame and view have identical
+  dimensions, so the box is stable whichever is shown.
+- Verified without a browser (the Chrome extension was not connected): the inlined `DATA`
+  parses as JSON — the real risk, since Rust's `format!` would happily emit `NaN`/`inf` and
+  break it — every one of the 40 referenced filenames exists, metric keys match the config
+  list on every frame, and the script passes `node --check`.
+- 2026-08-31 (**user visual verdict: the direction is confirmed, with two caveats that are
+  not about the operator**). Reviewed on the four frames.
+  - **`x3-hermite` "looks bad"** — the control did its job, so the operator is what matters
+    and the premise holds.
+  - **P3**: W16/W64/W256 all better than the default on **both** highlights and shadows.
+    **G2**: slightly better in the shadows. **E2**: slightly better in the highlights.
+    **P4**: differences visible but no clear winner — worth noting P4 is the sigmoid's *best*
+    frame (separation 114.0), so "no worse" there is the expected good outcome.
+  - Overall: *"I like the new tone-mapping. There are more details."*
+  - **The eye did not separate W16 / W64 / W256.** So `W` cannot be chosen by preference, and
+    the earlier suspicion that W256 would read as flat or washed was **not** confirmed.
+- **"All the tone-mapping looks darker than the default" is the operator, not the colour
+  shift — and it is structural.** Matching the *mid patch* does not match the curve: Reinhard
+  compresses globally, so with mid pinned to four decimal places everything *above* mid lands
+  lower than the sigmoid puts it. That is the same fact as the improved `blown%`. Design
+  consequence, and it is not a detail: **a single anchor cannot correct it**, because the
+  anchor is a uniform gain — raising it brightens mid too. The lever is the match point (a
+  percentile above mid), `W` itself, or accepting it and leaving `print.print_exposure` as
+  the user's knob. Unresolved, and it gates any default change.
+- **The blue cast cannot originate in the tone mapper, which is derivable rather than
+  observed.** `render_destination_pixel` applies the operator to **luminance** and scales all
+  three channels by one common `rendered / original` factor, so RGB ratios — and therefore
+  chromaticity — are preserved exactly; `gamut_map` then preserves hue direction by
+  construction; and the matched anchor is a scalar in density applied to every channel alike,
+  i.e. a neutral gain. The remaining candidate is the **reconstruction curve**: `apply_curve`
+  runs per channel, each channel has its own density distribution relative to the base, and
+  X3's power law has a different shape from the sigmoid's toe/shoulder. So the cast is
+  *X3 versus the sigmoid*, not *Reinhard versus the Hermite* — it lives in the half of the
+  pipeline this task does not touch. Falsifiable in one keystroke on the review page:
+  `x3-hermite` should show the same cast. **User decision: colour shift is deliberately out
+  of scope for now** — the curve is treated as colour-neutral and all channels alike; it will
+  be addressed separately.
+- **`W = 64` is the recommendation, on grounds neither the eye nor the SDR metrics can
+  reach.** `W = 256` leaves a pre-clamp peak of ≈1.016 — essentially nothing above diffuse
+  white — which is the *same condition* that makes today's gain map inert (`GainMapMax`
+  1.0x). It would win the SDR comparison and quietly re-break HDR, and per-output ceilings
+  are the reason this task exists. `W = 64` keeps 1.26–1.30 over-range and wins on both
+  metrics on all seven measured frames, where `W = 16` loses on G2.
+- 2026-08-31 (**the blue cast, measured — and it corrects the entry above**). New
+  `curve_colour_probe` reports R/G and B/G by luminance percentile under both curves at
+  matched midtone. The previous entry concluded the cast is "X3 versus the sigmoid". That is
+  **right in mechanism and wrong in magnitude**, which measurement caught and reasoning did
+  not.
+  - **The curve barely moves colour.** On G2 and E2 the two curves give near-identical
+    ratios at every percentile (E2 p50: 1.201/1.379 sigmoid against 1.199/1.375 X3). Only P3
+    shows a real difference, +4.8% B/G at p50 — and P3 is the *bright* frame, where the
+    sigmoid's shoulder is already active at mid.
+  - **The cast is in the render before any curve, and it is per-roll, not per-curve.**
+    Portra and Ektar lean blue (B/G 1.15–1.39), Gold 200 leans **warm** (B/G 0.76–0.95). All
+    of it is present in the shipped sigmoid too. Nothing in this task introduced it.
+  - **What the curve does control is how much of the cast survives into the highlights.**
+    The sigmoid's shoulder pushes all three channels toward the same ceiling, so colour
+    drains out and bright areas go neutral white — visible as B/G falling to ≈1.0 by p95 on
+    every frame. The exponential has no shoulder, so the cast stays. It does not *add* blue;
+    it stops *hiding* it. That is the same mechanism as the user's "there are more details":
+    the sigmoid was washing highlights to white, losing colour and detail together.
+  - **Gain or gamma?** Through the uncompressed range E2's B/G is essentially flat
+    (1.363 / 1.375 / 1.379 at p05 / p25 / p50), which is a per-channel *gain* signature. P3's
+    rises (1.151 → 1.287), which is not. One frame each; not settled.
+  - **The existing auto white balance could not be evaluated here, for a documented reason.**
+    `GrayWorld` and `Percentile` both made every frame far worse (P3 p50 B/G 1.349 → 2.19 /
+    2.87) while driving p95 to ≈1.0. They resolve on the **whole frame**, which on these
+    scans includes the opaque holder — the same contamination
+    `algo/auto-anchor-interior-measurement` exists for, met from the colour side rather than
+    the anchor side. So "auto WB does not fix the cast" is **not** a supported conclusion
+    from this probe; the measurement is blocked on that task.
+  - **User decision stands: colour is out of scope here.** Recorded so the future colour work
+    starts from measurement rather than from the impression that the new curve caused it.
+- 2026-08-31 (**"Portra and Ektar lean blue" is WITHDRAWN — the user doubted it, and the
+  clean measurement says it is wrong in kind**).
+  - **The method was confounded, which is worse than the small sample the user flagged.**
+    `curve_colour_probe` buckets channel ratios by luminance percentile across the whole
+    frame, so p05 may be a shadow of one object and p50 the midtones of another: it mixes
+    *scene content* with *film response* and cannot separate them. Demonstrably wrong, not
+    merely weak — it reported Gold 200 as **warm** (B/G 0.81) where the clean measurement
+    makes Gold the **most blue** roll of the three (B/G 1.83).
+  - **The user's mechanism is right and was already measured** in
+    `film-base/dmax-per-channel-reduction`, on the one target that has no scene content: the
+    uniformly exposed **leader**, which must render neutral by definition, so every deviation
+    is model error. Per-channel base-relative density there, and what one shared `gamma =
+    2.03` makes of it: Gold `B−G 0.1288` → **B/G 1.826**; Portra `R−G 0.1105` → **R/G 1.676**;
+    Ektar `B−G 0.0336` → B/G 1.170. That is 17–83% off neutral on a *grey* target.
+  - **The cause is the one the user named.** Stage 1 pins `D_c = 0` at the base on every
+    channel, so the base renders neutral *by construction* — but that is the only point
+    pinned. The channels do not reach the other end together (ranges differ by 0.05–0.14
+    density for the same exposure), so one shared `gamma` plus one scalar anchor is neutral
+    at the base and progressively wrong as density rises. The error is `10^(gamma·ΔD)`, so
+    raising gamma roughly **squares** it — the same defect at `gamma = 1` already produced a
+    "visibly blue white with blue clipping" on Gold.
+  - **Direction is not consistent** (blue densest on Gold and Ektar, **red** on Portra), so it
+    is a per-roll model error, not a film characteristic. Nothing about it can be absorbed by
+    one constant.
+  - **This task exposes the defect rather than causing it.** The sigmoid's shoulder washes
+    highlights toward white and hides the channel error along with the highlight detail; the
+    exponential has no shoulder, so both survive. Same mechanism, and it means
+    `film-base/dmax-per-channel-reduction` gains priority the moment a shoulder-less
+    reconstruction is on the table — its own analysis calls the per-channel term "redundant
+    under the exponential, not under the sigmoid, **which is the intended default**", and
+    that premise is exactly what this task is re-opening.
+  - **The lesson for this harness: a channel ratio taken over scene content is not a
+    measurement of the film.** Use a target with no content — the leader, or a grey card. The
+    percentile probe stays for tone-*dependence* within one render, which is what it can
+    actually see.
+- 2026-08-31 (**chunk 4: the darkness was the match point, not the operator — and that
+  unblocks the default question**). `tone_map_match_point_probe` re-solves the anchor
+  against **mean encoded lightness** (the whole distribution) instead of the mid patch (one
+  point), then confirms each solve against a real render.
+- **Why mean *encoded* lightness.** The display transfer approximates the eye's response, so
+  the mean of `srgb_encode(clamp(L))` tracks "how bright the picture looks"; mean *linear*
+  luminance is dominated by highlights and would have answered a different question.
+  Clamped, because anything over display white is shown as white.
+- **The probe evaluates candidates without re-rendering.** Constant-luminance gamut mapping
+  preserves luma and the anchor is a pure gain, so rendered luminance is
+  `operator(gain · L)` over a precomputed sample array — which is what makes a *distribution*
+  target tractable where the closed-form mid-patch solve was not. Every row is still
+  verified against a real render (lightness error ≤ 0.0003 throughout) and the probe asserts
+  it.
+- **Result: at equal mean lightness, `reinhard64` still beats the shipped sigmoid on both
+  metrics on all 7 frames.** So the user's "all the tone-mapping looks darker than the
+  default" was an artefact of matching at the mid patch, not the operator's price.
+- **And it costs almost nothing.** Moving the match point from mid to lightness gives up
+  **+0.03 to +0.13 pp** of `blown%` and 1–13% of code separation, while the render still
+  wins on both against the benchmark:
+
+  | frame | sigmoid blown/sep | reinhard64 @ lightness | anchor |
+  | --- | --- | --- | --- |
+  | E2 | 6.11 / 43.0 | 4.29 / 62.0 | 0.9928 |
+  | E3 | 6.45 / 37.9 | 4.15 / 55.7 | 0.9748 |
+  | G2 | 6.53 / 67.2 | 4.91 / 80.2 | 0.9716 |
+  | G3 | 6.87 / 4.5 | 5.89 / 23.3 | 0.9622 |
+  | P2 | 7.22 / 75.7 | 4.92 / 84.8 | 1.0224 |
+  | P3 | 6.30 / 0.6 | 5.74 / 11.6 | 0.9878 |
+  | P4 | 6.15 / 114.0 | 3.75 / 121.3 | 1.0394 |
+
+- **Mid then lands 1.7–16.5% *brighter* than the sigmoid's**, which is the expected shape:
+  compressing the top means lifting the bottom to reach the same average. Worth stating
+  because it inverts the earlier reading — the mid-matched configs were not "correctly
+  exposed and darker", they were *under*-exposed relative to an equal-brightness render.
+- **Design consequence for the CLI surface: the offset is chosen against lightness, not the
+  mid patch.** The implied mid-above-base offsets are **0.595–0.673, mean 0.626** — well
+  above X3's fitted **0.508**, which was fitted under a different render and should not be
+  inherited.
+- **The 0.626 is not a calibrated constant, and must not be shipped as one.** Each row is
+  matched to *that frame's own sigmoid render*, and the sigmoid's placement itself varies
+  with the roll `Dmax` — so these offsets inherit the reference's variation rather than
+  measuring the film. The 0.078 spread (**0.52 stops**) is that inherited variation plus
+  real frame-to-frame disagreement, undistinguished. Calibrating a shipping value needs a
+  bracketed roll and a grey card, which is `algo/sigmoid-parameter-calibration`'s recorded
+  precondition; this number is a *starting point with a known provenance*, nothing more.
+- 2026-09-01 (**chunk 5, rebuilt onto `output/linear-render`**). #99 landed first and shipped
+  `print.display_tone` / `--display-tone <shoulder|none>` — **the same concept as this
+  chunk's knob**, so the first version of chunk 5 (a parallel `print.tone_map` /
+  `--tone-map`) was discarded rather than rebased. Two names for one operator is exactly
+  what chunk 1's review round removed from the metadata; shipping it at the CLI would have
+  been worse. `--display-tone none` and a Reinhard at zero headroom are byte-identical, which
+  makes the duplication concrete rather than stylistic.
+- **The design was already written down for me.** `DisplayToneCurve`'s doc comment
+  anticipated this task by name: a parameterized operator "arrives here as a *new variant
+  with a payload* — `Reinhard { white: … }` — and serde's default externally-tagged
+  representation makes that a pure addition", at the cost of the `clap::ValueEnum` derive.
+  Followed exactly. The claim held: the two unit variants keep their bare-string spellings,
+  the default document is unchanged, and **the drift gate did not fire at all** — a better
+  outcome than the discarded version, which had to refresh the recipe hash.
+- **Two of their patterns are better than what I had and were adopted, not merged.** The
+  knee width lives *inside* the shouldered variant, so "no tone curve, and here is its knee
+  width" is unrepresentable rather than rejected; and `KneeWidth` is a checked newtype with a
+  private field, because an enum variant's fields are as public as the enum. `Headroom`
+  mirrors it for the same reason and with a specific hazard: a negative headroom is not loud
+  on its own — `2^-40` is a white point of ~9e-13, which maps essentially every sample past
+  the ceiling and renders a solid white field at exit 0 with the clip merely *counted*.
+- **The range policy is where the two tones genuinely differ, and that is now explicit.**
+  `DisplayTone::bounds_output()` is `true` for the shoulder and for `None` — whose whole
+  policy *is* the range check, which is what makes it self-policing — and `false` only for
+  Reinhard, which exists to carry content past the ceiling. So `none` refuses an overshoot
+  and Reinhard counts it at the encode boundary. Same arithmetic, opposite contracts,
+  deliberately.
+- **Headroom is stated in stops above reference white, not in density** (user decision). The
+  task file proposed density as "contrast-independent and roll-measurable", but it would make
+  a *print* key read the reconstruction's anchor and contrast — the stage coupling this task
+  exists to remove — and cannot resolve under `simple` at all. `0` stops is `W = 1`, where the
+  operator is exactly `v`; an integration test pins that it renders **byte-identically** to
+  `--display-tone none`.
+- **`Display` had a decision waiting for it.** `display_tone_display_impl_matches_its_serde_spelling`
+  said in prose that a parameterized variant "will fail here — deliberately: that is the
+  moment to decide what `Display` should spell for it." Decided: the **flag** spelling
+  (`reinhard`), because the property the validation messages depend on is that a spelling
+  handed to a user is one they can type — the headroom arrives on its own flag. The test is
+  re-driven off `NAMES` now that `ValueEnum` is gone, and states the invariant once: every
+  accepted name parses to a variant whose `Display` is that name and whose wire form is
+  either that bare string or an object keyed by it.
+- **`accepts_reinhard_tone` is narrower than "is a display preset"**, which is why it is a
+  fourth rule rather than an edit to the third: the other two tones are bounded and every
+  display preset takes them. Exhaustive match, so a new preset must state its answer. The
+  HDR presets are out because the ceiling-parameterized form that keeps their midtones
+  matched with SDR has not been derived — `hdr::render` also refuses it directly, as defence
+  in depth against a programmatic caller. `hdr-pq` silently applying the SDR shape at the
+  1000-nit ceiling is precisely the failure that rule prevents.
+- **The report needed no work, because #99 had already fixed the trap.** `output_render`
+  carries `display_tone` as a *field* and its `content` prose never names a curve — the
+  lesson CLAUDE.md now records as a knob's "fifth spot". The payload flows through unchanged
+  (`{"reinhard":{"headroom_stops":6.0}}`), so provenance is complete without new plumbing.
+- Verified against the binary: `--display-tone shoulder` is byte-identical to naming nothing,
+  the three modes produce three different renders, headroom reaches the operator, and all
+  five refusals fire with their own message (unknown name, wrong preset, headroom without
+  reinhard, knee width beside reinhard, and the HDR backstop). Gates green.
+- **Still outstanding before any default can move:** per-output ceilings, which is what makes
+  a gain map carry information and needs the ceiling-C form nothing has derived yet; and the
+  reconstruction offset that pairs with `W`, whose measured 0.626 is a starting point rather
+  than a calibration.

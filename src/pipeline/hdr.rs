@@ -341,6 +341,17 @@ pub fn render_linear(shared: &SharedDisplaySource, tone: DisplayTone) -> Result<
             highlight_compress: tone.highlight_compress(),
             shoulder_start,
             tone_curve: match tone {
+                // Defence in depth: `cli::validate` refuses reinhard on every HDR
+                // preset, because the ceiling-parameterized form that would keep HDR
+                // midtones matched with SDR has not been derived. Applying the SDR
+                // shape at the 1000-nit ceiling would silently mis-render, so a
+                // programmatic caller that gets here is a bug, not a user error.
+                DisplayTone::ExtendedReinhard(_) => {
+                    return Err(NcError::Other(
+                        "HDR display rendering was handed the extended-Reinhard tone                          curve, which has no HDR-ceiling form yet — `cli::validate`                          should have refused it upstream"
+                            .into(),
+                    ));
+                }
                 DisplayTone::HermiteShoulder(_) => "reference-white-preserving-hermite-shoulder-v1",
                 DisplayTone::None => display_tone::NO_TONE_CURVE,
             },
