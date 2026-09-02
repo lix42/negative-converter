@@ -1,0 +1,42 @@
+{
+  "name": "@nc/review-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Visual review app: compare rendered configurations side by side, in place.",
+  "keywords": [],
+  "license": "ISC",
+  "author": "",
+  "type": "module",
+  "scripts": {
+    "dev": "vp dev",
+    "build": "vp build",
+    "preview": "vp preview",
+    "test": "vp test run",
+    "check": "vp check",
+    "fix": "vp check --fix",
+    "verify": "vp check && vp test run && vp build"
+  },
+  "dependencies": {
+    "@stylexjs/stylex": "^0.19.0",
+    "solid-js": "^1.9.15"
+  },
+  "devDependencies": {
+    "@stylexjs/unplugin": "^0.19.0",
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.0",
+    "vite-plugin-solid": "^2.11.14",
+    "vite-plus": "0.3.0"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.0"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.25.0",
+      "onFail": "download"
+    }
+  },
+  "packageManager": "pnpm@11.25.0"
+}

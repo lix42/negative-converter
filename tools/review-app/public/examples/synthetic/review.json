@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "title": "Synthetic example",
+  "description": "A committed, dependency-free review set so the app runs out of the box. Each config rolls the bright end off differently \u2014 press 1/2/3 and watch only the brightest patches move. The images are larger than most windows, so `fullsize` shows the pan controls and mini-map.",
+  "configs": [
+    {
+      "id": "shoulder",
+      "label": "shoulder",
+      "note": "shipped Hermite shoulder"
+    },
+    {
+      "id": "soft",
+      "label": "soft",
+      "note": "a gentler roll-off"
+    },
+    {
+      "id": "none",
+      "label": "none",
+      "note": "no tone curve at all"
+    }
+  ],
+  "images": [
+    {
+      "id": "E1",
+      "label": "E1 \u2014 synthetic highlight ramp",
+      "note": "brightest patches merge as the ceiling drops",
+      "renditions": {
+        "shoulder": {
+          "src": "E1-shoulder.svg",
+          "width": 2400,
+          "height": 1500
+        },
+        "soft": {
+          "src": "E1-soft.svg",
+          "width": 2400,
+          "height": 1500
+        },
+        "none": {
+          "src": "E1-none.svg",
+          "width": 2400,
+          "height": 1500
+        }
+      }
+    },
+    {
+      "id": "G2",
+      "label": "G2 \u2014 synthetic sky",
+      "note": "brightest patches merge as the ceiling drops",
+      "renditions": {
+        "shoulder": {
+          "src": "G2-shoulder.svg",
+          "width": 2400,
+          "height": 1500
+        },
+        "soft": {
+          "src": "G2-soft.svg",
+          "width": 2400,
+          "height": 1500
+        },
+        "none": {
+          "src": "G2-none.svg",
+          "width": 2400,
+          "height": 1500
+        }
+      }
+    }
+  ]
+}

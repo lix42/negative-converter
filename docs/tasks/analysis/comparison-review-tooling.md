@@ -37,6 +37,20 @@ review (full-size gain-map files for the frames whose range exceeds SDR); and th
 compare *builds* as well as configurations, so a future default change can be reviewed the
 same way.
 
+## What has shipped
+
+The **viewer** half landed 2026-09-02 as `tools/review-app/` (Vite+ / Solid / StyleX, its own
+CI job). It reads a `review.json` — the format is `tools/review-app/SCHEMA.md` — and renders
+every configuration of a frame into one grid cell, so switching between them cannot move the
+picture; `fullsize` has pan controls and a mini-map. That settles "the matrix as data" from the
+viewing side and gives the rest of this task a contract to target.
+
+**Still open, and the reason this task is not done:** the **generator** that renders a described
+matrix and emits the JSON (today images and `review.json` are produced ad hoc), HDR review for
+frames whose range exceeds SDR, and build-vs-build comparison. The lessons in *Design* above still apply to
+the generator — especially *render through the path being measured*, which is now its
+obligation, and the `sips`-destroys-a-gain-map constraint that gates HDR review.
+
 ## Implementation Suggestion
 
 - Keep the derived-numbers discipline: the page may *display* images for a human, but no tool

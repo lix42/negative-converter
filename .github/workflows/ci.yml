@@ -64,3 +64,37 @@ jobs:
 
       - name: Test
         run: cargo test --all-features --verbose
+
+  # The review app is a self-contained tool with its own toolchain (Vite+), so it
+  # gates separately rather than joining the Rust matrix — a Rust change cannot
+  # break it and vice versa. Linux only: it builds no native code and produces the
+  # same bundle everywhere, so a second OS would buy nothing.
+  review-app:
+    name: review-app (check / test / build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/review-app
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          # Vite+ requires ^20.19 || ^22.18 || >=24.11.
+          node-version: 24
+
+      - name: Enable pnpm
+        run: corepack enable pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # `vp check` is format + lint + type-check in one pass.
+      - name: Check (format, lint, types)
+        run: pnpm check
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build

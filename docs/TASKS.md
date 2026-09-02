@@ -1009,7 +1009,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   black-box coverage now exercises real-binary `freeze` → `convert`, pins the recipe and
   TIFF/sidecar contracts, and reproduces the successful-wrong-container failure; the full
   stdlib analysis suite runs in Linux and macOS CI
-- [ ] [Comparison review tooling](tasks/analysis/comparison-review-tooling.md) — promote the
+- [~] [Comparison review tooling](tasks/analysis/comparison-review-tooling.md) — promote the
   ad-hoc review pages from `algo/reference-anchored-sigmoid` into a maintained tool for
   comparing rendering configurations by eye: one entry point, the matrix as data rather than
   code, HDR review for the frames whose range exceeds SDR, and build-vs-build comparison.
+  **Viewer half shipped 2026-09-02** (`tools/review-app/`, Vite+ / Solid / StyleX): the
+  `review.json` format settles "matrix as data", and switching config cannot move the picture
+  because every rendition shares one grid cell. Still open: the **generator** that renders a
+  matrix and emits the JSON, HDR review, and build-vs-build.

@@ -364,8 +364,8 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 
 ## comparison-review-tooling
 
-**Status:** not started
-**Updated:** 2026-08-03
+**Status:** in progress
+**Updated:** 2026-09-02
 
 - Goal: promote the ad-hoc review pages built during `algo/reference-anchored-sigmoid` into a
   maintained tool for comparing rendering configurations by eye. Requested explicitly by the
@@ -382,6 +382,42 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 - Wanted: one entry point instead of two overlapping script pairs, the configuration matrix as
   data rather than code, HDR review for frames whose range exceeds SDR, and build-vs-build
   comparison so a future default change can be reviewed the same way.
+
+### 2026-09-02 — the viewer half shipped: `tools/review-app/`
+
+- **Scope was deliberately halved** (user decision): a **viewer only**, plus the data format.
+  The generator that renders a matrix and emits the JSON is *not* built — image and
+  `review.json` production stays ad-hoc for now. So the task's "one documented entry point
+  renders a described matrix" is **not** met yet, and neither are HDR review nor build-vs-build.
+  What *is* settled is the contract those will target.
+- **The format is the deliverable as much as the app.** `review.json` (`tools/review-app/SCHEMA.md`)
+  declares `configs` and `images`, `snake_case` like every other JSON contract here, with image
+  paths resolved against the review file so a set is one movable directory. That answers "matrix
+  as data rather than code" from the viewer's side. Config order sets both button order and the
+  number-key mapping. An unknown config id in `renditions` is a loud error naming the typo (the
+  `deny_unknown_fields` reflex); a *missing* rendition is not — it renders as a visible gap,
+  because a comparison silently missing half of itself is the worst of the three outcomes.
+- **Toggling in place is the whole point, and it is structural**: every rendition of a frame
+  occupies one CSS grid cell, inactive ones hidden but still laid out, so switching config
+  cannot move the picture by a pixel. Side-by-side hides exactly the highlight differences this
+  was built to see. Verified in the browser — all renditions at row 1 / column 1, identical
+  bounding boxes.
+- **`fullsize` gained pan controls and a mini-map** (the user's sketch): edge buttons stepping
+  80% of a viewport, and a window box showing where the viewport sits in the image.
+- Stack is **Vite+ (`vp`) + Solid + StyleX + pnpm**, in `tools/review-app/` with its own CI job
+  (`pnpm check` / `test` / `build`). Deliberately *not* joined to the Rust matrix: a Rust change
+  cannot break it and vice versa.
+- **Four traps, every one of which failed silently** — all recorded in the app's `README.md`:
+  StyleX drops CSS shorthands it does not model (`background`, `border`, `gridArea` vanished,
+  leaving white text on a white button); `stylex.props()` returns React's `className` *and*
+  spreading it is not reactive in Solid; a scroll handler that writes a signal creates a
+  measure → render → layout → measure cycle that wedged the renderer so hard Chrome could not
+  inject a script; and `requestAnimationFrame` never fires in a hidden tab, which silently
+  disabled the pan controls and dropped smooth scrolls. Each cost a debugging round.
+- **The old lessons above still stand and are not yet re-implemented here.** In particular
+  "render through the path being measured" is now the *generator's* obligation, and the
+  `sips`-destroys-a-gain-map constraint still blocks HDR review. Whoever builds the generator
+  should read that bullet before starting.
 
 ## harness-regression-tests
 

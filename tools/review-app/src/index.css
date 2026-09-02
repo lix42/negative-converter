@@ -1,0 +1,46 @@
+/* StyleX injects every compiled rule at this directive. */
+@stylex;
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #151515;
+  --panel: #1e1e1e;
+  --edge: #333;
+  --fg: #dddddd;
+  --fg-dim: #8f8f8f;
+  --accent: #7fb3ff;
+  --accent-ink: #06131f;
+  --accent-wash: rgba(127, 179, 255, 0.22);
+  --missing: #40211f;
+  --bad: #ff8b7d;
+  --button: #262626;
+  --scrim: rgba(20, 20, 20, 0.82);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f6f6;
+    --panel: #ffffff;
+    --edge: #d5d5d5;
+    --fg: #1b1b1b;
+    --fg-dim: #666666;
+    --accent: #1c62c4;
+    --accent-ink: #ffffff;
+    --accent-wash: rgba(28, 98, 196, 0.18);
+    --missing: #f6dcda;
+    --bad: #b3261e;
+    --button: #ffffff;
+    --scrim: rgba(255, 255, 255, 0.86);
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    14px/1.5 -apple-system,
+    system-ui,
+    sans-serif;
+}

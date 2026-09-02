@@ -826,5 +826,26 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   `dark holder → thin inset rebate → picture` (the rebate is not the outer margin),
   so `--auto-base` is best-effort; measure `Dmin` once from an unexposed reference
   and reuse it via `--base-region`/`--film-base` (design-spec §8).
+- **Comparing renders by eye? Use `tools/review-app/`, don't build another page.**
+  Asked for a "visual review", a comparison page, or a before/after of two render
+  configurations, reach for that app rather than emitting one-off HTML — the ad-hoc
+  pages under `scripts/sigmoid-baseline/` are what it exists to replace. It renders
+  every configuration of a frame into **one grid cell**, so switching between them
+  cannot move the picture by a pixel; toggling in place is what makes highlight
+  differences visible at all, and side-by-side hides them. Feed it a `review.json`
+  (`tools/review-app/SCHEMA.md`) naming the configs and the images, and open the app
+  with `?data=<path to it>`; image paths resolve next to that file, so a review set
+  is a movable directory. It has its own toolchain — **Vite+ (`vp`), Solid, StyleX,
+  pnpm** — and its own CI job; run `pnpm check && pnpm test && pnpm build` in
+  `tools/review-app`, never the Rust gates, and read its `README.md` first: every
+  trap recorded there (StyleX silently dropping CSS shorthands, `stylex.props()`
+  spreads not being reactive in Solid, a scroll handler that writes a signal wedging
+  the renderer, and `requestAnimationFrame` never firing in a hidden tab) failed
+  *silently* and cost a debugging round each.
+  **Never commit or publish a review set**: the images are the user's own
+  photographs, so they go to a throwaway directory outside the repo, never into
+  `../nc-assets` or git. The one exception is the app's own
+  `public/examples/synthetic/` — a few KB of generated SVG, committed so the tool
+  runs out of the box; it contains no photograph and is not a review of anything.
 - For any library API, fetch current docs via Context7 rather than relying on
   memory.
