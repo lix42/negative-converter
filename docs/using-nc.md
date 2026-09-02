@@ -684,6 +684,16 @@ Two rules follow from the knob being display-only: `legacy`, `custom` and
 describes nothing when there is no knee. `--highlight-compress 0` is the default
 and asks for nothing, so it is accepted.
 
+**On the default `gain-map-hdr` preset, `none` makes the gain map inert by
+construction.** The examples above use `display-p3`, but the default renders *both*
+branches: skipping the shoulder makes the SDR and HDR renditions carry the same
+luminance, so their ratio is exactly 1.0 everywhere. nc still writes a valid
+gain-map JPEG and exits 0 without a warning. That is the §8 known issue in its
+sharpest form — the shipped default already decodes at 1.0x — so it costs nothing
+today, but if you are reaching for `--display-tone none` *because* you want HDR
+headroom, an SDR preset is the honest container until a reconstruction that exceeds
+reference white exists to fill it.
+
 ---
 
 ## 8. Output presets
