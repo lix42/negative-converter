@@ -190,23 +190,61 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   accepted only by those display presets (legacy ignores it — so it is rejected
   there rather than silently dropped — and film-master rejects it);
   `display_tone` resolves `print.display_tone` + `print.highlight_compress` into the
-  one tone value **both** display renderers read, so it owns the shared
+  one tone value both display renderers **read** — though not one both *accept*:
+  three selectors ship (`shoulder`, `none`, `reinhard`) and **all three are accepted by
+  every display preset**; only `legacy`/`custom`/`film-master` refuse. The gain-map pair
+  was the last admitted, and the condition is load-bearing: `gain_map::build` must ratio
+  against the base **as stored** (`min(sdr, 1)`), because that is what a decoder
+  multiplies and the encode clamps it — ratioing against the *rendered* SDR stored a gain
+  short by whatever was clamped, reconstructing up to 23% dark with every counter reading
+  zero. The fix is the ratio; never relax the check instead. The HDR branch applies a **lifted** form whose base is
+  asymptotic, so it sits strictly inside the 1000-nit peak; that is why
+  `bounds_sdr_output` and `bounds_hdr_output` are **two** predicates — the same tone
+  is unbounded on SDR and bounded on HDR, and one boolean asserted one of them
+  wrongly. It owns the shared
   `0.5 + 0.25/(1 + hc)` knee formula (never restate it in a stage) and its
-  `KneeWidth` newtype is what keeps an unchecked width unrepresentable — a bare
+  `KneeWidth` / `Headroom` newtypes are what keep an unchecked parameter
+  unrepresentable — a bare
   `f32` payload let `hc = -1` render an infinite knee, i.e. a silent identity curve
-  at exit 0. `DisplayToneCurve::None` skips *tone* only: gamut mapping, the transfer
+  at exit 0, and a negative headroom render a solid white field at exit 0 with the
+  clip merely counted. `DisplayToneCurve::None` skips *tone* only: gamut mapping, the transfer
   encode and each renderer's range check still run, which is what makes the mode
   self-policing instead of gated on a curve type — and those two ceilings **differ**
   (`1.0` for SDR, `LINEAR_HEADROOM` ≈ 4.93 for HDR), so any message or doc about
-  overshoot must name its branch: the same lift is refused on `display-p3` and
-  renders on `hdr-pq`, which is the headroom an HDR rendition exists to carry;
+  overshoot must name its branch: the same **over-range sample** is refused on
+  `display-p3` and renders on `hdr-pq`, which is the headroom an HDR rendition exists to
+  carry. ("Lift" is avoided here on purpose — this change made it a named operator
+  component, so it would read as reinhard's lift rather than any upward push.)
+  `reinhard` is the one selector `bounds_sdr_output()` reports **false** for: it exists
+  to overshoot, so its loss is counted at the u16 encode boundary instead of
+  refused, and the SDR gamut ceiling follows the pixel above display white rather
+  than being pinned at `1.0`. Its `headroom_stops` is display-referred (`W = 2^stops`),
+  and the stops→white-point conversion, the `[0, 24]` bound and its check live **once**
+  in `types.rs` (`headroom_white_point` / `MAX_HEADROOM_STOPS` /
+  `check_headroom_stops`) precisely so `cli::validate` and the renderer cannot bound
+  the knob differently. That bound is a **value** rule and therefore belongs in
+  `validate`, not `validate_convert` — `roll` and per-frame overrides reach only the
+  former, and a stage-only check let a whole roll decode before failing per frame;
+  the headroom-*presence* rule (a headroom stated beside a tone with no white point)
+  genuinely needs the flag and stays in `validate_convert`.
+  **`validate_output_preset`'s rules are ordered by how specific their diagnosis
+  is**, and the reinhard-acceptance rule goes **last**: it also matches
+  `legacy`/`custom`/`film-master`, where its remedy ("use `--display-tone shoulder`
+  or `none` there") is advice those branches themselves refuse;
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `pipeline/shadow_metrics.rs` (test-only diagnostic harness: `#[cfg(test)]`, every
-  entry `#[ignore]`d and skipping with a message when `../nc-assets` is absent, so
+  **asset-dependent** entry `#[ignore]`d and skipping with a message when
+  `../nc-assets` is absent (its `mod tests` / `mod window_tests` unit tests of the
+  harness's own helpers are synthetic and deliberately run normally), so
   `cargo test` is green without assets and CI never needs them; in-crate because the
   SDR/HDR renderers are not CLI-reachable and nc has no `[lib]` target; prints derived
   numbers only, never pixels. **`cargo build` does not compile it** — use
-  `cargo test --no-run` or `clippy --all-targets`),
+  `cargo test --no-run` or `clippy --all-targets`. **A probe that derives its variants from
+  a shipped function stops measuring when that function changes**: `hdr_gain_probe` computed
+  each variant as `shipped(v)/f(v)`, so when the shipped base became asymptotic all three
+  collapsed onto it and the evidence *this file* cites stopped reproducing — silently, since
+  a probe only prints. Build each variant from its parts, and assert the one mirroring the
+  shipped design equals the shipped function),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
   implementation — `telemetry::params_hash` delegates to it so the core report
@@ -412,11 +450,28 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
 (see `Cargo.toml` for versions; bump with `cargo add`).
 
 - `cargo build` — build · `cargo test` — all tests · `cargo test <name>` — one test
+- **A `cargo test <filter>` matching nothing still prints `test result: ok`.** Read the
+  **count**, not the word: `0 passed` is how you learn an inserted test never landed, or
+  that you filtered on a name that does not exist. Twice in one session an edit silently
+  failed to apply and the filtered run reported `ok`.
 - `cargo clippy --all-targets` — lint (keep clean)
 - **Before pushing, match CI** (`.github/workflows/ci.yml`, runs on every PR):
   `cargo fmt --all --check` → `cargo clippy --all-targets -- -D warnings` →
   `cargo build` → the `scripts/analysis` unittest command below → `cargo test`.
   The gate is strict — warnings fail the build.
+- **The gate sequence does not include `cargo doc`, so broken intra-doc links are
+  invisible to all of it.** A rename that splits a documented item (`bounds_output` →
+  `bounds_sdr_output`/`bounds_hdr_output`) leaves every `[\`Self::bounds_output\`]` link
+  dangling with `fmt`, `clippy --all-targets -D warnings`, `build` and `test` all green.
+  Run `cargo doc --no-deps 2>&1 | grep "unresolved link"` after renaming a public item, and
+  **compare against the baseline** — 16 pre-existing unresolved links live in
+  `main.rs`/`io`/`colorimetry`/`version`/`stages`/`decode`/`cli`, so the count alone tells
+  you nothing; what matters is whether your diff added any.
+- **No gate reads prose, so a comment contradicting the code beneath it survives all of
+  them.** Six of twenty findings in one review were exactly this, three being rustdocs
+  directly above bodies doing the opposite. After changing behaviour, grep for the
+  **negation** of the claim you just falsified — `grep -rn "SDR only\|is refused" src docs
+  CLAUDE.md` — not for the code you changed; the stale sentence is never in your diff.
 - **The Rust four-gate sequence does not itself cover `scripts/analysis/`.** CI
   runs its stdlib `nctool` Python suite as a separate gate on Linux and macOS:
   `PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis
@@ -511,6 +566,13 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   came up once: a question answered is not automatically a document to maintain.
   When asked for a change, write the part that will still matter in six months and
   leave the rest out.
+- **Two editing traps that produced durable false claims here.** Inserting with
+  `s.replace("fn X(…)", new + "fn X(…)")` lands **between** `X`'s doc comment and its
+  signature, so the new item adopts `X`'s doc and `X` is left bare — twice in one file, and
+  the tell was a sentence fragment. And a batched edit script with fail-fast asserts skips
+  every *later* edit when one anchor misses, which `rustfmt` guarantees by rewrapping lines.
+  Apply edits independently, print applied/missed per edit, and confirm by grepping the
+  result rather than trusting an exit status.
 - **A task file tracks work; it does not specify it.** When creating a task,
   record the **goal**, the **open questions**, and what is **known vs unknown** —
   and leave room to investigate. Keep the door open on approach. Leave out the
@@ -539,6 +601,17 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   edit; for the second, reply and resolve without touching the doc. Anything the
   type system, a function signature, or the first test run forces you to confront
   belongs to implementation, not to the plan.
+- **Rebuilding onto a concurrently-merged PR silently drops things, and every gate
+  stays green.** When the base ships the same concept first, resolving conflicts
+  line-by-line preserves the inferior model — take *their* design and re-apply yours
+  onto it. But a re-port loses what nothing references: this task dropped a
+  falsifiability-verified regression test, nine unit tests of a moved function, and a
+  `#[serde(default)]` that was the only way a recipe could name a knob without its
+  parameter. Compilers and tests cannot miss those out loud. **Matching output is not
+  evidence of a faithful port** — the ported probes reproduced their numbers exactly
+  while all three were already gone. Diff what you *dropped*
+  (`git diff <old-branch> -- <path>`), not just what you kept, before deleting the
+  old branch.
 - **Skill layout.** Agent skills live in `.agents/skills/` (the directory Codex
   CLI scans; Codex invokes them as `$<name>`); `.claude/skills/` holds relative
   symlinks into it for Claude Code. Exception: `review-fix-loop` ships as two
@@ -596,6 +669,16 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
 - **Fail loudly.** Map errors to the documented exit codes (design spec §11);
   surface clipping / unsupported-input as explicit errors or report warnings,
   never a quietly wrong image.
+  - *A rule's **order** is part of its diagnosis, and a remedy must actually work.*
+    Diagnose the more specific fault first: a rule that also matches branches it did
+    not mean to will blame the wrong knob and hand out advice those branches
+    themselves refuse — `--display-tone reinhard` on `film-master` was told to "use
+    `--display-tone none`", which `film-master` also rejects. This has shipped three
+    times (the anchor guard's message, `validate_output_preset`'s rule 4, then the
+    same defect via `validate_convert`, which runs *earlier*). Two habits that catch
+    it: when adding a rule, run it against **every** preset/branch it can match, not
+    just the one you wrote it for; and `assert!(err.contains(<knob>))` cannot tell two
+    rules apart when both name the knob — assert the losing rule's wording is *absent*.
   - *Validate the resolved value, never a stand-in for it.* The anchor guard once
     tested a proxy (`MID_GREY_OUTPUT_DECADES / slope`), correct for the placements
     that existed then; `black-at-base` divides the unbounded `−log10(floor)`, so a

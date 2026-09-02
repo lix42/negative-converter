@@ -579,7 +579,10 @@ renderers have to remember. `display_tone` and `highlight_compress` are delibera
 by the shared stage: they resolve once into a single tone value that each named
 display branch scales into its own domain, so SDR and HDR can use different
 display-domain knees — or no curve at all — without drifting in their common
-adjustments, and without being able to disagree about which curve ran.
+adjustments, and without being able to disagree about which curve ran. One
+selector, `reinhard`, is applied by every display preset and refused only by the two
+branches with no display tone stage and by `film-master` (§9); resolving it in one place
+is what makes that a single stated rule rather than two renderers disagreeing quietly.
 
 The resolved SDR policy is deterministic and display-referred. It transforms
 AP1/D60 ACEScg to the selected D65 destination (Display P3 or sRGB) with pinned
@@ -594,24 +597,56 @@ the bounded resolution
 finite value cannot move it below `0.5` and flatten the whole tonal range.
 Under `display_tone = none` no tone curve runs at all and the reconstruction alone
 places every tone; the range check below is then the operative bound, so a sample
-above reference white is a loud pixel-specific error rather than a clip. The
+above reference white is a loud pixel-specific error rather than a clip. Under
+`display_tone = reinhard` the branch applies extended Reinhard
+`v·(1 + v/W²)/(1 + v)` against the white point `W = 2^headroom_stops`, which maps
+`W` exactly to reference white. It is the one selector whose output is **not**
+bounded by the branch's ceiling — that is its purpose, to carry specular content
+several stops above diffuse white — so content above `W` still exceeds `1.0` and
+its loss is counted at the u16 encode boundary rather than refused. The **HDR** branch applies a lifted form of the same operator:
+`f(v) · (1 + (C − 1)·s(v))`, with `s` a smoothstep in `log₂` from reference white to
+the white point and `f` taken **asymptotically** (`v/(1 + v)`), so the composite
+stays strictly inside the 1000-nit peak instead of plateauing at it. Below reference
+white the lift is identically zero, which is what lets an HDR and an SDR rendition of
+the same frame agree there — the condition a gain map needs. The **gain-map presets take it too**, and what
+made that safe is narrower than "both renditions in range": the ratio must be taken
+against the base **as stored**, because that is what a decoder multiplies and the encode
+clamps it. Ratioing against the *rendered* SDR stored a gain short by whatever was
+clamped, reconstructing up to 23% dark; `gain_map::build` therefore ratios against
+`min(sdr, 1)`, which is the admission condition and not a relaxed check. The
 renderer then maps out-of-gamut color to the RGB-cube boundary with one common
 chroma scale around the same-luminance neutral axis. This preserves the neutral
-axis and chroma direction instead of independently clipping channels. Finite
+axis and chroma direction instead of independently clipping channels. The cube
+ceiling **follows the pixel** (`max(1.0, this pixel's rendered luminance)`) rather
+than being pinned at `1.0`, which matters only for an unbounded tone: it keeps the
+boundary continuous above display white, so highlights desaturate toward white
+instead of gaining a hard ring where full chroma snaps back. Under the two bounded
+selectors the ceiling is always `1.0` and the path is unchanged. Finite
 input that produces non-finite matrix/tone/gamut arithmetic is a loud conversion
 error naming the pixel; the renderer never substitutes black or white. Its typed
-result owns finite non-negative `[0,1]` **pre-transfer**, destination-linear
-pixels together with the resolved gamut metadata. The radial intersection is
+result owns finite non-negative **pre-transfer**, destination-linear pixels
+together with the resolved gamut metadata. The upper bound is a property of the
+**resolved tone, not of SDR**: under `shoulder` and `none` the result is bounded
+to `[0,1]` and a sample outside the cube is a loud pixel-specific error, which is
+what makes `none` self-policing; under `reinhard` the overshoot is the point, so
+values above `1.0` are carried to the u16 encode step and counted there
+(`EncodeReport`, `--strict`-promotable) instead. Negativity stays a hard error
+under every tone — nothing downstream is defined below black. The radial
+intersection is
 calculated in binary64 and sets its limiting channel to the exact computed cube
-boundary; this is the gamut mapping itself, not a terminal per-channel clamp.
-Any final sample outside the cube is a loud pixel-specific error. A separate
+boundary; this is the gamut mapping itself, not a terminal per-channel clamp. A separate
 destination stage derives the matching Display P3 or sRGB profile from that
 metadata, applies only the piecewise sRGB transfer curve, and returns the
 metadata with the encoded pixels. The gain-map path borrows the typed
 pre-transfer pixels.
 
 The resolved HDR policy uses the same tone selection and control amount but a
-distinct reference-white-relative domain. Adjusted linear `1.0` remains the binding
+distinct reference-white-relative domain. All three selectors, each in
+this branch's own domain: the Hermite shoulder scaled to the peak, `none`, and `reinhard`
+in the lifted form described above. `tone_curve_id` resolves the identifier before the
+render, so a tone this branch could not apply would be refused there rather than surfacing
+downstream as a range complaint — conditional, because it returns `Ok` for all three today.
+Adjusted linear `1.0` remains the binding
 **203 cd/m² reference white**, the fixed peak is `1000/203 = 4.926108...`, and
 the normalized knee position is
 `0.5 + 0.25 / (1 + highlight_compress)`. The HDR shoulder therefore starts at
@@ -1358,11 +1393,17 @@ print/tone sub-stage ran *at all* (not whether its values were non-default — i
 `false` for `film-master`, and also for legacy `simple`, whose positive passes
 through untouched); `display_render` says whether any tone/gamut/transfer operation
 ran; `display_tone` is the resolved `print.display_tone` selector — the display
-branch's tone policy, **absent** on `legacy` / `custom` and `film-master`, which have
-no display tone stage at all. It rides in `output_render`, the one block *every* preset
-emits, so the two SDR presets (which emit no per-preset block at all) and the AVIF pair
-(whose `avif` block states no rendering policy) still say which tone curve ran;
-`content` therefore states what the branch does *besides* tone and never names a curve. `encoding` is a stable identifier — one of
+branch's tone policy, serialized in the recipe's own externally-tagged form, so it is
+a bare string for a parameter-free curve (`"shoulder"`, `"none"`) and an **object** for
+a parameterized one (`{"reinhard": {"headroom_stops": 6.0}}`). It is **absent** on
+`legacy` / `custom` and `film-master`, which have no display tone stage at all. It rides in `output_render`, the one block *every* preset
+emits, so the two SDR presets, which emit no per-preset block at all, still say which tone curve ran;
+`content` therefore states what the branch does *besides* tone and never names a curve.
+Note the AVIF pair *also* carries the renderer's pinned identifiers and luminance
+anchors in `avif.rendering` (a nested block, because unlike the rest of `avif` it is
+declared policy rather than facts read back out of the file); `output_render.display_tone`
+remains the resolved **selector**, and the two answer different questions — what was
+asked for, and what the renderer applied. `encoding` is a stable identifier — one of
 `rendered-u16-tiff` | `transitional-rendered-float-tiff` |
 `unclamped-linear-acescg-float-tiff` | `legacy-ultra-hdr-v1-xmp-mpf-jpeg` |
 `dual-dialect-gain-map-jpeg` |
@@ -2033,27 +2074,62 @@ false-positive on legitimate high-contrast conversions).
   positive values move its resolved knee earlier, bounded in the branch's domain as
   specified in §6. Preset activation/versioning owns the semantic switch; this is
   not a second conversion knob.
-- `--display-tone <shoulder|none>` / `print.display_tone` (default `shoulder`) —
+- `--display-tone <shoulder|none|reinhard>` / `print.display_tone` (default
+  `shoulder`) —
   which tone curve the named display renderers apply. `none` skips the display
   shoulder entirely; gamut mapping and the transfer encode still run, so it removes
   *tone*, not display rendering. A **selector**, not a width: `highlight_compress`
   moves the knee within a bounded `[0.5, 0.75]` and no value of it removes the
   curve, which is why "off" cannot be spelled as a highlight-compression amount.
   Resolved once per frame together with `highlight_compress` into the single tone
-  value both display branches consume, so SDR and HDR cannot diverge.
-  Three rules, all loud (never a silently-dropped knob): a non-default value is
+  value the display branch consumes.
+  The recipe form is **externally tagged**, so the two parameter-free curves keep
+  their bare-string spellings and a parameterized one carries its own object:
+  `"display_tone": "none"`, `"display_tone": {"reinhard": {"headroom_stops": 6.0}}`.
+  The **bare operator name is also accepted** for a parameterized curve
+  (`"display_tone": "reinhard"`, and equivalently `{"reinhard": {}}`), resolving that
+  operator's documented default — the recipe must be able to spell whatever
+  `--display-tone` accepts, and every spelling a diagnostic hands the user has to parse
+  back. Serialization emits only the explicit object form, so a round trip normalizes.
+  A tone switch does **not** carry the previous operator's parameter across: that is a
+  `--strict`-promotable warning, not an error, since the flags-win reset is documented
+  policy and the report states the tone that actually ran.
+  Four rules, all loud (never a silently-dropped knob), checked in order of how
+  specific their diagnosis is: a non-default value is
   rejected on the legacy branch (`legacy` / `custom`, which apply no display tone
-  curve) and by `film-master` (which bypasses display rendering); and a
-  **non-default** `highlight_compress` beside `none` is a usage error, since a knee
+  curve) and by `film-master` (which bypasses display rendering); a
+  **non-default** `highlight_compress` beside a curve that has no knee (`none` or
+  `reinhard`) is a usage error, since a knee
   width describes nothing without a knee (the default `0` is the identity and is
-  accepted — every rule here is on the resolved value). The mode is otherwise **self-policing** rather than gated
+  accepted — every rule here is on the resolved value); and `reinhard` is rejected
+  by every preset that does not apply it — today exactly `legacy`, `custom` and
+  `film-master`, which have no display tone stage. The branch and `film-master` rules are
+  checked *before* the `reinhard` rule, because on those three branches they are the
+  accurate diagnosis and the `reinhard` rule's remedy would not be — which makes the
+  `reinhard` rule **unreachable today**, deliberately: it is the enforcement half of
+  `OutputPreset::accepts_reinhard_tone`'s exhaustiveness, so a future preset answering
+  `false` is refused rather than silently rendering a tone its branch cannot carry. `none` is otherwise **self-policing** rather than gated
   on a curve type: each renderer already refuses a sample outside its range, so
-  pairing `none` with a reconstruction that overshoots the branch's ceiling fails
+  pairing it with a reconstruction that overshoots the branch's ceiling fails
   naming the pixel instead of clipping. The ceilings differ — reference white for
   SDR, the 1000-nit peak (`LINEAR_HEADROOM`) for HDR — so an overshoot that SDR
   refuses can render legitimately on an HDR preset, which is where the headroom a
   gain map needs would come from. A sigmoid curve with `shoulder > 0` and neutral
   print gains is bounded by construction and is the intended pairing.
+- `--display-tone-headroom <stops>` /
+  `print.display_tone.reinhard.headroom_stops` (default `6`) — the specular
+  headroom the extended-Reinhard curve compresses against, in **stops above
+  reference white**, so its white point is `W = 2^stops` (the default `6` is
+  `W = 64`). Display-referred deliberately: a density spelling would make a print
+  key read the reconstruction's anchor and contrast, and could not resolve under
+  `simple` at all. `0` stops is `W = 1`, where the operator is exactly the
+  identity, so it renders as `none` does while differing in **range policy** —
+  `none` refuses an overshoot, `reinhard` counts it at the encode boundary
+  (`.loss`, promotable by `--strict`). Bounded to `[0, 24]` stops as a *value*
+  rule, so `roll` and per-frame overrides refuse it before any frame is decoded;
+  beyond ~8 stops the operator converges on plain Reinhard and the extra headroom
+  buys nothing. Stating it beside a resolved tone that has no white point is a
+  usage error rather than a silently dropped flag.
 
 ### Simple algorithm
 - Removed legacy controls: `--invert-white-balance R,G,B` and
@@ -2497,7 +2573,7 @@ nc/
     │   ├── input_semantics.rs # transfer + measurement-meaning resolver (stage 1b)
     │   ├── working_space.rs   # NC film RGB v1 → linear ACEScg mapper
     │   ├── render_split.rs    # film-master bypass + the shared print controls
-    │   ├── display_tone.rs    # resolves which display tone curve runs (+ its knee)
+    │   ├── display_tone.rs    # resolves which display tone curve runs + its parameter
     │   ├── sdr.rs        # SDR display render (P3/sRGB, tone + gamut mapping)
     │   ├── hdr.rs        # Rec.2100 PQ/HLG display render
     │   ├── gain_map.rs   # SDR+HDR → canonical gain map

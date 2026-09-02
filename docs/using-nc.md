@@ -655,6 +655,32 @@ The report says which one ran, in a block every preset emits:
 `{"reinhard":{"headroom_stops":6.0}}` on a display preset, and absent on
 `legacy` / `custom` / `film-master`, which have no display tone stage.
 
+On the HDR presets the per-preset block also states what the renderer *applied*, next
+to the luminance anchors no container can carry — `.avif.rendering` for
+`hdr-pq`/`hdr-hlg`, `.hdr_coded_tiff` and `.hdr_linear_tiff` for the TIFF pair:
+
+```console
+$ nc convert scan.tif -o out.avif --output-preset hdr-pq --film-base … \
+    --display-tone reinhard --report json | jq .avif.rendering
+{
+  "reference_white_nits": 203.0,
+  "target_peak_nits": 1000.0,
+  "linear_headroom": 4.9261084,
+  "tone_curve": "extended-reinhard-white-point-v1",
+  "gamut_mapping": "bt2020-neutral-axis-radial-boundary-v1",
+  "linear_domain": "bt2020-linear-relative-to-203-nit-reference-white"
+}
+```
+
+`shoulder_start` joins it only for a curve that *has* a knee, so its absence does not
+mean "no tone ran" — `tone_curve` is the field that says which one did.
+
+**In a recipe, the operator's name alone is enough.** `print.display_tone` accepts
+the bare `"reinhard"` and the empty `{"reinhard":{}}` as well as the explicit
+`{"reinhard":{"headroom_stops":6.0}}`; the first two resolve the documented default
+of 6 stops, exactly as `--display-tone reinhard` does. Reports and `--dump-params`
+always write the explicit object, so a round trip normalizes to one form.
+
 What it does *not* skip: gamut mapping and the transfer encode still run, so this
 is "no tone curve", not "raw pixels out". And it needs a reconstruction bounded by
 the render's own ceiling — the default sigmoid (`--sigmoid-shoulder` above 0) with
@@ -704,23 +730,57 @@ white point of 64 — the value measured to beat the shipped sigmoid on both cli
 fraction *and* highlight separation on all seven reference frames, with brightness
 matched so the comparison is not just "one render is darker".
 
-Three things to know:
+What to know:
 
-- **It is not bounded, by design.** Content above the white point still exceeds the
-  ceiling; that loss is *counted* at the encode step and reported in `.loss`, rather
-  than refused. This is the opposite policy from `none`, which relies on the range
-  check being the whole rule — and the difference is deliberate: `none` is for a
-  bounded reconstruction, `reinhard` for one that deliberately overshoots.
-- **`0` stops is the exact identity.** `W = 1` makes the operator `v`, so
-  `--display-tone reinhard --display-tone-headroom 0` renders **byte-identically**
-  to `--display-tone none`. The two still differ in range policy, which is the only
-  reason both exist at that setting.
-- **SDR only for now** — `display-p3` and `compatibility`. The HDR branches would
-  need a ceiling-parameterized form that keeps their midtones matched with SDR, and
-  that has not been derived; the gain-map presets pin a bounded tone because gain
-  ratios are only meaningful while both renditions stay inside their declared
-  ranges. Every other preset rejects it by name rather than silently applying the
-  wrong shape.
+- **It is not bounded, by design — so the headroom has to be sized to the
+  reconstruction.** Content above the white point still exceeds the ceiling; that
+  loss is *counted* at the encode step and reported in `.loss` rather than refused,
+  which is the opposite policy from `none`, which relies on the range check being
+  the whole rule. Counted is not free: the loss raises a warning, and under
+  `--strict` that warning is a **failure** (exit 1). A reconstruction that overshoots
+  by more than the stated headroom therefore does not quietly land flat — it lands
+  in `.loss`, and `--strict` turns it into a refusal. Read `.loss.clipped_high`
+  against `.loss.total_samples` on a representative frame and raise
+  `--display-tone-headroom` until the fraction is what you intend; the default `6`
+  is sized for the shipped sigmoid, not for an arbitrary curve.
+- **`0` stops is the exact identity, on every preset.** `W = 1` makes the operator
+  `v`, so `--display-tone reinhard --display-tone-headroom 0` renders
+  **byte-identically** to `--display-tone none` — verified on `display-p3`,
+  `hdr-linear-tiff` and `hdr-pq-tiff`. On the SDR presets the two still differ in
+  range policy (`none` refuses an overshoot, this counts it), which is the only
+  reason both exist at that setting; on the HDR presets, where this tone is
+  range-checked, they match in that too.
+- **A tone switch does not carry the headroom.** `--display-tone none` (or
+  `shoulder`) over a recipe that pinned `headroom_stops` resolves the named
+  operator, dropping the stated headroom — the flags-win reset that makes such a
+  recipe re-runnable at all. That is legitimate, so it is a **warning**, not an
+  error, and `--strict` promotes it; restate
+  `--display-tone reinhard --display-tone-headroom <stops>` to keep the value.
+  Re-naming `reinhard` itself *preserves* it.
+- **Taken by every display preset** — the two SDR ones, all five single-rendition HDR
+  ones, and the gain-map pair. `legacy`, `custom` and `film-master` apply no display
+  tone curve at all and refuse it by name.
+- **It costs about a stop at diffuse white at any headroom worth setting — on every
+  preset, SDR and HDR alike.** This is the main thing to weigh when choosing it, and it is
+  not an HDR concern: the operator compresses everywhere, not only above white. At the
+  default 6 stops, mid-grey `0.18` renders `0.153` and reference white `1.0` renders `0.5`,
+  so the cost is **1.00 stops at diffuse white** and 0.24 stops at middle grey. Nor is
+  raising `--display-tone-headroom` a way out — `f(1.0, W) = (1 + 1/W²)/2` is 0.502 at
+  `W = 16` and 0.500 at `W = 64`, so more headroom does not recover it; the compression is
+  what buys the headroom. It goes the other way, and only right at the bottom: 0.68 stops at
+  1 stop of headroom and **0.00 at `W = 1`**, which is the identity case above, with the
+  cost within 2% of a full stop from 3 stops up. It is intrinsic to Reinhard: not a bug, and
+  not the blue cast it is easy to mistake it for.
+- **The HDR branches apply a different shape, not the same curve at a bigger ceiling.**
+  They lift highlights toward the 1000-nit peak over an *asymptotic* base, which is what
+  keeps the result **strictly inside** that peak so nothing clips on the way out.
+- **The gain-map presets take it too, and what made that safe is worth knowing.** A gain
+  map stores the ratio between the HDR rendition and the SDR base **as stored** — and the
+  encode clamps the base at white. `reinhard`'s SDR half deliberately runs past white, so
+  ratioing against the *rendered* base stored a gain short by whatever was clamped, and a
+  decoder reconstructed those highlights up to **23% dark** in a file that looked
+  structurally perfect. The fix was the ratio (`min(sdr, 1)`), never a relaxed check, so
+  the two renditions now agree as far as the container can express.
 
 `--highlight-compress` is a *knee* width, so it is a usage error beside `reinhard`
 for the same reason it is beside `none`: there is no knee to place.

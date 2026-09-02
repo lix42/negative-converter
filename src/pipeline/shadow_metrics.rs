@@ -8,10 +8,12 @@
 //! way to measure the real render chain, and it keeps this diagnostic out of the
 //! shipped binary and adds no product surface that `output/presets` would have to undo.
 //!
-//! **Discipline.** Every entry point is `#[ignore]`d and skips with a clear message when
-//! the assets are absent, so `cargo test` stays green on a machine with no
-//! `../nc-assets` and CI never needs them. Only *derived numbers* are printed —
-//! coordinates, percentiles, counts — never pixels.
+//! **Discipline.** Every **asset-dependent** entry point is `#[ignore]`d and skips with
+//! a clear message when the assets are absent, so `cargo test` stays green on a machine
+//! with no `../nc-assets` and CI never needs them. Only *derived numbers* are printed —
+//! coordinates, percentiles, counts — never pixels. The two `mod tests` / `mod
+//! window_tests` blocks are the deliberate exception: they are synthetic unit tests of
+//! this harness's own helpers, touch no asset, and run normally.
 //!
 //! Run the patch proposal with:
 //!
@@ -58,10 +60,16 @@ const TILES_Y_DEFAULT: u32 = 22;
 /// another — adjacent tiles on the same surface — so the "top 3" would offer one choice,
 /// not three. Suppressing neighbours makes them genuinely distinct alternatives.
 /// A rendered SDR sample at or above this is treated as saturated — highlight separation
-/// compressed against display white. Deliberately not `1.0`: `sdr::render` guarantees
-/// `[0, 1]`, so an equality test against `1.0` would only find samples the shoulder mapped
-/// exactly to the ceiling, missing the flattened neighbourhood just below it that is the
-/// actual loss.
+/// compressed against display white. Deliberately not `1.0`: under a **bounded** tone
+/// `sdr::render` returns `[0, 1]`, so an equality test against `1.0` would only find
+/// samples the shoulder mapped exactly to the ceiling, missing the flattened
+/// neighbourhood just below it that is the actual loss.
+///
+/// The reasoning survives the unbounded tone unchanged, for two reasons: its one
+/// consumer (`measure_candidates`) renders with `DisplayTone::shoulder`, and the probes
+/// that do use `ExtendedReinhard` measure the **delivered** image, i.e. clamped to
+/// display range, which is what `io::encode` writes. A `>=` test is what makes both
+/// cases read correctly — an over-range sample counts as saturated, which it is.
 const SATURATED_AT: f32 = 0.999;
 
 const MIN_SEPARATION_TILES: u32 = 3;
@@ -1473,9 +1481,10 @@ fn tone_map_probe() {
         .join(f["file"].as_str().unwrap());
     let (image, _) = crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES).unwrap();
 
-    // X3's reconstruction: exponential, mid pinned 0.508 above the base, unbounded.
-    let contrast = 2.03f32;
-    let anchor = 0.508 + MID_OUTPUT_DECADES / contrast;
+    // X3's reconstruction: exponential, mid pinned `X3_MID_OFFSET` above the base,
+    // unbounded. Taken from the shared constants so retuning X3 moves every probe.
+    let contrast = X3_CONTRAST;
+    let anchor = x3_reference_anchor();
     // Outside the checkout (see the doc comment). Not writable everywhere, and this is
     // an `--ignored` probe, so a missing sibling directory is a skip, not a failure.
     let outdir = repo_root().join("../temp/tonemap-probe");
@@ -1849,8 +1858,9 @@ fn tone_map_stage_probe() {
     let (image, _) = crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES).unwrap();
 
     // X3's reconstruction, with **no** operator folded in: the stage applies it.
-    let contrast = 2.03f32;
-    let anchor = 0.508 + MID_OUTPUT_DECADES / contrast;
+    // Shared constants, so this probe cannot end up measuring a different X3.
+    let contrast = X3_CONTRAST;
+    let anchor = x3_reference_anchor();
     let x3_source = || {
         let mut density = to_density(&image, &base, &DensityParams::default());
         let _ = crate::algo::density::regional_balance(&mut density, &DensityParams::default());
@@ -2279,6 +2289,253 @@ fn tone_map_match_point_probe() {
         "\nIf `mean lightness` reaches the benchmark while blown%/sep still beat it, the\n\
          darkness was the match point. If blown%/sep give way, it is the operator's price."
     );
+}
+
+/// The HDR half of `output/display-tone-mapping`: does the highlight-lifted operator
+/// produce a **live** gain map, and does the HDR rendition stay under its ceiling?
+///
+/// This is the task's own acceptance criterion, which has never been met: *"the HDR
+/// rendition measures a peak below the ceiling with non-zero separation above reference
+/// white, and the resulting `gain-map-hdr` reports `GainMapMax > 1.0`"*. Since
+/// `pipeline_version` 3 that number has decoded as exactly 1.0x, because the shipped
+/// sigmoid's shoulder removes every above-white value during *reconstruction*, so both
+/// display branches receive identical input and their ratio is 1 by construction.
+///
+/// This computes the HDR branch's luminance directly, through the same pinned matrix and
+/// luma vector `hdr::render_pixel_checked` uses, rather than calling `hdr::render_linear`.
+/// That started as a necessity — `render_linear` refused the unbounded tone until
+/// 2026-09-02 — and the refusal is now gone, so the reason it stays is the remaining one:
+/// a probe that characterizes the renderer should not be routed through the function it is
+/// characterizing, and it needs the ratio *before* packaging, which `render_linear`'s
+/// typed result does not hand back in that form. Duplicated arithmetic, shared constants.
+/// It measures the
+/// **canonical gain** — the per-pixel HDR/SDR ratio the container encodes — rather than
+/// packaging a JPEG, because the packaging step is mechanical and the ratio is the thing
+/// under test.
+///
+/// The reconstruction is X3 (exponential, unbounded), matched to the shipped sigmoid's
+/// mean lightness, because a *bounded* reconstruction cannot produce a live gain map at
+/// any tone setting: with nothing above the crossover the lift is identically zero. That
+/// is the same finding from the other direction, and it is why this task and
+/// `algo/reconstruction-render-curve-split` are one question.
+///
+/// ```text
+/// NC_TONEMAP_FRAME=P3 cargo test --release shadow_metrics::hdr_gain_probe \
+///   -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires ../nc-assets; run with --ignored --nocapture"]
+fn hdr_gain_probe() {
+    use crate::pipeline::colorimetry::pinned::{ACESCG_TO_BT2020, BT2020_LUMA};
+    use crate::pipeline::display_tone::{extended_reinhard, highlight_lifted_reinhard};
+
+    const CEILING: f32 = crate::pipeline::hdr::LINEAR_HEADROOM;
+
+    let Some(assets) = assets_root() else {
+        eprintln!("SKIP: no ../nc-assets/manifest.json");
+        return;
+    };
+    let fx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/sigmoid-baseline/fixtures.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let only = std::env::var("NC_TONEMAP_FRAME").ok();
+
+    for (key, f) in fx["frames"].as_object().unwrap() {
+        if only.as_deref().is_some_and(|k| k != key) {
+            continue;
+        }
+        // A mid patch is required only so this frame is one the matched-lightness rows
+        // elsewhere also cover; the measurement below uses whole-frame lightness.
+        if rect_of(f, "mid").is_none() {
+            continue;
+        }
+        let roll = f["roll"].as_str().unwrap();
+        let base_arr = fx["rolls"][roll]["dmin"].as_array().unwrap();
+        let base = FilmBase {
+            r: base_arr[0].as_f64().unwrap() as f32,
+            g: base_arr[1].as_f64().unwrap() as f32,
+            b: base_arr[2].as_f64().unwrap() as f32,
+        };
+        let path = assets
+            .join("rolls")
+            .join(roll)
+            .join(f["file"].as_str().unwrap());
+        let Ok((image, _)) = crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES) else {
+            continue;
+        };
+
+        // Match the shipped sigmoid's mean lightness, per chunk 4: comparing at equal
+        // brightness is the only way these numbers mean anything.
+        let dmax = f["roll_dmax"].as_f64().unwrap() as f32;
+        let (film, _) = crate::algo::reconstruct(&image, &base, &benchmark_sigmoid(dmax)).unwrap();
+        let bench = crate::pipeline::sdr::render(
+            &crate::pipeline::render_split::display_source(
+                crate::pipeline::working_space::map_nc_film_rgb_v1(film),
+                &PrintParams::default(),
+            )
+            .unwrap(),
+            crate::pipeline::sdr::SdrGamut::DisplayP3,
+            DisplayTone::DEFAULT,
+        )
+        .unwrap();
+        let bench_light = {
+            let img = bench.image();
+            let n = img.rgb.len() / 3;
+            (0..n)
+                .map(|i| {
+                    f64::from(srgb_encode(
+                        p3_luma(&img.rgb[i * 3..i * 3 + 3]).clamp(0.0, 1.0),
+                    ))
+                })
+                .sum::<f64>()
+                / n as f64
+        } as f32;
+        drop(bench);
+
+        let density = to_density(&image, &base, &DensityParams::default());
+        let reference = x3_shared(&density, x3_reference_anchor());
+        let samples = pre_operator_luma_samples(&reference, 8);
+        drop(reference);
+
+        println!("\nframe {key}  {roll}  {}", f["file"].as_str().unwrap());
+        println!(
+            "ceiling {CEILING:.4} (1000/203, binding); matched to sigmoid lightness {bench_light:.4}"
+        );
+        println!(
+            "\n{:<26}{:>10}{:>11}{:>10}{:>11}{:>9}",
+            "W / crossover", "hdr peak", "sep >RW", "max gain", "lifted %", "verdict"
+        );
+
+        // Three ways to bound the multiplicative lift. The lift can only be bounded by
+        // bounding its base, so this is the whole design space: leave the base alone
+        // (unbounded), clamp it hard (flat top), or give it an asymptotic form (soft top
+        // at the cost of a tiny agreement deficit below the crossover).
+        for base_mode in ["raw", "clamped", "soft"] {
+            println!("  base: {base_mode}");
+            for w in [16.0f32, 64.0] {
+                for crossover in [1.0f32, 2.0] {
+                    // Solve the gain that matches SDR lightness at this W, so each row is a
+                    // like-for-like render rather than a different exposure.
+                    let sdr_op = |v: f32| extended_reinhard(v, w);
+                    let (mut lo, mut hi) = (1e-6f32, 1e6f32);
+                    for _ in 0..80 {
+                        let g = 0.5 * (lo + hi);
+                        if mean_lightness(&samples, g, &sdr_op) < bench_light {
+                            lo = g;
+                        } else {
+                            hi = g;
+                        }
+                    }
+                    let gain = 0.5 * (lo + hi);
+                    let anchor = x3_reference_anchor() - gain.log10() / X3_CONTRAST;
+                    let shared = x3_shared(&density, anchor);
+
+                    // The HDR branch's own luminance: ACEScg → BT.2020, then its luma vector.
+                    let rgb = shared.source.rgb();
+                    let mut hdr: Vec<f32> = Vec::with_capacity(rgb.len() / 3);
+                    let mut gains: Vec<f32> = Vec::with_capacity(rgb.len() / 3);
+                    for i in (0..rgb.len() / 3).step_by(4) {
+                        let aces = [rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2]];
+                        let bt = [
+                            dot3(ACESCG_TO_BT2020[0], aces),
+                            dot3(ACESCG_TO_BT2020[1], aces),
+                            dot3(ACESCG_TO_BT2020[2], aces),
+                        ];
+                        let luma = dot3(BT2020_LUMA, bt);
+                        if !luma.is_finite() || luma <= 0.0 {
+                            continue;
+                        }
+                        let sdr_v = extended_reinhard(luma, w);
+                        // Each variant constructs its own base and multiplies the **pure**
+                        // lift. Deriving the lift as `shipped / sdr_v` instead — which this
+                        // did until 2026-09-02 — silently re-applies whatever base
+                        // `highlight_lifted_reinhard` happens to use, and that is exactly
+                        // how these three stopped being three: when the shipped base became
+                        // asymptotic, `raw` became the shipped operator (peak 4.92594, i.e.
+                        // *bounded*, against a label reading "unbounded"), `soft` became the
+                        // base applied twice, and `clamped` became non-monotonic — 4.85 at
+                        // v=64 falling to 0.84 at v=20000. The rows still printed plausible
+                        // numbers, so nothing failed; the probe had merely stopped measuring
+                        // its own conclusion.
+                        let lift = |v: f32| -> f32 {
+                            if v <= crossover || CEILING <= 1.0 {
+                                return 1.0;
+                            }
+                            let (lo, hi) = (crossover.log2(), w.log2());
+                            if hi.partial_cmp(&lo) != Some(std::cmp::Ordering::Greater) {
+                                return 1.0;
+                            }
+                            let t = ((v.log2() - lo) / (hi - lo)).clamp(0.0, 1.0);
+                            let smooth = t * t * (3.0 - 2.0 * t);
+                            1.0 + (CEILING - 1.0) * smooth
+                        };
+                        // `raw`: the base as written, `f(v, W)` — unbounded, because `f` is.
+                        // `clamped`: that base held at reference white, which only bites
+                        // above `W` (6+ stops over diffuse white, where SDR already clips).
+                        // `soft`: the asymptotic base `extended_reinhard(v, inf) = v/(1+v)`,
+                        // so the composite approaches the ceiling without attaining it. This
+                        // last one is the shipped design, reconstructed here from its parts
+                        // rather than by calling the shipped function — which is what makes
+                        // the assertion below a drift detector instead of a tautology.
+                        let hdr_v = match base_mode {
+                            "soft" => extended_reinhard(luma, f32::INFINITY) * lift(luma),
+                            "clamped" => sdr_v.min(1.0) * lift(luma),
+                            _ => sdr_v * lift(luma),
+                        };
+                        if base_mode == "soft" {
+                            // The one line that would have caught the drift above: the
+                            // hand-built mirror of the shipped design must equal the shipped
+                            // function. If its base changes again, this fires instead of the
+                            // table quietly re-labelling itself.
+                            let shipped = highlight_lifted_reinhard(luma, w, crossover, CEILING);
+                            assert!(
+                                (hdr_v - shipped).abs() <= 1e-5 * shipped.abs().max(1.0),
+                                "the `soft` row no longer mirrors highlight_lifted_reinhard \
+                                 at v={luma}, W={w}, crossover={crossover}: {hdr_v} vs \
+                                 {shipped}"
+                            );
+                        }
+                        if sdr_v > 0.0 {
+                            gains.push(hdr_v / sdr_v);
+                        }
+                        hdr.push(hdr_v);
+                    }
+                    hdr.sort_by(f32::total_cmp);
+                    let peak = hdr.last().copied().unwrap_or(0.0);
+                    // Separation among content above reference white, in the HDR domain: if
+                    // the speculars arrive as one flat blob this is ~0 and the headroom is
+                    // being saturated rather than used.
+                    let above: Vec<f32> = hdr.iter().copied().filter(|v| *v > 1.0).collect();
+                    let sep = if above.len() > 20 {
+                        pct(&above, 0.99) - pct(&above, 0.50)
+                    } else {
+                        0.0
+                    };
+                    let lifted = 100.0 * above.len() as f32 / hdr.len().max(1) as f32;
+                    let max_gain = gains.iter().copied().fold(0.0f32, f32::max);
+                    let live = max_gain > 1.0;
+                    let under = peak <= CEILING;
+                    let separated = sep > 0.0;
+                    let verdict = match (live, under, separated) {
+                        (true, true, true) => "PASS",
+                        (false, _, _) => "inert",
+                        (_, false, _) => "over ceiling",
+                        _ => "flat",
+                    };
+                    println!(
+                        "  W={w:<5} xo={crossover:<5}{peak:>10.3}{sep:>11.3}{max_gain:>10.3}{lifted:>10.2}%{verdict:>10}"
+                    );
+                }
+            }
+        }
+        println!(
+            "\nPASS needs all three: max gain > 1.0 (the map carries information), peak <= \
+             {CEILING:.3} (inside\nthe declared headroom), and non-zero separation above \
+             reference white (detail, not a blob)."
+        );
+    }
 }
 
 /// Subsampled pre-operator destination luminance for the whole frame.
@@ -2848,7 +3105,9 @@ fn write_review_pair(
     }
 }
 
-/// X3's reconstruction contrast. Shared by every probe below so the two cannot drift.
+/// X3's reconstruction contrast. Shared by **every** probe in this module — including
+/// the ones defined above this line — so retuning X3 cannot leave one measuring a
+/// different reconstruction.
 const X3_CONTRAST: f32 = 2.03;
 /// X3's mid-above-base offset, and the anchor it resolves to. Provisional and fitted —
 /// see `algo/exponential-anchor-placement`.
@@ -2920,6 +3179,16 @@ fn pre_operator_mid_luma(
             }
         }
     }
+    // `pct` on an empty slice is NaN, which propagates silently into every gain solve
+    // downstream. Only reachable if the rect falls entirely outside the frame —
+    // `rect_of` keeps it inside today — so say so loudly rather than measure nothing.
+    assert!(
+        !v.is_empty(),
+        "mid-patch rect {rect:?} selected no in-frame pixel of a \
+         {}x{} source",
+        shared.source.width(),
+        shared.source.height()
+    );
     v.sort_by(f32::total_cmp);
     pct(&v, 0.5)
 }
@@ -2928,7 +3197,9 @@ fn pre_operator_mid_luma(
 /// without rendering.
 fn scalar_operator(tone: DisplayTone) -> impl Fn(f32) -> f32 {
     move |value: f32| match tone {
-        DisplayTone::HermiteShoulder(_) => hermite_reference(value),
+        DisplayTone::HermiteShoulder(_) => {
+            hermite_reference(value, tone.knee_position().expect("a shoulder has a knee"))
+        }
         DisplayTone::None => value,
         DisplayTone::ExtendedReinhard(headroom) => {
             crate::pipeline::display_tone::extended_reinhard(value, headroom.white_point())
@@ -2936,22 +3207,26 @@ fn scalar_operator(tone: DisplayTone) -> impl Fn(f32) -> f32 {
     }
 }
 
-/// The SDR branch's Hermite at the default knee, duplicated here because `sdr`'s own
-/// `shoulder` is private and this harness only needs it to *predict* a render it then
-/// verifies against the real one. Every probe that uses it asserts the prediction.
-fn hermite_reference(value: f32) -> f32 {
-    const START: f32 = 0.75;
+/// The SDR branch's Hermite, duplicated here because `sdr`'s own `shoulder` is private
+/// and this harness only needs it to *predict* a render it then verifies against the
+/// real one. Every probe that uses it asserts the prediction.
+///
+/// `start` is the resolved knee position, taken from the `DisplayTone` rather than
+/// hardcoded at the default `0.75`: a probe run at a non-default `highlight_compress`
+/// would otherwise mis-predict the match gain, and only the downstream `mid err` assert
+/// would notice.
+fn hermite_reference(value: f32, start: f32) -> f32 {
     if value <= 0.0 {
         0.0
-    } else if value <= START {
+    } else if value <= start {
         value
     } else if value >= 1.0 {
         1.0
     } else {
-        let span = 1.0 - START;
-        let t = (value - START) / span;
+        let span = 1.0 - start;
+        let t = (value - start) / span;
         let (t2, t3) = (t * t, t * t * t);
-        (2.0 * t3 - 3.0 * t2 + 1.0) * START + (t3 - 2.0 * t2 + t) * span + (-2.0 * t3 + 3.0 * t2)
+        (2.0 * t3 - 3.0 * t2 + 1.0) * start + (t3 - 2.0 * t2 + t) * span + (-2.0 * t3 + 3.0 * t2)
     }
 }
 
@@ -2982,6 +3257,13 @@ fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
+/// Unit tests for the highlight-window search, kept beside it.
+///
+/// Not `#[ignore]`d, and correctly so: the `#[ignore]` discipline in this module's docs
+/// is about the **asset-dependent entry points**, which need `../nc-assets` and print
+/// derived numbers. These are synthetic and self-contained, exactly like the `tests`
+/// module above, so they run in a plain `cargo test` and are meant to.
+#[cfg(test)]
 mod window_tests {
     use super::*;
 

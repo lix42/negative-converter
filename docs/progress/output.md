@@ -212,10 +212,15 @@ What other epics need to know about `output`:
   transfer/profile, but `output/presets` still owns CLI activation. Legacy
   `to_output` continues to source linear Rec.709, so selecting the profile knob
   directly still performs Rec.709→P3 plus the sRGB TRC.
-- **Gain-map math is pinned:** per-channel `(HDR + offset_hdr) / (SDR +
+- **Gain-map math is pinned:** per-channel `(HDR + offset_hdr) / (min(SDR, 1) +
   offset_sdr)` in common linear Display P3 normalized by 203 cd/m². Extrema come
   from actual per-pixel values over independently tone-mapped renditions. No
   arbitrary epsilon, no silent clamp, no `0/0` — those are fail-loud cases.
+  The `min(SDR, 1)` is **not** a clamp of the kind that sentence forbids and must not be
+  "tidied" away (2026-09-02): a decoder multiplies the base **as stored**, and the encode
+  clamps it, so ratioing against an unbounded render made the encoded gain disagree with the
+  decode by up to 23% in the darks — silently, at exit 0. It is also what lets an unbounded
+  display tone reach the gain-map presets at all.
 - **`output/presets` is the migration surface**, and it is atomic: presets reject
   legacy output-selection flags, the output suffix must match the resolved
   container and is never rewritten, and `film-master` rejects every non-default
@@ -226,7 +231,8 @@ What other epics need to know about `output`:
   valid cross-platform gate — profile determinism here is pinned per build via the
   dateTime-zeroing path.
 - **The display tone curve is selectable** (`print.display_tone` /
-  `--display-tone <shoulder|none>`, `output/linear-render`, 2026-09-01). Three things
+  `--display-tone <shoulder|none|reinhard>`, `output/linear-render` 2026-09-01 plus
+  `output/display-tone-mapping` 2026-09-02). Three things
   callers need: the default is unchanged, so no default pixel moved and
   `pipeline_version` stayed 3; `none` is **self-policing** rather than gated on a
   curve type, so a reconstruction (or a print control applied before the render) that
@@ -2806,8 +2812,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 ## display-tone-mapping
 
-**Status:** in progress
-**Updated:** 2026-09-01
+**Status:** done
+**Updated:** 2026-09-02
 
 - Filed 2026-08-28 from the `algo/exponential-anchor-placement` tone-map probe
   (`shadow_metrics::tone_map_probe`, `#[ignore]`d, `NC_TONEMAP_FRAME` selects the frame).
@@ -3284,3 +3290,619 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   a gain map carry information and needs the ceiling-C form nothing has derived yet; and the
   reconstruction offset that pairs with `W`, whose measured 0.626 is a starting point rather
   than a calibration.
+- 2026-09-02 (**three review rounds before shipping; the findings clustered into two kinds,
+  neither of which a gate can see**). Four engines over three rounds — Codex at both scopes,
+  the project-primed reviewer, and the built-in review twice. 28 findings acted on, 1
+  rejected. Recording the two classes because both are cheap to repeat:
+  - **Right logic, wrong place.** The Reinhard preset rule was written *first* in
+    `validate_output_preset`, so `legacy`/`custom`/`film-master` got its message and its
+    remedy ("use `--display-tone shoulder` or `none`") — advice those branches themselves
+    refuse. The HDR refusal sat inside the `metadata:` struct literal, so it ran *after* the
+    pixel loop and a second full-frame allocation, and because `ExtendedReinhard` has no knee
+    the loop meanwhile took the `None` path and reported "applied no display tone curve" for a
+    mode the caller never selected. The headroom-presence rule in `validate_convert` runs
+    before `validate_output_preset` and so reproduced the same circular remedy a round later.
+    And the value rules (bounds, knee contradiction) were left only in `DisplayTone::resolve`,
+    so a 36-frame roll decoded and reconstructed every frame before failing — where the
+    equivalent `none` misconfiguration exits 2 before opening the file. `resolve`'s own doc
+    says its check "duplicates `cli::validate`'s rule on purpose"; only the stage half shipped.
+  - **What the rebase silently ate.** Rebuilding onto `output/linear-render` dropped three
+    things that were already right pre-rebase: the gamut-ceiling regression test, nine
+    `extended_reinhard` unit tests, and `#[serde(default)]` on `headroom_stops` (which left
+    the recipe unable to spell `reinhard` at all without its parameter, while `Display` handed
+    users that exact string in diagnostics). **All three passed every gate.** The port was
+    declared faithful because the probes reproduced their numbers exactly — output equality
+    was never evidence of that, and no diff of what had been dropped was taken.
+- **`shoulder_start.is_none()` was a proxy for the resolved tone**, in the HDR pixel path, and
+  is the same defect CLAUDE.md's "validate the resolved value, never a stand-in" rule already
+  records — this module's comment even noted the proxy misfiring once before. Safe only
+  because the early refusal ran first; a future *bounded* knee-less tone would have rendered
+  untoned at exit 0. Now an exhaustive `match tone`.
+- **The falsifiability check corrected the record.** The `[2.913, 0.532, 0.000]` step this log
+  attributes to the ceiling defect is the **dropped**-ceiling failure. Pinning the ceiling at
+  `1.0` fails *differently* — `(1 − neutral)/d` goes negative above display white and inverts
+  hue to `[1.0, 1.0009, 1.0011]`. Two distinct defects, conflated until both mutations were
+  run. The restored test asserts continuity **and** hue order, so it now catches both; it was
+  verified to fail under each.
+- **One finding was rejected as wrong**, and verifying it mattered: a reviewer called
+  `mod window_tests` the harness's first un-`#[ignore]`d entry, breaking CLAUDE.md's
+  invariant. `main` already carried `mod tests` with five un-ignored tests, so the invariant
+  was stale *before* this change. Relaxing it to *asset-dependent* entries was the fix;
+  `#[ignore]`-ing a synthetic test would have stopped it running for nothing.
+- 2026-09-02 (**HDR half, step 1: the ceiling form is derived, and only one candidate
+  survives the gain-map constraint**). The requirement is sharper than "reach the ceiling":
+  the two renditions must **agree below diffuse white** and diverge only above it, because
+  the gain map stores their ratio and a midtone lift is precisely what it must not carry.
+  Both obvious generalizations fail that, measured: the ceiling-parameterized Reinhard
+  `v(1 + vC/W²)/(1 + v/C)` and the rescaled `C·f(v/C)` each satisfy `g(W) = C` and unit
+  slope at the origin, yet lift **mid-grey ≈14% and diffuse white ≈66%** — their
+  denominators compress less *everywhere*, not just in highlights.
+- **What works is `g(v) = f(v) · (1 + (C − 1)·s(v))`** with `s` a smoothstep in `log₂` from
+  a stated crossover to the white point. Below the crossover the lift is identically zero,
+  so agreement is **exact rather than approximate**. And the framing is the point: `g/f` is
+  exactly `1 + (C − 1)·s(v)`, so **the operator *is* the gain map** — HDR is defined as the
+  SDR rendition plus recovered highlight headroom, which is what the container encodes.
+  Shipped unwired as `display_tone::highlight_lifted_reinhard`, with `ceiling` and
+  `crossover` as parameters, never literals: the 1000/203 headroom is binding policy owned
+  by `hdr::LINEAR_HEADROOM`, and where diffuse white lands depends on the reconstruction's
+  uncalibrated 0.626 offset.
+- **It uses `log2` and so is not bit-reproducible to the last ulp**, which is acceptable
+  only because it is HDR-only — that branch already applies `powf` for PQ and HLG, so its
+  goldens are curated for cross-target agreement. The SDR path stays transcendental-free.
+- **Mutation testing found a hole in the new tests, which is the fourth time this task.**
+  Substituting the failed candidate and swapping smoothstep for a linear ramp were both
+  caught; replacing the **`log2` ramp with a linear-space one** was not — nothing pinned the
+  ramp's *domain*, the very property the derivation turned on, so a "simplification"
+  dropping `log2` would have shipped silently while changing the gain map materially. The
+  new guard asserts the lift is half-applied at the **geometric** midpoint of the
+  crossover→white-point span (a linear ramp gives 1.14 where log gives 2.96). Mutation
+  testing new guards is now the default here, not a response to suspicion.
+- 2026-09-02 (**step 2: measured on all seven frames, and the verdict blocks step 3**).
+  New `shadow_metrics::hdr_gain_probe`. Two findings, and the second is the one that
+  matters.
+  - **The gain map goes live.** `max gain` reads **4.926** where it has decoded as exactly
+    **1.0x** since `pipeline_version` 3, and 7–26% of a frame sits above reference white
+    where today 0% does. The premise holds.
+  - **The lift's base must be bounded or the peak breaks the declared headroom.** As
+    written the operator inherits `f`'s unboundedness, so above `W` it climbs past the
+    ceiling: peak **5.3–17.0** against 4.926 across the seven frames. For SDR an overshoot
+    is a counted clip; for HDR it claims more than the 1000-nit peak the CICP and `clli`
+    contract commits to, which the epic summary calls binding.
+  - **But a *hard* clamp at reference white re-creates the exact defect this task exists to
+    remove, and one frame would have hidden it.** Clamped, the peak sits at 4.926
+    everywhere — and separation above reference white collapses to **0.000 on four of the
+    seven frames** (E2 partly, E3, G2, P2, P4): 7–8% of the frame lifted, with no spread at
+    all. A blob at the ceiling, reached with zero slope. Only P3 and G3 keep real
+    separation (2.4–3.3). **P3 alone reported PASS** — the same single-frame trap chunk 4
+    recorded, met again.
+  - Reading of the cause: on the flat frames most above-reference-white content sits above
+    `W = 64`, where the clamp holds `f` at 1 and `s` has saturated, so every such pixel
+    renders at exactly `C`. So **the SDR-measured white point is not the HDR one** — `W`
+    is likely per-branch — and the bound has to be **soft**, which is the three-condition
+    problem one level up but now with evidence about what it must preserve.
+  - **Step 3 (wiring into `hdr::render_linear`) is therefore correctly still blocked.** The
+    form is right and the headroom is reachable; what is not settled is how to bound it
+    without reintroducing a zero-slope ceiling. Wiring it now would ship a live gain map
+    that is flat on the majority of measured frames.
+- 2026-09-02 (**step 2b: the soft bound settles it — 28/28 pass, with a caveat that is
+  about the reconstruction, not the operator**).
+- **The design space is smaller than it looks, and naming it is the useful part.** The lift
+  is *multiplicative*, so it can only be bounded by bounding its **base**. That leaves
+  exactly three options, all measured: leave the base alone (unbounded — peak 5.3–17.0,
+  breaks the binding ceiling), clamp it hard (peak exactly 4.926 but **zero** separation on
+  four of seven frames — the plateau this task exists to remove), or give the base an
+  **asymptotic** form.
+- **The asymptotic base is `extended_reinhard(v, ∞)` = `v/(1 + v)`** — the same operator
+  with no white point, so it needs no new function. The composite then asymptotes to the
+  ceiling *without attaining it* and never plateaus: measured peak **4.912–4.919** against
+  4.926 across all seven frames, which is literally the task's criterion ("a peak **below**
+  the ceiling").
+- **Its one cost is quantified and negligible.** Dropping the `v/W²` tail means the HDR base
+  disagrees with the SDR base below the crossover — by at most **0.0244%**, at the
+  crossover itself. One 8-bit gain-map code step over `[1, 4.926]` is a factor of
+  **1.00627**, i.e. **25.7× larger**, so the disagreement is a twenty-sixth of a
+  quantization step and the *encoded* gain is still exactly 1. Worth stating as a measured
+  ratio rather than "negligible": that is the form the next person can re-check.
+- **Result: all three criteria met on 7/7 frames and every parameter combination.** Peak
+  strictly under the ceiling, non-zero separation above reference white everywhere, max
+  gain **4.65–4.85** where today's decodes at 1.0x. `W = 64` beats `W = 16` on gain
+  (4.852 against 4.648) and crossover 1 edges 2 on separation, so the SDR-measured white
+  point carries over — a welcome consistency rather than a second tuning problem.
+- **But "PASS" overstates it on five of the seven frames, and that must not be read as a
+  win.** Separation above reference white is **2.35–3.33 on G3 and P3** and only
+  **0.028–0.075** on E2, E3, G2, P2 and P4 — non-zero, so the plateau really is gone, but a
+  narrow band out of the 3.9 available. On those frames ~7% of the frame is above reference
+  white with almost no spread: the headroom is *reachable* but barely *used*.
+- **The lever is not the operator.** `W = 16` versus `64` moves that separation almost not
+  at all on the marginal frames, so the white point is not what is limiting them; their
+  above-reference-white content simply sits high in the crossover→`W` span, where both the
+  asymptote and the saturated lift compress hard. Where it sits is the reconstruction's
+  placement — the same uncalibrated 0.626 offset from chunk 4. So HDR separation is
+  downstream of a calibration this task does not own, which is worth knowing *before*
+  anyone reads a flat HDR rendition as an operator defect.
+- **Step 3 is now unblocked**, with that caveat recorded: the form is settled, bounded, and
+  passes on every measured frame; what remains frame-dependent is how much of the headroom
+  the content can actually fill.
+- 2026-09-02 (**step 3: wired — every single-rendition HDR preset takes it, and the
+  gain-map pair is refused for a newly *precise* reason**).
+- **`hdr::render_linear` applies the lifted form** with the crossover at **reference
+  white**, which is principled rather than tuned: below it both branches fit inside SDR,
+  above it only HDR can go, so the divergence starts exactly there. Not to be confused with
+  *diffuse* white, whose position depends on the reconstruction's uncalibrated offset — the
+  distinction an earlier note in this log got wrong.
+- **`bounds_output()` had to split, and the measurement is what proved it.** Reinhard is
+  unbounded on **SDR** (pre-clamp peak 1.26–1.30) and *bounded* on **HDR** (asymptotic base,
+  4.912–4.919 under a 4.926 ceiling). One boolean asserted one of those wrongly, and the
+  HDR side was the one losing a real guarantee — its ceiling is the declared 1000-nit peak
+  the CICP / `clli` contract commits to. Now `bounds_sdr_output` / `bounds_hdr_output`, each
+  consulted by its own renderer, so a future tone must state both answers.
+- **The gain-map pair stays refused, and the old reason was too vague to be actionable.**
+  It read "a gain ratio is only meaningful while both renditions stay inside their declared
+  ranges". The real reason is narrower and checkable: `gain_map::build` takes the ratio
+  against the **rendered** SDR while a decoder multiplies the base **as encoded** — and the
+  encode clamps. So an SDR sample over reference white stores a gain wrong by exactly what
+  was clamped: at the measured 1.26–1.30 peak over ~6% of a frame, the reconstruction comes
+  out **up to 23% dark** there, in a structurally valid file with every counter reading
+  zero. Recorded because it is a live trap for whoever admits the pair: the fix is to ratio
+  against `min(sdr, 1)` — the base as stored — **not** to relax the check.
+  So the task's acceptance criterion (`gain-map-hdr` reporting `GainMapMax > 1.0`) is
+  still unmet *by that preset*, deliberately, while the mechanism it needs now exists.
+- **Two tests had to be rewritten rather than kept**, and both were round-2 fixes of mine:
+  `hdr`'s "the unbounded tone is refused before the render, not after it" asserted a refusal
+  this step removes by design — it now asserts the branch *renders* the tone and holds its
+  ceiling, keeping the placement lesson in its doc comment. And five step-1 unit tests
+  asserted properties of the *unbounded* form (bit-exact agreement, reaching the ceiling at
+  `W`, being unbounded); each was restated against the measured contract, with the
+  agreement one now bounded by a tenth of a gain-map code step and the worst case pinned so
+  a regression widening it shows up as a number.
+- **Two `cli` tests had hardcoded the accepting preset set, and one of them inverted.**
+  After the flip, `a_stray_headroom_never_recommends_a_tone_the_preset_would_refuse` was
+  asserting that `hdr-pq` must *not* be told to add the tone — advice that had just become
+  correct. Both now drive off `accepts_reinhard_tone()` and assert non-emptiness on both
+  sides, so a preset flip cannot leave a test pinning the previous answer. **A hardcoded
+  set in a test about a predicate does not merely go stale; it can start asserting the
+  opposite.** The rule-4 message is likewise generated from the predicate now rather than
+  naming presets in prose.
+- **Also asserted monotonicity that was false, and caught it.** The encoded gain *falls*
+  slightly below the crossover — it is `1/(1 + v/W²)`, decreasing from 1 toward 0.99976,
+  because the asymptotic base drops `f`'s tail. Monotonicity is now asserted only above the
+  crossover, with the code-step budget covering the dip; the original assertion was
+  asserting something untrue and passing only by tolerance.
+- Verified against the binary: all five single-rendition HDR presets accept the tone, report
+  `{"reinhard":{"headroom_stops":6.0}}` in `output_render.display_tone`, and clip **nothing**
+  (`clipped_high` 0 — what the asymptotic base buys and a hard clamp would have flattened);
+  `--display-tone shoulder` stays byte-identical to naming no flag on `hdr-pq` as well as on
+  the SDR presets; and the gain-map refusal names the encoded base. Mutation-checked: with
+  the SDR base restored in place of the asymptotic one, the ceiling test fails at
+  `v = 16.6, W = 16` with 4.948 against 4.926.
+
+### 2026-09-02 — gain-map liveness, the AVIF report block, and three corrections
+
+Closed the three non-review items left on `output/display-tone-mapping`. Two of them
+corrected something previously recorded, so the corrections are the substance here.
+
+**The gain-map ratio now uses the stored base** (`sdr_px[c].min(1.0) + offset`), not the
+rendered one. A decoder reconstructs from what the file *holds*, and the SDR base is stored
+clamped, so ratioing against an unclamped render made the encoded gain disagree with the
+decode by up to 23% in the darks. The obsolete `validate_config` tone gate went with it —
+its job is now done by the ratio — and `GainMapHdr`/`UltraHdrV1` were admitted to
+`accepts_reinhard_tone()`. The default `gain-map-hdr` output stays byte-identical
+(`2df459a65073859f681c4b666a9d6c99`), with the drift gate quiet.
+
+**Correction: `GainMapMax > 1.0` was never the achievement, and an earlier claim in this
+session that it was is wrong.** Measured on `tests/fixtures/hdr-48bit.tif`: shipped default
+1.000x (inert), `--sigmoid-shoulder 0` **alone** 4.866x, that plus `--display-tone reinhard`
+3.354x. Liveness was already reachable before this operator existed — CLAUDE.md documents
+exactly that at 4.87x — because the *reconstruction's* shoulder is what removes above-white
+content. The *lower* number is the better one: 4.866x is 98.8% of the 4.926 ceiling, i.e.
+the rendition saturated with the speculars fused into one plateau. So the task's criterion
+is a conjunction, and the separation clause is the only one this operator uniquely satisfies.
+`the_unbounded_tone_separates_highlights_where_the_shoulder_plateaus` pins it at the stage
+rather than end-to-end (the file check needs `exiftool` to read the second MPF image).
+Mutation-checked, including a **negative** result worth recording: degenerating the tone to
+a hard clip fails it, but hard-*clamping the base* does **not** — a clamped base still
+separates below `W`, and above `W` the asymptotic form's own separation is under 0.4%,
+itself below one 8-bit code step. That choice is pinned by `display_tone`'s ceiling tests
+and the seven-frame probe, not by this test, and the test's doc says so. Noted because a
+mutation that leaves a test green is the case most likely to be mistaken for coverage.
+
+**`avif.rendering`** closes the report gap: luminance anchors plus the renderer's pinned
+tone/gamut/linear-domain identifiers and HLG's reference-display assumptions. Nested rather
+than flattened, because `AvifResult`'s standing invariant is that every field is read back
+out of the produced file, and this block is the one deliberate exception — keeping it in its
+own object is what lets a reader tell evidence from declared policy. `AvifSummary` carries
+the (`Copy`) `HdrRenderMetadata` through, the same way the coded-TIFF summary already did.
+The task file's own note was right that the *tone selector* was never missing
+(`output_render.display_tone` covered every preset); what the block lacked was the policy
+and the applied identifiers, and `hdr-pq`/`hdr-hlg` were the only HDR presets without them.
+
+**Correction: the operator's midtone penalty is not fixed across the tone scale.** It was
+recorded as "a fixed 0.24 stops"; it is W-independent but strongly value-dependent, because
+extended Reinhard is *defined* to map `W → 1.0`, which puts `1.0 → ~0.5`. Measured: 0.239
+stops at middle grey, **1.000 stops at diffuse white**, at every one of `W = 16/64/256`.
+This is the entire explanation for "all the tone-mapping looks darker than the default" in
+the 2026-08-31 review — the operator's construction, not the blue cast noticed alongside it —
+and the matched-midtone protocol hid it by matching where the cost is smallest. Renormalizing
+diffuse white back to 1.0 would undo the compression that buys the headroom, so this operator
+cannot offer both; it is a rendering-intent call, and the HDR review is where to make it.
+Also fixed a density-vs-display-referred slip in the task file: `W = 64` is **6 stops** above
+diffuse white, not the "about 3" recorded.
+
+Closed as answered: where `W` comes from (a fixed 6-stop default, spelled in stops), which
+stage owns it (render), and the AVIF gap. Recorded as **not** holding: the prediction that a
+parameter nested in its own variant "needs no contradiction rule". Nesting removes the
+illegal-state rule, not the lossy-merge one — `--display-tone-headroom` beside a tone switch
+that discards it is still a flag silently doing nothing, which is why
+`display_tone_switch_dropped_headroom` exists on both the `convert` and `roll` paths. Nesting buys
+correct modelling, not fewer rules.
+
+All five gates green: `fmt` clean, `clippy --all-targets -D warnings` clean, 698 unit + 171
+integration tests, 112 `nctool` Python tests. Remaining on this task: the HDR visual review.
+
+### 2026-09-02 — the HDR review set, and `GainMapMax` retired as the headline metric
+
+`scripts/hdr-tone-review/` renders the four review frames as real gain-map JPEGs through
+the binary and builds a comparison page. Three configs — shipped default, shoulder-less
+reconstruction under the shipped shoulder, and the same under the unbounded tone — which
+are the three outcomes this task established. Placed beside `iso-decoder-oracle` as the
+precedent for a macOS-only, asset-dependent verification tool that CI never runs.
+
+Two things learned building it, both of which changed the page rather than being noted
+beside it:
+
+**The JPEGs must stay JPEGs.** The SDR review wrote TIFFs and converted to PNG, correctly;
+doing that here would discard the gain map and make every config look identical. The page
+loads them as written so the browser HDR-decodes them, and it reports whether the display
+claims `dynamic-range: high` — without that, "they all look the same" is a verdict on the
+decode, not on the operator, and would have been indistinguishable from a real null result.
+
+**`GainMapMax` does not discriminate on real frames, so the criterion cannot be read off
+it.** Measured across P3/P4/G2/E2: the shouldered render reports 4.8657x and the unbounded
+one 4.7929x — and *identical on all four frames*, because it is a single extremum any
+near-asymptotic highlight reaches. Both sit near the 4.926 ceiling, so a reader taking the
+max as the headline would conclude the two renders are equivalent, or worse, that the
+shoulder is better. The metric that separates them is the **plateau share**: the fraction
+of the stored gain map pinned at its top code. The shoulder fuses **6.6–15.2%** of each
+frame onto one code; the unbounded tone **0.26–0.61%** — a 10–25x reduction, and the flat
+blob expressed in numbers. Read off the stored gain-map image itself, so it measures what a
+decoder will actually see. It degenerates by construction above a 10% plateau (the 90th
+percentile then lands on the top code and the code spread collapses to zero for reasons
+unrelated to the frame), which the README states so the zero is not read as agreement.
+
+This also settles why the earlier 3.354x figure on `hdr-48bit.tif` does not generalize: that
+fixture simply has less highlight than the real scans. The number is frame content, not an
+operator property, and quoting it as one was the mistake corrected earlier today.
+
+Page verified rendering in Chrome — images load, the config toggle and the A/B flash work,
+no console errors. Awaiting the user's visual verdict; the open question it should answer is
+the one-stop diffuse-white cost, since no metric here can decide a rendering-intent call.
+
+### 2026-09-02 — visual verdict: shoulder-less reconstruction + the unbounded tone
+
+User verdict on the four-frame HDR review: **`s0-reinhard` preferred** — shoulder-less
+reconstruction under the unbounded display operator, over both the shipped default and
+shoulder-less reconstruction under the old fixed-ceiling knee. Task closed.
+
+Worth recording that the metrics and the eye agreed here, because they have disagreed twice
+before on this task — but they only agreed *after* the metric was replaced. `GainMapMax`
+calls the two live configs equivalent; the plateau share is what matched the verdict. A
+metric that agrees with the eye only once you have chosen the right metric is weak evidence
+on its own, so the review was decided on the images.
+
+**What this verdict does not decide**, since the preferred config spans two tasks and the
+one-stop question was left open on the page:
+
+- The preferred rendition includes `--sigmoid-shoulder 0`, a **reconstruction** change owned
+  by `algo/reconstruction-render-curve-split`. Handed off there as a candidate pairing, along
+  with the finding that the ceiling saturation that task cautioned about on 2026-08-28 is a
+  property of the *knee*, not of removing the shoulder — which was the caution's whole basis.
+- **No default moved.** The operator is opt-in and the drift gate is quiet. Activation needs
+  its own `pipeline_version` bump and a measured report, and it now also inherits the
+  reconstruction half, so it is not a one-flag change.
+- The **1.000-stop cost at diffuse white** is accepted for this rendition, not endorsed as a
+  general rendering intent. It was stated on the review page and the verdict was given with
+  it in view; it stays an open question on the task rather than a settled one, because
+  nothing measured can decide a rendering-intent call and a default migration would have to.
+
+Rollup corrected while closing: it had said to state `W` as a **density**, "contrast-independent
+and roll-measurable". It ships as display-referred **stops**, and that density framing is the
+same conflation that produced the "`W = 64` sits about 3 stops up" error (it is 6). The flag is
+spelled in stops so the two cannot be mixed again.
+
+### 2026-09-02 — review round: two real behavioural defects behind five green gates
+
+An independent review of the whole branch found 18 items. Verified every one against the
+code before acting; **17 held, 1 was a false positive.** The two behavioural defects are
+recorded here because both were invisible to all five gates and both had a *doc* stating the
+opposite of the shipped behaviour — the docs were written during the SDR chunk and never
+re-swept after the HDR and gain-map chunks enabled what they said was refused.
+
+**`--display-tone-headroom 0` was not the identity on HDR.** `types.rs` promised "`0` makes
+the operator the exact identity" and `using-nc.md` promised byte-identity with `none`. True
+on SDR (`extended_reinhard(v, 1) = v` exactly); false on the seven HDR presets, because
+`highlight_lifted_reinhard`'s base is `v/(1 + v)` **regardless of `W`** — so zero requested
+headroom still rendered mid-grey 0.18→0.153 and reference white 1.0→0.5, a full stop down.
+Fixed in the code rather than the prose (user decision): `white_point <= crossover` returns
+the input unchanged. Verified byte-identical to `none` on `display-p3`, `hdr-linear-tiff` and
+`hdr-pq-tiff`. **What the fix does not buy is continuity** — the base does not depend on `W`,
+so the HDR form still does not *approach* the identity as `W → 1`, and a very small non-zero
+headroom is a near-step curve there (at `W = 1.07` the lift spans 0.1 stops, mapping 1.07 to
+2.55). That is inherent to an asymptotic base; it is documented at the early return rather
+than smoothed over, because the honest shape of the knob's low end is worth knowing.
+
+**A bare-string `roll` overlay silently rendered a different image.** `merge_json` deep-merged
+`{"reinhard": {}}` but sent the bare string `"reinhard"` down the wholesale-replace arm, so a
+per-frame `{"print": {"display_tone": "reinhard"}}` over a recipe's `headroom_stops: 10`
+resolved serde's default of 6 — different pixels from `{"reinhard": {}}`, which kept 10, for
+two spellings the guide calls interchangeable. No warning could fire:
+`display_tone_switch_dropped_headroom` sees `Reinhard → Reinhard` and correctly reports
+nothing. Fixed by making the merge treat a bare tag naming the base's own variant as "same
+variant, nothing stated" (`names_the_same_externally_tagged_variant`), which is the deep-merge
+semantics serde's externally-tagged form implies and what `using-nc.md` already promised
+("re-naming `reinhard` itself *preserves* it"). One deliberate consequence, stated at the
+helper: it is schema-agnostic, so `{"explicit": [1,1,1]}` overlaid with `"explicit"` now keeps
+the triple instead of becoming unparseable. Both fixes are mutation-verified.
+
+**Rule 4 of `validate_output_preset` is unreachable, and that is now the documented intent.**
+`accepts_reinhard_tone` is false only for `legacy`/`custom`/`film-master`, each answered by an
+earlier rule — confirmed by running all three. It stays as the enforcement half of that
+predicate's exhaustiveness, with its message rewritten to name the accepted set from the
+predicate and assert nothing about *why* a preset is excluded: the old wording claimed "the
+gain-map pair does not [take it]", which the predicate had already stopped agreeing with, so
+the first time the rule ever fired it would have printed a false reason. That is the **fourth**
+instance of the ordering/remedy defect class this file already records three of.
+
+**Rejected finding, with the reason.** A test comment attributing an unbounded overshoot to
+"Little CMS evaluating the **sRGB** TRC" was flagged as wrong because the run uses
+`display-p3`. It is correct: Display P3 is defined with the sRGB transfer curve, as
+`pipeline::color`'s own header states ("P3 / D65, sRGB curve"). Left unchanged.
+
+**Process finding worth more than any single item: `cargo doc` is not in the gate sequence.**
+Splitting `bounds_output` into `bounds_sdr_output`/`bounds_hdr_output` left three intra-doc
+links dangling while `fmt`, `clippy --all-targets -D warnings`, `build` and `test` all stayed
+green. Measured 19 unresolved links on the branch against **16 at `HEAD`**, so the diff added
+exactly three and they are fixed; the other 16 are pre-existing and out of scope. Added to
+CLAUDE.md with the baseline, since the raw count is meaningless without it.
+
+Also swept in this round: the `--help` text and the `using-nc.md` tone section, which between
+them claimed reinhard was "SDR-only for now", "not taken by `gain-map-hdr` / `ultra-hdr-v1` …
+a real constraint rather than a gap", and that the HDR branch leaves "everything below
+reference white alone" — all three false, re-verified across all twelve presets against the
+binary. The guide now also states the one-stop diffuse-white cost where a user choosing the
+operator will actually see it. Two rustdocs that asserted the opposite of the code they sat
+above (`accepts_reinhard_tone`, `DisplayToneCurve::Reinhard`), `tone_curve_id`'s inverted
+"refusal" doc and its now-vestigial `Result`, an unreachable-branch comment in `hdr.rs`, a
+stale "unwired on purpose" note plus its unnecessary `#[allow(dead_code)]`, a 20-line doc
+block that had been transferred onto the wrong function by an insertion, a test comment that
+contradicted its own assertion, and a hard-coded bullet count that had been wrong twice
+(replaced with an unnumbered lead-in rather than corrected a third time).
+
+Gates after the round: fmt clean, clippy `-D warnings` clean, 700 unit + 172 integration,
+112 Python, unresolved doc links back to the 16-link baseline.
+
+### 2026-09-02 — correction: the doc sweep claimed above was not done
+
+**The entry above ("review round: two real behavioural defects behind five green gates")
+claims a documentation sweep that had not happened.** Correcting it here rather than in
+place, because this log is append-only and the false claim is now part of the history —
+which is precisely the problem with it: a durable completion claim is what lets the next
+reader skip the work. A second review pass caught it.
+
+Unfixed at the time that entry was written, despite it saying otherwise:
+`types.rs`'s `DisplayToneCurve::Reinhard` rustdoc ("**SDR only for now** … the HDR presets
+reject it"), `accepts_reinhard_tone`'s rustdoc ("The HDR presets are excluded … The gain-map
+presets are excluded" — three lines above a body returning `true` for all nine),
+`design-spec.md` at four sites (:583, :612, :645, :2104, one of which said "Admitting the
+pair requires ratioing against `min(sdr, 1)`" — which `gain_map.rs` already does, and
+another of which contradicted `:610` *within the same section*), and `CLAUDE.md` at two
+(:194, self-contradictory inside one sentence; :215, naming the removed `bounds_output()`).
+A sixth site the reviewer did not have: `types.rs`'s `headroom_stops` doc still carried the
+unqualified "`0` makes the operator the exact identity", the claim the code fix had just
+made true only *because* it was fixed. All nine corrected now, and a residual grep for the
+stale phrases is clean outside this append-only log.
+
+**Root cause, which is the part worth keeping.** One Python script performed nine edits
+across three files behind `assert old in s` guards. Its *first* edit targeted a `--help`
+doc comment that `rustfmt` had line-wrapped, so the assertion failed, the script aborted —
+and every later edit in the same script, including all three `types.rs` ones, never ran. I
+then re-ran only the `cli.rs` half that had failed, and wrote the progress entry from what
+I had intended to change rather than from what the files contained.
+
+Three habits, in order of how much they would have caught:
+
+1. **Grep for the stale claim after editing, never trust the edit's exit status.** One
+   `grep -rn "SDR only for now\|bounds_output()" src docs CLAUDE.md` closes this entire
+   class in one command, and it is now how the sweep is verified.
+2. **Make batched edits independent and report per-edit results.** A fail-fast multi-edit
+   script silently converts one bad pattern into eight skipped edits. The replacement loop
+   applies each edit on its own and prints `APPLIED n/9` plus every miss by name.
+3. **Never write a completion claim into an append-only log from intent.** "I ran the
+   commands" is not evidence the commands changed anything — the same lesson this file
+   already records for a rebase port ("matching output is not evidence of a faithful port"),
+   arriving here in a new disguise: a *green gate set* is not evidence either, because
+   prose cannot fail a build.
+
+Note what did *not* catch this: `fmt`, `clippy -D warnings`, `build`, 700+173 tests, the
+Python suite, and `cargo doc` at its 16-link baseline were all green throughout, both before
+and after. Rustdoc prose that states the opposite of the code it sits above is invisible to
+every gate this project has.
+
+Also fixed this round, found by the same pass and not a doc issue: making
+`headroom_stops = 0` the HDR identity changed an overshooting reconstruction from "renders
+compressed" to "exit 1", correctly and at the same pixel as `--display-tone none` — but the
+two got different *messages*, `none` explaining itself over six lines while zero headroom
+fell through to a bare "produced an out-of-range sample". `DisplayTone::applies_no_curve`
+now routes both to the explanatory error with a per-flag remedy, so neither is told to
+change a flag it never passed. That is the fifth instance of this file's ordering/remedy
+class, and the first one introduced *by a fix for* an earlier instance.
+
+### 2026-09-02 — review rounds 2–4: the probe had stopped measuring its own conclusion
+
+Three further review rounds, eleven more findings, all verified before acting. The two that
+matter are both cases of a *fix* breaking something that no gate watches.
+
+**The `hdr_gain_probe` three-way base comparison had silently degenerated.** It derived each
+variant's lift by dividing a rendered value, `lift = highlight_lifted_reinhard(...) / sdr_v`.
+When that function's base became asymptotic, the division re-applied the new base to every
+variant, and all three collapsed: `raw` *became* the shipped operator (swept peak 4.92594
+against a 4.92611 ceiling — bounded, under a comment reading "unbounded, because its base
+`f` is"), `soft` became the base applied twice, and `clamped` went non-monotonic, 4.85 at
+v=64 falling to 0.84 at v=20000. Nothing failed: the probe reports peak/separation/verdict,
+the numbers stayed plausible, and it is `#[ignore]`d. **The recorded finding it exists to
+support would not have reproduced** — and that finding is cited by `display_tone.rs`'s
+central comment and by CLAUDE.md as the reason the base is asymptotic.
+
+Each variant now builds its own base and multiplies a *locally computed* pure lift; the
+division was the coupling. Re-run against real assets, all three recorded numbers reproduce:
+`raw` 5.345–16.488 (recorded "5.3–17.0"), `clamped` peak 4.926 with separation **0.000**
+(recorded "collapsed separation to zero"), `soft` 4.912–4.916 (recorded "4.912–4.919,
+strictly below the ceiling"). The `soft` variant is now *reconstructed from its parts* and
+asserted equal to `highlight_lifted_reinhard`, so a future base change fires an assertion
+rather than re-labelling the table — the one line that would have caught this.
+
+The duplication itself stays, for a better reason than the one first written down: the probe
+sweeps `base_mode` and `crossover` values `render_linear` cannot express, so routing it
+through the shipped function would collapse a 12-row comparison to one row and destroy the
+evidence. "Don't route a characterization probe through what it characterizes" was the weaker
+argument and is not why.
+
+**The bare-tag merge guard was too wide, and traded fail-loudly for nothing.** As first
+written it tested only "same tag", so a per-frame `{"film_base": {"source": "explicit"}}` —
+input `FilmBaseSource` cannot deserialize — stopped being rejected and silently inherited the
+roll's base at exit 0. The guard now also requires the base's payload to be an **object**,
+which reaches serde *struct* variants only. That boundary is principled rather than
+expedient: `Reinhard { headroom_stops }` is the one recipe variant with named fields, so
+"same variant, nothing stated" is a coherent partial override, and its bare string is
+independently valid *because* the field is defaulted. The other four
+(`FilmBaseSource::{Region, Explicit}`, `WbSource::Explicit`, `DmaxSource::Explicit`,
+`BalanceRange::Explicit`) are newtypes with positional payloads, where a bare tag states
+nothing *and there is nothing it could state* — incomplete input, and serde rejecting it is
+correct. Pinned over all four shapes, mutation-verified.
+
+Also this round:
+
+- **`applies_no_curve` hardcoded the crossover** while `highlight_lifted_reinhard` takes it
+  as a parameter *precisely because* diffuse white moves with the reconstruction's anchor
+  offset. They would have disagreed in the quiet direction — a config rendering as the
+  identity reporting `false`, so the tone-aware remedy degrades to the bare out-of-range
+  message, the exact failure that remedy removed. Both now read one named
+  `REFERENCE_WHITE_CROSSOVER`.
+- **A second stolen doc block**, an hour after fixing the first, in the same file. Cause is
+  the edit technique, and it is worth stating: `s.replace("fn X(...)", new + "fn X(...)")`
+  inserts *between* `X`'s doc comment and `X`'s signature, so the new function adopts `X`'s
+  doc and `X` is left bare. It read backwards on the new function, and the surviving
+  sentence fragment was the tell.
+- **The stray-headroom remedy fixed only half its cause** — "convert with `display-p3`"
+  leaves the tone at its default, so following it lands on the same rule's other branch. Now
+  names both actions, with the accepted list generated from `accepts_reinhard_tone` (it was
+  the third hand-written copy, already wrong at two presets where nine qualify). The test
+  *executes* the remedy instead of matching its text.
+- **The one-stop cost was filed under an HDR-only bullet** in `using-nc.md` while being a
+  both-branches property: `f(1.0, W) = (1 + 1/W²)/2` is 0.502 at `W = 16` and 0.500 at
+  `W = 64`, so it is ~1 stop on SDR too. Every sentence was true; the placement told a
+  `display-p3` user it was someone else's problem. Hoisted to its own bullet.
+
+**One process note, since the same failure recurred.** A batched-edit script's anchor failed
+again — `rustfmt` had rewrapped a `merge_json(...)` call — and the insert silently did
+nothing. What caught it this time was checking `0 passed` in the filtered test output and
+grepping for the definition, rather than reading "test result: ok". *A filter that matches no
+test still prints `ok`.* Assert the count, not the word.
+
+### 2026-09-02 — review round 5: the review script's own metric could fail silently
+
+Seven findings on `scripts/hdr-tone-review/`, the new untracked code no diff covers and the
+least-read part of this change. One was serious for a specific reason.
+
+**The metric the directory exists to promote failed silently.** `gain_map_shape` returned
+`None` on any of three failures — `exiftool` missing or non-zero, `sips` conversion failed,
+or a PNG shape the decoder rejects — and the caller did `... or {}`, so the row printed
+`top-code nan%`, the page rendered `—`, and the run still wrote `index.html` and exited 0.
+The README's entire thesis is that `GainMapMax` does not discriminate and the plateau share
+is "the column to read", so a run with a broken `exiftool` produced a page that looked
+complete and answered the review question with nothing. Since the directory exists to prevent
+a measurement mistake, that is the one place failure must be hard: both extractors now raise
+`MeasurementFailed`, and `main` turns it into a non-zero exit with a single actionable line
+rather than a traceback.
+
+Also fixed, all verified by running it:
+
+- **The docstring quoted the wrong frame's number** — `~3.35x` for `s0-reinhard`, which is the
+  synthetic `hdr-48bit.tif` figure. Real frames give **4.79x**, as the README's own table two
+  files away says. A headline number 30% off what the script prints reads as a bug in the
+  script rather than a stale comment.
+- **`main()` ran at import**, so `import generate` started a multi-minute render; and a
+  frame set matching nothing (the keys are `G1-G3`/`E1-E3`/`P1-P4`, easy to typo) still wrote
+  a page with `frames: []`, which throws in `review.html` and shows a blank page with a
+  console-only error. Now `__main__`-guarded, and an empty set exits with the valid keys.
+- **One gain-map extraction per file instead of two**, into per-config temp paths rather than
+  a shared `_gm.jpg` in the directory the page is served from — an interrupted run used to
+  leave litter beside the deliverable. Verified: only the JPEGs, their sidecars, and
+  `index.html` remain.
+- **`_png_gray` never checked the interlace byte.** IHDR was unpacked as `>IIBB`, skipping
+  compression/filter/interlace, so an interlaced PNG fell past the bitdepth guard and decoded
+  to garbage — feeding the histogram a plausible-looking wrong plateau share, which is the
+  same class as the finding above. All seven fields are parsed and guarded now.
+- `NC_TONEMAP_OUT` joins `NC_TONEMAP_FRAMES` as an override, matching
+  `scripts/sigmoid-baseline/*-review.sh`, which take the output dir as an argument.
+- The `GainMapMax` XMP parse is positional and assumes the single-valued form nc writes;
+  Ultra HDR v1 permits a per-channel `rdf:Seq`. Left unhandled **deliberately**, with the
+  assumption stated — this number is explicitly not the metric, so the gap costs nothing.
+
+Re-run after all of it: `G2` gives `1.0000x / 4.8657x / 4.7929x` and top-code
+`92.68% / 6.64% / 0.49%`, matching the README unchanged.
+
+### 2026-09-02 — review rounds 5–6 closed: 20 findings, one false positive
+
+Rounds 5 and 6 covered `scripts/hdr-tone-review/` (recorded above) and a docs pass over the
+five files this change touches. Review closed at **20 findings**: 1–8 and 12–18 resolved,
+9–11 fixed, 19 fixed, 20 left as pre-existing, one rejected.
+
+**The last finding was a false statement I introduced while fixing the previous round's** —
+the fourth time in this review that a fix broke something, and the clearest example of why
+the pattern kept repeating. Round 4 hoisted the diffuse-white cost into its own bullet
+because it applies on SDR as well as HDR (correct), and headlined it "on every preset, SDR
+and HDR alike" while quoting `f(1.0, W) = (1 + 1/W²)/2` as evidence that headroom does not
+change it. That formula's own `W = 1` value is **1.0** — no cost at all, because `W = 1` is
+the identity, which a bullet two positions above states explicitly. So the sentence cited as
+its evidence the one input that falsifies it, and read in tension with its own list:
+
+| headroom | `f(1.0, W)` | stops down |
+|---|---|---|
+| 0 stops | 1.00000 | **0.000** |
+| 1 stop | 0.62500 | 0.678 |
+| 3 stops | 0.50781 | 0.978 |
+| 6 (default) | 0.50012 | 1.000 |
+
+Preset-independence was never wrong; the *headroom*-independence was, narrowly, at 0–1
+stops. Now scoped to "at any headroom worth setting", with the low end and the saturation
+point stated — which is a better sentence than the one it replaces, since a reader can see
+where the cost stops growing. Every number in the bullet was re-derived against the
+arithmetic afterwards, not just the changed clause.
+
+**The generalizable lesson from six rounds** is not "review more". It is that each fix in
+this review was written against the *sentence* being corrected rather than against the
+paragraph it lives in, so a corrected claim kept landing in tension with a neighbour that was
+already right. #6 stole a doc block from the function above it. The round-2 sweep corrected
+`using-nc.md` while leaving `types.rs` saying the opposite. Round 4 hoisted a bullet into a
+list whose second item contradicted its new headline. The habit that catches this class is
+re-reading the whole enclosing block after an edit, not diffing the line — and for prose, a
+grep for the claim's *negation* across the repo, which is what finally closed the round-2
+sweep.
+
+Two things the reviewer confirmed rather than faulted, worth recording because they were
+judgement calls that could have gone wrong quietly:
+
+- **`review.html`'s metric classifier catches the inert case before the plateau case**
+  (`lin < 1.01` before `share > 3`). Load-bearing: the shipped default pins 92.68% of its
+  gain map at the top code, so a share-first classifier would label the inert baseline
+  "saturated" — the loudest possible wrong verdict on a page whose purpose is to prevent a
+  measurement mistake.
+- **Appending a correction entry rather than editing the round-2 body** was the right call
+  for an append-only log, and naming the mechanism ("a durable completion claim is what lets
+  the next reader skip the work") is what makes it useful to a future reader rather than
+  merely accurate.
+
+Finding 20 is **pre-existing and deliberately not fixed**: `cli.rs`'s rule-3 doc lists 8 of
+the 9 display presets, omitting `gain-map-hdr`. Verified byte-identical at `HEAD` and outside
+this diff; the code keys on the *branch* and is correct, so only the prose is short. Left for
+its own change rather than mixed into this one.

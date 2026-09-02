@@ -53,21 +53,35 @@ What the probe established about the shape:
   **shouldered** sigmoid config measures `HDR peak = 1.000` and an inert gain map; the
   shoulder is what removes the above-white content, so `--sigmoid-shoulder 0` reaches
   4.87x like the shoulder-less exponential.
-- Reinhard costs a fixed **0.24 stops** of midtone (0.18 → 0.153), and the cost is the
-  same at `W = 16` and `W = 64`, so it belongs to the operator rather than to `W` and the
-  anchor can absorb it. Decide whether to absorb it or to pick an operator without it.
+- Reinhard costs **0.24 stops** of midtone (0.18 → 0.153), the same at `W = 16` and
+  `W = 64`, so it belongs to the operator rather than to `W` and the anchor can absorb it.
+  Decide whether to absorb it or to pick an operator without it.
+- **Corrected 2026-09-02: that cost is not fixed across the tone scale, and the shipped
+  wording said it was.** It is W-independent but strongly value-dependent, because
+  extended Reinhard is defined to map `W → 1.0`, which puts `1.0 → ~0.5`: **0.24 stops at
+  middle grey and a full 1.000 stops at diffuse white.** This is the whole explanation for
+  "every tone-mapped render looks darker than the default" in the 2026-08-31 visual review
+  — it is the operator's construction, not the blue cast reviewed alongside it, and the
+  matched-midtone protocol hid it by matching at 0.18 where the cost is smallest. Whether a
+  stop at diffuse white is acceptable is a **rendering-intent** decision and the main thing
+  the HDR review should answer; renormalizing so diffuse white returns to 1.0 would undo
+  the compression that buys the headroom, so the two cannot both be had from this operator.
 
 ## Open questions
 
-- **Which operator.** Reinhard is one of a family; it was the one probed. Its midtone
-  penalty may be avoidable.
-- **Where `W` comes from.** A fixed default, a per-stock value, or measured per roll. It
-  is the specular headroom above diffuse white — `W = 64` sits about 3 stops up — so it may
-  be a stock property, or a rendering-intent choice.
-- **Which stage owns it.** The probe composed the operator into the reconstruction curve
-  because `AcesCgImage` is only constructible inside `working_space`; that is a harness
-  convenience, not a design. It belongs in render — see
-  `algo/reconstruction-render-curve-split` for the boundary argument.
+- **Which operator.** Still open. Extended Reinhard shipped as the first one; its
+  penalty above is confirmed, quantified, and *not* avoidable within this operator.
+- ~~**Where `W` comes from.**~~ **Answered: a fixed default, spelled in stops.** It ships
+  as a rendering-intent choice, not a stock property — `--display-tone-headroom`, default
+  **6 stops**, carried by a checked `Headroom` newtype. Deferring it to a per-stock or
+  per-roll value stays possible and nothing here forecloses it.
+  *The prior text said `W = 64` "sits about 3 stops up"; it is 6 stops
+  (`log2 64`), and mixing density-referred with display-referred stops is what produced
+  the wrong figure. The flag is spelled in stops so the two cannot be confused again.*
+- ~~**Which stage owns it.**~~ **Answered: render.** It lives in `pipeline/display_tone.rs`
+  and is applied by `pipeline::sdr` and `pipeline::hdr`; nothing was composed into the
+  reconstruction curve. The harness convenience the probe used did not survive into the
+  design, as expected.
 - **How this composes with `output/linear-render`, which shipped 2026-09-01.** They are
   complements, and the relationship is now concrete rather than open: `print.display_tone`
   is the selector, `shoulder` and `none` are its first two values, and a real operator is a
@@ -83,15 +97,20 @@ What the probe established about the shape:
   - Put `W` **inside** the variant. The shoulder's knee width could not go there —
     `print.highlight_compress` is shared with the legacy path's above-`1.0` soft clip, where
     it means something else — and that flat pairing is why a contradiction rule
-    (`highlight_compress` beside `none`) had to be written at all. A parameter carried by
-    its own variant needs no such rule.
-- **Whichever operator ships should close the AVIF report gap it inherits.** The `avif`
-  block carries container and codestream facts only — no reference white, no peak —
-  while `hdr_coded_tiff` and `hdr_linear_tiff` state both. The *tone* half of this gap is
-  already closed: `output_render.display_tone` names the resolved selector for every
-  preset, `hdr-pq` / `hdr-hlg` included, so what is missing is the rendering policy those
-  numbers describe, not a tone identifier. Adding one to `avif` alone would be odd; the
-  block needs a rendering-policy section.
+    (`highlight_compress` beside `none`) had to be written at all.
+    **The prediction that followed — "a parameter carried by its own variant needs no such
+    rule" — did not hold, and the reason generalizes.** Nesting removes the *illegal-state*
+    rule, since no other variant can carry a headroom. It does not remove the *lossy-merge*
+    rule: `--display-tone-headroom` beside a tone switch that discards it is still a flag
+    silently doing nothing, so `display_tone_switch_dropped_headroom` had to be written on
+    both the `convert` and `roll` paths. Nesting buys correct *modelling*, not fewer rules —
+    a flag can be meaningless without the recipe being able to express a contradiction.
+- ~~**Whichever operator ships should close the AVIF report gap it inherits.**~~
+  **Closed.** `avif.rendering` now carries the luminance anchors and the renderer's pinned
+  identifiers, nested rather than flattened because — unlike every other field in that
+  block — it is declared policy, not facts read back out of the file. As this entry
+  predicted, the tone *selector* was never the gap; `output_render.display_tone` already
+  covered it, and the block now also states what the renderer applied.
 
 ## How to Verify
 
@@ -103,8 +122,24 @@ What the probe established about the shape:
   shouldered-vs-none comparison already written in that shape.
 - The HDR rendition measures a peak **below** the ceiling with non-zero separation above
   reference white, and the resulting `gain-map-hdr` reports `GainMapMax > 1.0`.
+  **Read this as the conjunction it is — the last clause alone is not evidence.**
+  `--sigmoid-shoulder 0` on its own already reaches 4.866x, because the *reconstruction's*
+  shoulder is what removes above-white content; but that is 98.8% of the 4.926 ceiling with
+  the speculars fused into one flat plateau. The separation clause is what only an
+  unbounded operator satisfies, and it is the one to measure.
 - Visual review on the fixture frames; the highlight metrics have disagreed with the eye
   twice already (see the cautions in `shadow_metrics`).
+  **Done — SDR 2026-08-31, HDR 2026-09-02** (`scripts/hdr-tone-review/`). The HDR verdict:
+  shoulder-less reconstruction under this operator **preferred** over both the shipped
+  default and shoulder-less reconstruction under the old knee. The metrics and the eye agreed
+  this time, but only after the metric was changed — `GainMapMax` calls the two live configs
+  equivalent (4.87x vs 4.79x, identical on every frame) and the plateau share separates them
+  (6.6–15.2% vs 0.26–0.61%). Read as accepting the rendition, **not** as three other
+  decisions it is easily mistaken for: the preferred config includes
+  `--sigmoid-shoulder 0`, a *reconstruction* change owned by
+  `algo/reconstruction-render-curve-split`; nothing about the default moved; and the
+  1.000-stop diffuse-white cost was flagged on the review page and is accepted *for this
+  rendition*, not endorsed as a general rendering intent.
 - Any default change carries a `pipeline_version` bump and a measured report.
 
 ## Dependencies

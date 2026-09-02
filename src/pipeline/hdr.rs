@@ -309,13 +309,20 @@ pub fn render(
 /// BT.2020 luminance relative to reference white, so `dot(rgb, BT2020_LUMA) *
 /// REFERENCE_WHITE_NITS` is this pixel's luminance in cd/m².
 pub fn render_linear(shared: &SharedDisplaySource, tone: DisplayTone) -> Result<LinearBt2020Hdr> {
+    // **First**, before any allocation or pixel work. Sitting in the metadata literal
+    // below, this refusal ran only after the whole frame had been rendered into a second
+    // full-frame buffer — and never at all on a frame that failed earlier, because
+    // `ExtendedReinhard` has no knee, so `shoulder_start` is `None` and the pixel loop
+    // took the `DisplayTone::None` path: the caller got `above_range_error`'s advice to
+    // "drop --display-tone none", a mode they never selected.
+    let tone_curve = tone_curve_id(tone)?;
     let shoulder_start = shoulder_start(tone);
     let source = shared.source.rgb().as_chunks::<3>().0;
     let mut rgb = Vec::with_capacity(shared.source.rgb().len());
     let mut peak_luminance = 0.0_f32;
     let mut luminance_sum = 0.0_f64;
     for (index, px) in source.iter().enumerate() {
-        let rendered = render_pixel_checked(*px, index, shoulder_start)?;
+        let rendered = render_pixel_checked(*px, index, tone, shoulder_start)?;
         // Gamut mapping is luminance-preserving, so this is the rendered pixel's
         // luminance whether or not it was moved to the cube boundary.
         let luminance = dot(rendered, BT2020_LUMA).max(0.0);
@@ -340,21 +347,7 @@ pub fn render_linear(shared: &SharedDisplaySource, tone: DisplayTone) -> Result<
             linear_headroom: LINEAR_HEADROOM,
             highlight_compress: tone.highlight_compress(),
             shoulder_start,
-            tone_curve: match tone {
-                // Defence in depth: `cli::validate` refuses reinhard on every HDR
-                // preset, because the ceiling-parameterized form that would keep HDR
-                // midtones matched with SDR has not been derived. Applying the SDR
-                // shape at the 1000-nit ceiling would silently mis-render, so a
-                // programmatic caller that gets here is a bug, not a user error.
-                DisplayTone::ExtendedReinhard(_) => {
-                    return Err(NcError::Other(
-                        "HDR display rendering was handed the extended-Reinhard tone                          curve, which has no HDR-ceiling form yet — `cli::validate`                          should have refused it upstream"
-                            .into(),
-                    ));
-                }
-                DisplayTone::HermiteShoulder(_) => "reference-white-preserving-hermite-shoulder-v1",
-                DisplayTone::None => display_tone::NO_TONE_CURVE,
-            },
+            tone_curve,
             gamut_mapping: "bt2020-neutral-axis-radial-boundary-v1",
             linear_domain: "bt2020-linear-relative-to-203-nit-reference-white",
         },
@@ -435,6 +428,24 @@ fn whole_nits(relative_luminance: f64) -> u16 {
     nits.round().clamp(0.0, f64::from(u16::MAX)) as u16
 }
 
+/// This branch's pinned tone identifier, for every tone it can apply — which is now all
+/// three.
+///
+/// The `Result` is **vestigial**: this was the gate that refused reinhard on the HDR
+/// branch, back when the lifted form had not been derived. It kept the `Result` after the
+/// refusal went away because the shape is what makes the identifier resolve *before* the
+/// render, so a future tone this branch cannot apply is still refused here rather than
+/// surfacing downstream as a range complaint about a mode the caller never selected.
+/// Collapsing it to a bare `&'static str` would move that decision into the metadata
+/// literal, which is the arrangement the original refusal was written to avoid.
+fn tone_curve_id(tone: DisplayTone) -> Result<&'static str> {
+    match tone {
+        DisplayTone::HermiteShoulder(_) => Ok("reference-white-preserving-hermite-shoulder-v1"),
+        DisplayTone::None => Ok(display_tone::NO_TONE_CURVE),
+        DisplayTone::ExtendedReinhard(_) => Ok(display_tone::EXTENDED_REINHARD),
+    }
+}
+
 /// Scale the branch-neutral knee position into this domain: the HDR shoulder runs
 /// from reference white to the peak, not within `[0, 1]`.
 fn shoulder_start(tone: DisplayTone) -> Option<f32> {
@@ -444,7 +455,25 @@ fn shoulder_start(tone: DisplayTone) -> Option<f32> {
 
 /// The loud half of "a linear render is self-policing" on the HDR side: with no
 /// tone curve nothing bounds a reconstruction that overshoots the declared peak.
-fn above_range_error(index: usize, luminance: f32) -> NcError {
+/// Where the SDR and HDR renditions diverge: **reference white**, which is principled
+/// rather than tuned — below it both fit inside SDR, above it only HDR can go. Named once
+/// because two rules read it (the lift's span and `applies_no_curve`'s identity test) and a
+/// literal in each would let them disagree. Not to be confused with *diffuse* white, whose
+/// position depends on the reconstruction's uncalibrated anchor offset.
+const REFERENCE_WHITE_CROSSOVER: f32 = 1.0;
+
+fn above_range_error(index: usize, luminance: f32, tone: DisplayTone) -> NcError {
+    // The last clause is the only part that differs, and it has to: telling a
+    // `--display-tone-headroom 0` user to "drop --display-tone none" names a flag they
+    // never passed. Zero headroom *is* the identity, so it lands here in exactly `None`'s
+    // situation and deserves the same explanation with its own remedy.
+    let remedy = match tone {
+        DisplayTone::ExtendedReinhard(_) => {
+            "raise --display-tone-headroom above 0 (which resolves a white point \
+             of 1, i.e. the exact identity — no compression at all)"
+        }
+        _ => "drop --display-tone none",
+    };
     NcError::Other(format!(
         "HDR display rendering applied no display tone curve, but pixel {index} sits \
          above the {TARGET_PEAK_NITS}-nit peak (luminance {luminance} of a permitted \
@@ -455,13 +484,14 @@ fn above_range_error(index: usize, luminance: f32) -> NcError {
          control applied before this render may have lifted it there \
          (--print-exposure, --white-balance / --auto-wb, --linear-range), or the \
          shoulder may simply be wanted. So: keep the print controls neutral, bound the \
-         reconstruction, or drop --display-tone none."
+         reconstruction, or {remedy}."
     ))
 }
 
 fn render_pixel_checked(
     aces: [f32; 3],
     index: usize,
+    tone: DisplayTone,
     shoulder_start: Option<f32>,
 ) -> Result<[f32; 3]> {
     if !aces.iter().all(|value| value.is_finite()) {
@@ -479,15 +509,46 @@ fn render_pixel_checked(
     // Diagnosed before the gamut map, for the same reason as the SDR side: without
     // a tone curve nothing pulls luminance down and the gamut map holds it constant,
     // so the range violation below would report a consequence rather than the cause.
-    if shoulder_start.is_none() && luminance > LINEAR_HEADROOM {
-        return Err(above_range_error(index, luminance));
+    //
+    // Keyed on the **resolved tone**, not on `shoulder_start.is_none()`. The absence of
+    // a knee is a proxy for "no curve ran", and it is only accidentally right: any
+    // future knee-less curve — a filmic S-curve, say — would make this branch claim no
+    // tone ran and tell the user to "drop --display-tone none", a mode they never
+    // selected. That is exactly what the unbounded tone did before `tone_curve_id`
+    // moved ahead of the render, and validating the resolved value rather than a
+    // stand-in for it is the project rule that failure taught.
+    // `REFERENCE_WHITE_CROSSOVER` is the single source for both this diagnosis and the
+    // lift's own span, so they cannot disagree about what "the identity" means.
+    if tone.applies_no_curve(REFERENCE_WHITE_CROSSOVER) && luminance > LINEAR_HEADROOM {
+        return Err(above_range_error(index, luminance, tone));
     }
     let rendered = if luminance <= 0.0 {
         [0.0; 3]
     } else {
-        let rendered_luminance = match shoulder_start {
-            Some(start) => shoulder(luminance, start, LINEAR_HEADROOM),
-            None => luminance,
+        // Matched on the tone for the same reason, and exhaustively rather than with a
+        // wildcard: a tone added later must state its shape here instead of silently
+        // rendering untoned. (This comment used to say `ExtendedReinhard` could not reach
+        // this match, which was true only while `tone_curve_id` refused it.)
+        let rendered_luminance = match tone {
+            DisplayTone::HermiteShoulder(_) => shoulder(
+                luminance,
+                shoulder_start.expect("a shoulder has a knee"),
+                LINEAR_HEADROOM,
+            ),
+            DisplayTone::None => luminance,
+            // The crossover is **reference white**, and that is principled rather than a
+            // tuning choice: below it both branches fit inside SDR, above it only this one
+            // can go, so the divergence starts exactly there. Not to be confused with
+            // *diffuse* white, whose position does depend on the reconstruction's
+            // uncalibrated anchor offset — that is what decides how much of the headroom a
+            // given frame can fill, measured strong on two of seven frames and marginal on
+            // the rest, and it is not something this operator can fix.
+            DisplayTone::ExtendedReinhard(headroom) => display_tone::highlight_lifted_reinhard(
+                luminance,
+                headroom.white_point(),
+                REFERENCE_WHITE_CROSSOVER,
+                LINEAR_HEADROOM,
+            ),
         };
         let scale = rendered_luminance / luminance;
         gamut_map(
@@ -501,9 +562,17 @@ fn render_pixel_checked(
             "HDR display rendering produced a non-finite sample at pixel {index}"
         )));
     }
-    if !rendered
-        .iter()
-        .all(|value| (0.0..=LINEAR_HEADROOM).contains(value))
+    // Keyed on the tone, exactly as the SDR side is — and the answer is the *opposite*
+    // there for the same tone, which is why these are two predicates rather than one.
+    // `bounds_hdr_output` is true for every tone that ships: the shoulder plateaus at the
+    // peak, `None` relies on this check being the policy, and the lifted Reinhard's
+    // asymptotic base holds the composite strictly under the ceiling. So this is never
+    // relaxed today, and a tone that needed it relaxed would have to say so here rather
+    // than inherit SDR's answer.
+    if tone.bounds_hdr_output()
+        && !rendered
+            .iter()
+            .all(|value| (0.0..=LINEAR_HEADROOM).contains(value))
     {
         return Err(NcError::Other(format!(
             "HDR display rendering produced an out-of-range sample at pixel {index}"
@@ -688,6 +757,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 mod tests {
     use super::*;
     use crate::algo::reconstruct;
+    use crate::pipeline::display_tone::Headroom;
     use crate::pipeline::render_split::{SharedDisplaySource, display_source};
     use crate::pipeline::working_space::map_nc_film_rgb_v1;
     use crate::types::{FilmBase, LinearImage, PrintParams, Reconstruction};
@@ -1145,6 +1215,65 @@ mod tests {
         assert_eq!(linear.metadata().shoulder_start, None);
         assert_eq!(linear.metadata().tone_curve, display_tone::NO_TONE_CURVE);
         assert_eq!(linear.metadata().linear_headroom, LINEAR_HEADROOM);
+    }
+
+    /// The HDR branch applies the lifted Reinhard, and keeps the ceiling it declares.
+    ///
+    /// This replaces a refusal. `render_linear` used to reject the tone outright because no
+    /// HDR-ceiling form had been derived; one now has been, measured on seven frames. What
+    /// is worth keeping from that refusal is the placement lesson it carried: it originally
+    /// sat in the metadata literal, i.e. *after* the pixel loop had rendered a second full
+    /// frame — and on a frame with a sample over the peak it never ran at all, because
+    /// `ExtendedReinhard` has no knee, so the loop took the `DisplayTone::None` path and
+    /// told the caller to "drop --display-tone none", a mode they had not selected. So this
+    /// asserts the pixel path keys on the **resolved tone**, not on the absence of a knee.
+    #[test]
+    fn the_hdr_branch_applies_the_lifted_tone_and_holds_its_ceiling() {
+        let tone = DisplayTone::ExtendedReinhard(Headroom::new(6.0).unwrap());
+        assert_eq!(
+            tone_curve_id(tone).unwrap(),
+            display_tone::EXTENDED_REINHARD
+        );
+
+        for source in [
+            vec![0.0, 0.18, 0.5],
+            // A sample over the 1000-nit peak: previously the case the misplaced refusal
+            // never reached, and the case the ceiling now has to hold on its own.
+            vec![1.0, 1.0, 1.0, 6.0, 6.0, 6.0],
+        ] {
+            let shared = shared_from_film_rgb(&source);
+            let render = render_linear(&shared, tone).expect("the lifted tone now renders");
+            assert_eq!(
+                render.metadata().tone_curve,
+                display_tone::EXTENDED_REINHARD
+            );
+            // The asymptotic base is what makes this hold, so it is the property to pin:
+            // strictly inside the declared headroom, with no plateau at it.
+            for v in &render.image().rgb {
+                assert!(
+                    v.is_finite() && (0.0..LINEAR_HEADROOM).contains(v),
+                    "sample {v} left the declared headroom"
+                );
+            }
+            // No knee, so nothing knee-shaped is reported.
+            assert_eq!(render.metadata().highlight_compress, None);
+            assert_eq!(render.metadata().shoulder_start, None);
+        }
+
+        // The pixel path keys on the resolved tone, not on the absent knee: reached
+        // directly on a sample far over the peak, the lifted tone still lands inside the
+        // ceiling, where `DisplayTone::None` on the same sample is refused.
+        let over_peak = [10.0f32; 3];
+        let lifted = render_pixel_checked(over_peak, 7, tone, shoulder_start(tone)).unwrap();
+        assert!(
+            lifted.iter().all(|v| (0.0..LINEAR_HEADROOM).contains(v)),
+            "{lifted:?}"
+        );
+        let refused = render_pixel_checked(over_peak, 7, DisplayTone::None, None);
+        assert!(
+            refused.is_err(),
+            "`None` must still refuse what the lifted tone renders"
+        );
     }
 
     #[test]

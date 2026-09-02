@@ -616,13 +616,20 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   gamut mapping and the transfer encode still run. Self-policing rather than curve-gated.
   The selector is the extension point `output/display-tone-mapping`'s operator plugs into —
   a payload variant is a pure recipe addition, only the CLI wiring changes
-- `output/display-tone-mapping` (post-MVP; no downstream blockers): `output/sdr-display-rendering`, `output/hdr-display-rendering`
-  — replace the fixed-ceiling Hermite knee with a real tone-mapping operator carrying a
-  stated **white point**. Measured 2026-08-28: the knee cannot hold content overshooting by
-  more than ~a stop (20.8% of the frame pinned at the ceiling with zero separation, on both
-  outputs), moving the knee makes it worse, and extended Reinhard at `W = 64` beat the
-  shipped sigmoid on both metrics on both probe frames. Per-output ceilings (1.0 / 4.926)
-  are what would make a gain map non-inert
+- `output/display-tone-mapping` (**done** 2026-09-02; no downstream blockers):
+  `output/sdr-display-rendering`, `output/hdr-display-rendering`
+  — replaced the fixed-ceiling Hermite knee with a real tone-mapping operator carrying a
+  stated **white point** (`--display-tone reinhard` / `--display-tone-headroom`, default 6
+  stops), opt-in with no default moved. Measured 2026-08-28: the knee cannot hold content
+  overshooting by more than ~a stop (20.8% of the frame pinned at the ceiling with zero
+  separation, on both outputs), moving the knee makes it worse, and extended Reinhard at
+  `W = 64` beat the shipped sigmoid on both metrics on both probe frames. Accepted by every
+  display preset — the gain-map pair required ratioing against `min(sdr, 1)` first, and the
+  HDR branch a *lifted* form over an asymptotic base. Two things a later task inherits: the
+  operator costs ~1 stop at diffuse white on **both** branches (a rendering-intent question,
+  left open), and `GainMapMax` is the wrong instrument for judging it — 4.87x shouldered vs
+  4.79x unbounded, identical on every frame, where the plateau share separates them
+  6.6–15.2% against 0.26–0.61%
 - `output/hdr-avif-output` (post-MVP): `output/hdr-display-rendering`
 - `output/hdr-avif-windows-packaging` (post-MVP): `output/hdr-avif-output`
 - `output/lossless-hdr-tiff` (post-MVP): `output/hdr-display-rendering`, `color/colorimetry-source-of-truth`, `io/transactional-output-writes`
@@ -910,13 +917,22 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   mode self-policing. Default unchanged, so `pipeline_version` stays 3 (only the `recipe`
   fingerprint moved). The residual ~4–5% blown is the *reconstruction's*, which sizes
   `output/display-tone-mapping`
-- [~] [Display tone mapping](tasks/output/display-tone-mapping.md) — give each display
-  renderer a real tone-mapping operator with a stated **white point**, replacing the
-  fixed-ceiling Hermite. Measured: the knee pins over-range content at the ceiling with zero
-  separation on both outputs and moving it only hurts, while extended Reinhard at `W = 64`
-  beat the shipped sigmoid on both metrics on both probe frames. State `W` as a **density**,
-  so it is contrast-independent and roll-measurable; per-output ceilings are what make a
-  gain map carry information
+- [x] [Display tone mapping](tasks/output/display-tone-mapping.md) — **done 2026-09-02.**
+  Each display renderer has a real tone-mapping operator with a stated white point:
+  `--display-tone reinhard` / `print.display_tone`, a third value of `output/linear-render`'s
+  selector rather than a parallel knob, with `--display-tone-headroom` defaulting to 6 stops.
+  Opt-in — no default moved, and the drift gate is quiet. The knee pins over-range content at
+  the ceiling with zero separation and moving it only hurts, which is what the operator
+  replaces. Visual verdict 2026-09-02 on four frames: **shoulder-less reconstruction plus
+  this operator preferred**, over both the shipped default and shoulder-less-under-the-old-knee.
+  Two corrections the work produced, both of which had been recorded the other way:
+  `W` ships as **display-referred stops**, *not* the density the earlier plan called for —
+  mixing the two is what produced a "3 stops" figure for `W = 64`, which is 6; and
+  `GainMapMax` does not measure the improvement (4.87x shouldered vs 4.79x unbounded,
+  identical on every frame), the **plateau share** does — 6.6–15.2% of the frame on one gain
+  code vs 0.26–0.61%. Left open by design: the operator's **1.000-stop cost at diffuse
+  white** (0.239 at middle grey) is intrinsic to Reinhard and a rendering-intent call, and
+  any default change needs its own `pipeline_version` bump
 - [ ] [Derive the output suffix from the resolved preset](tasks/output/output-path-suffix.md) — let `-o out` name the output without its container and take the suffix from the resolved preset; an explicit matching suffix is honoured verbatim (`.jpeg` stays `.jpeg`), a mismatched one still fails. Follow-up to completing the suffix table, which closed the `-o out.jpg` writing a TIFF hole but left the user needing to know each preset's container. Open: canonical spellings, when a dotted stem is a suffix, and how it meets `output/presets`' roll naming
 - [x] [HDR AVIF output](tasks/output/hdr-avif-output.md) — 10-bit 4:4:4 Rec.2100 PQ/HLG AVIF via published `libaom-sys` plus an **nc-written MIAF container** (no libavif: no published crate ships ≥ 1.4.2, and `avif-serialize` cannot emit `MA1A`). `hdr-pq`/`hdr-hlg` are live as explicit `convert`-only presets; `av1C` is parsed back out of the codestream; `MA1A` only inside the published Advanced-Profile limits, else general-brand-only **with the reason reported**; `cq_level` and codec bounds calibrated and pinned by equality against `avifdec`/dav1d; `RunProfile::HdrAvif` calibrated on two real scans. Windows deferred → `output/hdr-avif-windows-packaging`; counsel review of the AOM patent grant stays with release
 - [ ] [HDR AVIF Windows packaging](tasks/output/hdr-avif-windows-packaging.md) — add the missing `windows-latest` CI job and prove the static libaom build under MSVC; encoding behavior unchanged, and cross-build byte identity is explicitly not required

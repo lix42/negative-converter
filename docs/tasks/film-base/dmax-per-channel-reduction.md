@@ -150,7 +150,12 @@ the ratio proves stock-stable.
 rests on the per-channel term being redundant under the **exponential** but not under the
 **sigmoid, which is the intended default**. `output/display-tone-mapping` is measuring a
 shoulder-less exponential reconstruction paired with a real display tone mapper, and the
-user's visual review preferred it. If that direction lands, the redundancy argument applies
+user's visual review preferred it. **Confirmed 2026-09-02:** that pairing was preferred on
+the HDR review too, and `output/display-tone-mapping` closed with the operator shipped — but
+opt-in, with no default moved, and the reconstruction half still open in
+`algo/reconstruction-render-curve-split`. So the premise is firmer and the conditional below
+is unchanged: it turns on the *default* adopting it, which has not happened.
+If that direction lands, the redundancy argument applies
 to the *default* path, and this task changes from "investigate whether the scalar is
 justified" to "the correction the default render needs" — the sigmoid's shoulder is what
 was washing the error toward white and hiding it. The measured leader spread here
