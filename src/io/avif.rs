@@ -31,7 +31,7 @@ use libaom_sys as aom;
 
 use crate::io::staged::{self, Staged};
 use crate::pipeline::colorimetry::pinned::BT2020_NCL_RGB_TO_YCBCR;
-use crate::pipeline::hdr::{self, RenderedHdr};
+use crate::pipeline::hdr::{self, HdrRenderMetadata, RenderedHdr};
 use crate::types::{EncodeOutcome, EncodeReport, NcError, OutputStats, Result};
 
 /// Coded bit depth. 10-bit is the task's pinned contract for both PQ and HLG.
@@ -150,6 +150,10 @@ pub struct AvifSummary {
     pub cicp: (u8, u8, u8),
     pub full_range: bool,
     pub codestream_bytes: usize,
+    /// The renderer's own metadata, carried through so the report can state the
+    /// luminance semantics the container cannot. `Copy`, and deliberately taken from
+    /// the render rather than re-derived: the same rule the coded-TIFF summary follows.
+    pub metadata: HdrRenderMetadata,
 }
 
 /// Encode one rendered Rec.2100 HDR image as a 10-bit 4:4:4 AVIF file.
@@ -178,6 +182,7 @@ pub fn encode(
 
     let summary = AvifSummary {
         profile,
+        metadata,
         bit_depth: BIT_DEPTH,
         seq_profile: header.seq_profile,
         seq_level_idx: header.seq_level_idx_0,

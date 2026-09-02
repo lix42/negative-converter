@@ -61,6 +61,21 @@ wide latitude. The print rendering decides whether output exceeds diffuse white.
   construction. This is this task's premise stated mechanically. Caution: 4.866x is 98.8% of
   the declared 4.926 headroom, so turning the shoulder off does not buy graceful HDR — it
   saturates the ceiling.
+  **Resolved 2026-09-02, and it names a candidate pairing for this task.** That caution holds
+  only while the *display* stage keeps the fixed-ceiling knee. `output/display-tone-mapping`
+  shipped an unbounded display operator, and shoulder-less reconstruction under it puts
+  **0.26–0.61%** of the frame on the top gain code against the knee's **6.6–15.2%** — the
+  saturation is a property of the knee, not of removing the shoulder. On a four-frame visual
+  review that pairing was **preferred** over both the shipped default and shoulder-less
+  reconstruction under the old knee (user verdict, 2026-09-02).
+  So this task has a working half already: *reconstruction without a shoulder, character
+  supplied at the display stage* is exactly the split, and it now has a reviewed rendition
+  rather than only an argument. Two things it does **not** settle — which reconstruction
+  curve (`algo/exponential-anchor-placement` closed the exponential negatively, so that is
+  still open), and the operator's 1.000-stop cost at diffuse white, which is a
+  rendering-intent question inherited along with it. Note `GainMapMax` is the wrong
+  instrument for judging any of this: it reads 4.87x vs 4.79x for the two, identical on
+  every frame.
 - **A display-stage black point already does what a toe cannot**, which is evidence for the
   split: `print.black_point = 0.019` over mid@base+0.508 gives |EV| 0.13 with the base at
   1/255, dominating every single-anchor form on both axes at once, and it lands in the

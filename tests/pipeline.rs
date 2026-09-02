@@ -915,6 +915,19 @@ fn hdr_pq_writes_a_deterministic_advanced_profile_avif() {
         assert_eq!(report["avif"]["cicp"][1], 16);
         assert_eq!(report["avif"]["cicp"][2], 9);
         assert!(report["avif"]["profile_reason"].is_null());
+        // The rendering block is the one part that is *not* read back — no AVIF box
+        // can say where diffuse white sits — so it is asserted as declared policy.
+        let rendering = &report["avif"]["rendering"];
+        assert_eq!(rendering["reference_white_nits"], 203.0);
+        assert_eq!(rendering["target_peak_nits"], 1000.0);
+        assert_eq!(
+            rendering["tone_curve"],
+            "reference-white-preserving-hermite-shoulder-v1"
+        );
+        assert!(
+            rendering["shoulder_start"].as_f64().unwrap() > 0.0,
+            "a shouldered render must report its knee"
+        );
         // The conformance property is the ceiling, not a particular level: a
         // small fixture lands well under it, and pinning the exact value would
         // make a legitimate encoder change look like a conformance failure.
@@ -7573,6 +7586,540 @@ fn sdr_presets_write_lossless_16_bit_tiffs_through_the_modern_pipeline() {
 }
 
 #[test]
+fn the_reinhard_display_tone_reaches_the_pixels_and_zero_headroom_is_the_identity() {
+    let tmp = TempDir::new("reinhard-tone");
+    let scan = fixture("hdr-48bit.tif");
+    let render = |tag: &str, extra: &[&str]| {
+        let out = tmp.path(&format!("{tag}.tiff"));
+        let mut argv = vec![
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            "display-p3",
+            "--film-base",
+            "0.9,0.6,0.5",
+        ];
+        argv.extend_from_slice(extra);
+        let (code, _stdout, err) = run_exact(&argv);
+        assert_eq!(code, 0, "{tag}: {err}");
+        std::fs::read(&out).unwrap()
+    };
+
+    // Opt-in: naming the shipped tone is byte-identical to naming nothing.
+    let default = render("default", &[]);
+    assert_eq!(default, render("shoulder", &["--display-tone", "shoulder"]));
+
+    // The operator reaches the pixels, and the headroom reaches the operator.
+    let w64 = render("w64", &["--display-tone", "reinhard"]);
+    let w16 = render(
+        "w16",
+        &["--display-tone", "reinhard", "--display-tone-headroom", "4"],
+    );
+    assert_ne!(default, w64, "reinhard produced the shoulder's bytes");
+    assert_ne!(w64, w16, "the headroom did not reach the render");
+
+    // Zero stops is `W = 1`, where extended Reinhard is exactly `v` — so it must
+    // produce the *same pixels* as applying no tone curve at all. The two still differ
+    // in range policy (`none` refuses an overshoot, reinhard counts it), which is
+    // precisely why this identity is worth pinning rather than assuming.
+    assert_eq!(
+        render("none", &["--display-tone", "none"]),
+        render(
+            "zero",
+            &["--display-tone", "reinhard", "--display-tone-headroom", "0"]
+        ),
+        "zero headroom is not the identity"
+    );
+}
+
+#[test]
+fn an_unbounded_tone_has_its_overshoot_counted_at_the_encode_boundary() {
+    // The claim this pins is the whole reason `bounds_output()` exists: an unbounded tone
+    // does not *refuse* content past the ceiling, it lets the loss ride to `io::encode`,
+    // which counts it — and `docs/using-nc.md` turns that count into user procedure
+    // ("read `.loss.clipped_high` … raise the headroom until the fraction is what you
+    // intend"). Every other test of this path stops inside `sdr::render`'s own buffer,
+    // so nothing covered the part the user is told to act on.
+    //
+    // It is worth an end-to-end test rather than a unit one because it depends on Little
+    // CMS evaluating the sRGB TRC as an unbounded *parametric* segment — the fragility
+    // `pipeline::color` documents. Were that ever a sampled curve, the overshoot would
+    // saturate to exactly 1.0, `clipped_high` would read 0, no warning would fire, and a
+    // flat-white frame would exit 0: a quietly wrong image, in the one mode whose design
+    // rests on the count.
+    let tmp = TempDir::new("reinhard-loss");
+    let scan = fixture("hdr-48bit.tif");
+    let out = tmp.path("over.tif");
+    // `scan` and the output paths outlive every call, but the closure cannot prove it, so
+    // build the vector from owned pieces the caller keeps alive instead.
+    let scan_s = scan.to_str().unwrap().to_string();
+    let argv = |tone: &[&str], out: &str| -> Vec<String> {
+        let mut v = vec![
+            "convert".to_string(),
+            scan_s.clone(),
+            "-o".to_string(),
+            out.to_string(),
+            "--output-preset".to_string(),
+            "display-p3".to_string(),
+            "--film-base".to_string(),
+            "0.9,0.55,0.42".to_string(),
+            "--print-exposure".to_string(),
+            "3".to_string(),
+        ];
+        v.extend(tone.iter().map(|s| s.to_string()));
+        v
+    };
+    fn as_argv(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    let a = argv(
+        &["--display-tone", "reinhard", "--display-tone-headroom", "0"],
+        out.to_str().unwrap(),
+    );
+    let (code, stdout, err) = run_exact(&as_argv(&a));
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let clipped = report["loss"]["clipped_high"].as_u64().unwrap();
+    let total = report["loss"]["total_samples"].as_u64().unwrap();
+    // A fraction, not a fixed count: the exact number is a colour-transform product and
+    // so is target-dependent, but "most of this frame was lost" is not.
+    assert!(
+        clipped * 2 > total,
+        "expected the overshoot to be counted, got {clipped} of {total}"
+    );
+    // ...and it is reported, not merely counted.
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("clipped")),
+        "the counted loss was not surfaced as a warning: {}",
+        report["warnings"]
+    );
+
+    // Falsifiable control: the *bounded* no-tone mode refuses the identical argv rather
+    // than counting it. If this ever also exits 0, the two range policies have collapsed
+    // into one and the assertion above stops meaning anything.
+    let refused = tmp.path("refused.tif");
+    let b = argv(&["--display-tone", "none"], refused.to_str().unwrap());
+    let (code, _stdout, err) = run_exact(&as_argv(&b));
+    assert_eq!(code, 1, "`none` should refuse the same overshoot: {err}");
+    assert!(err.contains("no display tone curve"), "{err}");
+    assert!(!refused.exists(), "`none` wrote a file before refusing");
+}
+
+#[test]
+fn roll_warns_when_a_per_frame_tone_switch_drops_the_shared_headroom() {
+    // The convert path warns for this; `roll` did not, while it *does* warn for the
+    // analogous `curve.anchor` drop. A roll silently rendering one frame on a different
+    // tonal rule than the rest is exactly what those warnings exist to catch.
+    let tmp = TempDir::new("roll-tone-drop");
+    let scan = fixture("hdr-48bit.tif");
+    let out_dir = tmp.path("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let recipe = tmp.path("roll.json");
+    std::fs::write(
+        &recipe,
+        r#"{ "film_base": { "source": { "explicit": [0.9,0.55,0.42] } },
+             "output": { "preset": "display-p3" },
+             "print": { "display_tone": { "reinhard": { "headroom_stops": 10.0 } } } }"#,
+    )
+    .unwrap();
+    let frames = tmp.path("frames.json");
+    std::fs::write(
+        &frames,
+        format!(
+            r#"{{ "frames": [
+                   {{ "input": "{scan}" }},
+                   {{ "input": "{scan}", "output": "{out}/switched.tif",
+                      "params": {{ "print": {{ "display_tone": "none" }} }} }} ] }}"#,
+            scan = scan.to_str().unwrap(),
+            out = out_dir.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let (code, stdout, err) = run_exact(&[
+        "roll",
+        "--frames",
+        frames.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let warnings = report["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("display_tone")),
+        "the dropped headroom was not announced: {:?}",
+        report["warnings"]
+    );
+    // Names the value it lost, so the warning is actionable rather than a hint.
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap().contains("10")),
+        "the warning does not name the dropped headroom: {:?}",
+        report["warnings"]
+    );
+}
+
+#[test]
+fn the_reinhard_display_tone_is_refused_where_the_render_cannot_carry_it() {
+    let tmp = TempDir::new("reinhard-reject");
+    let scan = fixture("hdr-48bit.tif");
+    // The gain-map default and the HDR presets are display presets that take the other
+    // two tones but not this one — the narrower rule, distinct from the legacy branch
+    // check that refuses every `display_tone` and from film-master's control bypass.
+    //
+    // Each case asserts its **own rule's** wording, because every one of these messages
+    // names `display-tone`: a bare `contains("display-tone")` is satisfied by whichever
+    // rule happens to fire, which let the mis-ordered reinhard rule answer for `legacy`
+    // with advice (`use --display-tone none there`) that `legacy` itself refuses.
+    const REINHARD_RULE: &str = "is not applied by the";
+    // `hdr-pq` and `hdr-linear-tiff` were in this list until the HDR form was derived and
+    // measured; they now *accept* the tone, so the companion test
+    // `the_single_rendition_hdr_presets_apply_the_lifted_tone` covers them instead, and the
+    // gain-map pair left this list once `gain_map::build` began ratioing against the stored
+    // base. What remains is the set with no display tone stage at all — so `REINHARD_RULE`
+    // is now only ever the *wrong* answer here, which is exactly what these rows assert.
+    for (preset, ext, expected, other_rule) in [
+        (
+            "legacy",
+            "tiff",
+            "frozen legacy ordering",
+            Some(REINHARD_RULE),
+        ),
+        (
+            "film-master",
+            "tiff",
+            "bypasses all print and display controls",
+            Some(REINHARD_RULE),
+        ),
+    ] {
+        let out = tmp.path(&format!("{preset}.{ext}"));
+        let (code, _stdout, err) = run_exact(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--film-base",
+            "0.9,0.6,0.5",
+            "--display-tone",
+            "reinhard",
+        ]);
+        assert_eq!(code, 2, "{preset} should refuse: {err}");
+        assert!(err.contains(expected), "{preset}: {err}");
+        if let Some(wrong) = other_rule {
+            assert!(
+                !err.contains(wrong),
+                "{preset}: a less specific rule answered first: {err}"
+            );
+        }
+        assert!(!out.exists(), "{preset} wrote a file before refusing");
+    }
+}
+
+#[test]
+fn the_reinhard_headroom_is_gated_before_anything_is_opened() {
+    // The headroom bound and the no-knee contradiction are **value** rules, so they
+    // belong to `cli::validate` — not to `DisplayTone::resolve`, which runs after the
+    // decode. Proof that they moved: a nonexistent input still exits 2 (usage), never 3
+    // (decode). Before the fix these reached the decoder, and `--dump-params` had
+    // already written the invalid recipe to disk by then.
+    let tmp = TempDir::new("reinhard-gate");
+    let missing = tmp.path("does-not-exist.tif");
+    let dumped = tmp.path("dumped.json");
+    //
+    // Each case asserts the **rule's own wording**, not just exit 2: clap also exits 2,
+    // so a bare code check cannot tell a parse error from the validation rule. That
+    // mattered here — `-1` was refused by clap as an "unexpected argument" until
+    // `--display-tone-headroom` gained `allow_hyphen_values`, leaving
+    // `check_headroom_stops`'s negative branch unreachable from the flag whose name its
+    // own message prints.
+    let bad = [
+        (
+            vec![
+                "--display-tone",
+                "reinhard",
+                "--display-tone-headroom",
+                "30",
+            ],
+            "beyond the supported maximum",
+        ),
+        (
+            vec![
+                "--display-tone",
+                "reinhard",
+                "--display-tone-headroom",
+                "-1",
+            ],
+            "must be finite and non-negative",
+        ),
+        (
+            vec!["--display-tone", "reinhard", "--highlight-compress", "1"],
+            "no shoulder to place",
+        ),
+    ];
+    for (extra, expected) in bad {
+        let out = tmp.path("out.tiff");
+        let mut argv = vec![
+            "convert",
+            missing.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            "display-p3",
+            "--film-base",
+            "0.9,0.6,0.5",
+            "--dump-params",
+            dumped.to_str().unwrap(),
+        ];
+        argv.extend(extra.iter().copied());
+        let (code, _stdout, err) = run_exact(&argv);
+        assert_eq!(code, 2, "{extra:?} reached the decoder: {err}");
+        assert!(err.contains(expected), "{extra:?}: {err}");
+        assert!(
+            err.contains("--display-tone-headroom") || err.contains("--highlight-compress"),
+            "{extra:?}: clap answered for the validation rule: {err}"
+        );
+        assert!(
+            !dumped.exists(),
+            "{extra:?}: an invalid recipe was written to disk before failing"
+        );
+    }
+    // Falsifiable control: the same invocation with a usable headroom gets past
+    // validation and fails at the *decode* instead.
+    let out = tmp.path("out.tiff");
+    let (code, _stdout, err) = run_exact(&[
+        "convert",
+        missing.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-preset",
+        "display-p3",
+        "--film-base",
+        "0.9,0.6,0.5",
+        "--display-tone",
+        "reinhard",
+        "--display-tone-headroom",
+        "6",
+    ]);
+    assert_eq!(code, 3, "a valid headroom must reach the decoder: {err}");
+}
+
+#[test]
+fn a_tone_switch_that_drops_a_stated_headroom_warns_and_is_strict_promotable() {
+    // The wiring, not the message: a warning function with no call site is a no-op, and
+    // the whole point of aligning this with the curve-switch precedent is that the drop
+    // stops being silent. `hdr-48bit.tif` is the IR-free fixture, so the only warning a
+    // `--strict` run can trip is this one.
+    let tmp = TempDir::new("tone-switch-drop");
+    // The default reconstruction, deliberately: pinning only `curve.type` trips the
+    // unpinned-curve warning, which would make every `--strict` assertion below pass or
+    // fail for the wrong reason.
+    let recipe = write_file(
+        &tmp.path("r.json"),
+        r#"{
+  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+  "output": { "preset": "display-p3" },
+  "print": { "display_tone": { "reinhard": { "headroom_stops": 10.0 } } }
+}"#,
+    );
+    let scan = fixture("hdr-48bit.tif");
+    let convert = |out: &std::path::Path, extra: &[&str]| {
+        let mut argv = vec![
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+        ];
+        argv.extend(extra.iter().copied());
+        run_exact(&argv)
+    };
+
+    let out = tmp.path("dropped.tiff");
+    let (code, stdout, err) = convert(&out, &["--display-tone", "none"]);
+    assert_eq!(code, 0, "{err}");
+    let warnings = json(&stdout)["warnings"].to_string();
+    assert!(warnings.contains("headroom_stops"), "{warnings}");
+    assert!(
+        warnings.contains("--display-tone-headroom 10"),
+        "{warnings}"
+    );
+    // The report states the tone that actually ran, which is why a warning is the right
+    // loudness: nothing is hidden, but the recipe asked for something else.
+    assert_eq!(json(&stdout)["output_render"]["display_tone"], "none");
+
+    // `--strict` turns it into a refusal.
+    let strict = tmp.path("strict.tiff");
+    let (code, _stdout, err) = convert(&strict, &["--display-tone", "none", "--strict"]);
+    assert_eq!(code, 1, "the drop must be strict-promotable: {err}");
+
+    // The falsifiable control: re-naming the same operator preserves the headroom, so
+    // the same `--strict` run is clean. Without this the assertion above could be
+    // passing on some unrelated warning.
+    let kept = tmp.path("kept.tiff");
+    let (code, stdout, err) = convert(&kept, &["--display-tone", "reinhard", "--strict"]);
+    assert_eq!(code, 0, "re-naming the operator must not warn: {err}");
+    assert_eq!(
+        json(&stdout)["output_render"]["display_tone"]["reinhard"]["headroom_stops"],
+        10.0
+    );
+    // ...and so is the no-override run, which changes no tone at all.
+    let (code, _stdout, err) = convert(&tmp.path("bare.tiff"), &["--strict"]);
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn a_recipe_may_name_the_reinhard_operator_without_its_parameter() {
+    // "Every knob is a CLI flag *and* a recipe key" cuts both ways: `--display-tone
+    // reinhard` has always resolved the documented default, so a recipe must have a way
+    // to say the same thing. All three spellings must land on identical bytes.
+    let tmp = TempDir::new("reinhard-shorthand");
+    let scan = fixture("hdr-48bit.tif");
+    let mut rendered = Vec::new();
+    for (label, tone) in [
+        ("bare", r#""reinhard""#),
+        ("empty", r#"{"reinhard":{}}"#),
+        ("explicit", r#"{"reinhard":{"headroom_stops":6.0}}"#),
+    ] {
+        let recipe = write_file(
+            &tmp.path(&format!("{label}.json")),
+            &format!(
+                r#"{{
+  "film_base": {{ "source": {{ "explicit": [0.9, 0.6, 0.5] }} }},
+  "output": {{ "preset": "display-p3" }},
+  "print": {{ "display_tone": {tone} }}
+}}"#
+            ),
+        );
+        let out = tmp.path(&format!("{label}.tiff"));
+        let (code, stdout, err) = run_exact(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{label}: {err}");
+        // Normalized to the one canonical form on the way out, whatever went in.
+        assert_eq!(
+            json(&stdout)["recipe"]["print"]["display_tone"]["reinhard"]["headroom_stops"],
+            6.0,
+            "{label}"
+        );
+        rendered.push(std::fs::read(&out).unwrap());
+    }
+    assert_eq!(rendered[0], rendered[1], "bare vs empty payload");
+    assert_eq!(rendered[1], rendered[2], "empty payload vs explicit");
+}
+
+#[test]
+fn roll_refuses_an_out_of_range_headroom_in_the_shared_recipe() {
+    // `roll` never calls `validate_convert`, so a rule that lives only there — or only
+    // in the stage — is no gate at all for it: every frame decoded and reconstructed
+    // before failing, once per frame. The shared recipe is validated up front, so this
+    // must exit 2 with nothing written.
+    let tmp = TempDir::new("roll-headroom");
+    let recipe = write_file(
+        &tmp.path("roll.json"),
+        r#"{
+  "reconstruction": {
+    "type": "density",
+    "curve": { "type": "exponential", "dmax": { "explicit": 1.6 } }
+  },
+  "film_base": { "source": { "explicit": [0.9, 0.55, 0.42] } },
+  "output": { "preset": "display-p3" },
+  "print": { "display_tone": { "reinhard": { "headroom_stops": 60.0 } } }
+}"#,
+    );
+    let out_dir = tmp.path("out");
+    let (code, _stdout, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        fixture("hdri-64bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 2, "the shared recipe must be refused up front: {err}");
+    assert!(err.contains("--display-tone-headroom"), "{err}");
+    assert!(!out_dir.exists(), "a frame was written before refusing");
+}
+
+#[test]
+fn the_single_rendition_hdr_presets_apply_the_lifted_tone() {
+    // The HDR half of `output/display-tone-mapping`, end to end. These presets have no SDR
+    // rendition to keep in range, so the lifted form's asymptotic base is enough: it holds
+    // the composite strictly inside the declared 1000-nit peak, measured 4.912–4.919
+    // against 4.926 across seven fixture frames.
+    let tmp = TempDir::new("hdr-lifted");
+    let scan = fixture("hdr-48bit.tif");
+    for (preset, ext) in [
+        ("hdr-pq", "avif"),
+        ("hdr-hlg", "avif"),
+        ("hdr-linear-tiff", "tiff"),
+        ("hdr-pq-tiff", "tiff"),
+        ("hdr-hlg-tiff", "tiff"),
+    ] {
+        let plain = tmp.path(&format!("{preset}-plain.{ext}"));
+        let lifted = tmp.path(&format!("{preset}-lifted.{ext}"));
+        let run_one = |out: &std::path::Path, extra: &[&str]| {
+            let mut argv: Vec<String> = vec![
+                "convert".into(),
+                scan.to_str().unwrap().into(),
+                "-o".into(),
+                out.to_str().unwrap().into(),
+                "--output-preset".into(),
+                preset.into(),
+                "--film-base".into(),
+                "0.9,0.6,0.5".into(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let (code, stdout, err) = run_exact(&borrowed);
+            assert_eq!(code, 0, "{preset}: {err}");
+            serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        };
+        run_one(&plain, &[]);
+        let report = run_one(&lifted, &["--display-tone", "reinhard"]);
+        // Reported as the tone that ran, in the block every preset emits.
+        assert_eq!(
+            report["output_render"]["display_tone"]["reinhard"]["headroom_stops"], 6.0,
+            "{preset}: {}",
+            report["output_render"]["display_tone"]
+        );
+        // ...and it reached the pixels.
+        assert_ne!(
+            std::fs::read(&plain).unwrap(),
+            std::fs::read(&lifted).unwrap(),
+            "{preset}: the lifted tone produced the shoulder's bytes"
+        );
+        // The declared peak still holds: nothing clipped on the way out, which is what the
+        // asymptotic base buys and what a hard ceiling clamp would have flattened instead.
+        assert_eq!(
+            report["loss"]["clipped_high"], 0,
+            "{preset}: the lifted tone left the declared headroom: {}",
+            report["loss"]
+        );
+    }
+}
+
+#[test]
 fn the_two_sdr_presets_differ_only_in_gamut() {
     // They share a render and differ in destination gamut, so the files must not
     // be identical — the falsifiable half of "same render, different gamut". If
@@ -8336,5 +8883,307 @@ fn the_no_tone_curve_ceiling_is_per_branch_not_one_reference_white() {
     assert_eq!(
         code, 0,
         "the same overshoot is well inside the HDR peak and must render: {err}"
+    );
+}
+
+/// The AVIF report must distinguish two files whose container facts are identical.
+///
+/// `cicp`, `profile`, `bit_depth` and `level` are byte-for-byte the same for a
+/// shouldered and an unbounded rendition, so nothing *in the `avif` block* said which
+/// tone produced the pixels — `output_render.display_tone` did, but the artifact block
+/// should not depend on another block to be self-sufficient, and the coded/linear TIFF
+/// blocks had carried their own tone identifier all along.
+#[test]
+fn the_avif_report_states_which_display_tone_rendered_it() {
+    let dir = TempDir::new("avif-tone");
+    let mut container = None;
+    let mut rendering = Vec::new();
+    for tone in ["hermite", "reinhard"] {
+        let out = dir.path(&format!("{tone}.avif"));
+        let mut args = vec![
+            "convert",
+            "tests/fixtures/hdr-48bit.tif",
+            "--output-preset",
+            "hdr-pq",
+            "--film-base",
+            "1,1,1",
+            "-o",
+            out.to_str().unwrap(),
+            "--report",
+            "json",
+        ];
+        if tone == "reinhard" {
+            args.extend(["--display-tone", "reinhard"]);
+        }
+        let (code, stdout, err) = run_exact(&args);
+        assert_eq!(code, 0, "{tone}: {err}");
+        let report = json(&stdout);
+        let avif = &report["avif"];
+        // Everything the container carries is identical between the two...
+        let facts = (
+            avif["profile"].clone(),
+            avif["bit_depth"].clone(),
+            avif["cicp"].clone(),
+            avif["full_range"].clone(),
+        );
+        match &container {
+            None => container = Some(facts),
+            Some(first) => assert_eq!(
+                *first, facts,
+                "the container facts should not distinguish these renditions"
+            ),
+        }
+        rendering.push(avif["rendering"].clone());
+    }
+    // ...and the rendering block is what does.
+    assert_eq!(
+        rendering[0]["tone_curve"],
+        "reference-white-preserving-hermite-shoulder-v1"
+    );
+    assert_eq!(
+        rendering[1]["tone_curve"],
+        "extended-reinhard-white-point-v1"
+    );
+    // The knee is reported only where one exists — its absence is not a proxy for
+    // "no tone ran", which is why `tone_curve` is the field that says so.
+    assert!(rendering[0]["shoulder_start"].as_f64().unwrap() > 0.0);
+    assert!(rendering[1]["shoulder_start"].is_null());
+    // The luminance anchors are policy and hold for both.
+    for r in &rendering {
+        assert_eq!(r["reference_white_nits"], 203.0);
+        assert_eq!(r["target_peak_nits"], 1000.0);
+    }
+}
+
+/// The three spellings of one parameterized tone must render the same bytes on `roll`.
+///
+/// `using-nc.md` says the bare `"reinhard"`, `{"reinhard":{}}` and the explicit object are
+/// interchangeable, and that "re-naming `reinhard` itself *preserves*" the headroom. On
+/// `roll` that was false for exactly one of the three: a bare-string per-frame overlay took
+/// `merge_json`'s wholesale-replace arm and resolved serde's default of 6 stops, so the
+/// frame rendered a different image from its siblings — silently, at exit 0, with no warning
+/// available because the tone did not actually change variant.
+#[test]
+fn roll_renders_every_spelling_of_one_tone_identically() {
+    let tmp = TempDir::new("roll-tone-spellings");
+    let scan = fixture("hdr-48bit.tif");
+    let out_dir = tmp.path("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let recipe = tmp.path("roll.json");
+    std::fs::write(
+        &recipe,
+        r#"{ "film_base": { "source": { "explicit": [0.9,0.55,0.42] } },
+             "output": { "preset": "display-p3" },
+             "print": { "display_tone": { "reinhard": { "headroom_stops": 10.0 } } } }"#,
+    )
+    .unwrap();
+    let frames = tmp.path("frames.json");
+    std::fs::write(
+        &frames,
+        format!(
+            r#"{{ "frames": [
+                   {{ "input": "{scan}", "output": "{out}/inherit.tif" }},
+                   {{ "input": "{scan}", "output": "{out}/bare.tif",
+                      "params": {{ "print": {{ "display_tone": "reinhard" }} }} }},
+                   {{ "input": "{scan}", "output": "{out}/empty.tif",
+                      "params": {{ "print": {{ "display_tone": {{ "reinhard": {{}} }} }} }} }},
+                   {{ "input": "{scan}", "output": "{out}/explicit.tif",
+                      "params": {{ "print": {{ "display_tone":
+                         {{ "reinhard": {{ "headroom_stops": 10.0 }} }} }} }} }} ] }}"#,
+            scan = scan.to_str().unwrap(),
+            out = out_dir.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let (code, _stdout, err) = run_exact(&[
+        "roll",
+        "--frames",
+        frames.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+
+    let read = |name: &str| std::fs::read(out_dir.join(name)).unwrap();
+    let inherit = read("inherit.tif");
+    for name in ["bare.tif", "empty.tif", "explicit.tif"] {
+        assert_eq!(
+            read(name).len(),
+            inherit.len(),
+            "{name} differs in size from the inheriting frame"
+        );
+        assert!(
+            read(name) == inherit,
+            "{name} rendered different pixels than the frame that inherited the recipe's \
+             headroom, so this spelling is not interchangeable after all"
+        );
+    }
+
+    // Falsifiability: the same overlay naming a *different* tone must still change the
+    // render, or the assertions above would hold for a merge that ignored overlays wholesale.
+    let switched = tmp.path("switched.json");
+    std::fs::write(
+        &switched,
+        format!(
+            r#"{{ "frames": [ {{ "input": "{scan}", "output": "{out}/none.tif",
+                   "params": {{ "print": {{ "display_tone": "none" }} }} }} ] }}"#,
+            scan = scan.to_str().unwrap(),
+            out = out_dir.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let (code, _out, err) = run_exact(&[
+        "roll",
+        "--frames",
+        switched.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        read("none.tif") != inherit,
+        "a real tone switch must still change the render"
+    );
+}
+
+/// Two tones that apply no curve reach the same ceiling error, and each is told to change
+/// the flag it actually passed.
+///
+/// `--display-tone-headroom 0` resolves a white point of 1, which is the exact identity, so
+/// it hits the HDR range check in precisely `--display-tone none`'s situation — same pixel,
+/// same ceiling. Before this, only `none` got the explanatory error; zero headroom fell
+/// through to a bare "out-of-range sample" with no hint that zero headroom means no
+/// compression. The assertion that matters is the **negative** one: neither message may
+/// hand out the other's remedy, which is how this project's ordering/remedy defects have
+/// repeatedly shipped.
+#[test]
+fn a_curveless_tone_is_told_to_change_the_flag_it_passed() {
+    let tmp = TempDir::new("hdr-curveless-remedy");
+    let out = tmp.path("o.avif");
+    let scan = fixture("hdr-48bit.tif");
+    let run_tone = |extra: &[&str]| -> String {
+        let mut args = vec![
+            "convert",
+            scan.to_str().unwrap(),
+            "--film-base",
+            "0.9,0.55,0.42",
+            "--output-preset",
+            "hdr-pq",
+            // Overshoots the peak, which is what the range check exists to catch.
+            "--sigmoid-shoulder",
+            "0",
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let (code, _stdout, err) = run_exact(&args);
+        assert_eq!(code, 1, "expected the ceiling error, got:\n{err}");
+        err
+    };
+
+    let none = run_tone(&["--display-tone", "none"]);
+    let zero = run_tone(&["--display-tone", "reinhard", "--display-tone-headroom", "0"]);
+
+    // Both get the explanatory diagnosis, not a bare out-of-range line.
+    for err in [&none, &zero] {
+        assert!(
+            err.contains("has no curve to roll off"),
+            "not the explanatory error: {err}"
+        );
+        assert!(
+            !err.contains("produced an out-of-range sample"),
+            "fell through to the bare message: {err}"
+        );
+    }
+
+    // Each names its own flag...
+    assert!(none.contains("drop --display-tone none"), "{none}");
+    assert!(
+        zero.contains("raise --display-tone-headroom above 0"),
+        "{zero}"
+    );
+    // ...and, the load-bearing half, neither offers the other's.
+    assert!(
+        !none.contains("raise --display-tone-headroom"),
+        "`none` was handed the headroom remedy for a flag it never passed: {none}"
+    );
+    assert!(
+        !zero.contains("drop --display-tone none"),
+        "zero headroom was told to drop a flag it never passed: {zero}"
+    );
+}
+
+/// A stray `--display-tone-headroom` must give advice that actually works when followed.
+///
+/// The regression: on a preset that applies no `reinhard`, the remedy said "convert with
+/// `display-p3` / `compatibility`" — which fixes only half the cause, because the tone stays
+/// at its default and the very next run hits this same rule's other branch. It also named
+/// two presets where nine qualify, the third hand-written copy of a list `types.rs` records
+/// going stale twice. Both halves are asserted here, and the followability is executed
+/// rather than eyeballed.
+#[test]
+fn a_stray_headroom_remedy_can_be_followed_to_success() {
+    let tmp = TempDir::new("stray-headroom-remedy");
+    let scan = fixture("hdr-48bit.tif");
+
+    for preset in ["legacy", "custom", "film-master"] {
+        let out = tmp.path(&format!("{preset}.tiff"));
+        let (code, _o, err) = run_exact(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "--film-base",
+            "1,1,1",
+            "--output-preset",
+            preset,
+            "--display-tone-headroom",
+            "6",
+            "-o",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 2, "{preset}: expected a usage error, got:\n{err}");
+        // Names both actions: a preset that applies the tone, and selecting the tone.
+        assert!(
+            err.contains("--display-tone reinhard"),
+            "{preset}: the remedy omits the tone, so following it fails again: {err}"
+        );
+        assert!(
+            err.contains("`display-p3`"),
+            "{preset}: the remedy names no preset that applies the tone: {err}"
+        );
+        // The accepted list is generated, so it carries every qualifying preset rather
+        // than the two a hand-written copy had frozen.
+        for accepted in ["`gain-map-hdr`", "`hdr-pq`", "`hdr-hlg-tiff`"] {
+            assert!(
+                err.contains(accepted),
+                "{preset}: {accepted} qualifies but is missing from the list: {err}"
+            );
+        }
+    }
+
+    // Now actually follow it. This is the assertion the old message would have failed.
+    let out = tmp.path("followed.tiff");
+    let (code, _o, err) = run_exact(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "--film-base",
+        "1,1,1",
+        "--output-preset",
+        "display-p3",
+        "--display-tone",
+        "reinhard",
+        "--display-tone-headroom",
+        "6",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "following the remedy verbatim still failed:\n{err}"
     );
 }

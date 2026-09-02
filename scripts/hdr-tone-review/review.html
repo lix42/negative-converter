@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Display tone mapping — HDR visual review</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1d2026; --line: #2c313a;
+    --ink: #e6e9ef; --dim: #9aa3b2; --accent: #6ea8fe; --warn: #f0a868; --good: #7ddc9a;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10; }
+  h1 { margin: 0 0 3px; font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .sub { color: var(--dim); font-size: 12.5px; }
+  .bars { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; margin-top: 12px; }
+  .group { display: flex; gap: 6px; align-items: center; }
+  .group > .lbl { color: var(--dim); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .07em; margin-right: 2px; }
+  button { font: inherit; font-size: 13px; color: var(--ink); background: #262b33;
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 11px; cursor: pointer; }
+  button:hover { border-color: #454d5a; }
+  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent);
+    color: #0d1117; font-weight: 600; }
+  kbd { font: 600 10.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: #11141a;
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px;
+    padding: 1px 5px; color: var(--dim); margin-left: 6px; }
+  main { padding: 20px; display: grid; grid-template-columns: minmax(0,1fr) 360px; gap: 22px;
+    align-items: start; }
+  @media (max-width: 1100px) { main { grid-template-columns: minmax(0,1fr); } }
+  .stage { background: #0c0e12; border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px; position: relative; min-height: 300px; }
+  /* Same grid-stack reason as the SDR page: one cell for every config, so switching is a
+     visibility toggle with no reflow and no reload. */
+  .frameStack { display: grid; justify-content: start; line-height: 0; }
+  .frameStack img { grid-area: 1 / 1; display: block; max-width: 100%; height: auto;
+    border-radius: 4px; }
+  .frameStack img[hidden] { display: none !important; }
+  .badge { position: absolute; top: 22px; left: 22px; z-index: 5; pointer-events: none;
+    background: rgba(8,10,14,.82); border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 10px; font: 600 12px ui-monospace, Menlo, monospace; }
+  .badge.flash { background: var(--warn); color: #17120b; border-color: var(--warn); }
+  aside { display: flex; flex-direction: column; gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 15px; }
+  .card h2 { margin: 0 0 9px; font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--dim); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: right; padding: 4px 5px; border-bottom: 1px solid #232830; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; }
+  tr.cur td { background: #212836; color: #fff; }
+  td.inert { color: var(--dim); }
+  td.sat { color: var(--warn); }
+  td.good { color: var(--good); }
+  .note { font-size: 12.5px; color: var(--dim); }
+  .note strong { color: var(--ink); font-weight: 600; }
+  .note ol, .note ul { margin: 6px 0 0; padding-left: 18px; }
+  .note li { margin-bottom: 6px; }
+  .hdrwarn { background: #2a1f12; border: 1px solid var(--warn); color: #f5cfa2;
+    border-radius: 8px; padding: 10px 12px; font-size: 12.5px; margin-bottom: 14px; }
+  code { font: 12px ui-monospace, Menlo, monospace; background: #11141a; padding: 1px 5px;
+    border-radius: 4px; }
+  .miss { padding: 40px 20px; color: var(--warn); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Display tone mapping — HDR visual review</h1>
+  <div class="sub">Real <strong>gain-map JPEGs</strong>, shown as-is so the browser HDR-decodes them. Not converted to PNG — that would flatten what is under review.</div>
+  <div class="bars">
+    <div class="group"><span class="lbl">Frame</span><span id="frames"></span></div>
+    <div class="group"><span class="lbl">Config</span><span id="configs"></span></div>
+  </div>
+  <div class="sub" style="margin-top:9px">
+    <span id="keyhint"></span> config · <kbd>←</kbd><kbd>→</kbd> cycle · <kbd>F</kbd> frame ·
+    <strong>hold <kbd>space</kbd></strong> to flash back to the shipped default
+  </div>
+</header>
+<main>
+  <div class="stage" id="stage">
+    <div class="badge" id="badge"></div>
+    <div class="frameStack" id="stack"></div>
+    <div class="miss" id="miss" hidden></div>
+  </div>
+  <aside>
+    <div class="hdrwarn" id="hdrwarn">
+      Checking HDR support…
+    </div>
+    <div class="card">
+      <h2>Gain map — <span id="mframe"></span></h2>
+      <table><thead><tr><th>config</th><th>max</th><th>at top code</th><th>MB</th></tr></thead>
+        <tbody id="mtable"></tbody></table>
+      <div class="note" style="margin-top:9px">
+        <strong><code>max</code> does not discriminate here, and that is itself a finding.</strong>
+        On these frames the shouldered and unbounded renders land at 4.87x and 4.79x — both near the
+        4.926 ceiling, and identical on all four frames, because <code>GainMapMax</code> is a single
+        extremum that any near-asymptotic highlight reaches.
+        <br><br>
+        <strong><code>at top code</code> is the metric.</strong> It is the share of the gain map pinned
+        at its maximum code — the flat blob, in numbers. The shoulder fuses <strong>6.6–15.2%</strong>
+        of the frame onto one code; the unbounded tone <strong>0.26–0.61%</strong>, a 10–25x reduction.
+        For <code>default</code> a high share just means the map is uniformly inert.
+      </div>
+    </div>
+    <div class="card">
+      <h2>What to judge</h2>
+      <div class="note"><ol>
+        <li><strong>Does <code>s0-reinhard</code> read as HDR at all?</strong> Highlights should
+        extend past paper white with gradation, not glow uniformly.</li>
+        <li><strong><code>s0-shoulder</code> vs <code>s0-reinhard</code> — the main comparison.</strong>
+        Measured: the shoulder pins 6.6–15.2% of each frame at one gain code, the unbounded tone
+        0.26–0.61%. So look at the brightest areas and ask whether the shoulder's are a uniform
+        wash where the unbounded one holds shape. This is the whole argument for the operator, and
+        the eye has overruled these metrics twice before — so it decides.</li>
+        <li><strong>The one-stop question.</strong> Reinhard maps diffuse white to ~0.5 by
+        construction: <em>measured 0.24 stops down at middle grey but a full 1.00 stop at diffuse
+        white.</em> That is why every tone-mapped render looked darker in the SDR review — it is
+        the operator, <em>not</em> the blue cast. In HDR the headroom may absorb it, or the image
+        may just read dark. This is a rendering-intent call and it is yours.</li>
+        <li><strong><code>default</code> is the shipped baseline</strong> and its gain map is inert,
+        so it is effectively the SDR render. Hold <kbd>space</kbd> to A/B against it.</li>
+        <li>Blue cast is <strong>out of scope</strong> — deferred to the colour work by prior decision.</li>
+      </ol></div>
+    </div>
+    <div class="card">
+      <h2>Configs</h2>
+      <div class="note" id="legend"></div>
+    </div>
+  </aside>
+</main>
+<script>
+const DATA = __DATA__;
+const LEGEND = {
+  "default":     "shipped sigmoid + shipped shoulder — the baseline; gain map inert",
+  "s0-shoulder": "shoulder-less reconstruction + <em>shipped</em> shoulder — live but saturated",
+  "s0-reinhard": "shoulder-less reconstruction + the unbounded tone — the candidate",
+};
+const CONFIGS = DATA.configs, FRAMES = DATA.frames.map(f => f.key);
+let frame = FRAMES[0], config = 0, flashing = false;
+
+const $ = id => document.getElementById(id);
+const btn = (text, on, click) => {
+  const b = document.createElement("button");
+  b.textContent = text; b.setAttribute("aria-pressed", on); b.onclick = click;
+  return b;
+};
+
+// Report what the browser will actually do with these files, so a "looks flat" verdict is
+// never silently a verdict on an SDR-clamped decode.
+function hdrStatus() {
+  const el = $("hdrwarn");
+  const dyn = matchMedia("(dynamic-range: high)").matches;
+  const vid = matchMedia("(video-dynamic-range: high)").matches;
+  if (dyn || vid) {
+    el.style.background = "#12251a"; el.style.borderColor = "#2f6b47"; el.style.color = "#bfe6cd";
+    el.innerHTML = "<strong>HDR display detected.</strong> Gain maps should decode with real " +
+      "headroom. Safari is the most reliable here; keep the display at a fixed brightness while " +
+      "comparing, since headroom scales with it.";
+  } else {
+    el.innerHTML = "<strong>No HDR display reported</strong> (<code>dynamic-range: high</code> is " +
+      "false). These files will decode SDR-clamped, so every config will look similar and a " +
+      "&quot;no difference&quot; verdict would say nothing about the operator. Read the gain-map " +
+      "numbers instead, or open this on an HDR screen in Safari.";
+  }
+}
+
+function buildBars() {
+  $("frames").replaceChildren(...FRAMES.map(f =>
+    btn(f, f === frame, () => { frame = f; render(); })));
+  $("configs").replaceChildren(...CONFIGS.map((c, i) =>
+    btn(`${i + 1}. ${c}`, i === config, () => { config = i; render(); })));
+}
+
+function buildStack() {
+  $("stack").replaceChildren(...CONFIGS.map(c => {
+    const img = document.createElement("img");
+    img.src = `${frame}-${c}.jpg`;
+    img.alt = `${frame} ${c}`;
+    img.onerror = () => { img.dataset.missing = "1"; showMissing(); };
+    return img;
+  }));
+}
+
+function showMissing() {
+  const missing = [...$("stack").children].some(i => i.dataset.missing);
+  $("miss").hidden = !missing;
+  if (missing) $("miss").textContent =
+    "Images not found — run the generator script to produce the JPEGs next to this page.";
+}
+
+function paint() {
+  const shown = flashing ? 0 : config;
+  [...$("stack").children].forEach((img, i) => { img.hidden = i !== shown; });
+  const badge = $("badge");
+  badge.textContent = flashing ? `${CONFIGS[0]}  (comparing)` : CONFIGS[config];
+  badge.classList.toggle("flash", flashing);
+  [...$("configs").children].forEach((b, i) => b.setAttribute("aria-pressed", i === config));
+}
+
+function paintMetrics() {
+  const fr = DATA.frames.find(f => f.key === frame);
+  $("mframe").textContent = `${frame} · ${fr.file}`;
+  $("mtable").replaceChildren(...CONFIGS.map((c, i) => {
+    const m = fr.metrics[c], tr = document.createElement("tr");
+    if (i === config) tr.className = "cur";
+    if (!m) { tr.innerHTML = `<td>${c}</td><td colspan="3">not generated</td>`; return tr; }
+    const lin = m.gain_linear, share = m.top_code_share;
+    // Classified on the plateau share, not on the max: the max is near-identical for the
+    // two live configs, so colouring by it would call the separated render saturated.
+    // An inert map is called out first — a low plateau share means nothing there.
+    const cls = share == null ? ""
+      : (lin != null && lin < 1.01) ? "inert"
+      : share > 3 ? "sat" : "good";
+    tr.innerHTML =
+      `<td>${c}</td>` +
+      `<td>${lin == null ? "—" : lin.toFixed(2) + "x"}</td>` +
+      `<td class="${cls}">${share == null ? "—" : share.toFixed(2) + "%"}</td>` +
+      `<td>${(m.bytes / 1e6).toFixed(1)}</td>`;
+    return tr;
+  }));
+}
+
+function render() { buildBars(); buildStack(); paint(); paintMetrics(); showMissing(); }
+
+addEventListener("keydown", e => {
+  if (e.key === " " && !flashing) { flashing = true; paint(); e.preventDefault(); return; }
+  if (e.key >= "1" && e.key <= String(CONFIGS.length)) { config = +e.key - 1; paint(); }
+  else if (e.key === "ArrowRight") { config = (config + 1) % CONFIGS.length; paint(); }
+  else if (e.key === "ArrowLeft") { config = (config - 1 + CONFIGS.length) % CONFIGS.length; paint(); }
+  else if (e.key.toLowerCase() === "f") { frame = FRAMES[(FRAMES.indexOf(frame) + 1) % FRAMES.length]; render(); }
+});
+addEventListener("keyup", e => { if (e.key === " ") { flashing = false; paint(); } });
+
+// Rendered rather than hardcoded: the handler bounds on `CONFIGS.length`, so a hardcoded
+// "1–3" silently goes stale the moment a fourth config is added — and a fourth is likely,
+// since the task's open questions include trying other operators.
+$("keyhint").innerHTML = CONFIGS.length > 1
+  ? `<kbd>1</kbd>–<kbd>${CONFIGS.length}</kbd>`
+  : "<kbd>1</kbd>";
+
+$("legend").innerHTML = CONFIGS.map(c =>
+  `<div style="margin-bottom:6px"><code>${c}</code><br>${LEGEND[c] || ""}</div>`).join("");
+hdrStatus();
+render();
+</script>
+</body>
+</html>

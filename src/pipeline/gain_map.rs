@@ -299,8 +299,15 @@ fn bilinear_sample(
 }
 
 fn validate_config(config: GainMapConfig) -> Result<()> {
-    // The tone needs no check here: `DisplayTone` validates its knee width at
-    // construction, and both renderers are handed the same resolved value.
+    // **No tone gate here any more, and that is the point.** This used to refuse a tone
+    // whose SDR half was unbounded, because `build` ratioed against the *rendered* SDR
+    // while a decoder multiplies the base as *encoded* — which the encode clamps. That was
+    // a defect in the arithmetic, not a property of the tone, and it now lives fixed in
+    // `build` (`min(sdr, 1)`). A gate here would have made the tone permanently
+    // inadmissible for a reason that no longer holds.
+    //
+    // The tone's *knee width* needs no check either: `DisplayTone` validates it at
+    // construction and both renderers are handed the same resolved value.
     for (name, values) in [("SDR", config.offset_sdr), ("HDR", config.offset_hdr)] {
         for (channel, value) in values.into_iter().enumerate() {
             if !value.is_finite() || value <= 0.0 {
@@ -378,7 +385,18 @@ fn build(sdr: RenderedSdr, hdr: LinearBt2020Hdr, config: GainMapConfig) -> Resul
 
         let mut gain_px = [0.0; 3];
         for channel in 0..3 {
-            let denominator = sdr_px[channel] + config.offset_sdr[channel];
+            // **The base as *stored*, not as rendered.** A decoder reconstructs
+            // `base × gain`, and the base it multiplies is what the JPEG carries — which
+            // the encode clamps to `[0, 1]` per channel. Ratioing against an SDR sample
+            // above reference white would therefore store a gain short by exactly what was
+            // clamped, and the highlight would come back *dark*: at a 1.30 sample the
+            // reconstruction lands 23% low, in a structurally valid file with every
+            // counter reading zero.
+            //
+            // Under the two bounded tones this is an exact identity — `sdr::render`'s own
+            // postcondition asserts `[0, 1]` for them — so it moves no shipped pixel. It is
+            // what makes an unbounded-SDR tone admissible here at all.
+            let denominator = sdr_px[channel].min(1.0) + config.offset_sdr[channel];
             let numerator = mapped[channel] + config.offset_hdr[channel];
             let gain = numerator / denominator;
             if !denominator.is_finite()
@@ -533,6 +551,128 @@ mod tests {
             offset_sdr: [1.0 / 64.0; 3],
             offset_hdr: [1.0 / 64.0; 3],
             gain_gamma: [1.0; 3],
+        }
+    }
+
+    /// What the unbounded tone actually buys the gain map — and it is **not** liveness.
+    ///
+    /// `GainMapMax > 1.0` was reachable before this operator existed: turning the
+    /// reconstruction's own shoulder off (`--sigmoid-shoulder 0`) reaches 4.866x, because
+    /// the shoulder is what removes above-white content during reconstruction. Measured on
+    /// `tests/fixtures/hdr-48bit.tif`: shipped default 1.000x, `--sigmoid-shoulder 0` alone
+    /// **4.866x**, that plus `--display-tone reinhard` **3.354x**.
+    ///
+    /// The *lower* number is the better one, which is why the criterion is a conjunction and
+    /// not a threshold. The shipped shoulder plateaus, so past its knee every input maps to
+    /// one output: film RGB 8, 16 and 64 all render an HDR peak of exactly 4.92611 and a gain
+    /// of exactly 4.8657 — the speculars arrive as a single flat blob at 98.8% of the
+    /// ceiling. That is what "no usable headroom" means, and asserting **separation** rather
+    /// than peak magnitude is what distinguishes the two operators.
+    ///
+    /// Scope, established by mutation and worth knowing before trusting this: it fails when
+    /// the tone degenerates to a plateau or a hard clip, and it does **not** guard the
+    /// asymptotic-vs-hard-clamped *base* — clamping the base still separates below `W`, and
+    /// above `W` the asymptotic form's own separation is under 0.4%, itself below one 8-bit
+    /// code step. That choice is pinned by `display_tone`'s ceiling tests and by the
+    /// seven-frame `shadow_metrics` probe, not here.
+    #[test]
+    fn the_unbounded_tone_separates_highlights_where_the_shoulder_plateaus() {
+        let reinhard = DisplayTone::ExtendedReinhard(
+            crate::pipeline::display_tone::Headroom::new(6.0).unwrap(),
+        );
+        // Three stops of specular, all past the shipped shoulder's knee.
+        let peaks = |tone: DisplayTone| {
+            [8.0f32, 16.0, 64.0].map(|v| {
+                let src = shared_from_film_rgb(&[v, v, v, 0.18, 0.18, 0.18]);
+                crate::pipeline::hdr::render_linear(&src, tone)
+                    .unwrap()
+                    .image()
+                    .rgb
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max)
+            })
+        };
+        let ceiling = crate::pipeline::hdr::LINEAR_HEADROOM;
+        let shouldered = peaks(DisplayTone::DEFAULT);
+        let lifted = peaks(reinhard);
+
+        // The shoulder: every one of the three lands on the ceiling, indistinguishably.
+        for peak in shouldered {
+            assert!(
+                (peak - ceiling).abs() < 1e-4,
+                "expected the shoulder to plateau at {ceiling}, got {shouldered:?}"
+            );
+        }
+        // The lifted form: strictly increasing, and never arriving at the ceiling.
+        for pair in lifted.windows(2) {
+            assert!(
+                pair[1] > pair[0] * 1.05,
+                "the lifted tone must keep separating these stops, got {lifted:?}"
+            );
+        }
+        assert!(
+            lifted.iter().all(|&p| p < ceiling),
+            "the lifted tone must stay under {ceiling}, got {lifted:?}"
+        );
+
+        // Both are live on such a source — stated so the weaker claim is not mistaken for
+        // this test's point.
+        for tone in [DisplayTone::DEFAULT, reinhard] {
+            let src = shared_from_film_rgb(&[16.0, 16.0, 16.0, 0.18, 0.18, 0.18]);
+            let render = render(&src, GainMapConfig { tone, ..config() }).unwrap();
+            let gain = render.metadata.gain_max.into_iter().fold(0.0f32, f32::max);
+            assert!(gain > 1.0, "{tone:?}: gain {gain}");
+        }
+    }
+
+    /// The gain is ratioed against the base **as stored**, which is the invariant that
+    /// replaced a gate refusing unbounded-SDR tones outright.
+    ///
+    /// A decoder computes `base × gain`, and the base it has is the clamped one. Ratioing
+    /// against a rendered SDR above reference white stores a gain short by exactly what
+    /// was clamped, so the highlight reconstructs *dark* — 23% at a 1.30 sample — with no
+    /// counter and no warning anywhere. Falsifiable below: the two bounded tones are
+    /// unaffected, because for them the clamp is an identity.
+    #[test]
+    fn the_gain_is_ratioed_against_the_stored_base_not_the_rendered_one() {
+        let offset = ULTRA_HDR_V1_OFFSET;
+        // One channel over reference white, as an unbounded SDR tone produces.
+        let (sdr_over, hdr) = (1.30f32, 4.80f32);
+        let stored = sdr_over.min(1.0);
+        let correct = (hdr + offset) / (stored + offset);
+        let naive = (hdr + offset) / (sdr_over + offset);
+        // The decoder's inverse of the offset-adjusted formula: it has the *stored* base,
+        // so it computes `gain·(base + offset) − offset`. Getting this wrong is what made
+        // the first version of this test fail on correct code.
+        let decode = |gain: f32| gain * (stored + offset) - offset;
+        assert!(
+            (decode(correct) - hdr).abs() < 1e-4,
+            "the stored-base ratio must round-trip the HDR value: {} vs {hdr}",
+            decode(correct)
+        );
+        let dark = 1.0 - decode(naive) / hdr;
+        assert!(
+            (0.20..0.26).contains(&dark),
+            "the rendered-base ratio should reconstruct ~23% dark, which is the defect it \
+             replaced; got {:.1}%",
+            100.0 * dark
+        );
+
+        // And for a bounded tone the clamp changes nothing at all.
+        for sdr in [0.0f32, 0.18, 0.5, 1.0] {
+            assert_eq!(sdr.min(1.0).to_bits(), sdr.to_bits(), "sdr = {sdr}");
+        }
+        // Every tone now passes the config gate; the arithmetic is what protects the pair.
+        for tone in [
+            DisplayTone::DEFAULT,
+            DisplayTone::None,
+            DisplayTone::ExtendedReinhard(
+                crate::pipeline::display_tone::Headroom::new(6.0).unwrap(),
+            ),
+        ] {
+            validate_config(GainMapConfig { tone, ..config() })
+                .unwrap_or_else(|e| panic!("{tone:?}: {e}"));
         }
     }
 

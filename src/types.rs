@@ -733,7 +733,17 @@ impl Default for PrintParams {
 /// `OutputPreset::parse` pattern) plus a flag for the operator's parameter — exactly
 /// how [`DmaxSource`] is spelled at the CLI. Recipe shape stays put; only the flag
 /// wiring changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+///
+/// **The parameterized operator arrived (2026-09-01, `output/display-tone-mapping`).**
+/// `Reinhard` is the payload variant this note anticipated, and the wire form held: the
+/// two unit variants keep their bare-string spellings, so every recipe and sidecar
+/// written before it still parses. The `clap::ValueEnum` derive is gone as predicted —
+/// [`DisplayToneCurve::parse`] replaces it — and the operator's parameter arrives on its
+/// own flag.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Default)]
+// `Deserialize` is hand-written below — the derive could not accept the bare
+// `"reinhard"` shorthand, and the accepted spellings must match what `--display-tone`
+// takes. `Serialize` stays derived, so the canonical object form is what gets written.
 #[serde(rename_all = "kebab-case")]
 pub enum DisplayToneCurve {
     /// The shipped C¹ Hermite shoulder, its knee placed by `highlight_compress`.
@@ -750,13 +760,314 @@ pub enum DisplayToneCurve {
     /// sigmoid with `shoulder > 0` and neutral print gains is bounded by
     /// construction).
     None,
+    /// Extended Reinhard `v(1 + v/W²)/(1 + v)`, compressing globally against a stated
+    /// white point rather than rolling off to a fixed ceiling.
+    ///
+    /// Unlike the other two this one is **not bounded**: content above the white point
+    /// still exceeds the render's ceiling, so its loss is counted at the encode
+    /// boundary instead of refused. That is the difference in kind from
+    /// [`None`](Self::None), which relies on the range check *being* the policy — this
+    /// operator is for a reconstruction that deliberately overshoots.
+    ///
+    /// **Taken by every display preset.** The HDR branch applies a *lifted* form over an
+    /// asymptotic base ([`highlight_lifted_reinhard`]) so its composite stays strictly
+    /// inside the 1000-nit peak, which is why the two branches need separate boundedness
+    /// predicates: the same tone is unbounded on SDR and bounded on HDR.
+    ///
+    /// [`highlight_lifted_reinhard`]: crate::pipeline::display_tone::highlight_lifted_reinhard
+    Reinhard {
+        /// Specular headroom above reference white, in **stops** — how far above
+        /// diffuse white content may sit and still be distinguishable, so
+        /// `W = 2^headroom_stops`.
+        ///
+        /// Display-referred deliberately. The alternative was density above the
+        /// reconstruction's anchor, which would make a *print* key read the
+        /// reconstruction's anchor and contrast — the stage coupling
+        /// `algo/reconstruction-render-curve-split` exists to remove — and cannot
+        /// resolve under `simple` at all.
+        ///
+        /// `0` makes the operator the exact **identity** (`W = 1` gives
+        /// `v(1+v)/(1+v) = v`) on **both** branches — the HDR form returns its input
+        /// unchanged when the white point leaves no span above the crossover, which it
+        /// needs an explicit early return for because its base is `v/(1 + v)` regardless
+        /// of `W`. Without that, this setting was the identity on SDR and a full stop of
+        /// darkening on the seven single-rendition HDR presets.
+        ///
+        /// So it coincides with [`None`](Self::None) in tone. On SDR they still differ in
+        /// range policy — `None` refuses an overshoot, this counts it — while on HDR, where
+        /// this tone is bounds-checked, zero headroom matches `None` including the refusal
+        /// (`DisplayTone::applies_no_curve` is what routes both to the same diagnosis).
+        ///
+        /// Defaulted on the wire, so `{"reinhard": {}}` — and the bare `"reinhard"` —
+        /// both resolve [`DEFAULT_HEADROOM_STOPS`]. Without that there was no recipe way
+        /// to say "reinhard at the default", which the CLI has always accepted.
+        #[serde(default = "default_headroom_stops")]
+        headroom_stops: f32,
+    },
+}
+
+/// Default specular headroom for [`DisplayToneCurve::Reinhard`], in stops.
+///
+/// `6` stops is `W = 64`, the value measured to beat the shipped sigmoid on both
+/// highlight metrics on all seven fixture frames at matched brightness. `W = 256`
+/// scored better on clipped fraction alone but leaves a pre-clamp peak of 1.016 —
+/// nothing above diffuse white — which is the condition that makes a gain map inert, so
+/// it is deliberately not the default.
+pub const DEFAULT_HEADROOM_STOPS: f32 = 6.0;
+
+/// The largest accepted specular headroom, in stops.
+///
+/// Beyond this the operator is indistinguishable from plain `v/(1 + v)` and the number
+/// only looks like a setting. The measured useful range is 4–8 stops.
+///
+/// Lives here beside the default and [`headroom_white_point`] so the CLI gate and the
+/// renderer's `Headroom` cannot bound the knob differently — the failure that pattern
+/// produces is a config `cli::validate` accepts and the render then refuses, at exit 1
+/// after a whole roll has decoded.
+pub const MAX_HEADROOM_STOPS: f32 = 24.0;
+
+/// The white point a specular headroom asks for: `2^stops`.
+///
+/// The **single** definition. `DisplayToneCurve::white_point` (what the validation gate
+/// and the report read) and `pipeline::display_tone::Headroom::white_point` (what the
+/// renderer multiplies by) both call it, so a change to the stops→white-point meaning
+/// cannot move one and leave the other.
+pub fn headroom_white_point(stops: f32) -> f32 {
+    stops.exp2()
+}
+
+/// Check a specular headroom in stops, or refuse it.
+///
+/// The single definition of the rule, called from both gates that need it:
+/// `cli::validate` (so `roll` and every per-frame override inherit it *before* a decode)
+/// and `pipeline::display_tone::Headroom::new` (so a stage caller cannot skip it). The
+/// stage check is deliberately a duplicate, not a fallback — see that constructor.
+///
+/// A negative headroom is not loud on its own: `2^-40` is a white point of ~9e-13, which
+/// maps essentially every sample past the ceiling and turns the render into a solid
+/// white field at exit 0 with the clip merely *counted*.
+pub fn check_headroom_stops(stops: f32) -> Result<()> {
+    if !stops.is_finite() || stops < 0.0 {
+        return Err(NcError::Usage(format!(
+            "--display-tone-headroom / print.display_tone.reinhard.headroom_stops must \
+             be finite and non-negative (got {stops}). It is specular headroom above \
+             reference white in stops; `0` is the identity."
+        )));
+    }
+    if stops > MAX_HEADROOM_STOPS {
+        return Err(NcError::Usage(format!(
+            "--display-tone-headroom / print.display_tone.reinhard.headroom_stops is \
+             {stops} stops, beyond the supported maximum of {MAX_HEADROOM_STOPS}. Above \
+             ~8 stops the operator converges on plain Reinhard and the extra headroom \
+             buys nothing; the measured useful range is 4–8 (the default \
+             {DEFAULT_HEADROOM_STOPS} is a white point of {}).",
+            headroom_white_point(DEFAULT_HEADROOM_STOPS)
+        )));
+    }
+    Ok(())
+}
+
+impl DisplayToneCurve {
+    /// The accepted `--display-tone` spellings, for diagnostics and the help text.
+    pub const NAMES: [&'static str; 3] = ["shoulder", "none", "reinhard"];
+
+    /// The accepted names as a comma-separated backticked list, for diagnostics.
+    /// Shared by the flag parser and the recipe deserializer so a new operator cannot
+    /// reach one list and not the other.
+    fn accepted_list() -> String {
+        Self::NAMES
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Parse a `--display-tone` value.
+    ///
+    /// Hand-written because `clap::ValueEnum` cannot derive over a payload variant —
+    /// the cost this type's docs predicted. `reinhard` resolves the documented default
+    /// headroom; `--display-tone-headroom` refines it.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "shoulder" => Ok(Self::Shoulder),
+            "none" => Ok(Self::None),
+            "reinhard" => Ok(Self::Reinhard {
+                headroom_stops: DEFAULT_HEADROOM_STOPS,
+            }),
+            other => Err(NcError::Usage(format!(
+                "unknown --display-tone `{other}`; expected one of {}",
+                Self::accepted_list()
+            ))),
+        }
+    }
+
+    /// The operator's white point as the linear multiple of reference white the
+    /// renderer consumes. `None` for the two curves that have no white point.
+    pub fn white_point(self) -> Option<f32> {
+        match self {
+            Self::Shoulder | Self::None => Option::None,
+            Self::Reinhard { headroom_stops } => Some(headroom_white_point(headroom_stops)),
+        }
+    }
+
+    /// Whether this operator has a knee for `print.highlight_compress` to place.
+    ///
+    /// Only the shoulder does. Named rather than spelled `== Shoulder` at each site so
+    /// the "a stated knee width would be silently ignored" rule stays one predicate
+    /// across `cli::validate` and `DisplayTone::resolve`.
+    pub fn has_knee(self) -> bool {
+        matches!(self, Self::Shoulder)
+    }
+
+    /// The selector as a *diagnostic* names it: the flag spelling, plus the operator's
+    /// own parameter where it has one.
+    ///
+    /// [`Display`](std::fmt::Display) is deliberately the bare, retypeable flag spelling
+    /// — `--display-tone` takes the name alone. A message that reports a **value** the
+    /// user set needs the parameter too, or the two configs `reinhard` at 6 and at 24
+    /// stops produce word-for-word identical errors and the user is told which knob is
+    /// non-default but never which value.
+    pub fn described(self) -> String {
+        match self {
+            Self::Shoulder | Self::None => self.to_string(),
+            Self::Reinhard { headroom_stops } => {
+                format!("{self} at {headroom_stops} stops of headroom")
+            }
+        }
+    }
+
+    /// Check the operator's own parameter, or refuse it.
+    ///
+    /// A **value** rule, so it belongs to `cli::validate` rather than
+    /// `validate_convert`: `roll` and every per-frame override must inherit it, and they
+    /// go through `validate` only.
+    pub fn check_parameters(self) -> Result<()> {
+        match self {
+            Self::Shoulder | Self::None => Ok(()),
+            Self::Reinhard { headroom_stops } => check_headroom_stops(headroom_stops),
+        }
+    }
+}
+
+/// [`DEFAULT_HEADROOM_STOPS`] as serde's field default. A function because
+/// `#[serde(default = …)]` names one; it exists only to avoid a second literal.
+fn default_headroom_stops() -> f32 {
+    DEFAULT_HEADROOM_STOPS
+}
+
+impl<'de> Deserialize<'de> for DisplayToneCurve {
+    /// Accepts the canonical externally-tagged forms plus the **bare operator name**:
+    /// `"shoulder"`, `"none"`, `"reinhard"`, `{"reinhard": {}}` and
+    /// `{"reinhard": {"headroom_stops": 6.0}}` all parse. `Serialize` still emits only
+    /// the canonical form, so a round trip normalizes.
+    ///
+    /// Hand-written for one reason: **every spelling this type hands a user must parse
+    /// back.** `Display` is the bare flag name (`--display-tone reinhard`), and the
+    /// validation messages interpolate it beside `print.display_tone` — so a derived
+    /// `Deserialize`, which rejects a bare string for a struct variant, made those
+    /// messages quote a recipe value the parser refused. Same shape as [`WbSource`]:
+    /// a shorthand accepted on input, one canonical form on output.
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        /// The payload, with its own `deny_unknown_fields`: a mistyped nested key must be
+        /// loud, like every other recipe object.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ReinhardParams {
+            #[serde(default = "default_headroom_stops")]
+            headroom_stops: f32,
+        }
+
+        // A self-describing intermediate, like `DensityCurve`'s: the two shapes are a
+        // string and a single-key object, which no derive spells in one type.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let unknown = |name: &str| {
+            D::Error::custom(format!(
+                "unknown print.display_tone `{name}`; expected one of {}",
+                Self::accepted_list()
+            ))
+        };
+        match value {
+            serde_json::Value::String(name) => match name.as_str() {
+                "shoulder" => Ok(Self::Shoulder),
+                "none" => Ok(Self::None),
+                "reinhard" => Ok(Self::Reinhard {
+                    headroom_stops: DEFAULT_HEADROOM_STOPS,
+                }),
+                other => Err(unknown(other)),
+            },
+            serde_json::Value::Object(obj) => {
+                if obj.len() != 1 {
+                    return Err(D::Error::custom(format!(
+                        "print.display_tone must name exactly one tone curve (got {} keys); \
+                         expected one of {}, either bare (\"reinhard\") or as a single-key \
+                         object ({{\"reinhard\": {{\"headroom_stops\": 6.0}}}})",
+                        obj.len(),
+                        Self::accepted_list()
+                    )));
+                }
+                let (tag, payload) = obj.into_iter().next().expect("exactly one key");
+                match tag.as_str() {
+                    "reinhard" => {
+                        // Re-worded rather than forwarded: serde's own message names the
+                        // private `ReinhardParams`, which appears in no doc, no `--help`
+                        // and no recipe key, so a user cannot map it back to anything.
+                        // The field errors it raises (unknown key, wrong value type) are
+                        // already well-worded, so only the "not an object at all" case
+                        // needs replacing.
+                        let params: ReinhardParams =
+                            serde_json::from_value(payload).map_err(|e| {
+                                let text = e.to_string();
+                                if text.contains("ReinhardParams") {
+                                    D::Error::custom(format!(
+                                        "print.display_tone.reinhard must be an object of \
+                                         its parameters ({{\"headroom_stops\": 6.0}}), or \
+                                         empty ({{}}) for the default {DEFAULT_HEADROOM_STOPS} \
+                                         stops; the bare string \"reinhard\" also works"
+                                    ))
+                                } else {
+                                    D::Error::custom(format!("print.display_tone.reinhard: {text}"))
+                                }
+                            })?;
+                        Ok(Self::Reinhard {
+                            headroom_stops: params.headroom_stops,
+                        })
+                    }
+                    // Named individually: "this one takes no parameter" is a better
+                    // diagnosis than "unknown tone", and it is the mistake a user makes
+                    // after seeing the reinhard object form.
+                    "shoulder" | "none" => Err(D::Error::custom(format!(
+                        "print.display_tone `{tag}` takes no parameters — write it as the \
+                         bare string \"{tag}\". Only `reinhard` carries an object."
+                    ))),
+                    other => Err(unknown(other)),
+                }
+            }
+            other => Err(D::Error::custom(format!(
+                "print.display_tone must be a tone name or a single-key object (got {other})"
+            ))),
+        }
+    }
 }
 
 impl std::fmt::Display for DisplayToneCurve {
+    /// The **flag spelling**, deliberately without the operator's parameter.
+    ///
+    /// `display_tone_display_impl_matches_its_serde_spelling` left this decision to
+    /// whoever added a parameterized variant. The property the validation messages
+    /// depend on is that a spelling handed to a user is one they can *type*, and
+    /// `--display-tone` takes the bare name — the headroom arrives on its own flag. So
+    /// `reinhard` spells `reinhard`; a message wanting the value interpolates it
+    /// separately rather than making this string un-typeable.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             DisplayToneCurve::Shoulder => "shoulder",
             DisplayToneCurve::None => "none",
+            DisplayToneCurve::Reinhard { .. } => "reinhard",
         })
     }
 }
@@ -1636,6 +1947,53 @@ impl OutputPreset {
         }
     }
 
+    /// Whether this preset's render can apply the **extended-Reinhard** display tone.
+    ///
+    /// Narrower than "is a display preset", which is why it is separate from rule 3's
+    /// branch check: the other two tones are bounded and every display preset takes
+    /// them, while this one deliberately overshoots.
+    ///
+    /// Exhaustive on purpose — a new preset must state its answer rather than inherit
+    /// one. Deriving it from another property is the trap `cli::required_extensions`
+    /// already fell into, where "pins a suffix" was read as "convert-only" and refused
+    /// every preset.
+    ///
+    /// **Every display preset now answers `true`**, which is the end state rather than a
+    /// reason to delete the predicate — see `cli::validate_output_preset`'s rule 4, whose
+    /// job is to refuse a *future* preset that answers `false` instead of letting it render
+    /// a tone its branch cannot carry.
+    ///
+    /// Both original exclusions were lifted on 2026-09-02 and neither by relaxing a check.
+    /// The HDR presets waited on the ceiling-parameterized form, which
+    /// `display_tone::highlight_lifted_reinhard` supplies: a lift over an **asymptotic**
+    /// base, so the composite stays strictly inside the declared 1000-nit peak. The
+    /// gain-map pair waited on `gain_map::build` ratioing against `min(sdr, 1)` — the base
+    /// as *stored*, which is what a decoder multiplies — since an unbounded SDR half had
+    /// stored a gain short by whatever the encode clamped.
+    pub fn accepts_reinhard_tone(self) -> bool {
+        match self {
+            // The two SDR presets, and every **single-rendition** HDR preset: the HDR form
+            // was derived and measured on 2026-09-02, and its asymptotic base holds the
+            // composite strictly inside the declared 1000-nit peak on all seven fixture
+            // frames (4.912–4.919 against 4.926).
+            OutputPreset::DisplayP3
+            | OutputPreset::Compatibility
+            | OutputPreset::HdrPq
+            | OutputPreset::HdrHlg
+            | OutputPreset::HdrLinearTiff
+            | OutputPreset::HdrPqTiff
+            | OutputPreset::HdrHlgTiff => true,
+            // The gain-map pair, admitted once `gain_map::build` began ratioing against
+            // `min(sdr, 1)` — the base as *stored*, which is what a decoder multiplies.
+            // Before that the unbounded SDR half stored a gain short by whatever the encode
+            // clamped, reconstructing up to 23% dark. The fix was the ratio, never a
+            // relaxed check here.
+            OutputPreset::GainMapHdr | OutputPreset::UltraHdrV1 => true,
+            // No display tone stage at all.
+            OutputPreset::Legacy | OutputPreset::Custom | OutputPreset::FilmMaster => false,
+        }
+    }
+
     /// Every preset this build accepts, in help order.
     ///
     /// Diagnostics are generated from this list rather than restating it, because
@@ -1942,32 +2300,139 @@ mod tests {
         // type a spelling their recipe rejects. Driven off `value_variants` so a new
         // variant is covered without editing the test.
         //
-        // A future *parameterized* operator serializes as an object rather than a bare
-        // string and will fail here — deliberately: that is the moment to decide what
-        // `Display` should spell for it.
-        for variant in <DisplayToneCurve as clap::ValueEnum>::value_variants() {
-            let wire = serde_json::to_value(variant).unwrap();
-            let wire = wire
-                .as_str()
-                .unwrap_or_else(|| panic!("{variant:?} no longer serializes as a string: {wire}"));
-            assert_eq!(variant.to_string(), wire, "{variant:?}");
-            // clap is the third spelling, and it is derived independently of serde: a
-            // `#[value(name = "…")]` would move the flag's spelling alone, so a message
-            // could still name one `--display-tone` rejects.
+        // Driven off `NAMES` rather than `clap::ValueEnum`, which the parameterized
+        // variant removed — `DisplayToneCurve::parse` is now the flag's third spelling
+        // and this is what ties it to the other two.
+        //
+        // The invariant, stated once: for every accepted name, `parse` yields a variant
+        // whose `Display` is that same name, and whose serde form is either that bare
+        // string (unit variants) or an object keyed by it (parameterized ones).
+        //
+        // **The bare-string round trip is asserted for every name, outside the match.**
+        // It used to sit inside the `Value::String` arm, so the parameterized variant
+        // skipped it — and skipping it is exactly how `Display` came to hand users
+        // `reinhard`, a spelling the derived `Deserialize` then rejected with
+        // "invalid type: unit variant". That is the whole property this test exists for,
+        // so it cannot be conditional on the wire shape.
+        for name in DisplayToneCurve::NAMES {
+            let variant = DisplayToneCurve::parse(name)
+                .unwrap_or_else(|e| panic!("`{name}` is in NAMES but does not parse: {e}"));
+            assert_eq!(variant.to_string(), name, "{variant:?}: Display");
             assert_eq!(
-                <DisplayToneCurve as clap::ValueEnum>::to_possible_value(variant)
-                    .unwrap()
-                    .get_name(),
-                wire,
-                "{variant:?}: clap's flag spelling"
+                serde_json::from_str::<DisplayToneCurve>(&format!("\"{name}\"")).unwrap_or_else(
+                    |e| panic!(
+                        "`{name}` is handed to users by Display but the recipe parser \
+                         rejects it: {e}"
+                    )
+                ),
+                variant,
+                "{variant:?}: the bare name must parse back to what `parse` produced"
             );
-            // And the spelling a message hands the user round-trips back through the
-            // parser, which is the property the messages actually depend on.
+            let wire = serde_json::to_value(variant).unwrap();
+            match &wire {
+                serde_json::Value::String(spelled) => {
+                    assert_eq!(spelled, name, "{variant:?}: bare-string wire form");
+                }
+                serde_json::Value::Object(map) => {
+                    // Externally tagged, so the object's single key is the same name.
+                    // This is what kept the two unit variants' recipes parsing.
+                    assert_eq!(
+                        map.keys().collect::<Vec<_>>(),
+                        vec![name],
+                        "{variant:?}: externally-tagged key"
+                    );
+                    assert_eq!(
+                        serde_json::from_value::<DisplayToneCurve>(wire.clone()).unwrap(),
+                        variant
+                    );
+                    // ...and the empty payload means "this operator at its documented
+                    // default", so the three spellings of that are interchangeable.
+                    assert_eq!(
+                        serde_json::from_str::<DisplayToneCurve>(&format!("{{\"{name}\":{{}}}}"))
+                            .unwrap(),
+                        variant,
+                        "{variant:?}: `{{\"{name}\": {{}}}}` must resolve the default"
+                    );
+                }
+                other => panic!("{variant:?}: unexpected wire form {other}"),
+            }
+        }
+    }
+
+    /// The wire form the parameterized variant actually took, pinned because the whole
+    /// "pure addition" claim rests on it: the two unit variants keep bare strings, and
+    /// only the new operator needs an object.
+    #[test]
+    fn the_parameterized_display_tone_is_an_externally_tagged_addition() {
+        assert_eq!(
+            serde_json::to_string(&DisplayToneCurve::Reinhard {
+                headroom_stops: 6.0
+            })
+            .unwrap(),
+            r#"{"reinhard":{"headroom_stops":6.0}}"#
+        );
+        // A recipe written before this variant existed still parses unchanged.
+        assert_eq!(
+            serde_json::from_str::<DisplayToneCurve>(r#""shoulder""#).unwrap(),
+            DisplayToneCurve::Shoulder
+        );
+        assert_eq!(
+            serde_json::from_str::<DisplayToneCurve>(r#""none""#).unwrap(),
+            DisplayToneCurve::None
+        );
+        // `2^stops`, and zero stops is the identity white point.
+        assert_eq!(DisplayToneCurve::Shoulder.white_point(), None);
+        assert_eq!(DisplayToneCurve::None.white_point(), None);
+        for (stops, w) in [(0.0, 1.0), (4.0, 16.0), (6.0, 64.0), (8.0, 256.0)] {
             assert_eq!(
-                serde_json::from_str::<DisplayToneCurve>(&format!("\"{variant}\"")).unwrap(),
-                *variant
+                DisplayToneCurve::Reinhard {
+                    headroom_stops: stops
+                }
+                .white_point(),
+                Some(w)
             );
         }
+    }
+
+    #[test]
+    fn the_reinhard_payload_denies_unknown_fields_like_every_other_recipe_object() {
+        // Project convention: every recipe struct denies unknown fields, so a mistyped
+        // key is loud instead of silently ignored. A struct *variant* needs
+        // `deny_unknown_fields` on the enum to inherit it, which this was missing — the
+        // one recipe object in the crate where `{"reinhard": {"bogus_key": 1, …}}`
+        // converted at exit 0 while `{"print": {"bogus_key": 1}}` was an error.
+        let err = serde_json::from_str::<DisplayToneCurve>(
+            r#"{"reinhard":{"headroom_stops":6.0,"bogus_key":1}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `bogus_key`"), "{err}");
+        // Falsifiable, and the *reason* the field is defaulted rather than required: the
+        // same object without the stray key parses, and the payload really is optional —
+        // an empty one, and the bare name, both resolve the documented default. Asserted
+        // against `DEFAULT_HEADROOM_STOPS`, not the literal 6, so moving the default
+        // cannot leave this test pinning the old number.
+        for spelling in [
+            r#"{"reinhard":{"headroom_stops":6.0}}"#,
+            r#"{"reinhard":{}}"#,
+            r#""reinhard""#,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<DisplayToneCurve>(spelling).unwrap(),
+                DisplayToneCurve::Reinhard {
+                    headroom_stops: DEFAULT_HEADROOM_STOPS
+                },
+                "{spelling}"
+            );
+        }
+        assert_eq!(DEFAULT_HEADROOM_STOPS, 6.0);
+        // The whole recipe path, not just the leaf type — that is where a user meets it.
+        let err = serde_json::from_str::<crate::cli::ResolvedConfig>(
+            r#"{"print":{"display_tone":{"reinhard":{"headroom_stops":6.0,"bogus_key":1}}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `bogus_key`"), "{err}");
     }
 
     #[test]
