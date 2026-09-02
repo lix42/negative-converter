@@ -951,6 +951,7 @@ fn build_profile(space: &OutputSpace) -> Result<Profile> {
 mod tests {
     use super::*;
     use crate::algo::reconstruct;
+    use crate::pipeline::display_tone::DisplayTone;
     use crate::pipeline::render_split::display_source;
     use crate::pipeline::sdr;
     use crate::pipeline::working_space::map_nc_film_rgb_v1;
@@ -967,7 +968,7 @@ mod tests {
         let (film, _) =
             reconstruct(&image, &FilmBase::from([1.0; 3]), &Reconstruction::Simple).unwrap();
         let shared = display_source(map_nc_film_rgb_v1(film), &PrintParams::default()).unwrap();
-        sdr::render(&shared, gamut, 0.0).unwrap()
+        sdr::render(&shared, gamut, DisplayTone::DEFAULT).unwrap()
     }
 
     #[test]

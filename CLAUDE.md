@@ -131,7 +131,7 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode,ultra_hdr,avif}.rs`,
-  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,sdr,hdr,gain_map,memory}.rs`
+  `pipeline/{film_base,color,stages,input_semantics,working_space,render_split,display_tone,sdr,hdr,gain_map,memory}.rs`
   plus `pipeline/colorimetry/` — the **single source of truth for every
   standards-based matrix and luma vector**; see the colorimetry note below
   (`film_base::estimate` is stage 2, resolved by the orchestrator before the
@@ -189,6 +189,17 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   `hdr-pq-tiff`, `hdr-hlg-tiff`) are wired; a non-default `print.linear_range` is
   accepted only by those display presets (legacy ignores it — so it is rejected
   there rather than silently dropped — and film-master rejects it);
+  `display_tone` resolves `print.display_tone` + `print.highlight_compress` into the
+  one tone value **both** display renderers read, so it owns the shared
+  `0.5 + 0.25/(1 + hc)` knee formula (never restate it in a stage) and its
+  `KneeWidth` newtype is what keeps an unchecked width unrepresentable — a bare
+  `f32` payload let `hc = -1` render an infinite knee, i.e. a silent identity curve
+  at exit 0. `DisplayToneCurve::None` skips *tone* only: gamut mapping, the transfer
+  encode and each renderer's range check still run, which is what makes the mode
+  self-policing instead of gated on a curve type — and those two ceilings **differ**
+  (`1.0` for SDR, `LINEAR_HEADROOM` ≈ 4.93 for HDR), so any message or doc about
+  overshoot must name its branch: the same lift is refused on `display-p3` and
+  renders on `hdr-pq`, which is the headroom an HDR rendition exists to carry;
   `memory::preflight` is the stage-0 peak-memory gate — see the memory note below),
   `pipeline/shadow_metrics.rs` (test-only diagnostic harness: `#[cfg(test)]`, every
   entry `#[ignore]`d and skipping with a message when `../nc-assets` is absent, so
@@ -559,6 +570,11 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   a field in the CLI `*Overrides` struct (`cli.rs`), the recipe `*Params` struct
   (`types.rs`), a `merge` arm, and usually a `validate` check — a forgotten
   `merge` arm silently makes the flag a no-op, so add a merge test for new knobs.
+  A knob that changes **what a stage does** has a fifth spot: the report's *prose*
+  claims. `output_render.content` asserted "the reference-white-preserving shoulder
+  … have all run" for a whole preset, so `--display-tone none` made one report
+  contradict itself. Prose that names an operation is a claim about the run; either
+  derive it from the resolved config or say the fact in a field instead.
   **`film_base.source` is the first knob with no default at all** (`Option`, no
   `Default` on `FilmBaseSource`): `convert`/`roll` refuse an unstated one rather
   than choosing. A defaultless knob adds two obligations — every `ResolvedConfig`
@@ -628,6 +644,13 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     parallel-fields shape and gave the value half a real recipe spelling, but the
     presence hole is a property of "u16 is the default", not of the old modelling —
     a first pass at the rename assumed it dissolved and was wrong.
+    **The tiebreaker for any new rule** (two independent reviewers proposed widening
+    it and both were wrong): reject by presence only when the flag *forces something
+    the branch cannot produce*, as `--out-depth u16` forces 16-bit from an f32-only
+    master. An identity value that renders byte-identically — `--bigtiff auto`,
+    `--highlight-compress 0`, `--display-tone shoulder` — asks for nothing, and
+    rejecting it kills the flags-win reset that lets one recipe be re-used on another
+    branch.
   - *`validate` is not the whole `convert` gate.* Every rule inside it reads only
     the resolved config — which is why `roll` and each per-frame override share it
     verbatim. `convert` must call **`validate_convert`**, which composes it with the

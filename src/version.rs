@@ -176,7 +176,12 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
         // `docs/reports/render-defaults-v3.md`.
         render: "9beca8b24eb785b0",
         base: "01c5acccc36a3388",
-        recipe: "5b22d0505ed4fb79",
+        // Refreshed in place when `print.display_tone` was added (`output/linear-render`):
+        // a new opt-in knob whose default (`shoulder`) is the behaviour v3 already had,
+        // so the default document gained a key while no default pixel moved — `render`
+        // and `base` are byte-identical. That is the one case this field sanctions
+        // editing for; see `docs/progress/core.md`.
+        recipe: "a26e8ec6434e8ebc",
         behavior: PIPELINE_BEHAVIOR,
     },
 ];

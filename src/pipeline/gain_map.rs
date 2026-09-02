@@ -13,6 +13,7 @@ use serde::Serialize;
 pub(crate) mod iso;
 
 use crate::pipeline::colorimetry::pinned::{BT2020_TO_DISPLAY_P3, DISPLAY_P3_LUMA};
+use crate::pipeline::display_tone::DisplayTone;
 use crate::pipeline::hdr::{LINEAR_HEADROOM, LinearBt2020Hdr, REFERENCE_WHITE_NITS, render_linear};
 use crate::pipeline::render_split::SharedDisplaySource;
 use crate::pipeline::sdr::{RenderedSdr, SdrGamut, render as render_sdr};
@@ -33,19 +34,19 @@ const ULTRA_HDR_V1_OFFSET: f32 = 1.0 / 64.0;
 /// user-facing conversion controls.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GainMapConfig {
-    pub highlight_compress: f32,
+    pub tone: DisplayTone,
     pub offset_sdr: [f32; 3],
     pub offset_hdr: [f32; 3],
     pub gain_gamma: [f32; 3],
 }
 
 impl GainMapConfig {
-    /// Fixed public Ultra HDR v1 construction policy. Only highlight placement
+    /// Fixed public Ultra HDR v1 construction policy. Only the display tone
     /// remains a resolved print control; offsets and encoding gamma are format
     /// constants, not conversion knobs.
-    pub fn ultra_hdr_v1(highlight_compress: f32) -> Self {
+    pub fn ultra_hdr_v1(tone: DisplayTone) -> Self {
         Self {
-            highlight_compress,
+            tone,
             offset_sdr: [ULTRA_HDR_V1_OFFSET; 3],
             offset_hdr: [ULTRA_HDR_V1_OFFSET; 3],
             gain_gamma: [1.0; 3],
@@ -175,8 +176,8 @@ pub(crate) struct EncodedGainMap {
 /// canonical gain map in reference-white-relative linear Display P3.
 pub fn render(shared: &SharedDisplaySource, config: GainMapConfig) -> Result<GainMapRender> {
     validate_config(config)?;
-    let sdr = render_sdr(shared, SdrGamut::DisplayP3, config.highlight_compress)?;
-    let hdr = render_linear(shared, config.highlight_compress)?;
+    let sdr = render_sdr(shared, SdrGamut::DisplayP3, config.tone)?;
+    let hdr = render_linear(shared, config.tone)?;
     build(sdr, hdr, config)
 }
 
@@ -298,12 +299,8 @@ fn bilinear_sample(
 }
 
 fn validate_config(config: GainMapConfig) -> Result<()> {
-    if !config.highlight_compress.is_finite() || config.highlight_compress < 0.0 {
-        return Err(NcError::Usage(format!(
-            "gain-map highlight compression must be finite and non-negative (got {})",
-            config.highlight_compress
-        )));
-    }
+    // The tone needs no check here: `DisplayTone` validates its knee width at
+    // construction, and both renderers are handed the same resolved value.
     for (name, values) in [("SDR", config.offset_sdr), ("HDR", config.offset_hdr)] {
         for (channel, value) in values.into_iter().enumerate() {
             if !value.is_finite() || value <= 0.0 {
@@ -532,7 +529,7 @@ mod tests {
 
     pub(super) fn config() -> GainMapConfig {
         GainMapConfig {
-            highlight_compress: 0.0,
+            tone: DisplayTone::DEFAULT,
             offset_sdr: [1.0 / 64.0; 3],
             offset_hdr: [1.0 / 64.0; 3],
             gain_gamma: [1.0; 3],
@@ -544,6 +541,38 @@ mod tests {
         let shared = shared_from_film_rgb(&[1.0; 3]);
         let output = render(&shared, config()).unwrap();
         for gain in output.gain().rgb() {
+            close(*gain, 1.0);
+        }
+    }
+
+    #[test]
+    fn without_a_display_tone_curve_a_bounded_source_gains_exactly_unity() {
+        // Today the SDR shoulder *lifts* highlights above the untouched HDR
+        // rendition, so the default gain map is below unity above the knee. Remove
+        // the curve and both renditions carry the same luminance, so the map is
+        // exactly flat — the inert default becomes inert by construction rather than
+        // by the shoulder's arithmetic. Worth pinning: it is the interaction a reader
+        // would otherwise have to derive.
+        let ramp: Vec<f32> = [0.0, 0.18, 0.5, 0.9, 1.0]
+            .into_iter()
+            .flat_map(|v| [v; 3])
+            .collect();
+        let shared = shared_from_film_rgb(&ramp);
+        let shouldered = render(&shared, config()).unwrap();
+        assert!(
+            shouldered.gain().rgb().iter().any(|gain| *gain < 0.99),
+            "the shipped shoulder should move some gains off unity"
+        );
+
+        let linear = render(
+            &shared,
+            GainMapConfig {
+                tone: DisplayTone::None,
+                ..config()
+            },
+        )
+        .unwrap();
+        for gain in linear.gain().rgb() {
             close(*gain, 1.0);
         }
     }

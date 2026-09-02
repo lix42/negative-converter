@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::algo::density::to_density;
+use crate::pipeline::display_tone::DisplayTone;
 use crate::types::{
     DensityCurve, DensityParams, DmaxSource, FilmBase, LinearImage, PrintParams, Reconstruction,
     SigmoidParams,
@@ -1178,7 +1179,7 @@ fn measure_candidates() {
             let sdr = match crate::pipeline::sdr::render(
                 &shared,
                 crate::pipeline::sdr::SdrGamut::DisplayP3,
-                cand.hc,
+                DisplayTone::shoulder(cand.hc).unwrap(),
             ) {
                 Ok(v) => v,
                 // `sdr::render` errors on any sample outside [0, 1]. A shoulder-less curve
@@ -1265,7 +1266,7 @@ fn measure_candidates() {
                 let br = crate::pipeline::sdr::render(
                     &bs,
                     crate::pipeline::sdr::SdrGamut::DisplayP3,
-                    cand.hc,
+                    DisplayTone::shoulder(cand.hc).unwrap(),
                 )
                 .unwrap();
                 srgb_encode(p3_luma(&br.image().rgb[0..3])) * 255.0
@@ -1273,27 +1274,30 @@ fn measure_candidates() {
 
             // The HDR half. Every metric above is SDR, but "speculars live in the
             // headroom" is a claim about *this* rendition — so measure it directly.
-            let hdr_stats = crate::pipeline::hdr::render_linear(&shared, cand.hc)
-                .ok()
-                .map(|hdr| {
-                    let him = hdr.image();
-                    let mut hl: Vec<f32> = (0..him.rgb.len() / 3)
-                        .map(|i| {
-                            use crate::pipeline::colorimetry::pinned::BT2020_LUMA as L;
-                            let p = &him.rgb[i * 3..i * 3 + 3];
-                            L[0] * p[0] + L[1] * p[1] + L[2] * p[2]
-                        })
-                        .filter(|v| v.is_finite())
-                        .collect();
-                    hl.sort_by(f32::total_cmp);
-                    let above = hl.iter().filter(|v| **v > 1.0).count();
-                    let (a, b) = (pct(&hl, 0.990), pct(&hl, 0.9999));
-                    (
-                        100.0 * above as f32 / hl.len() as f32,
-                        *hl.last().unwrap_or(&0.0),
-                        if a > 0.0 { (b / a).log2() } else { 0.0 },
-                    )
-                });
+            let hdr_stats = crate::pipeline::hdr::render_linear(
+                &shared,
+                DisplayTone::shoulder(cand.hc).unwrap(),
+            )
+            .ok()
+            .map(|hdr| {
+                let him = hdr.image();
+                let mut hl: Vec<f32> = (0..him.rgb.len() / 3)
+                    .map(|i| {
+                        use crate::pipeline::colorimetry::pinned::BT2020_LUMA as L;
+                        let p = &him.rgb[i * 3..i * 3 + 3];
+                        L[0] * p[0] + L[1] * p[1] + L[2] * p[2]
+                    })
+                    .filter(|v| v.is_finite())
+                    .collect();
+                hl.sort_by(f32::total_cmp);
+                let above = hl.iter().filter(|v| **v > 1.0).count();
+                let (a, b) = (pct(&hl, 0.990), pct(&hl, 0.9999));
+                (
+                    100.0 * above as f32 / hl.len() as f32,
+                    *hl.last().unwrap_or(&0.0),
+                    if a > 0.0 { (b / a).log2() } else { 0.0 },
+                )
+            });
 
             let mid_s = rect("mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
             let sh_s = rect("shadow").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
@@ -1545,9 +1549,11 @@ fn tone_map_probe() {
         let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
         let shared =
             crate::pipeline::render_split::display_source(aces, &PrintParams::default()).unwrap();
-        let Ok(sdr) =
-            crate::pipeline::sdr::render(&shared, crate::pipeline::sdr::SdrGamut::DisplayP3, 0.0)
-        else {
+        let Ok(sdr) = crate::pipeline::sdr::render(
+            &shared,
+            crate::pipeline::sdr::SdrGamut::DisplayP3,
+            DisplayTone::DEFAULT,
+        ) else {
             println!("{label:<32}   SDR REFUSED (samples outside [0,1])");
             continue;
         };
@@ -1587,9 +1593,12 @@ fn tone_map_probe() {
         let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
         let shared =
             crate::pipeline::render_split::display_source(aces, &PrintParams::default()).unwrap();
-        let sdr =
-            crate::pipeline::sdr::render(&shared, crate::pipeline::sdr::SdrGamut::DisplayP3, 0.0)
-                .unwrap();
+        let sdr = crate::pipeline::sdr::render(
+            &shared,
+            crate::pipeline::sdr::SdrGamut::DisplayP3,
+            DisplayTone::DEFAULT,
+        )
+        .unwrap();
         let img = sdr.image();
         let mut lum: Vec<f32> = (0..img.rgb.len() / 3)
             .map(|i| p3_luma(&img.rgb[i * 3..i * 3 + 3]))
@@ -1644,4 +1653,150 @@ fn write_ppm(path: &Path, img: &LinearImage, step: u32) {
         }
     }
     let _ = std::fs::write(path, out);
+}
+
+/// Does removing the display tone curve actually improve the picture?
+/// (`output/linear-render`.)
+///
+/// Renders every `scripts/sigmoid-baseline` fixture frame through the **shipped
+/// default** reconstruction — sigmoid, default contrast/toe/shoulder/anchor, the
+/// roll's own measured `Dmax` as the reference — and measures the SDR rendition
+/// twice: with the Hermite shoulder and with no display tone curve at all. The
+/// reconstruction is identical between the two rows, so every difference is the
+/// display stage.
+///
+/// Read `blown%` (share at or above absolute white) with `code sep` (p90→p99 in
+/// 8-bit code values); `sat%` from `measure_candidates` is deliberately absent —
+/// it shifts with the black point and so cannot compare these two. `mid` is the
+/// declared mid patch, printed to confirm the two modes did *not* move midtones,
+/// which is the claim that makes the pair comparable at all.
+///
+/// The HDR columns exist for the second half of the same question: the HDR knee sits
+/// at ~3.94, so on a bounded reconstruction it never fires and both modes should
+/// report the same peak, while the gain map goes exactly flat.
+///
+/// ```text
+/// cargo test --release shadow_metrics::linear_render_probe -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires ../nc-assets; run with --ignored --nocapture"]
+fn linear_render_probe() {
+    let Some(assets) = assets_root() else {
+        eprintln!("SKIP: no ../nc-assets/manifest.json");
+        return;
+    };
+    let fx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/sigmoid-baseline/fixtures.json"))
+            .unwrap(),
+    )
+    .unwrap();
+
+    println!(
+        "\nshipped default reconstruction (sigmoid, roll Dmax as the reference), \
+         neutral print controls"
+    );
+    println!(
+        "\n{:<6}{:<10}{:>9}{:>9}{:>10}{:>9}{:>10}{:>10}",
+        "frame", "display", "mid", "blown%", "code sep", "peak", "hdr peak", "gain max"
+    );
+
+    for (mark, f) in fx["frames"].as_object().unwrap() {
+        let roll = f["roll"].as_str().unwrap();
+        let base_arr = fx["rolls"][roll]["dmin"].as_array().unwrap();
+        let base = FilmBase {
+            r: base_arr[0].as_f64().unwrap() as f32,
+            g: base_arr[1].as_f64().unwrap() as f32,
+            b: base_arr[2].as_f64().unwrap() as f32,
+        };
+        let path = assets
+            .join("rolls")
+            .join(roll)
+            .join(f["file"].as_str().unwrap());
+        let (image, _) = match crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("{mark:<6}DECODE FAILED: {e}");
+                continue;
+            }
+        };
+
+        // The shipped default curve, roll-calibrated exactly as a user would with
+        // `--d-max`: only `dmax` departs from `SigmoidParams::default()`.
+        let recon = Reconstruction::Density {
+            density: DensityParams::default(),
+            curve: DensityCurve::Sigmoid(SigmoidParams {
+                dmax: DmaxSource::Explicit(f["roll_dmax"].as_f64().unwrap() as f32),
+                ..SigmoidParams::default()
+            }),
+        };
+        let print = PrintParams::default();
+        let (film, _) = crate::algo::reconstruct(&image, &base, &recon).unwrap();
+        let aces = crate::pipeline::working_space::map_nc_film_rgb_v1(film);
+        let shared = crate::pipeline::render_split::display_source(aces, &print).unwrap();
+
+        for (label, tone) in [
+            ("shoulder", DisplayTone::DEFAULT),
+            ("none", DisplayTone::None),
+        ] {
+            let sdr = match crate::pipeline::sdr::render(
+                &shared,
+                crate::pipeline::sdr::SdrGamut::DisplayP3,
+                tone,
+            ) {
+                Ok(v) => v,
+                // Self-policing in action: without a curve, a reconstruction that
+                // overshoots reference white is refused. That is a finding, not a
+                // harness bug.
+                Err(e) => {
+                    println!("{mark:<6}{label:<10}SDR REFUSED: {e}");
+                    continue;
+                }
+            };
+            let img = sdr.image();
+            let mut lum: Vec<f32> = (0..img.rgb.len() / 3)
+                .map(|i| p3_luma(&img.rgb[i * 3..i * 3 + 3]))
+                .filter(|v| v.is_finite())
+                .collect();
+            lum.sort_by(f32::total_cmp);
+            let blown =
+                100.0 * lum.iter().filter(|v| **v >= 0.999).count() as f32 / lum.len() as f32;
+            let csep = srgb_encode(pct(&lum, 0.99)) * 255.0 - srgb_encode(pct(&lum, 0.90)) * 255.0;
+            let mid = rect_of(f, "mid").map(|(x, y, w, h)| patch_luma_p50(img, x, y, w, h));
+
+            let hdr = crate::pipeline::hdr::render_linear(&shared, tone);
+            let hdr_peak = hdr.as_ref().ok().map(|h| {
+                use crate::pipeline::colorimetry::pinned::BT2020_LUMA as L;
+                let im = h.image();
+                (0..im.rgb.len() / 3)
+                    .map(|i| {
+                        let p = &im.rgb[i * 3..i * 3 + 3];
+                        L[0] * p[0] + L[1] * p[1] + L[2] * p[2]
+                    })
+                    .fold(0.0f32, f32::max)
+            });
+            let gain_max = crate::pipeline::gain_map::render(
+                &shared,
+                crate::pipeline::gain_map::GainMapConfig::ultra_hdr_v1(tone),
+            )
+            .ok()
+            .map(|g| g.gain().rgb().iter().copied().fold(0.0f32, f32::max));
+
+            let show = |v: Option<f32>| v.map(|x| format!("{x:.4}")).unwrap_or_else(|| "-".into());
+            println!(
+                "{mark:<6}{label:<10}{:>9}{blown:>8.2}%{csep:>10.1}{:>9.3}{:>10}{:>10}",
+                show(mid),
+                lum.last().copied().unwrap_or(0.0),
+                show(hdr_peak),
+                show(gain_max),
+            );
+        }
+    }
+    println!(
+        "\nRead: lower 'blown%' with higher 'code sep' is more highlight separation, and \
+         the 'none' row's\nblown% is the share the *reconstruction* put at absolute \
+         white — the display stage cannot fix\nthat part. 'mid' must not move between \
+         the rows; if it does, the comparison is confounded.\nNo p99/p99.9 column: with \
+         several percent flattened against white both land inside the flat\nregion and \
+         measure nothing (see `measure_candidates`)."
+    );
 }

@@ -501,6 +501,7 @@ fn check(status: uhdr::uhdr_error_info_t, action: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::display_tone::DisplayTone;
 
     #[test]
     fn base_quantization_counts_every_loss() {
@@ -958,6 +959,7 @@ mod tests {
     /// than hand-rolled JPEGs.
     fn real_render() -> gain_map::GainMapRender {
         use crate::algo::reconstruct;
+        use crate::pipeline::display_tone::DisplayTone;
         use crate::pipeline::render_split::display_source;
         use crate::pipeline::working_space::map_nc_film_rgb_v1;
         use crate::types::{FilmBase, LinearImage, PrintParams, Reconstruction};
@@ -973,7 +975,7 @@ mod tests {
         let shared = display_source(map_nc_film_rgb_v1(film), &print).unwrap();
         gain_map::render(
             &shared,
-            gain_map::GainMapConfig::ultra_hdr_v1(print.highlight_compress),
+            gain_map::GainMapConfig::ultra_hdr_v1(DisplayTone::resolve(&print).unwrap()),
         )
         .unwrap()
     }
@@ -1068,7 +1070,7 @@ mod tests {
         println!("oracle render: {input} at {ev:+} EV, dmax {dmax}");
         gain_map::render(
             &source.shared,
-            gain_map::GainMapConfig::ultra_hdr_v1(print.highlight_compress),
+            gain_map::GainMapConfig::ultra_hdr_v1(DisplayTone::resolve(&print).unwrap()),
         )
         .unwrap()
     }

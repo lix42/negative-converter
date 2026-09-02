@@ -485,9 +485,13 @@ curve) and owns the resulting `FilmRgbImage` boundary:
 Stage 5b's **shared print controls** (`render_split::display_source`) and both
 pure display renderers are implemented and unit-tested: `pipeline::sdr`
 produces rendered-linear Display P3/sRGB, while `pipeline::hdr` produces
-display-linear BT.2020 plus in-place Rec.2100 PQ/HLG encoding. `ultra-hdr-v1`
-consumes both renderers and accepts non-default `print.linear_range`; the legacy
-TIFF path still rejects that control because its frozen ordering does not apply it.
+display-linear BT.2020 plus in-place Rec.2100 PQ/HLG encoding. **Every** display
+preset consumes the shared stage and accepts a non-default `print.linear_range` —
+`gain-map-hdr` (the default) and `ultra-hdr-v1`, `display-p3` / `compatibility`,
+`hdr-pq` / `hdr-hlg`, `hdr-linear-tiff`, and `hdr-pq-tiff` / `hdr-hlg-tiff`. The rule
+is keyed on the *branch*, not on a preset list: only the legacy TIFF path
+(`legacy` / `custom`) rejects that control, because its frozen ordering does not
+apply it, and `film-master` rejects it under its own bypass rule.
 See the "Architecture" section of `CLAUDE.md` for the current-vs-target framing.
 
 ```
@@ -571,21 +575,26 @@ Mechanically (as shipped in `pipeline::render_split`), the controls are resolved
 gains there, so the branches cannot re-estimate and drift — applied once, and then
 *borrowed* by both branches from one `SharedDisplaySource`. "SDR and HDR receive
 the identical adjusted source" is therefore structural, not a convention the two
-renderers have to remember. `highlight_compress` is deliberately **not applied**
-by the shared stage: the amount is resolved independently into each named
-display branch's tone policy, so SDR and HDR can use different display-domain
-knees without drifting in their common adjustments.
+renderers have to remember. `display_tone` and `highlight_compress` are deliberately **not applied**
+by the shared stage: they resolve once into a single tone value that each named
+display branch scales into its own domain, so SDR and HDR can use different
+display-domain knees — or no curve at all — without drifting in their common
+adjustments, and without being able to disagree about which curve ran.
 
 The resolved SDR policy is deterministic and display-referred. It transforms
 AP1/D60 ACEScg to the selected D65 destination (Display P3 or sRGB) with pinned
 AP1→XYZ, Bradford D60→D65, and XYZ→destination matrices; no installed ICC or CMM
 participates in rendering. Adjusted linear `1.0` is the binding **203 cd/m²
-reference white**. Named SDR always applies a C¹ Hermite shoulder: the baseline
+reference white**. Under the default `print.display_tone = shoulder`, named SDR
+applies a C¹ Hermite shoulder: the baseline
 (`highlight_compress = 0`) starts at `0.75`, reaches `1.0` with zero slope, and
 plateaus at `1.0`; positive highlight compression moves the start earlier using
 the bounded resolution
 `shoulder_start = 0.5 + 0.25 / (1 + highlight_compress)`, so even an extreme
-finite value cannot move it below `0.5` and flatten the whole tonal range. The
+finite value cannot move it below `0.5` and flatten the whole tonal range.
+Under `display_tone = none` no tone curve runs at all and the reconstruction alone
+places every tone; the range check below is then the operative bound, so a sample
+above reference white is a loud pixel-specific error rather than a clip. The
 renderer then maps out-of-gamut color to the RGB-cube boundary with one common
 chroma scale around the same-luminance neutral axis. This preserves the neutral
 axis and chroma direction instead of independently clipping channels. Finite
@@ -601,14 +610,17 @@ metadata, applies only the piecewise sRGB transfer curve, and returns the
 metadata with the encoded pixels. The gain-map path borrows the typed
 pre-transfer pixels.
 
-The resolved HDR policy uses the same control amount but a distinct
-reference-white-relative domain. Adjusted linear `1.0` remains the binding
+The resolved HDR policy uses the same tone selection and control amount but a
+distinct reference-white-relative domain. Adjusted linear `1.0` remains the binding
 **203 cd/m² reference white**, the fixed peak is `1000/203 = 4.926108...`, and
 the normalized knee position is
 `0.5 + 0.25 / (1 + highlight_compress)`. The HDR shoulder therefore starts at
 `1 + (1000/203 - 1) * knee_position`, reaches `1000/203` with zero slope, and
 plateaus there. A positive amount moves the HDR knee earlier while reference
-white and peak stay fixed. After the shoulder, same-luminance radial gamut
+white and peak stay fixed. `display_tone = none` skips this shoulder too — the knee
+sits at ≈3.94, far above anything a reconstruction bounded at reference white
+produces, so on such a source the HDR rendition is *pixel-identical* either way and
+only the reported policy differs; the peak bound stays the operative check. After the shoulder, same-luminance radial gamut
 mapping produces display-linear BT.2020. Single-rendition output transfer-encodes
 that typed value as PQ/HLG; gain-map construction must first transform it to the
 common linear Display P3 domain used by the SDR rendition.
@@ -661,9 +673,9 @@ black/white remap. In the shipped pipeline, stage 3 ends at unclamped
 Inversion WB and clip remapping move after the ACEScg boundary to the downstream
 shared WB/black/range-placement contract. **As shipped**, both replacement homes
 now exist — explicit `print.white_balance` and `print.linear_range` /
-`--linear-range LOW,HIGH` — and the explicit `ultra-hdr-v1` display preset
-consumes them. The legacy TIFF path still rejects a non-default
-`print.linear_range`, and `film-master` bypasses print controls. The old flags and
+`--linear-range LOW,HIGH` — and every display preset consumes them (see §6). The
+legacy TIFF path still rejects a non-default `print.linear_range`, and `film-master`
+bypasses print controls. The old flags and
 `simple.*` recipe keys remain **rejected with a migration error** that names the
 concrete replacement; convenient alias acceptance is deferred to the complete
 output-preset migration so its warnings, provenance, roll handling, and version
@@ -1345,7 +1357,12 @@ ran and what it applied**, so a consumer never has to re-derive it from the reci
 print/tone sub-stage ran *at all* (not whether its values were non-default — it is
 `false` for `film-master`, and also for legacy `simple`, whose positive passes
 through untouched); `display_render` says whether any tone/gamut/transfer operation
-ran. `encoding` is a stable identifier — one of
+ran; `display_tone` is the resolved `print.display_tone` selector — the display
+branch's tone policy, **absent** on `legacy` / `custom` and `film-master`, which have
+no display tone stage at all. It rides in `output_render`, the one block *every* preset
+emits, so the two SDR presets (which emit no per-preset block at all) and the AVIF pair
+(whose `avif` block states no rendering policy) still say which tone curve ran;
+`content` therefore states what the branch does *besides* tone and never names a curve. `encoding` is a stable identifier — one of
 `rendered-u16-tiff` | `transitional-rendered-float-tiff` |
 `unclamped-linear-acescg-float-tiff` | `legacy-ultra-hdr-v1-xmp-mpf-jpeg` |
 `dual-dialect-gain-map-jpeg` |
@@ -2011,11 +2028,32 @@ false-positive on legitimate high-contrast conversions).
   specified generalization.
 - `--highlight-compress <f>` — highlight roll-off amount. Frozen legacy
   semantics use `0` as off and positive values for the existing above-`1.0`
-  soft clip. Named SDR and HDR target semantics always include their baseline
-  display shoulder: `0` selects the branch baseline and positive values move its
-  resolved knee earlier, bounded in the branch's domain as specified in §6.
-  Preset activation/versioning owns the semantic switch; this is not a second
-  conversion knob.
+  soft clip. Under `print.display_tone = shoulder` the named SDR and HDR branches
+  apply their baseline display shoulder: `0` selects the branch baseline and
+  positive values move its resolved knee earlier, bounded in the branch's domain as
+  specified in §6. Preset activation/versioning owns the semantic switch; this is
+  not a second conversion knob.
+- `--display-tone <shoulder|none>` / `print.display_tone` (default `shoulder`) —
+  which tone curve the named display renderers apply. `none` skips the display
+  shoulder entirely; gamut mapping and the transfer encode still run, so it removes
+  *tone*, not display rendering. A **selector**, not a width: `highlight_compress`
+  moves the knee within a bounded `[0.5, 0.75]` and no value of it removes the
+  curve, which is why "off" cannot be spelled as a highlight-compression amount.
+  Resolved once per frame together with `highlight_compress` into the single tone
+  value both display branches consume, so SDR and HDR cannot diverge.
+  Three rules, all loud (never a silently-dropped knob): a non-default value is
+  rejected on the legacy branch (`legacy` / `custom`, which apply no display tone
+  curve) and by `film-master` (which bypasses display rendering); and a
+  **non-default** `highlight_compress` beside `none` is a usage error, since a knee
+  width describes nothing without a knee (the default `0` is the identity and is
+  accepted — every rule here is on the resolved value). The mode is otherwise **self-policing** rather than gated
+  on a curve type: each renderer already refuses a sample outside its range, so
+  pairing `none` with a reconstruction that overshoots the branch's ceiling fails
+  naming the pixel instead of clipping. The ceilings differ — reference white for
+  SDR, the 1000-nit peak (`LINEAR_HEADROOM`) for HDR — so an overshoot that SDR
+  refuses can render legitimately on an HDR preset, which is where the headroom a
+  gain map needs would come from. A sigmoid curve with `shoulder > 0` and neutral
+  print gains is bounded by construction and is the intended pairing.
 
 ### Simple algorithm
 - Removed legacy controls: `--invert-white-balance R,G,B` and
@@ -2124,8 +2162,8 @@ would cost a Unix-only code path for output that is reproducible by re-running.
     `output.depth`, and after recipe/CLI merge it rejects the frame-local measurements
     `auto` `Dmax` and (when a balance is actually applied) `auto`
     `reconstruction.density.balance_range`, plus every non-default print control
-    (`print_exposure`, `black_point`, `white_balance`, `highlight_compress`,
-    `linear_range`) whatever their source. There is no ignore-conflicting-controls
+    (`print_exposure`, `black_point`, `white_balance`, `display_tone`,
+    `highlight_compress`, `linear_range`) whatever their source. There is no ignore-conflicting-controls
     mode; a linear export that also wants a creative/print/display adjustment is the
     `custom` workflow. Supported anchors by curve: exponential — `fixed` (default),
     explicit/roll, or `none` (unity placement); sigmoid — `fixed` or explicit/roll
@@ -2448,12 +2486,21 @@ nc/
     ├── cli.rs            # arg structs, recipe load/merge, report emit
     ├── io/
     │   ├── decode.rs     # SilverFast HDR/HDRi (TIFF) → LinearImage(+IR)
-    │   └── encode.rs     # LinearImage → u16/f32 TIFF + ICC + sidecar
+    │   ├── encode.rs     # LinearImage → u16/f32 TIFF + ICC + sidecar
+    │   ├── ultra_hdr.rs  # gain-map JPEG packaging (XMP/MPF + ISO 21496-1)
+    │   ├── avif.rs       # AVIF container written here; libaom codes only
+    │   └── staged.rs     # write to a temp beside the target, fsync, rename
     ├── pipeline/
     │   ├── film_base.rs  # Dmin estimation (pure)
     │   ├── color.rs      # working/output color transforms (lcms2, no copy)
+    │   ├── colorimetry/  # every standards-based matrix + luma vector, with provenance
     │   ├── input_semantics.rs # transfer + measurement-meaning resolver (stage 1b)
     │   ├── working_space.rs   # NC film RGB v1 → linear ACEScg mapper
+    │   ├── render_split.rs    # film-master bypass + the shared print controls
+    │   ├── display_tone.rs    # resolves which display tone curve runs (+ its knee)
+    │   ├── sdr.rs        # SDR display render (P3/sRGB, tone + gamut mapping)
+    │   ├── hdr.rs        # Rec.2100 PQ/HLG display render
+    │   ├── gain_map.rs   # SDR+HDR → canonical gain map
     │   ├── memory.rs     # peak-memory sizing model + budget preflight
     │   └── stages.rs     # stage wiring as pure functions
     ├── algo/
@@ -2461,8 +2508,13 @@ nc/
     │   ├── simple.rs     # baseline inversion
     │   ├── density.rs    # density reconstruction + exponential curve
     │   └── sigmoid.rs    # sigmoid density curve
+    ├── telemetry.rs      # opt-in JSONL perf/context record (never perturbs output)
+    ├── version.rs        # build identity, pipeline_version, params hash
     └── types.rs          # LinearImage, FilmBase, Reconstruction, params, errors
 ```
+
+The tree is the shipped module set, not a proposal — it had drifted by nine modules
+and is worth re-checking whenever one is added.
 
 ### Candidate crates
 

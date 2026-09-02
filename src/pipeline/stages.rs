@@ -39,6 +39,7 @@ use std::time::Instant;
 
 use crate::algo;
 use crate::pipeline::color::{self, OutputSpace};
+use crate::pipeline::display_tone::DisplayTone;
 use crate::pipeline::{render_split, sdr, working_space};
 use crate::types::{
     FilmBase, LinearImage, OutputParams, OutputPreset, PrintParams, Reconstruction, Result,
@@ -197,10 +198,13 @@ pub fn render_sdr_preset(
     print: &PrintParams,
     gamut: sdr::SdrGamut,
 ) -> Result<Rendered> {
+    // Before the source render, so an unusable knee width fails without having paid
+    // for reconstruction and the print stage.
+    let tone = DisplayTone::resolve(print)?;
     let source = render_display_source(image, film_base, reconstruction, print)?;
     let mut timings = source.timings;
     let started = Instant::now();
-    let rendered = sdr::render(&source.shared, gamut, print.highlight_compress)?;
+    let rendered = sdr::render(&source.shared, gamut, tone)?;
     // The transform into the output space is colour work, like the gain-map and
     // Rec.2100 branches; only the container write counts as encode.
     let (image, icc, _metadata) = color::encode_rendered_sdr(rendered)?;

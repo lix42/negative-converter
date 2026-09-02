@@ -648,12 +648,13 @@ impl<'de> Deserialize<'de> for WbSource {
 /// named-output split resolves once for both display branches
 /// (`pipeline::render_split`, design-spec §6): the pinned order is
 /// `white balance → exposure → black point → linear_range placement`.
-/// `highlight_compress` is deliberately **not** applied in the shared stage:
-/// each named display renderer resolves its own knee from the same amount.
-/// SDR resolves `0.5 + 0.25 / (1 + amount)` in `[0,1]`; HDR applies the same
-/// normalized position across `[1, 1000/203]`. The legacy no-preset render and
-/// the explicit `ultra-hdr-v1` display path are CLI-reachable today; only the
-/// latter goes through the shared stage.
+/// [`display_tone`](Self::display_tone) and `highlight_compress` are deliberately
+/// **not** applied in the shared stage: they resolve once into the tone each named
+/// display renderer then scales into its own domain — see
+/// [`DisplayTone`](crate::pipeline::display_tone::DisplayTone), which owns the knee
+/// resolution so it is stated in exactly one place. Every preset except `legacy` /
+/// `custom` (the frozen no-preset path) and `film-master` (which bypasses print and
+/// display entirely) goes through the shared stage.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrintParams {
@@ -664,9 +665,17 @@ pub struct PrintParams {
     /// Highlight/neutral white-balance gain source (default explicit `[1, 1, 1]`
     /// = neutral). Auto modes estimate the gains per frame; see [`WbSource`].
     pub white_balance: WbSource,
+    /// Which tone curve the named display renderers apply (default `shoulder`).
+    /// See [`DisplayToneCurve`]; display presets only, like
+    /// [`linear_range`](Self::linear_range).
+    pub display_tone: DisplayToneCurve,
     /// Named-display highlight roll-off amount. Non-negative; positive values
     /// move each branch's shoulder knee earlier without changing its fixed
-    /// reference white or peak.
+    /// reference white or peak. It is a **width**, so a non-default one describes
+    /// nothing under `display_tone = none` — that pairing is rejected, not silently
+    /// dropped. The default `0` is the identity and asks for nothing, so it is
+    /// accepted beside `none` (the rule is on the resolved value, like every other
+    /// display-only rule).
     pub highlight_compress: f32,
     /// Black/white-range placement endpoints `[low, high]` in the rendered
     /// positive's linear domain — the exact affine `(x − low)/(high − low)` the
@@ -688,9 +697,67 @@ impl Default for PrintParams {
             print_exposure: 0.0,
             black_point: 0.0,
             white_balance: WbSource::default(),
+            display_tone: DisplayToneCurve::default(),
             highlight_compress: 0.0,
             linear_range: [0.0, 1.0],
         }
+    }
+}
+
+/// Which tone curve a named display preset applies (design-spec §6/§9,
+/// `print.display_tone` / `--display-tone`).
+///
+/// This is the **selector**; the render stage pairs it with
+/// `print.highlight_compress` into the resolved
+/// [`DisplayTone`](crate::pipeline::display_tone::DisplayTone) that the SDR and HDR
+/// renderers actually consume.
+///
+/// A *width* knob cannot express "off" — which is why this is a separate selector
+/// and not a distinguished `highlight_compress` value: `highlight_compress` moves
+/// the knee within a bounded `[0.5, 0.75]` and no value of it removes the curve.
+///
+/// **Room for an operator that carries parameters.** `output/display-tone-mapping`
+/// wants a real tone-mapping operator with a stated white point (extended Reinhard
+/// measured well). It arrives here as a *new variant with a payload* —
+/// `Reinhard { white: … }` — and serde's default externally-tagged representation
+/// makes that a pure addition: unit variants keep their bare-string spellings, so
+/// every recipe and sidecar written today still parses, and only the new operator
+/// needs an object (`{"reinhard": {…}}`). That is the same shape [`WbSource`]
+/// (`{"explicit": [r, g, b]}` beside `"gray-world"`) and [`DmaxSource`] already use;
+/// an internally-tagged `{"type": …}` form would have respelled these two and needed
+/// a migration. `display_tone_wire_form_leaves_room_for_a_parameterized_operator`
+/// pins it.
+///
+/// What such a variant *does* cost is the CLI side: `clap::ValueEnum` cannot derive
+/// over a payload, so the selector then needs its own parse function (the
+/// `OutputPreset::parse` pattern) plus a flag for the operator's parameter — exactly
+/// how [`DmaxSource`] is spelled at the CLI. Recipe shape stays put; only the flag
+/// wiring changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisplayToneCurve {
+    /// The shipped C¹ Hermite shoulder, its knee placed by `highlight_compress`.
+    #[default]
+    Shoulder,
+    /// No display tone curve: the reconstruction alone places every tone.
+    ///
+    /// Gamut mapping and the transfer encode still run — this skips *tone*, not the
+    /// rest of display rendering — and the renderers' range checks make it
+    /// self-policing: a reconstruction that overshoots the render's ceiling — 1.0 on
+    /// SDR, the 1000-nit peak on HDR — is a loud error rather than a quiet clip. The
+    /// two ceilings differ by design, so the same overshoot can render on `hdr-pq`
+    /// and be refused on `display-p3`. Pair it with a bounded reconstruction (a
+    /// sigmoid with `shoulder > 0` and neutral print gains is bounded by
+    /// construction).
+    None,
+}
+
+impl std::fmt::Display for DisplayToneCurve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DisplayToneCurve::Shoulder => "shoulder",
+            DisplayToneCurve::None => "none",
+        })
     }
 }
 
@@ -1836,6 +1903,72 @@ impl OutputParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_tone_wire_form_leaves_room_for_a_parameterized_operator() {
+        // Both variants are bare strings, which is what makes a future operator that
+        // *carries* parameters (`output/display-tone-mapping`'s Reinhard white point)
+        // a pure addition rather than a migration: it would serialize as
+        // `{"reinhard": {…}}` while these two keep the spellings every stored recipe
+        // and sidecar already contains.
+        assert_eq!(
+            serde_json::to_string(&DisplayToneCurve::Shoulder).unwrap(),
+            r#""shoulder""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DisplayToneCurve::None).unwrap(),
+            r#""none""#
+        );
+        assert_eq!(
+            serde_json::from_str::<DisplayToneCurve>(r#""none""#).unwrap(),
+            DisplayToneCurve::None
+        );
+        // Pinned because the encoding that would break them is one attribute away:
+        // adding `#[serde(tag = "type")]` respells both as `{"type": …}` objects, and
+        // nothing else in the suite would notice — including in the default recipe
+        // document that every sidecar and the `recipe` fingerprint are built from.
+        let document = serde_json::to_string(&PrintParams::default()).unwrap();
+        assert!(
+            document.contains(r#""display_tone":"shoulder""#),
+            "default recipe document changed shape: {document}"
+        );
+    }
+
+    #[test]
+    fn display_tone_display_impl_matches_its_serde_spelling() {
+        // `Display` is what the two validation messages interpolate, and the serde
+        // form is what the recipe parser accepts. Nothing but this test ties them
+        // together, so a variant added to one and not the other would tell a user to
+        // type a spelling their recipe rejects. Driven off `value_variants` so a new
+        // variant is covered without editing the test.
+        //
+        // A future *parameterized* operator serializes as an object rather than a bare
+        // string and will fail here — deliberately: that is the moment to decide what
+        // `Display` should spell for it.
+        for variant in <DisplayToneCurve as clap::ValueEnum>::value_variants() {
+            let wire = serde_json::to_value(variant).unwrap();
+            let wire = wire
+                .as_str()
+                .unwrap_or_else(|| panic!("{variant:?} no longer serializes as a string: {wire}"));
+            assert_eq!(variant.to_string(), wire, "{variant:?}");
+            // clap is the third spelling, and it is derived independently of serde: a
+            // `#[value(name = "…")]` would move the flag's spelling alone, so a message
+            // could still name one `--display-tone` rejects.
+            assert_eq!(
+                <DisplayToneCurve as clap::ValueEnum>::to_possible_value(variant)
+                    .unwrap()
+                    .get_name(),
+                wire,
+                "{variant:?}: clap's flag spelling"
+            );
+            // And the spelling a message hands the user round-trips back through the
+            // parser, which is the property the messages actually depend on.
+            assert_eq!(
+                serde_json::from_str::<DisplayToneCurve>(&format!("\"{variant}\"")).unwrap(),
+                *variant
+            );
+        }
+    }
 
     #[test]
     fn nc_error_exit_codes() {
