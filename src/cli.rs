@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::algo::density;
 use crate::io::decode::{DecodeInfo, decode_within, probe};
 use crate::io::{avif, encode, staged, ultra_hdr};
+use crate::pipeline::display_tone::DisplayTone;
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
@@ -31,9 +32,9 @@ use crate::pipeline::{color, film_base, gain_map, hdr, sdr, stages, working_spac
 use crate::telemetry;
 use crate::types::{
     AnchorPlacement, BalanceRange, BigTiff, DensityCurve, DensityCurveType, DensityParams,
-    DmaxSource, EncodeReport, FilmBase, FilmBaseParams, FilmBaseSource, FilmType, InputParams,
-    MeaningAssertion, NcError, OutDepth, OutputParams, OutputPreset, OutputStats, PrintParams,
-    Reconstruction, ReconstructionType, Result, TransferAssertion, WbSource,
+    DisplayToneCurve, DmaxSource, EncodeReport, FilmBase, FilmBaseParams, FilmBaseSource, FilmType,
+    InputParams, MeaningAssertion, NcError, OutDepth, OutputParams, OutputPreset, OutputStats,
+    PrintParams, Reconstruction, ReconstructionType, Result, TransferAssertion, WbSource,
 };
 use crate::version::{self, Identity};
 
@@ -570,6 +571,19 @@ pub struct PrintOverrides {
     /// Estimate the white-balance gains per frame from image statistics.
     #[arg(long = "auto-wb", value_enum, value_name = "MODE")]
     pub auto_wb: Option<AutoWb>,
+    /// Which tone curve the named display renderers apply (recipe key
+    /// `print.display_tone`, default `shoulder`). `none` skips the display
+    /// shoulder entirely, leaving the reconstruction to place every tone — gamut
+    /// mapping and the transfer encode still run. It suits a reconstruction that
+    /// is already bounded at the render's own ceiling — reference white on the SDR
+    /// presets, the 1000-nit mastering peak (≈4.93x reference white) on the HDR ones
+    /// — which a sigmoid curve with `shoulder > 0` and neutral print gains is.
+    /// Anything above that ceiling is then a loud error rather than a quiet clip. Display presets only, and it takes no knee
+    /// width: a *non-default* `--highlight-compress` is rejected beside `none`
+    /// rather than silently ignored (the default `0` asks for nothing and is
+    /// accepted).
+    #[arg(long = "display-tone", value_enum, value_name = "MODE")]
+    pub display_tone: Option<DisplayToneCurve>,
     /// Highlight roll-off amount; named SDR/HDR branches resolve their own knee.
     #[arg(long)]
     pub highlight_compress: Option<f32>,
@@ -974,9 +988,13 @@ pub struct HdrLinearTiffResult {
     /// largest value the renderer will produce, and the reason this output cannot
     /// be a 16-bit integer TIFF.
     pub linear_headroom: f32,
-    /// Resolved highlight-shoulder control and where the shoulder begins.
-    pub highlight_compress: f32,
-    pub shoulder_start: f32,
+    /// Resolved highlight-shoulder control and where the shoulder begins. Both are
+    /// **absent** when the render applied no display tone curve — there is no knee
+    /// then, and `tone_curve` is what says which of the two happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub highlight_compress: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shoulder_start: Option<f32>,
     /// Pinned tone-curve / gamut-mapping / linear-domain identifiers, straight from
     /// the renderer's own metadata rather than restated here.
     pub tone_curve: &'static str,
@@ -1023,6 +1041,12 @@ pub struct HdrCodedTiffResult {
     /// Reference white in cd/m² (203) and the mastering peak (1000).
     pub reference_white_nits: f32,
     pub target_peak_nits: f32,
+    /// Which display tone curve produced these pixels, straight from the renderer's
+    /// own metadata — the same identifier `hdr_linear_tiff` reports, and the field
+    /// that distinguishes a shouldered rendition from one whose tone came only from
+    /// the reconstruction (`print.display_tone`). Everything else in this block is
+    /// identical between the two.
+    pub tone_curve: &'static str,
     /// This frame's **measured** peak and average light levels in cd/m², for PQ.
     ///
     /// Present only for PQ, mirroring the `clli` box `io::avif` writes for the same
@@ -1057,11 +1081,22 @@ pub struct HdrCodedTiffResult {
 pub struct OutputRenderResult {
     /// The resolved output preset (`"legacy"` / `"film-master"`).
     pub preset: OutputPreset,
-    /// Whether the print / tone-render sub-stage (white balance, exposure, black
-    /// point, range placement, highlight roll-off) **ran at all** — not whether its
+    /// Whether the print / tone-render sub-stage **ran at all** — not whether its
     /// values were non-default. Always `false` for `film-master` (the branch never
-    /// reaches the stage), and also `false` for legacy `simple`, whose positive
-    /// passes through untouched (design-spec §7.1).
+    /// reaches the stage), and also `false` for legacy `simple`, whose positive passes
+    /// through untouched (design-spec §7.1).
+    ///
+    /// *Which* controls that covers is branch-dependent, so this flag is deliberately
+    /// not a promise about a fixed list: the shared display stage applies white
+    /// balance, exposure, black point and `linear_range`, while the frozen legacy path
+    /// applies white balance, exposure, black point and the above-`1.0`
+    /// `highlight_compress` soft clip — it never applies `linear_range` (which is why
+    /// `validate_output_preset` rejects a non-default one there).
+    ///
+    /// The display tone curve is **not** one of these: it is applied inside each
+    /// display renderer rather than in the shared stage, so it is reported by
+    /// [`display_tone`](Self::display_tone) and this flag stays `true` under
+    /// `display_tone = none`.
     pub print_controls: bool,
     /// Whether any display rendering — tone mapping, destination gamut mapping, or
     /// a transfer/display encoding — ran. Always `false` for `film-master` (its
@@ -1069,6 +1104,18 @@ pub struct OutputRenderResult {
     pub display_render: bool,
     /// The encoding the preset resolved to, as a stable identifier.
     pub encoding: &'static str,
+    /// Which display tone curve the branch applied, straight from the resolved
+    /// `print.display_tone` selector.
+    ///
+    /// Absent when the branch has no display tone stage **at all** — the legacy
+    /// path's frozen ordering and `film-master`'s bypass — which is a different
+    /// fact from having one and skipping it, and the reason this is an `Option`
+    /// rather than a defaulted selector. It is the only statement of tone policy
+    /// the SDR presets and the AVIF pair emit (neither writes a per-preset
+    /// contract block), so `content` states what the branch does *besides* tone
+    /// and never names a curve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_tone: Option<DisplayToneCurve>,
     /// What the pixels contain. For `film-master` this states the intentional-film
     /// content and explicitly disclaims physical scene recovery, and names which
     /// anchor placement the run actually made — roll-fixed `Dmax`, film-base-derived,
@@ -1129,8 +1176,14 @@ fn master_anchor(reconstruction: &Reconstruction) -> MasterAnchor {
 
 /// Build the report's `output_render` from the resolved config. Pure derivation
 /// (like [`reconstruction_result`]): the branch and what it applies are fully
-/// determined by the preset plus the reconstruction, so there is nothing to thread
-/// back from the render.
+/// determined by the preset, the reconstruction, and the resolved
+/// `print.display_tone` selector, so there is nothing to thread back from the
+/// render.
+///
+/// That third input is not optional bookkeeping. Deriving the block from the preset
+/// alone let `content` assert a shoulder the run had skipped, contradicting the
+/// per-preset block's own `tone_curve` in the same report — so tone is reported as a
+/// field and kept out of the prose.
 fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
     let (print_controls, display_render, encoding, content) = match cfg.output.preset {
         OutputPreset::FilmMaster => (
@@ -1209,10 +1262,9 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
             "display-linear HDR interchange: BT.2020/D65 primaries with **no \
              transfer function applied**, samples relative to the 203 cd/m² \
              reference white and running to the 1000 cd/m² peak at ≈4.926108. \
-             Print controls, the reference-white-preserving shoulder and BT.2020 \
-             gamut mapping have all run, so this is a rendered display image and \
-             not a film master; and being linear it is not a Rec.2100 PQ/HLG signal \
-             either",
+             Print controls and BT.2020 gamut mapping have both run, so this is a \
+             rendered display image and not a film master; and being linear it is \
+             not a Rec.2100 PQ/HLG signal either",
         ),
         OutputPreset::DisplayP3 => (
             true,
@@ -1220,10 +1272,10 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
             "display-p3-u16-tiff",
             "single-rendition SDR: Display P3 primaries with the sRGB transfer, \
              203 cd/m² reference white, stored losslessly as 16-bit integer codes. \
-             The shared print controls, the reference-white-preserving shoulder and \
-             gamut mapping into P3 have all run, so this is a rendered display \
-             image, not a film master — and unlike the legacy TIFF path it crosses \
-             the NC film RGB v1 → linear ACEScg boundary first",
+             The shared print controls and gamut mapping into P3 have both run, so \
+             this is a rendered display image, not a film master — and unlike the \
+             legacy TIFF path it crosses the NC film RGB v1 → linear ACEScg \
+             boundary first",
         ),
         OutputPreset::Compatibility => (
             true,
@@ -1267,11 +1319,28 @@ fn output_render_result(cfg: &ResolvedConfig) -> OutputRenderResult {
              a rendered display image, not a film master",
         ),
     };
+    // Sourced from the resolved selector, never inferred from the preset: a display
+    // branch applies whichever curve `print.display_tone` named. Matched
+    // exhaustively so a new preset has to state whether it has a display tone stage
+    // rather than inheriting one silently.
+    let display_tone = match cfg.output.preset {
+        OutputPreset::Legacy | OutputPreset::Custom | OutputPreset::FilmMaster => None,
+        OutputPreset::GainMapHdr
+        | OutputPreset::UltraHdrV1
+        | OutputPreset::DisplayP3
+        | OutputPreset::Compatibility
+        | OutputPreset::HdrPq
+        | OutputPreset::HdrHlg
+        | OutputPreset::HdrLinearTiff
+        | OutputPreset::HdrPqTiff
+        | OutputPreset::HdrHlgTiff => Some(cfg.print.display_tone),
+    };
     OutputRenderResult {
         preset: cfg.output.preset,
         print_controls,
         display_render,
         encoding,
+        display_tone,
         content,
         working_mapping: working_space::WORKING_MAPPING_ID,
         reconstruction_schema_version: crate::types::RECONSTRUCTION_SCHEMA_VERSION,
@@ -2426,6 +2495,9 @@ pub fn merge(mut cfg: ResolvedConfig, args: &ConvertArgs) -> Result<ResolvedConf
     } else if let Some(mode) = args.print.auto_wb {
         cfg.print.white_balance = mode.into();
     }
+    if let Some(v) = args.print.display_tone {
+        cfg.print.display_tone = v;
+    }
     if let Some(v) = args.print.highlight_compress {
         cfg.print.highlight_compress = v;
     }
@@ -2988,22 +3060,33 @@ pub fn validate_with_remedy(cfg: &ResolvedConfig, remedy: FilmBaseRemedy) -> Res
         )));
     }
     // Explicit gains must be positive; the auto modes carry no value to check
-    // here (estimated gains are guarded at the estimation point, exit 1). An auto
-    // mode only has an effect through a print white-balance stage — density
-    // reconstruction has one (both curves route through `finish_print`'s WB
-    // slot); `simple` does not (its positive passes through untouched).
-    // Whitelist the reconstruction that consumes the gains rather than blacklist
-    // `simple`: a future reconstruction that also skips the print stage must
-    // fail loudly here by default, not silently drop the requested estimation
-    // (exit 0, no gains) — the "forgotten coupled spot" trap.
+    // here (estimated gains are guarded at the estimation point, exit 1). Whitelist
+    // the reconstruction that consumes the gains rather than blacklist `simple`: a
+    // future reconstruction that also skips the print stage must fail loudly here by
+    // default, not silently drop the requested estimation (exit 0, no gains) — the
+    // "forgotten coupled spot" trap.
+    //
+    // **The rule is broader than its original reason, deliberately, for now.** It was
+    // written when `simple` had no white-balance stage at all: the legacy path routes
+    // density through `finish_print`'s WB slot and passes simple's positive through
+    // untouched. A display preset is different — `render_split::resolve_shared_controls`
+    // applies WB whatever the reconstruction, and resolves an auto mode there through
+    // the same `density::estimate_wb_gains`, so `simple` + a display preset + `--auto-wb`
+    // would work. Relaxing it is a *behaviour* change (it newly accepts a combination)
+    // and wants its own evidence that the estimators read sensibly off simple's
+    // unclamped positive, so the rule stays and the message below states what is true
+    // rather than the stale reason.
     match cfg.print.white_balance {
         WbSource::Explicit(gains) => positive("--white-balance", &gains)?,
         WbSource::GrayWorld | WbSource::Percentile
             if !matches!(cfg.reconstruction, Reconstruction::Density { .. }) =>
         {
             return Err(usage(
-                "--auto-wb needs --reconstruction density (simple reconstruction \
-                 has no print white-balance stage); pass explicit --white-balance \
+                "--auto-wb needs --reconstruction density: the auto estimators are \
+                 defined on the density path's corrected positive and nc does not \
+                 currently run them for `simple`. Note this is a restriction on \
+                 *estimation*, not on white balance itself — a display preset applies \
+                 explicit --white-balance gains to a simple reconstruction, so pass \
                  gains instead, or switch reconstruction"
                     .into(),
             ));
@@ -3030,6 +3113,31 @@ pub fn validate_with_remedy(cfg: &ResolvedConfig, remedy: FilmBaseRemedy) -> Res
     }
 
     validate_output_preset(cfg)?;
+
+    // A knee width describes where a shoulder starts, so it says nothing when no
+    // shoulder runs. Rejected rather than ignored — a user who set both stated two
+    // things and only one of them can happen, and the render would silently honour
+    // the other. (`DisplayTone::resolve` repeats this for stage callers.)
+    //
+    // **After `validate_output_preset`, deliberately.** This rule reasons about the
+    // *display* meaning of `highlight_compress`, which is only its meaning on a
+    // display branch: on `legacy` / `custom` the same knob is the above-`1.0` soft
+    // clip in `density::render_print`, and it genuinely applies there. Running first,
+    // this told a legacy user their knee width had no shoulder to place — blaming the
+    // knob that works instead of `display_tone`, the one that branch cannot apply.
+    // Ordering by specificity, like the film-base rule below.
+    if cfg.print.display_tone == DisplayToneCurve::None
+        && cfg.print.highlight_compress != PrintParams::default().highlight_compress
+    {
+        return Err(usage(format!(
+            "--highlight-compress / print.highlight_compress ({}) places the display \
+             shoulder's knee, but --display-tone / print.display_tone = none applies \
+             no shoulder to place. Drop one: keep `--display-tone none` for a render \
+             whose tone comes only from the reconstruction, or drop it to place the \
+             knee.",
+            cfg.print.highlight_compress
+        )));
+    }
 
     // Last, deliberately: `film_base.source` has no default, and `Dmin` is the
     // divisor of the density conversion, so falling into auto-detection by
@@ -3090,35 +3198,58 @@ fn linear_range_is_default(cfg: &ResolvedConfig) -> bool {
 ///    *frame-local measurements* — `auto` `Dmax` and an actually-consulted `auto`
 ///    `balance_range` — which normalize per frame and break the cross-frame
 ///    consistency a master exists to preserve.
-/// 3. **A non-default `print.linear_range` is display-only.** Every display preset
-///    consumes it through the shared display stage (`pipeline::render_split`) —
-///    `ultra-hdr-v1`, `hdr-pq`/`hdr-hlg`, `hdr-linear-tiff`, and
-///    `hdr-pq-tiff`/`hdr-hlg-tiff` — while the legacy path's frozen ordering does
-///    not include it. A knob that legacy would silently ignore is a loud error
-///    there. The check below keys on `preset == Legacy` and so is
-///    preset-agnostic: a new display preset inherits acceptance automatically, and
-///    `film-master` rejects the knob separately under rule 2.
+/// 3. **The display-only print knobs — `print.linear_range` and
+///    `print.display_tone` — are rejected on the legacy branch.** Every display
+///    preset consumes them (`linear_range` through the shared display stage,
+///    `display_tone` inside each display renderer) — `ultra-hdr-v1`,
+///    `hdr-pq`/`hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff`/`hdr-hlg-tiff`, and the
+///    two SDR presets — while the legacy path's frozen ordering includes neither:
+///    it has no shared range placement and no display tone curve at all
+///    (`--highlight-compress` there is the old above-`1.0` soft clip, a different
+///    operation). A knob that legacy would silently ignore is a loud error there.
+///    The check below keys on the *branch* and so is preset-agnostic: a new display
+///    preset inherits acceptance automatically, and `film-master` rejects both knobs
+///    separately under rule 2.
 fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
     let usage = NcError::Usage;
     let preset = cfg.output.preset;
 
     // Gated on **which branch renders**, not on one preset name: `custom` routes
     // through `render_legacy` exactly as `legacy` does (`stages::render`), so it
-    // ignores `linear_range` in exactly the same way. Naming only `Legacy` here let
+    // ignores these in exactly the same way. Naming only `Legacy` here let
     // `--output-preset custom --linear-range …` exit 0 and write a byte-identical
     // file — the silent knob drop this rule exists to prevent.
-    if !linear_range_is_default(cfg)
-        && matches!(preset, OutputPreset::Legacy | OutputPreset::Custom)
-    {
+    if matches!(preset, OutputPreset::Legacy | OutputPreset::Custom) {
         let [lo, hi] = cfg.print.linear_range;
-        return Err(usage(format!(
-            "--linear-range / print.linear_range ({lo},{hi}) is applied only by the \
-             shared display stage of a named display preset. The `{}` TIFF path keeps \
-             the frozen legacy ordering and does not apply it, so \
-             the value would be silently ignored — it is rejected instead. Leave it at \
-             the default `0,1`.",
-            preset.name()
-        )));
+        let display_only = [
+            (
+                !linear_range_is_default(cfg),
+                format!("--linear-range / print.linear_range ({lo},{hi})"),
+                "the shared display stage",
+                "the default `0,1`",
+            ),
+            (
+                cfg.print.display_tone != PrintParams::default().display_tone,
+                format!(
+                    "--display-tone / print.display_tone ({})",
+                    cfg.print.display_tone
+                ),
+                "the display renderers",
+                "the default `shoulder`",
+            ),
+        ];
+        if let Some((_, knob, applied_by, remedy)) = display_only
+            .into_iter()
+            .find(|(non_default, ..)| *non_default)
+        {
+            return Err(usage(format!(
+                "{knob} is applied only by {applied_by} of a named display preset. The \
+                 `{}` TIFF path keeps the frozen legacy ordering and does not apply it, \
+                 so the value would be silently ignored — it is rejected instead. Leave \
+                 it at {remedy}.",
+                preset.name()
+            )));
+        }
     }
 
     // Rule 1 — a named preset is atomic: it resolves the container *format*, depth, and
@@ -3223,6 +3354,7 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
         print_exposure,
         black_point,
         white_balance,
+        display_tone,
         highlight_compress,
         linear_range,
     } = &cfg.print;
@@ -3241,6 +3373,11 @@ fn validate_output_preset(cfg: &ResolvedConfig) -> Result<()> {
             "--white-balance / --auto-wb / print.white_balance",
             *white_balance != d.white_balance,
             format!("{white_balance:?}"),
+        ),
+        (
+            "--display-tone / print.display_tone",
+            *display_tone != d.display_tone,
+            format!("{display_tone}"),
         ),
         (
             "--highlight-compress / print.highlight_compress",
@@ -4231,15 +4368,16 @@ fn convert_frame(
                     )));
                 }
             };
+            // Resolved before the source is rendered: an unusable knee width then
+            // fails without having paid for the reconstruction and print stage.
+            let tone = DisplayTone::resolve(&cfg.print)?;
             let source =
                 stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
             let convert = source.convert;
             let mut timings = source.timings;
             let display_started = Instant::now();
-            let render = gain_map::render(
-                &source.shared,
-                gain_map::GainMapConfig::ultra_hdr_v1(cfg.print.highlight_compress),
-            )?;
+            let render =
+                gain_map::render(&source.shared, gain_map::GainMapConfig::ultra_hdr_v1(tone))?;
             // Both independent SDR/HDR display renders plus the common-domain gain
             // construction are color work. Keep them out of encode_ms so stage
             // totals account for every pixel operation even when telemetry is off.
@@ -4255,12 +4393,13 @@ fn convert_frame(
             // The same shared display source as every other display preset, stopped
             // one stage earlier — `render_linear` without `encode_transfer`, so the
             // samples stay display-linear BT.2020 and no transfer is ever applied.
+            let tone = DisplayTone::resolve(&cfg.print)?;
             let source =
                 stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
             let convert = source.convert;
             let mut timings = source.timings;
             let display_started = Instant::now();
-            let render = hdr::render_linear(&source.shared, cfg.print.highlight_compress)?;
+            let render = hdr::render_linear(&source.shared, tone)?;
             // The linear display render is colour work, like the PQ/HLG and gain-map
             // branches. Only the TIFF write belongs to encode_ms.
             timings.color_ms += elapsed_ms(display_started);
@@ -4284,12 +4423,13 @@ fn convert_frame(
                     cfg.output.preset.name()
                 ))
             })?;
+            let tone = DisplayTone::resolve(&cfg.print)?;
             let source =
                 stages::render_display_source(&image, &base.base, &cfg.reconstruction, &cfg.print)?;
             let convert = source.convert;
             let mut timings = source.timings;
             let display_started = Instant::now();
-            let render = hdr::render(&source.shared, transfer, cfg.print.highlight_compress)?;
+            let render = hdr::render(&source.shared, transfer, tone)?;
             // The display render and its PQ/HLG transfer are colour work, like the
             // gain-map branch above — coding alone belongs to encode_ms.
             timings.color_ms += elapsed_ms(display_started);
@@ -4558,6 +4698,7 @@ fn convert_frame(
             rms_quantization_error_codes: summary.rms_quantization_error_codes,
             reference_white_nits: metadata.linear.reference_white_nits,
             target_peak_nits: metadata.linear.target_peak_nits,
+            tone_curve: metadata.linear.tone_curve,
             // PQ only, for the same reason `io::avif` omits `clli` on HLG: HLG is
             // display-referred, so absolute content-light values would be a false
             // claim rather than a missing one.
@@ -8673,6 +8814,232 @@ mod tests {
     }
 
     #[test]
+    fn merge_display_tone_flag_replaces_the_recipe_selector() {
+        // The merge arm — a forgotten one silently makes `--display-tone` a no-op.
+        let cfg = merge(base_cfg(), &parse_convert(&["--display-tone", "none"])).unwrap();
+        assert_eq!(cfg.print.display_tone, DisplayToneCurve::None);
+        // Absent flag → the recipe's selector survives.
+        let recipe: ResolvedConfig =
+            serde_json::from_str(r#"{"print":{"display_tone":"none"}}"#).unwrap();
+        assert_eq!(
+            merge(recipe.clone(), &parse_convert(&[]))
+                .unwrap()
+                .print
+                .display_tone,
+            DisplayToneCurve::None
+        );
+        // Passing the documented default is the flags-win *reset* of a recipe's
+        // non-default selector — what makes such a recipe usable under `film-master`.
+        assert_eq!(
+            merge(recipe, &parse_convert(&["--display-tone", "shoulder"]))
+                .unwrap()
+                .print
+                .display_tone,
+            DisplayToneCurve::Shoulder
+        );
+        // No flag, no recipe key → the shipped shoulder.
+        assert_eq!(
+            merge(base_cfg(), &parse_convert(&[]))
+                .unwrap()
+                .print
+                .display_tone,
+            DisplayToneCurve::Shoulder
+        );
+    }
+
+    #[test]
+    fn a_knee_width_beside_no_tone_curve_is_rejected_not_dropped() {
+        // `highlight_compress` places the shoulder's knee, so it describes nothing
+        // without a shoulder. Rejected loudly rather than silently ignored.
+        let cfg = ResolvedConfig {
+            print: PrintParams {
+                display_tone: DisplayToneCurve::None,
+                highlight_compress: 1.0,
+                ..PrintParams::default()
+            },
+            output: OutputParams {
+                preset: OutputPreset::UltraHdrV1,
+                ..OutputParams::default()
+            },
+            ..base_cfg()
+        };
+        let msg = validate_err(&cfg);
+        assert!(msg.contains("highlight_compress"), "{msg}");
+        assert!(msg.contains("no shoulder to place"), "{msg}");
+
+        // Falsifiable: each half alone is fine on a display preset.
+        let mut ok = cfg.clone();
+        ok.print.highlight_compress = 0.0;
+        validate(&ok).unwrap();
+        let mut ok = cfg;
+        ok.print.display_tone = DisplayToneCurve::Shoulder;
+        validate(&ok).unwrap();
+    }
+
+    #[test]
+    fn the_default_knee_width_is_accepted_beside_no_tone_curve() {
+        // `--display-tone none --highlight-compress 0` is **correct** to accept, and
+        // this pins it so a later "the flag was passed, reject it" tightening trips a
+        // test instead of shipping.
+        //
+        // `0` is the identity for that knob: it asks for nothing the render would not
+        // already do, so it contradicts nothing. That makes it the `--bigtiff auto`
+        // case, not the `--out-depth u16` case — `u16` is rejected by *presence*
+        // because it still forces a depth an atomic preset cannot produce, while a
+        // zero knee width forces no knee. Rejecting it by presence would also kill the
+        // documented flags-win reset (`merge_display_tone_flag_replaces_the_recipe_selector`):
+        // a recipe carrying a knee width could never be re-run with `none`.
+        let cfg = |highlight_compress: f32| ResolvedConfig {
+            print: PrintParams {
+                display_tone: DisplayToneCurve::None,
+                highlight_compress,
+                ..PrintParams::default()
+            },
+            output: OutputParams {
+                preset: OutputPreset::DisplayP3,
+                ..OutputParams::default()
+            },
+            ..base_cfg()
+        };
+        assert_eq!(PrintParams::default().highlight_compress, 0.0);
+        validate(&cfg(0.0)).unwrap();
+        // The flag provenance is accepted too — the rule reads the resolved value, so
+        // typing the default must behave exactly like omitting it.
+        let merged = merge(
+            base_cfg(),
+            &parse_convert(&[
+                "--output-preset",
+                "display-p3",
+                "--display-tone",
+                "none",
+                "--highlight-compress",
+                "0",
+            ]),
+        )
+        .unwrap();
+        validate(&merged).unwrap();
+        // Falsifiable: a non-zero width beside `none` is still the loud contradiction.
+        assert!(
+            validate_err(&cfg(1.0)).contains("no shoulder to place"),
+            "a non-default knee width must still be rejected"
+        );
+    }
+
+    #[test]
+    fn the_default_tone_selector_is_accepted_on_every_non_display_branch() {
+        // `--display-tone shoulder` on `legacy` / `custom` / `film-master` is
+        // **correct** to accept: rule 3 is a resolved-*value* rule, and `shoulder` is
+        // the documented default, so it asserts nothing those branches contradict.
+        //
+        // It is also the idiom that makes a recipe carrying `display_tone: none`
+        // usable on them at all — the flags-win reset
+        // `merge_display_tone_flag_replaces_the_recipe_selector` documents. A presence
+        // rule here would remove that escape hatch and would have to be mirrored for
+        // recipe keys to keep the two provenances indistinguishable, which is the
+        // trade `validate_output_preset`'s rustdoc declines.
+        let recipe: ResolvedConfig =
+            serde_json::from_str(r#"{"print":{"display_tone":"none"}}"#).unwrap();
+        for preset in ["legacy", "custom", "film-master"] {
+            let cfg = merge(
+                recipe.clone(),
+                &parse_convert(&[
+                    "--output-preset",
+                    preset,
+                    "--display-tone",
+                    "shoulder",
+                    "--auto-base",
+                ]),
+            )
+            .unwrap();
+            assert_eq!(cfg.print.display_tone, DisplayToneCurve::Shoulder);
+            validate(&cfg).unwrap_or_else(|e| panic!("{preset}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_branch_rule_outranks_the_knee_contradiction_on_the_legacy_path() {
+        // Both rules match a legacy config carrying `display_tone = none` *and* a knee
+        // width, and only one of them describes it correctly: on the legacy branch
+        // `highlight_compress` is the above-1.0 soft clip and genuinely applies, so
+        // blaming the knee width points at the knob that works. `display_tone` is the
+        // one that branch cannot apply, and rule 3 is what says so.
+        let cfg = |preset: OutputPreset| ResolvedConfig {
+            print: PrintParams {
+                display_tone: DisplayToneCurve::None,
+                highlight_compress: 2.0,
+                ..PrintParams::default()
+            },
+            output: OutputParams {
+                preset,
+                ..OutputParams::default()
+            },
+            ..base_cfg()
+        };
+        for preset in [OutputPreset::Legacy, OutputPreset::Custom] {
+            let msg = validate_err(&cfg(preset));
+            assert!(msg.contains("frozen legacy ordering"), "{preset:?}: {msg}");
+            assert!(
+                !msg.contains("no shoulder to place"),
+                "{preset:?}: the knee contradiction pre-empted the branch rule: {msg}"
+            );
+        }
+        // On a display branch the knee contradiction is the correct diagnosis, so the
+        // ordering must not have silenced it.
+        let msg = validate_err(&cfg(OutputPreset::DisplayP3));
+        assert!(msg.contains("no shoulder to place"), "{msg}");
+    }
+
+    #[test]
+    fn display_tone_is_consumed_only_by_the_display_presets() {
+        // Same shape as `linear_range_is_consumed_only_by_the_display_preset`, and for
+        // the same reason: legacy/`custom` render a branch with no display tone curve
+        // at all, and `film-master` bypasses display rendering entirely. Assert each
+        // rule's own distinctive wording — both messages name `display_tone`, so a
+        // `contains("display_tone")` check alone would survive one rule vanishing.
+        let cfg_with = |preset: OutputPreset| ResolvedConfig {
+            print: PrintParams {
+                display_tone: DisplayToneCurve::None,
+                ..PrintParams::default()
+            },
+            output: OutputParams {
+                preset,
+                ..OutputParams::default()
+            },
+            ..base_cfg()
+        };
+        for preset in [OutputPreset::Legacy, OutputPreset::Custom] {
+            let msg = validate_err(&cfg_with(preset));
+            assert!(msg.contains("display_tone"), "{preset:?}: {msg}");
+            assert!(msg.contains(preset.name()), "{preset:?}: {msg}");
+            assert!(msg.contains("frozen legacy ordering"), "{preset:?}: {msg}");
+        }
+        let msg = validate_err(&cfg_with(OutputPreset::FilmMaster));
+        assert!(msg.contains("display_tone"), "{msg}");
+        assert!(
+            msg.contains("bypasses all print and display controls"),
+            "{msg}"
+        );
+        // Every display preset accepts it — including the SDR pair, which is where it
+        // changes pixels today.
+        for preset in [
+            OutputPreset::GainMapHdr,
+            OutputPreset::UltraHdrV1,
+            OutputPreset::DisplayP3,
+            OutputPreset::Compatibility,
+            OutputPreset::HdrPq,
+            OutputPreset::HdrHlg,
+            OutputPreset::HdrLinearTiff,
+            OutputPreset::HdrPqTiff,
+            OutputPreset::HdrHlgTiff,
+        ] {
+            validate(&cfg_with(preset)).unwrap_or_else(|e| panic!("{preset:?}: {e}"));
+        }
+        // The default selector is fine everywhere.
+        validate(&base_cfg()).unwrap();
+        validate(&film_master_cfg()).unwrap();
+    }
+
+    #[test]
     fn ultra_hdr_preset_is_convert_only_and_requires_a_jpeg_suffix() {
         let cfg = ResolvedConfig {
             output: OutputParams {
@@ -9659,6 +10026,32 @@ mod tests {
                 "working_mapping",
             ]
         );
+
+        // A branch with no display tone stage omits `display_tone` entirely — the key
+        // set above is that assertion. A display preset carries the resolved selector,
+        // and its `content` states what the branch does *besides* tone rather than
+        // naming a curve that may not have run.
+        for preset in [OutputPreset::DisplayP3, OutputPreset::HdrLinearTiff] {
+            for tone in [DisplayToneCurve::Shoulder, DisplayToneCurve::None] {
+                let block = value(&ResolvedConfig {
+                    print: PrintParams {
+                        display_tone: tone,
+                        ..PrintParams::default()
+                    },
+                    output: OutputParams {
+                        preset,
+                        ..OutputParams::default()
+                    },
+                    ..base_cfg()
+                });
+                assert_eq!(block["display_tone"], tone.to_string(), "{preset:?}");
+                let content = block["content"].as_str().unwrap();
+                assert!(
+                    !content.contains("shoulder"),
+                    "{preset:?}: content names a tone curve: {content}"
+                );
+            }
+        }
 
         // The master's content claim must not invent a Dmax placement it did not make:
         // validation deliberately accepts exponential `dmax = none`, and `simple` has no

@@ -732,6 +732,7 @@ impl From<tiff::TiffError> for NcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::display_tone::DisplayTone;
     use crate::types::OutputPreset;
     use std::io::Cursor;
     use tiff::decoder::{Decoder, DecodingResult};
@@ -1045,7 +1046,7 @@ mod tests {
             ..PrintParams::default()
         };
         let shared = display_source(map_nc_film_rgb_v1(film), &print).unwrap();
-        crate::pipeline::hdr::render_linear(&shared, 0.75).unwrap()
+        crate::pipeline::hdr::render_linear(&shared, DisplayTone::shoulder(0.75).unwrap()).unwrap()
     }
 
     fn hdr_linear_params() -> OutputParams {
@@ -1239,7 +1240,8 @@ mod tests {
         let (film, _) =
             reconstruct(&image, &FilmBase::from([1.0; 3]), &Reconstruction::Simple).unwrap();
         let shared = display_source(map_nc_film_rgb_v1(film), &PrintParams::default()).unwrap();
-        crate::pipeline::hdr::render(&shared, transfer, 0.75).unwrap()
+        crate::pipeline::hdr::render(&shared, transfer, DisplayTone::shoulder(0.75).unwrap())
+            .unwrap()
     }
 
     fn coded_params(preset: crate::types::OutputPreset) -> OutputParams {

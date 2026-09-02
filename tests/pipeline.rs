@@ -8079,3 +8079,262 @@ fn telemetry_reports_the_primary_containers_depth_not_the_ir_planes() {
         );
     }
 }
+
+#[test]
+fn display_tone_none_changes_the_sdr_render_and_reports_which_curve_ran() {
+    // The knob's product claim: on a display preset it is a real pixel change, and
+    // the report says which of the two curves produced them.
+    let tmp = TempDir::new("display-tone");
+    let scan = fixture("hdr-48bit.tif");
+    let mut bytes = Vec::new();
+    for (tag, extra) in [
+        ("shoulder", vec![]),
+        ("none", vec!["--display-tone", "none"]),
+    ] {
+        let out = tmp.path(&format!("{tag}.tiff"));
+        let mut args = vec![
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            "display-p3",
+            "--film-base",
+            "0.9,0.6,0.5",
+        ];
+        args.extend(extra);
+        let (code, stdout, err) = run(&args);
+        assert_eq!(code, 0, "{tag}: {err}");
+        // The resolved recipe is what makes the two runs distinguishable in the
+        // report for *every* preset, so assert it rather than a per-preset block.
+        let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(report["recipe"]["print"]["display_tone"], tag, "{tag}");
+        bytes.push(std::fs::read(&out).unwrap());
+    }
+    assert_ne!(
+        bytes[0], bytes[1],
+        "skipping the display shoulder must change the rendered pixels"
+    );
+}
+
+#[test]
+fn display_tone_none_states_its_curve_in_the_coded_hdr_report_block() {
+    // `hdr_coded_tiff` carries the rendition's tone identifier, so a consumer reading
+    // the contract block alone can tell the two renditions apart.
+    let tmp = TempDir::new("display-tone-coded");
+    let scan = fixture("hdr-48bit.tif");
+    let out = tmp.path("pq.tiff");
+    let (code, stdout, err) = run(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-preset",
+        "hdr-pq-tiff",
+        "--display-tone",
+        "none",
+        "--film-base",
+        "0.9,0.6,0.5",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["hdr_coded_tiff"]["tone_curve"], "no-tone-curve-v1");
+}
+
+#[test]
+fn output_render_reports_the_tone_curve_that_actually_ran() {
+    // `output_render` is the one block every preset emits, and it must never assert a
+    // tone curve the run skipped. The SDR presets emit no per-preset contract block at
+    // all and the AVIF pair's carries no rendering policy, so for them this field is
+    // the report's only statement of tone.
+    let tmp = TempDir::new("display-tone-output-render");
+    let scan = fixture("hdr-48bit.tif");
+    for (preset, ext) in [("display-p3", "tiff"), ("hdr-linear-tiff", "tiff")] {
+        for (tone, extra) in [
+            ("shoulder", vec![]),
+            ("none", vec!["--display-tone", "none"]),
+        ] {
+            let out = tmp.path(&format!("{preset}-{tone}.{ext}"));
+            let mut args = vec![
+                "convert",
+                scan.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--output-preset",
+                preset,
+                "--film-base",
+                "0.9,0.6,0.5",
+            ];
+            args.extend(extra);
+            let (code, stdout, err) = run_exact(&args);
+            assert_eq!(code, 0, "{preset}/{tone}: {err}");
+            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(
+                report["output_render"]["display_tone"], tone,
+                "{preset}/{tone}"
+            );
+            // And the prose must not contradict it by naming a curve of its own.
+            let content = report["output_render"]["content"].as_str().unwrap();
+            assert!(
+                !content.contains("shoulder"),
+                "{preset}/{tone}: content names a tone curve: {content}"
+            );
+        }
+    }
+    // A branch with no display tone stage omits the field rather than claiming a
+    // curve — `display_tone: "shoulder"` there would assert one that never ran.
+    let out = tmp.path("legacy.tiff");
+    let (code, stdout, err) = run_exact(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-preset",
+        "legacy",
+        "--film-base",
+        "0.9,0.6,0.5",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let branch = &report["output_render"];
+    // The block has to be shown present *first*: indexing a missing key yields
+    // `Value::Null`, and `Null.get(…)` is also `None`, so asserting the field's absence
+    // alone would pass just as well if `output_render` disappeared entirely.
+    assert_eq!(branch["preset"], "legacy", "{branch}");
+    assert!(branch.get("display_tone").is_none(), "{branch}");
+}
+
+#[test]
+fn display_tone_none_is_refused_where_no_display_tone_curve_runs() {
+    let tmp = TempDir::new("display-tone-refused");
+    let scan = fixture("hdr-48bit.tif");
+    // Legacy renders a branch that has no display tone curve at all, and
+    // `film-master` bypasses display rendering — both must refuse rather than
+    // silently ignore the selector.
+    for (preset, suffix, expected) in [
+        ("legacy", "tiff", "frozen legacy ordering"),
+        ("custom", "tiff", "frozen legacy ordering"),
+        (
+            "film-master",
+            "tiff",
+            "bypasses all print and display controls",
+        ),
+    ] {
+        let out = tmp.path(&format!("{preset}.{suffix}"));
+        let (code, _stdout, err) = run_exact(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--display-tone",
+            "none",
+            "--film-base",
+            "0.9,0.6,0.5",
+        ]);
+        assert_eq!(code, 2, "{preset}: {err}");
+        assert!(err.contains(expected), "{preset}: {err}");
+        assert!(!out.exists(), "{preset}: refused runs must write nothing");
+    }
+    // And a knee width beside `none` is a contradiction, not a silent drop.
+    let out = tmp.path("contradiction.tiff");
+    let (code, _stdout, err) = run_exact(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-preset",
+        "display-p3",
+        "--display-tone",
+        "none",
+        "--highlight-compress",
+        "1",
+        "--film-base",
+        "0.9,0.6,0.5",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("no shoulder to place"), "{err}");
+}
+
+#[test]
+fn display_tone_none_refuses_a_reconstruction_that_overshoots_reference_white() {
+    // The mode polices itself instead of needing a curve-type gate: `--sigmoid-shoulder
+    // 0` removes the reconstruction's own bound, and the render then fails naming the
+    // pixel rather than clipping it quietly.
+    let tmp = TempDir::new("display-tone-overshoot");
+    let scan = fixture("hdr-48bit.tif");
+    let out = tmp.path("overshoot.tiff");
+    let args = |extra: Vec<&str>| {
+        let mut args = vec![
+            "convert".to_string(),
+            scan.to_str().unwrap().to_string(),
+            "-o".to_string(),
+            out.to_str().unwrap().to_string(),
+            "--output-preset".to_string(),
+            "display-p3".to_string(),
+            "--film-base".to_string(),
+            "0.9,0.6,0.5".to_string(),
+            "--sigmoid-shoulder".to_string(),
+            "0".to_string(),
+        ];
+        args.extend(extra.into_iter().map(str::to_string));
+        args
+    };
+    let unbounded = args(vec!["--display-tone", "none"]);
+    let (code, _stdout, err) = run_exact(&unbounded.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("no display tone curve"), "{err}");
+    assert!(err.contains("above reference white"), "{err}");
+    assert!(err.contains("pixel "), "{err}");
+
+    // Falsifiable: the same reconstruction renders fine *with* the shoulder, so the
+    // refusal is the mode's bound and not a broken fixture.
+    let shouldered = args(vec![]);
+    let (code, _stdout, err) =
+        run_exact(&shouldered.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn the_no_tone_curve_ceiling_is_per_branch_not_one_reference_white() {
+    // `docs/using-nc.md` promises the SDR presets stop at reference white while the
+    // HDR ones stop at the 1000-nit peak, so the *same* overshoot is refused on one
+    // and renders on the other. Both single-branch bounds are unit-tested; this pins
+    // the difference between them, which is the part a reader acts on — and the part
+    // that makes HDR headroom reachable under `--display-tone none`.
+    let tmp = TempDir::new("display-tone-ceilings");
+    let scan = fixture("hdr-48bit.tif");
+    let run_preset = |preset: &str, name: &str| {
+        let out = tmp.path(name);
+        let (code, _stdout, err) = run_exact(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--output-preset",
+            preset,
+            "--display-tone",
+            "none",
+            // A mild lift: enough to cross reference white, nowhere near the peak.
+            "--print-exposure",
+            "0.3",
+            "--film-base",
+            "0.9,0.6,0.5",
+        ]);
+        (code, err)
+    };
+
+    let (code, err) = run_preset("display-p3", "sdr.tiff");
+    assert_eq!(
+        code, 1,
+        "SDR must refuse an overshoot of reference white: {err}"
+    );
+    assert!(err.contains("above reference white"), "{err}");
+
+    let (code, err) = run_preset("hdr-pq-tiff", "hdr.tiff");
+    assert_eq!(
+        code, 0,
+        "the same overshoot is well inside the HDR peak and must render: {err}"
+    );
+}

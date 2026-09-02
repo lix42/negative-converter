@@ -608,12 +608,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   tagging it), and a **machine-readable SDR contract** in the report (the
   `hdr_coded_tiff` block is the shape to follow). `RunProfile::SdrTiff` is no longer
   one of them: it was measured against peak on two frame sizes on 2026-08-09.
-- `output/linear-render` (post-MVP; no downstream blockers): `output/sdr-display-rendering`
-  — let a display render skip its tone curve. Both renderers apply a fixed Hermite shoulder
-  today and neither can disable it (`highlight_compress` only moves the knee, 0.75 at the
-  default and never later), so under the shipped sigmoid — which guarantees output ≤ 1.0 —
-  SDR is shouldered twice. No curve-type gate: `sdr::render` already errors on out-of-range
-  samples, so the mode is self-policing
+- `output/linear-render` (**done** 2026-09-01; no downstream blockers):
+  `output/sdr-display-rendering`
+  — shipped `print.display_tone` / `--display-tone <shoulder|none>`, applied by both display
+  branches and rejected by the legacy branch and `film-master`. `none` skips the display
+  Hermite so a reconstruction already bounded at reference white is not shouldered twice;
+  gamut mapping and the transfer encode still run. Self-policing rather than curve-gated.
+  The selector is the extension point `output/display-tone-mapping`'s operator plugs into —
+  a payload variant is a pure recipe addition, only the CLI wiring changes
 - `output/display-tone-mapping` (post-MVP; no downstream blockers): `output/sdr-display-rendering`, `output/hdr-display-rendering`
   — replace the fixed-ceiling Hermite knee with a real tone-mapping operator carrying a
   stated **white point**. Measured 2026-08-28: the knee cannot hold content overshooting by
@@ -900,12 +902,14 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [MP container conformance (CIPA DC-007)](tasks/output/mp-container-conformance.md) — **deferred conformance**, split out of `iso-gain-map-metadata` on 2026-08-06 after reading the free CIPA text. Three gaps, none functional: the gain map carries MP Type `000000` (Undefined) where DC-007 Table 4 assigns `050000` and marks `000000` "shall not be used" in a Baseline MP File — inherited from libultrahdr, whose own output does the same — the baseline is JFIF with no Exif APP1 where §4.2.1/§5.1 specify an Exif file (§7's *tag* requirements are only "should"), and in the gain-map image libultrahdr's prepended XMP puts `APP1` before `APP0 JFIF`, so JFIF is not first in the dependent image (found by review, not in the CIPA read). The type code is a masked 4-byte MPEntry patch but **changes shipped `ultra-hdr-v1` bytes**; the Exif half must be probed against `package()` and re-run through the ImageIO oracle, since a marker-layout change is exactly what silently disabled the ISO metadata once. Blocks nothing
 - [ ] [Gain-map dialect activation](tasks/output/gain-map-dialect-activation.md) — the two items `iso-gain-map-metadata` shipped without: **Android 15+** decoder verification (the only platform reading *both* dialects, so the only place coexistence is observable — record whichever it prefers as *observed behaviour*, never a conformance property) and a **CLI path** for `Dialects::LegacyPlusIso`, which is implemented, Apple-verified, and reachable only from an `#[ignore]` test. Removing its `#[allow(dead_code)]` is the mechanical definition of done. Blocks nothing; **not** a dependency of `output/presets` — per the `hdr-avif-output` boundary rule, whichever task ships the CLI surface owns the `gain-map-hdr` name, so coordinate rather than race. `ultra-hdr-v1` must stay byte-identical
 - [ ] [SDR preset follow-ups](tasks/output/sdr-preset-followups.md) — the three questions the `display-p3` / `compatibility` presets deliberately left open: **making `display-p3` the default** (decided 2026-08-09; a pixel *and* container change against the incumbent `gain-map-hdr`, so it needs its own version bump + report, and it is what finally lets `legacy` be deleted), **Adobe RGB** as a first-class gamut (the one notable omission for a photography tool — usable today only via `--output-profile <icc>`, and a real addition because the modern renderer *gamut-maps* rather than tags), and a **machine-readable SDR contract** in the report (today the preset's tone/gamut/transfer contract is prose only, where `hdr-pq-tiff` emits an `hdr_coded_tiff` block). `RunProfile::SdrTiff` was one of the three and is now settled — measured against peak on two frame sizes on 2026-08-09. Blocks nothing
-- [ ] [Linear display render](tasks/output/linear-render.md) — let a display render skip its
-  tone curve. The shipped sigmoid guarantees stage-3 output ≤ 1.0, so the fixed Hermite
-  shoulder then compresses already-rolled-off highlights a second time; `highlight_compress`
-  can only move the knee earlier, never disable it, and measured **worse** in every config
-  tried (6.45% → 6.64% blown on the default). Needs no curve-type gate — `sdr::render`
-  already errors on out-of-range samples
+- [x] [Linear display render](tasks/output/linear-render.md) — `print.display_tone` /
+  `--display-tone <shoulder|none>`, on **both** display branches. Measured on ten fixture
+  frames against the shipped default reconstruction: `blown%` fell on every one (mean 6.5 →
+  4.9), `code sep` improved on the three whose p90 sits above the knee and is blind on the
+  rest, midtones bit-identical. No curve-type gate — the renderers' range checks make the
+  mode self-policing. Default unchanged, so `pipeline_version` stays 3 (only the `recipe`
+  fingerprint moved). The residual ~4–5% blown is the *reconstruction's*, which sizes
+  `output/display-tone-mapping`
 - [ ] [Display tone mapping](tasks/output/display-tone-mapping.md) — give each display
   renderer a real tone-mapping operator with a stated **white point**, replacing the
   fixed-ceiling Hermite. Measured: the knee pins over-range content at the ceiling with zero

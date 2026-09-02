@@ -1611,3 +1611,18 @@ the task as shipped and stays verbatim.
   it to a roll re-derived all three per frame, with no warning beyond an incidental
   region-uniformity note.
 - Precedent exists: roll already warns when the film base is not `explicit`.
+
+### 2026-09-01 — cross-reference: the v3 `recipe` fingerprint was refreshed in place
+
+Appended rather than edited into the `conversion-versioning` section above, which
+records the task as shipped and stays verbatim.
+
+- `output/linear-render` added `print.display_tone` (default `shoulder`), so the
+  **default recipe document gained a key** and its hash moved
+  `5b22d0505ed4fb79` → `a26e8ec6434e8ebc`. `render` and `base` are byte-identical,
+  because the default selector resolves to exactly the shoulder v3 already applied
+  — no default pixel moved, and `PIPELINE_VERSION` stays 3.
+- This is the case the table sanctions editing `recipe` in place for. Bumping
+  instead would have been actively harmful: `pipeline_version_warning` fires on any
+  mismatch, so a user re-running an archived v3 sidecar would be told "the output
+  will not match the original" when it matches exactly.

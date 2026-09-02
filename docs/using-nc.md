@@ -27,10 +27,16 @@ shape every workflow below:
   explicitly ask for it.
 - **Every knob is a CLI flag *and* a recipe key**, and nothing is reachable only
   from code. Passing a flag that doesn't apply to your selected *curve* or *preset*
-  is a **loud error**, never a no-op. The exception is `--reconstruction simple`,
-  which has no print stage: `--print-exposure`, `--black-point`,
-  `--highlight-compress` and `--white-balance` are accepted there and silently do
-  nothing (verified — the output is byte-identical).
+  is a **loud error**, never a no-op. The exception is `--reconstruction simple`
+  **on the `legacy` / `custom` path**, which has no print stage: `--print-exposure`,
+  `--black-point`, `--highlight-compress` and `--white-balance` are accepted there
+  and silently do nothing (verified — the output is byte-identical). On a display
+  preset — including the default — they all reach the render whatever the
+  reconstruction, so they *do* change the picture: white balance, exposure and the
+  black point run in the shared display stage, and `--highlight-compress` places the
+  knee inside each display renderer. `--auto-wb` is the exception on both paths: it
+  still requires `--reconstruction density` and is a usage error under `simple`, even
+  on a display preset — pass explicit `--white-balance` gains there.
 - **Calibrate once, apply many.** The film base (`Dmin`) and the reference density
   (`Dmax`) are properties of the *roll* — film stock, development, scanner — not
   of an individual frame. You measure them once and reuse them, which is what
@@ -333,6 +339,7 @@ nc params
   "film_base": { "source": null },
   "print":     { "print_exposure": 0.0, "black_point": 0.0,
                  "white_balance": { "explicit": [1.0, 1.0, 1.0] },
+                 "display_tone": "shoulder",
                  "highlight_compress": 0.0, "linear_range": [0.0, 1.0] },
   "output":    { "preset": "gain-map-hdr", "depth": "u16",
                  "output_profile": null, "bigtiff": "auto" }
@@ -376,7 +383,7 @@ ignored:
 ```
 usage: invalid recipe t.json: unknown field `exposure`,
        expected one of `print_exposure`, `black_point`, `white_balance`,
-       `highlight_compress`, `linear_range`
+       `display_tone`, `highlight_compress`, `linear_range`
 ```
 
 This means a **misplaced** key fails too — a key must live under the stage section
@@ -610,7 +617,8 @@ This is deliberate: a flag that quietly did nothing would be worse than a failur
 | `--black-point F` | Paper black / shadow floor |
 | `--white-balance R,G,B` | Explicit highlight / neutral gains |
 | `--auto-wb MODE` | Estimate gains per frame — `gray-world` (≈ NLP Auto-AVG) or `percentile` (≈ NLP Auto-Neutral, more robust to a dominant scene colour) |
-| `--highlight-compress F` | Highlight roll-off |
+| `--highlight-compress F` | Highlight roll-off — where the display shoulder's knee sits |
+| `--display-tone MODE` | `shoulder` (default) or `none` — see below. **Display presets only** |
 | `--linear-range LOW,HIGH` | Affine black/white placement, applied last — **display presets only**, which includes the default (see §8) |
 
 `--white-balance` and `--auto-wb` are the two faces of one setting and are mutually
@@ -623,6 +631,68 @@ nc convert scan.tif -o out.jpg --film-base … --auto-wb percentile \
 ```
 
 Feed that back as an explicit `--white-balance` to freeze it across a roll.
+
+### `--display-tone` — skipping the display shoulder
+
+Display presets normally apply a Hermite shoulder that rolls highlights off to
+display white, with `--highlight-compress` moving its knee earlier. The default
+sigmoid *already* places every tone below reference white, so that shoulder
+compresses highlights a second time. `--display-tone none` skips it:
+
+```sh
+nc convert scan.tif -o out.tiff --output-preset display-p3 \
+  --film-base … --display-tone none
+```
+
+Measured over ten reference frames on the shipped default reconstruction, this
+reduced the share of the frame at absolute white on **every** frame (mean 6.5% →
+4.9%) and improved highlight separation most on the frames where it was worst.
+Midtones and shadows are untouched — only values above the knee change.
+
+The report says which of the two ran, in a block every preset emits:
+`.output_render.display_tone` is `"shoulder"` or `"none"` on a display preset, and
+absent on `legacy` / `custom` / `film-master`, which have no display tone stage.
+
+What it does *not* skip: gamut mapping and the transfer encode still run, so this
+is "no tone curve", not "raw pixels out". And it needs a reconstruction bounded by
+the render's own ceiling — the default sigmoid (`--sigmoid-shoulder` above 0) with
+neutral print gains is. **The two ceilings differ**: the SDR presets stop at
+reference white, the HDR ones at the 1000-nit mastering peak (≈4.93x reference
+white), so the same overshoot can be refused on `display-p3` and render cleanly on
+`hdr-pq` — that headroom is exactly what an HDR rendition exists to carry. If
+anything exceeds its branch's ceiling, the render **fails** naming the pixel rather
+than clipping it quietly:
+
+```
+error: SDR display rendering applied no display tone curve, but pixel 9 sits above
+reference white (luminance 1.1606276). …
+```
+
+**"Neutral print gains" is part of the requirement, not a footnote — and the check
+is late.** The shared print controls run *before* the display render, so a
+non-neutral one can lift samples past reference white even under a bounded sigmoid:
+`--print-exposure 0.3`, `--white-balance 1.3,1,1`, `--auto-wb percentile` and
+`--linear-range 0,0.5` each trip the error above on the same frame that renders
+cleanly with neutral gains. Nothing is rejected up front, because the real condition
+is a pixel value rather than a flag combination — so nc renders the whole frame
+first and *then* exits 1, writing no file. On a large scan, prove `--display-tone
+none` out with neutral print controls before adding grading on top.
+
+Two rules follow from the knob being display-only: `legacy`, `custom` and
+`film-master` reject it (they apply no display tone curve at all), and passing a
+*non-default* `--highlight-compress` beside `none` is a usage error — a knee width
+describes nothing when there is no knee. `--highlight-compress 0` is the default
+and asks for nothing, so it is accepted.
+
+**On the default `gain-map-hdr` preset, `none` makes the gain map inert by
+construction.** The examples above use `display-p3`, but the default renders *both*
+branches: skipping the shoulder makes the SDR and HDR renditions carry the same
+luminance, so their ratio is exactly 1.0 everywhere. nc still writes a valid
+gain-map JPEG and exits 0 without a warning. That is the §8 known issue in its
+sharpest form — the shipped default already decodes at 1.0x — so it costs nothing
+today, but if you are reaching for `--display-tone none` *because* you want HDR
+headroom, an SDR preset is the honest container until a reconstruction that exceeds
+reference white exists to fill it.
 
 ---
 

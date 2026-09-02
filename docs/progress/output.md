@@ -225,6 +225,18 @@ What other epics need to know about `output`:
 - **ICC bytes are platform-dependent**, so profile-inclusive byte hashes are not a
   valid cross-platform gate — profile determinism here is pinned per build via the
   dateTime-zeroing path.
+- **The display tone curve is selectable** (`print.display_tone` /
+  `--display-tone <shoulder|none>`, `output/linear-render`, 2026-09-01). Three things
+  callers need: the default is unchanged, so no default pixel moved and
+  `pipeline_version` stayed 3; `none` is **self-policing** rather than gated on a
+  curve type, so a reconstruction (or a print control applied before the render) that
+  exceeds the branch's ceiling fails loudly *mid-render*, exit 1, writing no file —
+  and those ceilings **differ**, reference white for SDR against the 1000-nit peak for
+  HDR, so the same lift is refused on `display-p3` and renders on `hdr-pq`. Anything
+  rendering acceptance images (`analysis/display-output-acceptance`) should expect
+  that failure mode rather than treat it as a bug. The selector is also the extension
+  point a future tone-mapping operator plugs into: a payload variant is a pure recipe
+  addition, only the CLI wiring changes (`output/display-tone-mapping`).
 
 
 ## display-p3-output
@@ -2666,8 +2678,8 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
 
 ## linear-render
 
-**Status:** not started
-**Updated:** 2026-08-28
+**Status:** done
+**Updated:** 2026-09-01
 
 - Filed 2026-08-28 out of the `algo/exponential-anchor-placement` experiments. Both display
   renderers apply a fixed Hermite shoulder that cannot be switched off — `shoulder_start` is
@@ -2689,6 +2701,108 @@ warnings`, `cargo build`, `cargo test` all green (307 unit + 86 integration).
   `print_exposure` can lift samples afterwards). `sdr::render` already errors on any sample
   outside `[0, 1]`, so the mode polices itself and a config-time gate would test a proxy
   instead of the real condition.
+
+### 2026-09-01 — implemented: `print.display_tone` / `--display-tone <shoulder|none>`
+
+- **The prediction held, on every frame.** Ten `scripts/sigmoid-baseline` fixture frames,
+  shipped default reconstruction (sigmoid, the roll's own `Dmax`), neutral print controls,
+  SDR shouldered vs no tone curve: `blown%` fell on **all ten** — 6.86→5.65, 6.11→4.66,
+  6.45→4.24, 6.19→4.84, 6.53→5.04, 6.87→5.91, 6.12→4.44, 7.22→5.18, 6.30→5.72, 6.15→3.90
+  (mean 6.5 → 4.9, ~25% relative). `mid` is bit-identical between the rows, so the
+  comparison is not confounded, and everything below the knee is bit-identical by
+  construction. Harness: `shadow_metrics::linear_render_probe` (`#[ignore]`d).
+- **`code sep` improves exactly where separation was worst and is blind elsewhere.** It
+  moved on the three frames whose p90 sits *above* the knee — E1 11.6→15.2, G3 4.5→8.8,
+  P3 0.6→2.9 — and was unchanged (or 0.1 of rounding) on the seven where p90 is below it,
+  because the shoulder never touched those samples. Read the two columns together; a
+  p99/p99.9 pair measures nothing here, since several percent are flat against white and
+  both percentiles land inside the flat region (the caution `measure_candidates` records).
+- **The residual ~4–5% blown is the reconstruction's, not the display stage's.** That is
+  what the `none` row measures: the sigmoid's own asymptotic approach to 1.0. It sizes what
+  `output/display-tone-mapping` is actually chasing — the display stage cannot fix it.
+- **The Hermite *lifts* highlights; it does not darken them.** It is concave and sits above
+  the identity line on `[0.75, 1]`, so removing it lowers highlight values and spreads them.
+  That also explains the shipped gain map: SDR luma ends up ≥ HDR luma above the knee, so
+  ratios are ≤ 1 and `gain_max` is 1.0. Without a curve the two renditions agree exactly and
+  the map is flat by construction rather than by arithmetic — pinned by a test.
+- **Surface: a selector, not a distinguished width** (user decision, 2026-09-01, over a
+  boolean and over an "off" spelling of `highlight_compress`). A width knob cannot express
+  "off": `highlight_compress` moves the knee inside a bounded `[0.5, 0.75]` and no value
+  removes the curve. Applied to **both** display branches, not SDR only — otherwise the
+  three HDR presets would accept a print knob and silently ignore it, which the rules
+  forbid, and each would need its own rejection rule. HDR pixels are unchanged on a bounded
+  source (its knee is at ≈3.94), which a test pins.
+- **Two illegal states made unrepresentable, one of them the hard way.** The knee width
+  rides *inside* the shouldered variant, so "no curve, and here is its knee width" cannot
+  reach a renderer. The width itself is a `KneeWidth` newtype: an enum variant's fields are
+  as public as the enum, so a bare `f32` payload left the check skippable — and skipping it
+  is **silent**, not loud. `highlight_compress = -1` divides by zero in the knee resolution,
+  and an infinite knee is one no pixel reaches, so the frame renders with an identity curve
+  at exit 0 while the metadata claims `shoulder_start: inf`. Found by review after three
+  validation sites had been deleted on the strength of the weaker invariant.
+- **Self-policing, verified end to end.** `--sigmoid-shoulder 0 --display-tone none` exits 1
+  naming the pixel and the two ways out; the same reconstruction renders fine *with* the
+  shoulder. No curve-type gate anywhere, as the task asked.
+- **Diagnosis order matters between the two new rules.** The knee/tone contradiction rule
+  reasons about the *display* meaning of `highlight_compress`; on `legacy`/`custom` that
+  same knob is the above-`1.0` soft clip and genuinely applies. Running the contradiction
+  first told a legacy user their knee width had no shoulder to place — blaming the knob that
+  works instead of `display_tone`, the one that branch cannot apply. It now runs after
+  `validate_output_preset`, ordered by specificity like the film-base rule.
+- **The recipe encoding already has room for a parameterized operator, and that was
+  measured rather than assumed.** Unit variants serialize as bare strings under serde's
+  default externally-tagged form, so `display-tone-mapping`'s future `reinhard { white }`
+  arrives as `{"reinhard": {…}}` while `"shoulder"` / `"none"` keep their spellings and
+  every stored recipe still parses — the shape `WbSource` and `DmaxSource` already use. An
+  internally-tagged `{"type": …}` form would have respelled both and needed a migration; it
+  is one attribute away, so the wire form is pinned by a test. What a payload variant *does*
+  cost is the CLI: `clap::ValueEnum` cannot derive over it, so the selector then needs a
+  parse fn plus a parameter flag, exactly as `DmaxSource` is spelled.
+- **The guard at diffuse white has zero margin, by measurement.** The intended pairing puts
+  diffuse white *at* reference white, so the brightest pixel lands exactly on the mode's
+  bound: film RGB `[1,1,1]` gives destination luminance of exactly `1.0` on both gamuts —
+  zero ulps over — and Display P3's red channel is itself one ulp above 1.0, pulled back by
+  the radial gamut map. A tolerance was rejected: letting `1.0 + ε` through does not render
+  it (the final range check rejects it with a worse message), and making it render needs a
+  clamp outside the u16 encode step, which the clamping-boundary rule forbids. Pinned as a
+  tripwire test instead, so a colorimetry re-pin fails in CI rather than in a user's
+  conversion.
+- **Known gap, deliberately not closed here:** the `avif` report block carries container and
+  codestream facts only — no reference white, no peak, no tone curve — so `hdr-pq`/`hdr-hlg`
+  runs state their rendering policy nowhere but `recipe`. `hdr_coded_tiff` was different (it
+  already carried reference white and peak, so `tone_curve` joined a block that described
+  the rendition) and did get the field. Closing the AVIF side means giving that block a
+  rendering-policy section, which is a report-contract change owned by whoever next touches
+  it — noted in `display-tone-mapping`, its likeliest next toucher.
+- **Visual review passed (user, 2026-09-01)** on all ten fixture frames, toggling shoulder
+  vs `none` in place. That was the deciding check, not the metrics: this repo has twice seen
+  the highlight numbers and the eye disagree, so a measured win alone would not have closed
+  the task.
+- `pipeline_version` stays **3**: the default selector resolves to exactly the shoulder v3
+  already applied, so no default pixel moved. Only the `recipe` fingerprint was refreshed —
+  see `docs/progress/core.md` (2026-09-01) for why bumping would have been actively harmful.
+
+### 2026-09-01 — review round: `output_render` now states the tone that ran
+
+- **A report block asserted a shoulder that had been skipped.** `output_render.content`
+  was derived from the preset alone, so `--display-tone none` still produced "the
+  reference-white-preserving shoulder … has run" on `hdr-linear-tiff` while
+  `hdr_linear_tiff.tone_curve` in the same report said `no-tone-curve-v1`. On
+  `display-p3` / `compatibility` — which emit no per-preset block — that sentence was
+  the report's *only* rendering-policy claim, and it was wrong.
+- Fixed by making tone a **field**, not prose: `output_render.display_tone` carries the
+  resolved selector, absent on `legacy` / `custom` / `film-master` (no display tone
+  stage at all — a different fact from having one and skipping it), and the two
+  `content` strings that named a shoulder no longer name a curve. That also supersedes
+  the entry above about the SDR presets and the AVIF pair stating policy nowhere but
+  `recipe`: `output_render` is emitted by every preset, so all four now say which curve
+  ran. Giving the `avif` block its own rendering-policy section remains open and is
+  still owned by whoever next touches it.
+- The three accepted-by-design pairings are now pinned by tests rather than by argument:
+  `--display-tone none --highlight-compress 0` (identity width — the `--bigtiff auto`
+  case, not the `--out-depth u16` case) and `--display-tone shoulder` on all three
+  non-display branches (the flags-win reset that makes a `display_tone: none` recipe
+  usable there). Both were proposed as bugs in review and are not.
 
 ## display-tone-mapping
 

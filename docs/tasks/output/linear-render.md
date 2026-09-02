@@ -5,11 +5,17 @@
 Let a display render skip its tone curve, so a reconstruction that already places
 every tone is not compressed a second time on the way out.
 
-Today both display renderers apply a fixed Hermite shoulder and neither can turn it
-off — `highlight_compress` only moves the knee (`0.5 + 0.25/(1+hc)`, so 0.75 at the
-default and never later). Under the shipped sigmoid that means SDR is shouldered
-**twice**: once in density space by the curve, once again in linear display space
-from 0.75 upward.
+**Shipped.** `print.display_tone` / `--display-tone <shoulder|none>` selects the
+display tone curve; `none` skips it. Before it, both display renderers applied a
+fixed Hermite shoulder and neither could turn it off — `highlight_compress` only
+moved the knee (`0.5 + 0.25/(1+hc)`, so 0.75 at the default and never later) — so
+under the shipped sigmoid SDR was shouldered **twice**: once in density space by the
+curve, once again in linear display space from 0.75 upward.
+
+The default is unchanged (`shoulder`), so no `pipeline_version` bump was needed —
+only the current row's `recipe` hash refreshed. The knob is display-only, and `legacy` / `custom` / `film-master` reject a non-default
+selector rather than ignoring it. `docs/progress/output.md`'s `## linear-render`
+section carries the execution record.
 
 ## Why
 
@@ -41,15 +47,17 @@ Not predetermined. What is known:
 
 ## Open questions
 
-- **Surface.** A new preset, a `print` key, or an extension of `highlight_compress`
-  (e.g. an explicit "off")? The last keeps one concept in one place, but
-  `highlight_compress` is a *width* knob and "off" is not a width.
-- **Does it actually improve the picture?** The double-compression argument predicts
-  more highlight separation; that is a prediction, not a measurement. Verify on the
-  `scripts/sigmoid-baseline` fixtures with the `blown%` / `code sep` pair — and note
-  `sat%` is unusable for this comparison (see that harness's cautions).
-- Whether the gamut mapping and transfer encode, which stay in either case, make
-  "linear render" a misleading name for what this actually is.
+All three are answered by what shipped:
+
+- **Surface** — a `print` key, not a preset and not an extension of
+  `highlight_compress`: `print.display_tone`, a selector whose two spellings are bare
+  strings so a future parameterized operator is a pure addition.
+- **Does it actually improve the picture?** Yes, measurably: mean 6.5% → 4.9% of the
+  frame at absolute white across ten fixture frames, with midtones and shadows
+  bit-identical (only values above the knee change). Visual review passed.
+- **Is "linear render" a misleading name?** Yes, which is why the shipped spelling is
+  `none` meaning "no *tone curve*" — gamut mapping and the transfer encode still run,
+  so the render is not "raw pixels out".
 
 ## How to Verify
 

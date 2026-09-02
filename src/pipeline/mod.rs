@@ -3,6 +3,7 @@
 
 pub mod color;
 pub mod colorimetry;
+pub mod display_tone;
 pub mod film_base;
 pub mod gain_map;
 pub mod hdr;
