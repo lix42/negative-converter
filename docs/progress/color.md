@@ -50,6 +50,15 @@ What other epics need to know about `color`:
   every non-default downstream control **loudly**, never silently — see
   `film-base`'s summary for why the anchor must be roll-fixed. `--output-hdr`
   remains a *rendered* float TIFF and is never an alias for it.
+  **Its contract is the configured reconstruction, not a curve shape** (checked
+  2026-09-02 by `algo/reconstruction-render-curve-split`): `film_master` is a pure
+  unwrap that takes no `PrintParams` and knows nothing of which curve ran, so the
+  branch already varies with `--density-curve` and every curve knob. A
+  shoulder-less reconstruction renders through it at exit 0 with nothing clipped
+  or non-finite, and `output_render.content` names "density curve" generically, so
+  neither the branch nor its report needs work when that task moves the shoulder to
+  the display stage. What changes then is the default master's *rendering* — the
+  master becomes unbounded above 1.0, which is already its documented contract.
 - **The preset's rejections are checked on the *resolved value*, with exactly one
   presence exception.** A knob is rejected identically whether it came from a recipe or
   a flag, and a flag that resets a value back to its documented default is accepted

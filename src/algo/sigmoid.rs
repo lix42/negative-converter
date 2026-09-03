@@ -348,7 +348,7 @@ mod tests {
     use crate::algo::{finish_print, reconstruct};
     use crate::types::{
         AnchorPlacement, BalanceRange, DensityCurve, DensityParams, ExponentialParams, FilmBase,
-        LinearImage, PrintParams, Reconstruction, WbSource,
+        LinearImage, PrintParams, REFERENCE_CONTRAST, Reconstruction, WbSource,
     };
 
     fn approx(a: f32, b: f32, eps: f32) -> bool {
@@ -1142,5 +1142,44 @@ mod tests {
             wb_balanced.iter().all(|g| g.is_finite() && *g > 0.0),
             "usable gains {wb_balanced:?}"
         );
+    }
+
+    /// The anchor is a **pure gain** exactly when `shoulder = 0` — the toe does not
+    /// spoil it, but the shoulder does.
+    ///
+    /// `t − floor` is `contrast·d`, so the toe term carries no `anchor` and the whole
+    /// curve factors as `10^(−contrast·anchor) · h(d)`. The shoulder's soft-min is
+    /// against a *fixed* ceiling, so it does not commute with that gain: measured
+    /// 69–81% deviation at the default `0.6`.
+    ///
+    /// Load-bearing for `pipeline::shadow_metrics`, whose matched-exposure probes solve
+    /// the anchor as a scalar gain instead of re-rendering per candidate. That shortcut
+    /// is only valid on the shoulder-less curve.
+    #[test]
+    fn anchor_is_a_pure_gain_only_without_the_shoulder() {
+        let contrast = REFERENCE_CONTRAST;
+        let toe = 0.2f32;
+        let worst = |shoulder: f32, a0: f32, a1: f32| {
+            let gain = 10f32.powf(-contrast * (a1 - a0));
+            (0..60)
+                .map(|i| -0.2 + 0.05 * i as f32)
+                .filter_map(|d| {
+                    let lo = s_curve(d, contrast, toe, shoulder, a0);
+                    (lo > 1e-9).then(|| {
+                        (s_curve(d, contrast, toe, shoulder, a1) / (lo * gain) - 1.0).abs()
+                    })
+                })
+                .fold(0.0f32, f32::max)
+        };
+        for (a0, a1) in [(0.875f32, 1.0f32), (0.875, 0.626)] {
+            assert!(
+                worst(0.0, a0, a1) < 1e-5,
+                "shoulder-less anchor must be a gain"
+            );
+            assert!(
+                worst(0.6, a0, a1) > 0.5,
+                "the shipped shoulder must break it"
+            );
+        }
     }
 }

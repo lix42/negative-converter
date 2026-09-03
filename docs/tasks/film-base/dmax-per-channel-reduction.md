@@ -179,3 +179,26 @@ cheap, and every other question here is downstream of it.
 
 User's framing: this stays an **investigation with a verdict**, not a presumed fix — decide
 when the number is in.
+
+---
+
+**2026-09-02 — the conditional above has fired; this is now a blocker.**
+`algo/reconstruction-render-curve-split` reached its verdict: the split holds, and the
+default reconstruction sheds **both knees**, which is bit-exactly the exponential. So the
+premise this task's "why it may not matter" argument rests on — the per-channel term being
+redundant under the exponential but not under "the sigmoid, which is the intended default" —
+no longer holds on the side that mattered: the intended default *is* becoming the
+shoulder-less form.
+
+Two consequences, and they point the same way:
+
+- **The redundancy argument now applies to the default path**, so this task changes from
+  "investigate whether the scalar is justified" to "the correction the default render needs",
+  exactly as the 2026-08-31 entry anticipated.
+- **It is on the critical path.** `algo/split-default-migration` was filed depending on this
+  task, because the shoulder the migration removes is what currently *hides* the error: the
+  shoulder washes highlights toward white and drains the cast with them, so shoulder-less the
+  17–83% off-neutral leader reading survives into the highlights. Activating the split before
+  this lands ships a visible cast on Gold and Portra.
+
+The user's objection recorded below is unaffected and still the crux of whether this can work.

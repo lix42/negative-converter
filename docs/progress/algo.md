@@ -66,6 +66,18 @@ What other epics need to know about `algo`:
   `--auto-d-max` with a base-derived placement is correctly neither refused nor warned.
   `curve.anchor` is emitted in the report for both curves. Defaults are unchanged and
   deliberately per-curve: sigmoid `MidAtDmaxFraction(0.5)`, exponential `WhiteAtDmax`.
+- **The reconstruction/render split is settled affirmatively (2026-09-02), but no default
+  has moved.** `algo/reconstruction-render-curve-split` measured that reconstruction should
+  keep the density conversion, contrast and anchor and shed **both knees**, with the character
+  supplied by the display operator. Consequences other epics must key on: the shipped default
+  is **unchanged** and still the shouldered sigmoid, so anything describing what nc renders
+  today is still correct; activation is `algo/split-default-migration`, which is blocked on
+  `film-base/dmax-per-channel-reduction` because the shoulder hides a 17-83% off-neutral
+  channel error on the grey leader. `film-master` needs no work — its contract is the
+  configured reconstruction, not a curve shape. And the **anchor is a pure gain exactly when
+  the shoulder is off** (`anchor_is_a_pure_gain_only_without_the_shoulder`), which is what
+  lets a matched-exposure probe solve a scalar instead of re-rendering; under the shipped
+  shoulder that shortcut is wrong by 69-81%.
 - **A curve switch resets `anchor` and says so.** `dmax` is a measured roll calibration and
   carries across a `--density-curve` switch; `anchor` is a rendering rule whose right value is
   per-curve, so it resets — and `curve_switch_dropped_anchor` warns (roll-level,
@@ -2495,8 +2507,8 @@ What other epics need to know about `algo`:
 
 ## reconstruction-render-curve-split
 
-**Status:** not started
-**Updated:** 2026-08-10
+**Status:** done
+**Updated:** 2026-09-02
 
 - Goal: try a modified exponential as the density→linear reconstruction with the
   sigmoid character applied by the display stage instead of inside reconstruction.
@@ -2564,3 +2576,258 @@ What other epics need to know about `algo`:
   highlight separation as a **linear ratio** (inverts against visual review, because sRGB
   spends more code values per stop higher up). The surviving pair is `blown%` (absolute
   ≥ 0.999) and separation in **code values**; neither alone matches the eye, both together do.
+
+### 2026-09-02 — started; chunk A: what reconstruction keeps, measured on seven frames
+
+Scope agreed with the user: **verdict + shape + `film-master` reconciliation**, with the
+default migration deliberately split off (it inherits a calibration and a colour-model fix
+this task does not own — see the end of this entry). Chunk A is measurement only: no CLI
+surface, no default moved, `pipeline_version` untouched.
+
+**The split is confirmed, and the direction was already decided elsewhere.** Two of the
+three legs this task was filed on were answered while it sat: `algo/exponential-anchor-placement`
+ruled the exponential out (2026-08-29) and `output/display-tone-mapping` closed on a user
+visual verdict for `s0-reinhard` — shoulder-less reconstruction under the unbounded display
+operator (2026-09-02). So this is a landing task, not an open experiment.
+
+**The reviewed configuration needs no new curve, which resizes the whole task.**
+`scripts/hdr-tone-review/generate.py` shows `s0-reinhard` is `--sigmoid-shoulder 0
+--display-tone reinhard`, everything else at defaults. The reconstruction curve the task
+went looking for is *the shipped sigmoid with its shoulder set to zero*. The shoulder was
+the only genuinely print-side operation the curve performed; moving it out is a default
+change plus a definitional reconciliation, not a new algorithm.
+
+**A new argument for the split, mechanical rather than aesthetic: the anchor is a pure gain
+exactly when the shoulder is off.** `t − floor` is `contrast·d`, so the toe term carries no
+`anchor` and the curve factors as `10^(−contrast·anchor) · h(d)`. Measured: 5e-7 relative
+deviation at `shoulder = 0` **with the toe on**, against 69–81% at the shipped `0.6`. Pinned
+by `algo::sigmoid::anchor_is_a_pure_gain_only_without_the_shoulder` (both assertions
+mutation-verified). So under today's default the exposure anchor and the print shoulder
+interact — which is the stage-collapse the fidelity rule names, now measured instead of
+argued — and the split makes the anchor a clean exposure control. It also makes the
+matched-exposure probes exact: the gain is solved on a scalar array rather than fitted.
+
+New `shadow_metrics::reconstruction_shape_probe`. Every candidate is matched to the
+benchmark's **mean encoded lightness** (chunk 4's protocol from `output/display-tone-mapping`)
+and every row asserts the render hit the statistic it solved for; that guard was verified to
+fail, as was the black-point term in the scalar model.
+
+**Result: all five shapes beat the shipped sigmoid on both metrics on all seven frames** —
+35/35 rows on `blown%`, 33/35 on separation (the two exceptions are the deepest black-point
+rows on P4). The split is not marginal.
+
+**The toe is dead — it buys nothing and costs black depth.** Across all seven frames, toe
+`0.2` against `0`: `blown%` identical to two decimals on every frame, separation within 0.2
+code values, and the floor consistently **lower without it** (E3 27.9 → 25.9, P3 27.0 → 25.3,
+P4 22.8 → 20.9). `algo/exponential-anchor-placement` refuted the toe as a black-recovery
+device; this shows it is not a highlight device either once the operator carries the
+character. Reconstruction should keep neither knee.
+
+**Which means the split's endpoint is the straight line — the curve this task recorded as
+ruled out.** `toe = shoulder = 0` is bit-exactly the exponential, pinned by the existing
+`convert_with_knees_off_matches_exponential_bit_exactly`. That is not a contradiction of
+`algo/exponential-anchor-placement` but a **rescoping of its verdict**: it measured the
+exponential under the shipped fixed-ceiling knee at anchor 0.875 and got 21.4% blown with
+zero top-decile separation. Under the unbounded operator at the lightness-matched anchors
+(0.954–1.030) the same curve measures **3.89–5.95% blown with 10.9–120.1 code separation**.
+The curve was never the problem; the pairing was. Worth stating plainly because this file
+records "the modified exponential cannot be this task's reconstruction curve", and that
+sentence is true only of the pairing it was measured in.
+
+**`black_point = 0.019` is refuted at that value, and it took a fifth metric to see it.**
+`algo/exponential-anchor-placement` measured it dominating every reconstruction-side form on
+both its axes (|EV| 0.13, base at 1/255). Neither |EV| nor a floor percentile can see
+*crushing*: at 0.019 this probe measures **0.69–8.66% of every frame pinned to code 0**,
+where the benchmark and every black-point-free shape crush 0.00%. Swept properly:
+
+| black point | floor (code) | crushed% | separation cost |
+| --- | --- | --- | --- |
+| 0     | 20.9–30.7 | 0.00 | — |
+| 0.005 | 10.4–23.2 | **0.00 on 7/7** | 1–4 |
+| 0.010 | 0.0–14.8 | 0.00 on 6/7, **P4 2.07** | 2–7 |
+| 0.019 | 0.0 | **0.69–8.66** | 5–14 |
+
+So a *fixed* black point cannot be pushed past ≈0.005 without crushing some frame, which is
+itself the finding: the linear subtraction trades floor against crushing roughly 1:1, so this
+is a per-frame grading control, not a default. `crushed%` is added to the harness as
+`blown%`'s shadow counterpart — the **fifth** metric trap this harness has produced, after
+`sat%`, `flat%`, linear-ratio separation and unclamped separation.
+
+**The anchor placement cannot be adjudicated by this probe, and the reason is worth recording
+so it is not rediscovered as a result.** Matching to a common lightness *solves* the anchor,
+and the anchor is a pure gain, so every placement converges on identical pixels — measured:
+`MidAtBaseOffset(0.626)` and `MidAtDmaxFraction(0.5)` agreed to four decimals on every metric,
+which is why they are no longer separate rows. A placement's value is how well it *predicts*
+that solved anchor, and the probe reports that per roll — but **the bias column is confounded**:
+the solved anchor is matched to the shipped sigmoid, which reads the roll `Dmax` itself, so a
+`Dmax`-reading rule is scored against a target built from it. The uncontaminated column is the
+spread, and within a roll the two rules differ by a constant, so their spreads are **identical
+by construction**: 0.07 EV (Gold), 0.10 (Ektar), 0.32 (Portra). That is frame-to-frame exposure
+disagreement no single-anchor rule can remove, and it bounds what any placement can deliver.
+Adjudicating the placement needs a content-independent target — a grey card on a bracketed roll
+— which is `algo/sigmoid-parameter-calibration`'s recorded precondition, not something to fit
+here.
+
+**Shape verdict for chunk B:** reconstruction keeps the density conversion, the contrast and
+the anchor, and sheds **both knees**. Character comes from the display operator; black
+placement is a display-stage control at a value well below the one previously measured.
+
+Gates: fmt clean, clippy `-D warnings` clean, 702 unit + 174 integration, 112 Python,
+unresolved doc links at the 16-link baseline. No production code touched — the probe is
+`#[cfg(test)]` and `#[ignore]`d; the one non-harness addition is the `algo::sigmoid` test.
+
+### 2026-09-02 — chunk B: `film-master` reconciled, and the "sharpest constraint" dissolves
+
+The task recorded `film-master` as likely the sharpest constraint, on the reasoning that it
+is "defined as the intentional film rendering *including* the curve", so moving the curve
+downstream changes the master's meaning. Checked against the code and the binary, and the
+premise is a **documentation artefact rather than a design conflict**.
+
+**`film-master`'s contract was never a curve shape.** `render_split::film_master` is
+`aces.into_linear()` — a pure unwrap with no range check, no `PrintParams`, and no knowledge
+of which curve ran. The branch already varies with `--density-curve` and every curve knob
+today. What named a shape was the `TASKS.md` rollup sentence ("It includes reconstruction and
+the reference-anchored sigmoid's toe/midtone/shoulder rendering"), which stated the *current
+default's* shape as if it were part of the definition. Reworded to separate contract from
+default; it is true today either way, so this fixes a misleading claim rather than describing
+a default that has not moved.
+
+**Verified against the binary**, `film-master` on `tests/fixtures/hdr-48bit.tif` (IR-free, so
+`--strict` stays usable; `--film-base 1,1,1` because the fixture has no rebate):
+
+| reconstruction | anchor | clipped hi/lo | non-finite | mean RGB |
+| --- | --- | --- | --- | --- |
+| default (shoulder 0.6) | 1.010 | 0 / 0 | 0 | 0.65 0.84 0.95 |
+| `--sigmoid-shoulder 0` | 1.010 | 0 / 0 | 0 | 3.81 5.15 30.15 |
+| that, `--sigmoid-toe 0` | 1.010 | 0 / 0 | 0 | 3.81 5.15 30.15 |
+
+Three things it establishes. The branch **accepts a shoulder-less reconstruction cleanly** —
+exit 0, nothing clipped, nothing non-finite — so there is no structural work to do. The
+master's *values* change materially at the same anchor (the shoulder was compressing hard),
+which is the anchor pairing chunk A solves, not a defect. And **the toe changes nothing at
+this boundary either**, corroborating chunk A from a second direction.
+
+**The report needs no change, and that is the fifth-spot trap already avoided.**
+`output_render.content` reads "…reconstruction, **density curve**, and the resolved
+roll-fixed Dmax placement", naming the stage generically rather than naming the sigmoid's
+shoulder — so unlike the case CLAUDE.md records for `--display-tone none`, no prose here
+becomes false when the curve's shape changes. Worth recording as a positive instance: the
+claim was written at the right altitude the first time.
+
+**The reconciliation, stated for the default-migration task to inherit:** after the split,
+`film-master` is the film's density record — density conversion, contrast and anchor —
+carried unclamped into ACEScg with **no print decision baked in**. That is a *better* master
+by the epic's own fidelity rule, not a diminished one: a print shoulder in a master is
+precisely the stage collapse the rule forbids, and every print decision stays available
+downstream where a grader can change it. The one real consequence is that the master becomes
+unbounded above 1.0 where the shoulder previously held reconstruction at `lin ≤ 1.0` — which
+is already its documented contract (unclamped f32), and the mapping through
+`map_nc_film_rgb_v1` could exceed 1.0 even with the shoulder on, so nothing downstream was
+relying on the bound.
+
+### 2026-09-02 — closed: the verdict, and what the split does to HDR
+
+The task's three verification items, answered:
+
+**1. A written verdict with measurements on real rolls.** The split holds. Reconstruction
+keeps the density conversion, the contrast and the anchor, and sheds **both knees**;
+character comes from the display operator. Measured on seven frames at matched mean encoded
+lightness: 35/35 rows beat the shipped sigmoid on `blown%`, 33/35 on highlight separation.
+
+**2. `film-master` reconciled explicitly** rather than left to drift — chunk B. Its contract
+is the configured reconstruction, not a curve shape, and the rollup sentence that said
+otherwise was describing the current default.
+
+**3. What the chosen split does to HDR headroom**, which the task asked for as a side effect
+either way. It is the whole difference between a live gain map and an inert one, and the
+numbers come from `output/display-tone-mapping`'s HDR review:
+
+| | shipped default | split (`s0` + unbounded tone) |
+| --- | --- | --- |
+| gain map | inert, `GainMapMax` **1.000x** | live |
+| frame on the top gain code | **6.6-15.2%** (shouldered) / 92.68% (default) | **0.26-0.61%** |
+| above reference white | 0% by construction | 7-26% |
+
+The mechanism is the one this task was filed on: the shoulder ran during *reconstruction* and
+stripped every above-white value before either display branch saw it, so SDR and HDR received
+identical input and their ratio was 1.0 by construction. Removing it is what makes the
+container carry information. **`GainMapMax` is the wrong instrument** for reading this — it
+reports 4.87x vs 4.79x for the two live configs, identical on all four review frames — which
+is why the plateau share is the row that matters.
+
+**Not done here, deliberately:** no default moved, `pipeline_version` is untouched and the
+drift gate is quiet (verified). Activation is `algo/split-default-migration`, blocked on
+`film-base/dmax-per-channel-reduction` — the shoulder being removed is what hides a 17-83%
+off-neutral channel error on the grey leader, so the split's own success is what promotes
+that task from optional investigation to prerequisite.
+
+Nothing in `src/` outside a test module changed: the probe is `#[cfg(test)]` + `#[ignore]`d,
+and the one production-adjacent addition is `algo::sigmoid`'s pure-gain test. All five gates
+green, doc links at the 16-link baseline.
+
+### 2026-09-03 — the fourth quadrant measured: `shipped sigmoid + --display-tone none`
+
+Asked whether `output/linear-render`'s pairing — keep the shoulder in *reconstruction*, skip
+the tone at *display* — is a viable default instead of the split. It had never been
+benchmarked against the split: `linear-render` measured itself against the old default, and
+`reconstruction-render-curve-split`'s chunk A did the same, so the two candidates had only
+ever been compared to a common baseline. Added as a row to
+`shadow_metrics::reconstruction_shape_probe` (no exposure matching needed, and the scalar
+solve would be *invalid* here: it shares the benchmark's reconstruction exactly, and with
+`shoulder > 0` the anchor is not a gain).
+
+Seven frames, means:
+
+| config | blown% | code sep | sep vs benchmark | `GainMapMax` |
+| --- | --- | --- | --- | --- |
+| shipped sigmoid + Hermite (today) | 6.52 | 49.0 | — | **1.0000x** |
+| shipped sigmoid + `none` | **4.95** | 49.9 | **+0.9** | **1.0027x** |
+| `s0` + reinhard (the split) | **4.93** | 61.5 | **+12.5** | **4.7929x** |
+
+**The two candidates tie on `blown%` and are not close on anything else.** 4.95 against 4.93
+is a tie on every frame individually too (largest gap 0.17pp, sign varying). But `none`'s
+separation is *unchanged from the benchmark* on five of seven frames — 43.0/43.0, 37.9/37.9,
+67.2/67.2, 75.7/75.7, 113.9/114.0 — improving only on G3 (4.5 → 8.8) and P3 (0.6 → 2.9), the
+two frames where the benchmark had almost none to begin with.
+
+**The mechanism, which makes this predictable rather than surprising:** the reconstruction
+shoulder fuses highlights **in density space**, upstream of everything. Skipping the display
+tone avoids the *second* compression, which is enough to stop values being pushed to 1.0
+(hence the `blown%` win) but cannot recover spread that was already collapsed. `s0` never
+fuses them, so the display operator has real separation to preserve. Same reason the floor is
+*bit-identical* to the benchmark under `none` — nothing below the knee changes, exactly as
+`linear-render` documented.
+
+**And the HDR half is settled by construction.** `shoulder > 0` keeps reconstruction bounded
+at `lin ≤ 1.0`, so the gain map stays inert: measured **1.0027x** on a real Gold 200 frame
+against the split's 4.7929x. The 0.0027 is the SDR branch losing its shoulder while HDR keeps
+its own; it is not headroom.
+
+**But it has one real advantage the split does not, and it is worth recording:** because the
+shoulder is still there washing highlights toward white, it still **hides** the per-channel
+neutrality error. So `shipped + none` is *not* blocked on
+`film-base/dmax-per-channel-reduction`, where `algo/split-default-migration` is. It is
+therefore available as a **conservative interim default** — already shipped, no new operator,
+byte-identical below the knee, ~80% of the `blown%` improvement, no new blocker — at the cost
+of forgoing highlight separation and HDR entirely. That is a scheduling option, not a
+destination.
+
+## split-default-migration
+
+**Status:** not started
+**Updated:** 2026-09-02
+
+- Goal: make the reconstruction/render split the shipped default — a
+  `pipeline_version` bump with a before/after report. See
+  [the task file](../tasks/algo/split-default-migration.md).
+- Filed 2026-09-02 out of `algo/reconstruction-render-curve-split`, which reached a positive
+  verdict but scoped the migration out deliberately: it inherits a colour-model fix the split
+  does not own. Read that task's four entries above first — chunks A and B carry the measured
+  shape (both knees off), the `film-master` reconciliation and the black-point bracket; the
+  close-out carries the HDR outcome; and **the fourth-quadrant entry is direct input to this
+  task's scheduling**, since `shipped sigmoid + --display-tone none` is an interim default
+  that reaches ~80% of the `blown%` win *without* this task's per-channel blocker.
+- **The blocker is real, not bookkeeping.** `film-base/dmax-per-channel-reduction` must land
+  first: the shoulder this migration removes is what currently *hides* a 17-83% off-neutral
+  channel error on the grey leader, so a shoulder-less default ships a visible cast on Gold
+  and Portra.

@@ -41,11 +41,16 @@ decode → validate input semantics → film-base → preset dispatch
 ```
 
 The target `film-master` branch preserves NC's intentional film, lens,
-development, and scanner rendering in unclamped linear ACEScg. It includes
-reconstruction and the reference-anchored sigmoid's toe/midtone/shoulder
-rendering, with fixed/roll Dmax placement, but bypasses later print/display
-controls and rejects frame-local fitting. Exponential and simple remain
-advanced/diagnostic paths pending a separate retirement decision. All paths
+development, and scanner rendering in unclamped linear ACEScg. Its contract is
+**whatever the configured reconstruction produces**, unclamped, with fixed/roll
+Dmax placement, bypassing every later print/display control and rejecting
+frame-local fitting — it is *not* tied to a particular curve shape, and already
+varies with `--density-curve` and every curve knob. Under today's default that
+happens to include the reference-anchored sigmoid's toe/midtone/shoulder
+rendering; `algo/reconstruction-render-curve-split` is moving the shoulder to the
+display stage, which changes the default master's rendering but not this
+contract. Exponential and simple remain advanced/diagnostic paths pending a
+separate retirement decision. All paths
 produce one typed `FilmRgbImage`; NC film RGB v1 interprets that rendering
 consistently as linear Rec.709/D65 and maps it into ACEScg/D60. This is
 film-rendering intent, not physical scene recovery. Optional measured correction
@@ -196,6 +201,7 @@ graph TD
     algo/curve-endpoint-validation
     algo/sigmoid-parameter-calibration
     algo/reconstruction-render-curve-split
+    algo/split-default-migration
   end
   subgraph color
     color/management
@@ -319,6 +325,8 @@ graph TD
   algo/auto-anchor-interior-measurement --> algo/content-aware-sigmoid-toe
   algo/reference-anchored-sigmoid --> algo/reconstruction-render-curve-split
   color/film-master-render-pipeline --> algo/reconstruction-render-curve-split
+  algo/reconstruction-render-curve-split --> algo/split-default-migration
+  film-base/dmax-per-channel-reduction --> algo/split-default-migration
   algo/reference-anchored-sigmoid --> algo/sigmoid-parameter-calibration
   algo/film-stock-profiles --> algo/sigmoid-parameter-calibration
   io/scanner-density-calibration --> algo/sigmoid-parameter-calibration
@@ -466,8 +474,10 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   (`reference_dmax` measures `D_c` per channel, then averages). Measured spread is 0.05–0.14
   density (0.16–0.46 stops) with inconsistent direction. Redundant with `print.white_balance`
   under the **exponential** curve (a per-channel anchor is exactly a per-channel gain) but
-  **not** under the sigmoid, which is the intended default — hence an investigation with a
-  quantified verdict, not a presumed fix. Changes no pixels
+  **not** under the shipped sigmoid. That exemption is closing: `algo/reconstruction-render-curve-split`
+  settled (2026-09-02) that the default reconstruction sheds both knees, which *is* the
+  exponential — so this became a **blocker** for `algo/split-default-migration` rather than an
+  open investigation, because the shoulder being removed is what hides the error. Changes no pixels
 - `film-base/ir-usability-detection` (post-MVP): `film-base/ir-holder-detection`
   — decide IR usability from the **plane itself**, not from `--film-type`, which becomes a hint.
   Measured 2026-08-11: IR separability tracks the frame's *density*, not the stock's chemistry —
@@ -515,7 +525,11 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   Shipped 2026-08-29 with **no default moved**: measured on ten real frames, the exponential is
   not competitive at any anchor — at the sigmoid's own anchor it blows 21.4% of the frame to
   white with zero top-decile separation, because it has no shoulder. Its problem was never the
-  anchor, so `white-at-dmax` stays its default on evidence rather than caution. The black pin
+  anchor, so `white-at-dmax` stays its default on evidence rather than caution.
+  **Rescoped 2026-09-02** by `algo/reconstruction-render-curve-split`: that measurement was
+  taken under the *old fixed-ceiling knee*, and under the shipped unbounded display operator
+  the same curve measures 3.89-5.95% blown. The verdict stands against the **pairing** it was
+  measured in, not against the curve. The black pin
   (candidate 5b, "most likely GO" on shadow numbers) is *dominated* by the shipped default when
   judged as a whole picture
 - `algo/content-aware-sigmoid-toe` (post-MVP, **optional / deferred**): `algo/reference-anchored-sigmoid`, `core/roll-conversion`, `output/presets`, `algo/auto-anchor-interior-measurement`; no downstream blockers
@@ -543,17 +557,25 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   (that task can loosen its floor without a full registry; a false edge would kill
   real parallelism), but the two must be coordinated so stock-awareness is not
   solved twice
-- `algo/reconstruction-render-curve-split` (post-MVP, **experiment with a verdict**):
+- `algo/reconstruction-render-curve-split` (post-MVP, **verdict reached 2026-09-02**):
   `algo/reference-anchored-sigmoid`, `color/film-master-render-pipeline`
   — filed 2026-08-10 to move the sigmoid character to the *display* stage, restoring the
   "density conversion and print rendering are separate sub-stages" rule the current curve
-  partly collapses. **The goal stands; the proposed curve does not.**
-  `algo/exponential-anchor-placement` settled what "modified exponential" meant on 2026-08-29
-  and the answer is negative — it is not competitive at any anchor — so the reconstruction
-  curve is open again. The HDR-headroom half is already decided: `GainMapMax` answers to the
+  partly collapses. **The split holds**, measured on seven frames at matched lightness. The
+  curve is the shipped sigmoid with **both knees off** — the toe buys nothing and costs black
+  depth — which is bit-exactly the exponential. That does not contradict
+  `algo/exponential-anchor-placement`'s negative verdict so much as **rescope** it: that
+  measured the curve under the *old fixed-ceiling knee* at its own anchor, and the pairing was
+  what failed. The HDR-headroom half was already decided: `GainMapMax` answers to the
   **shoulder** alone, which runs during reconstruction and strips above-white values before
-  either display branch sees them, which is this task's premise stated mechanically. Sharpest
-  constraint is `film-master`, whose definition *includes* the curve
+  either display branch sees them. `film-master` looked like the sharpest constraint and was
+  not one: its contract is the configured reconstruction, not a curve shape
+- `algo/split-default-migration` (post-MVP): `algo/reconstruction-render-curve-split`,
+  `film-base/dmax-per-channel-reduction`
+  — filed 2026-09-02 out of `algo/reconstruction-render-curve-split`, which reached a positive
+  verdict but deliberately excluded the default migration. The per-channel dependency is not
+  bookkeeping: the shipped sigmoid's shoulder **hides** a 17-83% off-neutral channel error on
+  the grey leader, and a shoulder-less default lets it survive into the highlights
 - `algo/dmax-white-anchor` (post-MVP): `algo/density`
 - `algo/density-safety-bounds` (post-MVP): `algo/density`, `core/pipeline-orchestration`
 - `algo/auto-neutral-wb` (post-MVP): `algo/density`, `core/pipeline-orchestration`
@@ -825,10 +847,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [x] [Reference-anchored sigmoid calibration and redesign](tasks/algo/reference-anchored-sigmoid.md) — reproduce and quantify the shipped sigmoid's raised, narrow real-roll shadow spread, then choose the least invasive defaults/semantics/equation remedy against frozen film-master/SDR/HDR metrics
 - [x] [Anchor placement for the exponential curve](tasks/algo/exponential-anchor-placement.md) —
   all four placements now exist on **both** curves behind one curve-neutral `--anchor-*` family,
-  so contrast and endpoint placement stop fighting. The **rendering** verdict is negative and is
-  the durable result: on ten real frames the exponential is not competitive at any anchor (21.4%
-  blown with zero top-decile separation at the sigmoid's anchor — no shoulder), so **no default
-  moved** and the default render is byte-identical. Also measured here: the anchor trades
+  so contrast and endpoint placement stop fighting. The **rendering** verdict was negative on
+  ten real frames — not competitive at any anchor (21.4% blown, zero top-decile separation at
+  the sigmoid's anchor — no shoulder) — so **no default moved** and the default render is
+  byte-identical. **That verdict was rescoped on 2026-09-02**: it holds against the old
+  fixed-ceiling knee it was measured under, not against the curve, which measures 3.89-5.95%
+  blown under the shipped unbounded operator. Also measured here: the anchor trades
   midtone against black *and* highlights monotonically, a toe *raises* the black floor rather
   than pulling it down, and `GainMapMax` is controlled by the shoulder alone
 - [ ] [Content-aware sigmoid toe](tasks/algo/content-aware-sigmoid-toe.md) — **optional / deferred** explicit frame/roll convenience modes; the reference path remains the default and this blocks no output
@@ -857,14 +881,20 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   (resolves 2.23–2.37 against roll Dmax 1.28–1.38) and every frame renders black. Restrict the
   measurement to the picture area; an implausible anchor must fail loudly, not render a black
   image. Blocks every content-driven rendering mode.
-- [ ] [Reconstruction / render curve split](tasks/algo/reconstruction-render-curve-split.md) —
-  **the next rendering step (2026-08-10).** Move the sigmoid character to the render stage,
-  restoring the separate-sub-stages rule. The reconstruction curve is **open again**: the
-  modified exponential this task assumed was ruled out on measurement by
-  `algo/exponential-anchor-placement` (2026-08-29). The HDR-headroom half is already decided —
-  `GainMapMax` is controlled by the **shoulder** alone, which runs during reconstruction and
-  strips above-white values before either display branch sees them. A verdict either way is a
-  complete outcome
+- [x] [Reconstruction / render curve split](tasks/algo/reconstruction-render-curve-split.md) —
+  move the sigmoid character to the render stage, restoring the separate-sub-stages rule.
+  **Verdict 2026-09-02: the split holds** — measured on seven frames at matched lightness, the
+  shoulder-less reconstruction under the unbounded display operator beats the shipped sigmoid
+  on both metrics on every frame. The curve is the shipped sigmoid with **both knees off**
+  (the toe buys nothing and costs black depth), which is bit-exactly the exponential —
+  rescoping `algo/exponential-anchor-placement`'s negative verdict, which measured that curve
+  under the *old knee*. `film-master` needs no change: its contract is the configured
+  reconstruction, not a curve shape. Default activation is `algo/split-default-migration`
+- [ ] [Activate the split as the default](tasks/algo/split-default-migration.md) — the
+  `pipeline_version` bump the split left out: reconstruction stops shaping tone, the display
+  operator carries the character. Blocked on `film-base/dmax-per-channel-reduction`, because
+  the shoulder being removed is what currently **hides** a 17-83% off-neutral channel error
+  on the grey leader
 - [ ] [Sigmoid parameter calibration](tasks/algo/sigmoid-parameter-calibration.md) — turn the
   provisional contrast (≈2.07), shoulder (≈0.6) and per-stock anchor offsets into calibrated
   values. Needs a **bracketed roll** (so exposure labels are true by construction) and a **grey
