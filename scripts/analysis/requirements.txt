@@ -12,3 +12,6 @@
 # code, not by a library's release, and the tests assert the numbers.
 numpy>=1.26
 tifffile>=2024.1.30
+# JPEG input. A JPEG's samples are whatever the decoder says they are, so the
+# record carries the Pillow/libjpeg version that produced them.
+Pillow>=10.0

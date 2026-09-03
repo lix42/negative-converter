@@ -169,12 +169,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="measure all but this fraction of each edge (0.05 trims 5%% per side). "
              "Use it to keep the film holder and rebate out of the statistics — but "
              "check it actually clears them: a holder can occupy 10-15%% of an edge")
+    mimage.add_argument(
+        "--jpeg-image", choices=("sdr", "hdr"), default="sdr",
+        help="which rendition of a gain-map JPEG to measure (default: sdr, the "
+             "base image — which is also what a plain JPEG has). `hdr` needs the "
+             "gain map applied and is not implemented; it says so rather than "
+             "measuring the base and calling it HDR")
     mimage.add_argument("--out", help="write the record here (default: stdout)")
     mimage.add_argument(
         "--no-checksum", action="store_true",
         help="skip hashing the image bytes (the record then cannot identify which "
              "file it described)")
     mimage.set_defaults(func=_metrics.cmd_image)
+
+    mroll = esub.add_parser(
+        "roll", help="measure every converted frame of one roll and roll the "
+                     "scalars up into one artifact")
+    mroll.add_argument("roll", help="source roll name from manifest.json")
+    mroll.add_argument("run", help="configuration ID or path to tags.json")
+    _add_root(mroll)
+    mroll.add_argument(
+        "--space",
+        help="override the colour space; by default it is resolved from the run's "
+             "frozen recipe (recorded provenance, not a guess at the pixels) and "
+             "an under-determined one is refused")
+    mroll.add_argument("--region", help="as for `metrics image`: x,y,w,h fractions")
+    mroll.add_argument("--inset", type=float,
+                       help="as for `metrics image`: trim this fraction per edge")
+    mroll.add_argument(
+        "--jpeg-image", choices=("sdr", "hdr"), default="sdr",
+        help="which rendition of a gain-map JPEG to measure (default: sdr, the "
+             "base image — which is also what a plain JPEG has). `hdr` needs the "
+             "gain map applied and is not implemented; it says so rather than "
+             "measuring the base and calling it HDR")
+    mroll.add_argument("--out", help="write the record here "
+                                     "(default: metrics.json beside tags.json)")
+    mroll.add_argument("--markdown", help="also write the Markdown table here")
+    mroll.set_defaults(func=_metrics.cmd_roll)
+
+    mtable = esub.add_parser(
+        "table", help="render a stored roll metrics record as Markdown")
+    mtable.add_argument("record", help="path to a metrics.json written by `roll`")
+    mtable.add_argument("--out", help="write here (default: stdout)")
+    mtable.set_defaults(func=_metrics.cmd_table)
 
     return ap
 

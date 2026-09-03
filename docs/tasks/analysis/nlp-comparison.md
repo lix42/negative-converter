@@ -39,9 +39,11 @@ NLP did — which is a claim a number can carry and a side-by-side cannot.
   its manifest entries have `source_frame: null`, so it is unpaired today.
 - Two Portra160 source frames (1096, 1097) have no NLP output; the manifest
   already records these in `coverage_gaps`.
-- nc's default output is a **gain-map JPEG**, which the metric reader will not
-  open. Comparison runs render through a TIFF preset (`display-p3` /
-  `compatibility`), which `nctool roll convert --output-preset` already does.
+- nc's default output is a **gain-map JPEG**. Its SDR base is readable
+  (`metrics --jpeg-image sdr`, the default), so a default roll can be compared —
+  but that base is not the rendition an HDR-aware viewer shows, and reconstructing
+  the HDR one is not implemented. A comparison that wants the HDR signal renders
+  through `hdr-linear-tiff` instead.
 
 ## Decided (2026-09-02)
 
@@ -59,6 +61,29 @@ NLP did — which is a claim a number can carry and a side-by-side cannot.
 - **A missing side is reported, not skipped**, and every artifact states the
   no-registration caveat and the regions it used.
 
+## What `conversion-metrics` settled (2026-09-03)
+
+It shipped as `nctool metrics {image,roll,table}`, so this task consumes rather
+than builds the measurement:
+
+- **Only the reference side needs a declared color space.** `metrics roll`
+  resolves nc's own space from the run's frozen recipe and refuses an
+  under-determined one, so the manifest work below shrinks to the reference and
+  target images.
+- **Reuse `frame_axes` and `spread`, do not re-derive them.** The scalar axis list
+  and the crossover terms already exist; a comparison is a delta over the same
+  axes, and a second list would drift from the first.
+- **A per-roll rollup does mean something, as spread rather than mean** — but it
+  is **not attributable**: one frozen recipe serves every frame, so variation
+  combines scene content with calibration fit. A comparison rollup inherits that
+  caveat, with one improvement: `|nc − target|` per frame is already
+  content-normalized, so *its* spread is more nearly about the render than the
+  absolute spread is.
+- **A default (gain-map JPEG) roll is measurable as its SDR base**, so no
+  re-render is needed to compare one — but the record's `gain_map_present` flag
+  has to reach the comparison output, or a P3 SDR base gets compared against an
+  NLP export as though it were the whole rendition.
+
 ## Open questions
 
 - Where do the reference role and the color-space declaration live — additive
@@ -73,8 +98,9 @@ NLP did — which is a claim a number can carry and a side-by-side cannot.
   pairs to [`comparison-review-tooling`](comparison-review-tooling.md) rather
   than growing a second page builder? Visual review remains a required step —
   the numbers support it, they do not replace it.
-- Does a per-roll rollup mean anything, given each frame's content differs, or is
-  the per-frame table the honest artifact?
+- Which of `metrics`' axes belong in a comparison table at all? Thirteen plus two
+  crossover terms is right for one roll's absolute numbers; a three-way delta over
+  all of them may be more than a reader can use.
 
 ## How to Verify
 

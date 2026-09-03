@@ -73,6 +73,14 @@ implementing — against real converted rolls, not on paper. The families:
   crossover detector and the most diagnostic color number for a negative
   conversion; per-hue-sector chroma and hue placement; neutral share.
 
+Both shipped (tone 2026-09-02, color 2026-09-02). CIELAB's reference white is
+derived from this module's own D65 rather than the tabulated `(0.95047, 1,
+1.08883)`, so an RGB-neutral frame measures `a* = b* = 0` exactly — a cast metric
+whose zero is not zero reports a fault the render does not have. That is a
+different choice from the one `display-output-acceptance` pins for its
+cross-encoding oracle, which compares absolute colorimetry rather than relative
+cast; the two coexist deliberately.
+
 Deliberately **out of scope**: sharpness, micro-contrast and noise (NLP sharpens,
 nc does not, and resolutions differ — the metric would always report a difference
 nobody intends to close), and any composite quality score.
