@@ -174,6 +174,29 @@ pub const DISPLAY_P3: ColorSpace = ColorSpace {
     white: D65,
 };
 
+/// Adobe RGB (1998), with D65 white.
+///
+/// Source: Adobe RGB (1998) Color Image Encoding (Adobe, version 2005-05); IEC
+/// 61966-2-5 adopts the same primaries and white point. The transfer function is
+/// a pure `563/256` power law with no linear segment, which this type does not
+/// model.
+///
+/// Its red and blue primaries are **identical to [`REC709`]'s**; only green moves
+/// (0.300, 0.600) -> (0.210, 0.710). That is the whole difference between the two
+/// gamuts, and it is also the easiest pair to transcribe wrongly, so the tests
+/// assert both halves of the relationship rather than just the values.
+///
+/// nc itself does not render to this space. It is defined here because
+/// `scripts/analysis/nctool/metrics.py` measures Adobe RGB exports against nc's
+/// output, and colorimetry has exactly one home in this repository — a set of
+/// primaries transcribed into the Python instead would be a second source of
+/// truth by definition. That analysis tool's tests re-read this file.
+pub const ADOBE_RGB: ColorSpace = ColorSpace {
+    name: "adobe-rgb",
+    primaries: Primaries::new(xy(0.640, 0.330), xy(0.210, 0.710), xy(0.150, 0.060)),
+    white: D65,
+};
+
 /// ITU-R BT.2020 (and BT.2100, which adopts the same primaries) with D65 white.
 ///
 /// Source: ITU-R BT.2020-2. BT.2100-2 references these primaries unchanged, so

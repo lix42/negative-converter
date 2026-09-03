@@ -6,7 +6,7 @@ otherwise.
 
 | Directory or script | Purpose |
 |---|---|
-| [`analysis/`](analysis/) | The `nctool` CLI: asset manifests, manifest-driven roll conversion, diff-friendly roll analysis, and build comparison. |
+| [`analysis/`](analysis/) | The `nctool` CLI: asset manifests, manifest-driven roll conversion, diff-friendly roll analysis, build comparison, and pixel-derived image metrics. |
 | [`real-scan-verify/`](real-scan-verify/) | The older staged full-resolution verification harness and its frozen recipes. |
 | [`iso-decoder-oracle/`](iso-decoder-oracle/) | A macOS ImageIO interoperability oracle for ISO and legacy gain-map JPEGs. |
 | [`render-defaults-v2/`](render-defaults-v2/) | Reproduce the historical v1-to-v2 default-render measurements. |

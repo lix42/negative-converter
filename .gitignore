@@ -10,3 +10,6 @@ __pycache__/
 
 # Local, environment-specific config (not shared)
 *.local.json
+
+# Python venv (scripts/analysis/requirements.txt)
+.venv/

@@ -271,7 +271,14 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   literals the renderer multiplies by; `derive.rs` (the binary64 math) and
   `audit.rs` (the check/regen harness) are **`#[cfg(test)]`**, so rendering
   cannot start deriving per run. Never add a matrix or luma literal to a stage —
-  import it. Product policy (reference white, peak nits, shoulder, gain-map
+  import it. A colour space the **analysis tool** needs is defined here first, even
+  when nc renders to nothing like it (`ADOBE_RGB` is the first, and is unused by the
+  runtime on purpose): primaries living only in `scripts/analysis/nctool/metrics.py`
+  would be a second source of truth by construction, and that file's tests re-read
+  this one. Note also that nc's ProPhoto output is a **pure 1.8** power law
+  (`color::build_profile` omits the ROMM toe), so a consumer applying the specified
+  piecewise curve disagrees with nc's own pixels below encoded 0.03125 — 1.3 stops
+  out at 0.01. Product policy (reference white, peak nits, shoulder, gain-map
   offsets) stays with its stage and refers to a *named* space instead of
   restating colorimetry. Workflow for changing any of it:
   `docs/colorimetry-maintenance.md`; `NC_COLORIMETRY_REGEN=1 cargo test
@@ -482,10 +489,18 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   **negation** of the claim you just falsified — `grep -rn "SDR only\|is refused" src docs
   CLAUDE.md` — not for the code you changed; the stale sentence is never in your diff.
 - **The Rust four-gate sequence does not itself cover `scripts/analysis/`.** CI
-  runs its stdlib `nctool` Python suite as a separate gate on Linux and macOS:
-  `PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis
-  -p "test_*.py"`. Run that command by hand after touching it; the suite includes
-  fixture-backed black-box coverage of `scripts/real-scan-verify/harness.sh`.
+  runs the `nctool` Python suite as a separate gate on Linux and macOS:
+  `NCTOOL_REQUIRE_DEPS=1 PYTHONPATH=scripts/analysis python3 -m unittest discover
+  -s scripts/analysis -p "test_*.py"`. Run that command by hand after touching it;
+  the suite includes fixture-backed black-box coverage of
+  `scripts/real-scan-verify/harness.sh` (which needs `target/debug/nc`, so
+  `cargo build` first — release alone leaves that one test failing).
+  **`nctool` is stdlib-only *except* `metrics`**, which reads output pixels and
+  needs `numpy`/`tifffile`/`Pillow` from `scripts/analysis/requirements.txt` (CI
+  installs them; locally, a `.venv`). The import is lazy, so every other command still runs
+  without them — which is exactly why its tests `skipUnless` the packages are
+  importable, and why `NCTOOL_REQUIRE_DEPS=1` exists to turn a forgotten install
+  into a failure instead of ~29 silent skips under a green `ok`.
 - **`tests/pipeline.rs`'s `run()` injects `--output-preset legacy`** into a
   `convert` that names no preset, loads no `--params`, and writes `.tif`/`.tiff` —
   ~87 tests predate the gain-map default and assert TIFF-path behaviour. A test
@@ -831,7 +846,9 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   exercise the pipeline on them either with a throwaway `#[ignore]` test that calls
   `io::decode` and prints only derived numbers, or via the committed
   `scripts/real-scan-verify/` harness (staged verification driving the `nc` binary,
-  derived numbers only — see its `README.md`). Note: real scans are laid out
+  derived numbers only — see its `README.md`). To measure an output *image* — nc's
+  or another tool's — use `python -m nctool metrics image|roll` (needs the venv);
+  it is the only thing here that reads output pixels rather than nc's report. Note: real scans are laid out
   `dark holder → thin inset rebate → picture` (the rebate is not the outer margin),
   so `--auto-base` is best-effort; measure `Dmin` once from an unexposed reference
   and reuse it via `--base-region`/`--film-base` (design-spec §8).

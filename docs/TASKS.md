@@ -249,6 +249,7 @@ graph TD
     analysis/nlp-comparison
     analysis/drive-asset-migration
     analysis/comparison-review-tooling
+    analysis/metrics-visualization
     analysis/harness-regression-tests
   end
   core/project-foundation --> io/silverfast-decode
@@ -405,6 +406,8 @@ graph TD
   analysis/conversion-analysis-tooling --> analysis/asset-manifest
   analysis/asset-manifest --> analysis/conversion-metrics
   analysis/conversion-metrics --> analysis/nlp-comparison
+  analysis/conversion-metrics --> analysis/metrics-visualization
+  analysis/comparison-review-tooling --> analysis/metrics-visualization
   analysis/asset-manifest --> analysis/drive-asset-migration
   core/roll-conversion --> core/base-acquisition-planner
   film-base/auto-base-redesign --> core/base-acquisition-planner
@@ -687,6 +690,12 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - `analysis/comparison-review-tooling` (post-MVP): `algo/reference-anchored-sigmoid`
   — promote the ad-hoc review pages into a maintained config-comparison tool; the user asked
   for it as a separate task rather than continued inline patching
+- `analysis/metrics-visualization` (post-MVP): `analysis/conversion-metrics`,
+  `analysis/comparison-review-tooling`
+  — filed 2026-09-03. The measurements exist and read well as JSON and as a Markdown table;
+  neither shows what a difference *looks* like. The review app already compares configs by
+  toggling in place and its `review.json` is keyed by (image, config), which is the shape a
+  metrics record has — so this is an extension of that app, not a new one
 
 > **Post-MVP follow-ups** are recorded for continuity and are **not** blockers of
 > `core/pipeline-orchestration` / the Step-1 MVP. The `film-base` follow-ups came
@@ -1029,16 +1038,24 @@ Dependency list (a task is executable when all its deps are `[x]` done):
 - [ ] [Display-output acceptance](tasks/analysis/display-output-acceptance.md) — verify the final gain-map default, SDR fallback, explicit output presets, metadata, and cross-device behavior on the same real scans
 - [x] [Conversion-analysis tooling (spike)](tasks/analysis/conversion-analysis-tooling.md) — grow the real-scan-verify harness into a toolkit: asset manifest, image-library analysis of results, and NLP-vs-nc comparison. **Done 2026-07-23** (spike): scope decided (Python `nctool` toolkit, JSON manifest of rolls+converted, configurable-but-local asset root, NLP global-metrics comparison without registration); split into the four child tasks below; see the task file's "Spike outcome" section.
 - [x] [Asset manifest](tasks/analysis/asset-manifest.md) — tracked JSON manifest of `../nc-assets` (roll frames + roles + derived facts + converted outputs); `generate`/`validate`; retires the hard-coded `ROLLS` array
-- [ ] [Conversion metrics & photographic analysis](tasks/analysis/conversion-metrics.md) —
-  enrich deterministic per-frame and per-roll analysis with useful color and tone
-  distributions, shadow/highlight occupancy, range and endpoint behavior, plus thumbnails and
-  JSON/Markdown artifacts suitable for standard diff tools
-- [ ] [NLP vs nc comparison](tasks/analysis/nlp-comparison.md) — ingest NLP outputs, global-metric diff tables + side-by-side contact sheets (no registration); startable once NLP outputs are added
+- [x] [Conversion metrics & photographic analysis](tasks/analysis/conversion-metrics.md) —
+  **Done 2026-09-03**: `nctool metrics {image,roll,table}` — declared colour space,
+  fractional regions, endpoint + tone + colour statistics, per-roll spread rollup and
+  Markdown table; verified against nc's `loss.*` and `output_stats`. Colorimetry is
+  transcribed from `definitions.rs` and cross-checked against it by test —
+  the first tooling that reads pixels **out of an output image** rather than out of nc's
+  report, so any producer's conversion can be measured: tone/color distributions,
+  shadow/highlight occupancy, range and endpoint behavior, on a declared color space and a
+  recorded region, as deterministic diff-friendly JSON/Markdown
+- [ ] [Reference comparison: nc vs NLP and tweaked targets](tasks/analysis/nlp-comparison.md) —
+  pair nc output with NLP / SmartConvert / hand-edited **targets** by `source_frame` (no
+  registration) and report per-axis deltas, so `|nc − target| < |NLP − target|` becomes a
+  checkable claim; NLP outputs are already in the manifest
 - [ ] [Drive asset migration](tasks/analysis/drive-asset-migration.md) — assets **moved** to the shared Google Drive folder + reorganized + self-relative `manifest.json` (2026-07-24); remaining: repo `../nc-assets` path convention (symlink/env), stream-on-demand materialization guard, sync hygiene
 - [x] [Harness regression tests](tasks/analysis/harness-regression-tests.md) — fixture-backed
   black-box coverage now exercises real-binary `freeze` → `convert`, pins the recipe and
   TIFF/sidecar contracts, and reproduces the successful-wrong-container failure; the full
-  stdlib analysis suite runs in Linux and macOS CI
+  analysis suite runs in Linux and macOS CI
 - [~] [Comparison review tooling](tasks/analysis/comparison-review-tooling.md) — promote the
   ad-hoc review pages from `algo/reference-anchored-sigmoid` into a maintained tool for
   comparing rendering configurations by eye: one entry point, the matrix as data rather than
@@ -1047,3 +1064,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   `review.json` format settles "matrix as data", and switching config cannot move the picture
   because every rendition shares one grid cell. Still open: the **generator** that renders a
   matrix and emits the JSON, HDR review, and build-vs-build.
+- [ ] [Metrics visualization](tasks/analysis/metrics-visualization.md) — plot the `nctool
+  metrics` output inside `tools/review-app`, so numeric review sits beside visual review:
+  percentile curves that overlay two configs, the cast-by-tone-band path that shows crossover,
+  band occupancy across a roll, and per-channel endpoint bars.
