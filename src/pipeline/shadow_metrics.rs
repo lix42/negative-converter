@@ -2319,10 +2319,18 @@ fn tone_map_match_point_probe() {
 /// shoulder breaks it by 69–81%). So the gain is solved on a scalar sample array and only
 /// then rendered, and every row asserts the render hit the lightness it solved for.
 ///
-/// Metrics are the surviving pair — `blown%` and highlight separation in **code values**,
-/// both on clamped output — plus the black **floor** in code values, which is the axis the
-/// toe question turns on. The four traps this harness has produced (`sat%`, `flat%`,
-/// linear-ratio separation, unclamped separation) are all avoided by construction.
+/// It also sweeps three **black-point** values, because the one previously measured as
+/// dominating every reconstruction-side form turns out to crush several percent of the
+/// frame; and it carries the `output/linear-render` pairing (the shipped reconstruction with
+/// the display tone skipped) as the fourth quadrant of (shoulder in reconstruction?) x (tone
+/// at display?), which nothing had benchmarked against the split.
+///
+/// Metrics: `blown%` and highlight separation in **code values**, both on clamped output,
+/// plus the black **floor** — the axis the toe question turns on — and **`crushed%`**, added
+/// here as `blown%`'s shadow counterpart because neither `|EV|` nor a floor percentile can
+/// see shadow clipping. That makes five metric traps this harness has produced (`sat%`,
+/// `flat%`, linear-ratio separation, unclamped separation, and a floor percentile read as if
+/// it were a clipping count); all are avoided by construction.
 ///
 /// ```text
 /// cargo test --release shadow_metrics::reconstruction_shape_probe \
@@ -2404,7 +2412,7 @@ fn reconstruction_shape_probe() {
 
     let mut per_roll: std::collections::BTreeMap<String, Vec<(String, f32, f32, f32)>> =
         std::collections::BTreeMap::new();
-    let mut wins = (0usize, 0usize);
+    let mut wins = (0usize, 0usize, 0usize);
     for (key, f) in fx["frames"].as_object().unwrap() {
         if only.as_deref().is_some_and(|k| k != key) {
             continue;
@@ -2506,18 +2514,29 @@ fn reconstruction_shape_probe() {
         // cleanest comparison available; and with `shoulder > 0` the anchor is not a gain, so
         // the bisection the shape rows use would be invalid here. Its lightness is printed so
         // the difference against the benchmark is visible rather than assumed away.
+        //
+        // This is the **only fallible render in the loop**, so it is the one that must not
+        // `unwrap`. `DisplayTone::None` refuses any sample above reference white, and the
+        // composite film-RGB → P3-luma functional sums to 1.0000000468 — so a near-white
+        // pixel can round over 1.0 even with the shoulder holding film RGB at <= 1.0. That
+        // is a legitimate result for this row, not a reason to abandon six other frames.
         {
-            let out = render(
-                &benchmark_sigmoid(dmax),
-                &PrintParams::default(),
+            let shared = shared_for(&benchmark_sigmoid(dmax), &PrintParams::default());
+            match crate::pipeline::sdr::render(
+                &shared,
+                crate::pipeline::sdr::SdrGamut::DisplayP3,
                 DisplayTone::None,
-            );
-            let (blown, sep, floor, crush, light) = measure(out.image());
-            println!(
-                "{:<22}{:>9}{light:>10.4}{blown:>9.2}{sep:>10.1}{floor:>8.1}{crush:>9.2}   \
-                 <- linear-render",
-                "[shipped + tone none]", "-"
-            );
+            ) {
+                Ok(out) => {
+                    let (blown, sep, floor, crush, light) = measure(out.image());
+                    println!(
+                        "{:<22}{:>9}{light:>10.4}{blown:>9.2}{sep:>10.1}{floor:>8.1}\
+                         {crush:>9.2}   <- linear-render",
+                        "[shipped + tone none]", "-"
+                    );
+                }
+                Err(e) => println!("{:<22}{:>9}   REFUSED: {e}", "[shipped + tone none]", "-"),
+            }
         }
 
         for shape in SHAPES {
@@ -2546,13 +2565,21 @@ fn reconstruction_shape_probe() {
             // - the anchor is a pure gain at `shoulder = 0` (see `algo::sigmoid`'s
             //   `anchor_is_a_pure_gain_only_without_the_shoulder`), so it commutes out of
             //   reconstruction; and
-            // - at the default `linear_range` the print stage is `v − black_point` per
-            //   channel, so on luminance it is a *subtraction* of `black_point · k`, with
-            //   `k` the destination luma of ACEScg white. It does **not** commute with the
-            //   gain, so it is modelled here rather than folded into the samples.
+            // - the print stage reduces to `v − black_point` per channel, so on luminance
+            //   it is a *subtraction* of `black_point · k` (`k` = destination luma of ACEScg
+            //   white). It does **not** commute with the gain, so it is modelled here rather
+            //   than folded into the samples. That reduction needs **all three** of
+            //   `PrintParams`'s other defaults, not just `linear_range`: the stage is
+            //   `(v·wb·2^EV − black − low)/span`. The white-balance one is load-bearing —
+            //   under an auto `WbSource` the gains are re-estimated from each candidate's
+            //   own buffer, so the solve would stop commuting entirely.
             //
             // The samples therefore come from the reference render with the print stage
             // neutral, and the black point is applied in the scalar model.
+            // `pre_operator_luma_samples` strides raster-ordered pixels, and both fixture
+            // widths (5184, 10368) are multiples of `SUBSAMPLE`, so this is one column phase
+            // in eight rather than a uniform 1-in-8 sample. Left as is: the target is a mean
+            // over the whole frame and the `light` assert below bounds the consequence.
             let samples = pre_operator_luma_samples(
                 &shared_for(&sigmoid(reference), &PrintParams::default()),
                 SUBSAMPLE,
@@ -2580,6 +2607,7 @@ fn reconstruction_shape_probe() {
                 (false, true) => "sep",
                 _ => "-",
             };
+            wins.2 += 1;
             if blown < b_blown {
                 wins.0 += 1;
             }
@@ -2614,13 +2642,18 @@ fn reconstruction_shape_probe() {
     }
     println!(
         "\nblown% lower is better, code sep higher is better, floor lower is darker black.\n\
-         Shapes beating the benchmark: blown% {} / sep {} of the rows above.",
-        wins.0, wins.1
+         Shapes beating the benchmark: blown% {}/{n} / sep {}/{n} (all frames, all shapes).",
+        wins.0,
+        wins.1,
+        n = wins.2
     );
 
-    // Which placement rule predicts the solved exposure? An anchor error `dA` in density
-    // is a gain of `10^(-contrast*dA)`, i.e. `contrast * dA * log2(10)` **stops** of
-    // exposure — the unit the error is actually spent in.
+    // Which placement rule predicts the solved exposure? An anchor error `dA = rule −
+    // solved` is a gain of `10^(−contrast·dA)`, i.e. **`−contrast·dA·log2(10)` stops** —
+    // the unit the error is actually spent in. `stops` below returns that signed value, so
+    // a **negative** bias means the rule anchors *above* the solved one and therefore
+    // renders **darker**; positive is brighter. (The sign is easy to drop: a higher anchor
+    // is a smaller gain.)
     //
     // **Read the bias column with the confound in mind, stated here so it is not
     // rediscovered as a result.** The solved anchor is whatever matches *the shipped
@@ -2636,7 +2669,7 @@ fn reconstruction_shape_probe() {
     // **identical by construction**. Frame-to-frame exposure disagreement is what neither
     // placement can fix, and it bounds what any single-anchor rule can deliver.
     let contrast = crate::types::REFERENCE_CONTRAST;
-    let stops = |d: f32| contrast * d * std::f32::consts::LOG2_10;
+    let stops = |d: f32| -contrast * d * std::f32::consts::LOG2_10;
     println!(
         "\n{:<28}{:>8}{:>10}{:>12}{:>12}",
         "placement rule vs solved", "frames", "bias EV", "spread EV", "worst EV"
@@ -2665,7 +2698,7 @@ fn reconstruction_shape_probe() {
                 - errs.iter().fold(f32::MAX, |a, b| a.min(*b));
             let worst = errs.iter().fold(0.0f32, |a, b| a.max(b.abs()));
             println!(
-                "    {name:<26}{:>8}{mean:>10.2}{spread:>12.2}{worst:>12.2}",
+                "  {name:<26}{:>8}{mean:>10.2}{spread:>12.2}{worst:>12.2}",
                 errs.len()
             );
         }

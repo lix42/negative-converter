@@ -2812,6 +2812,48 @@ byte-identical below the knee, ~80% of the `blown%` improvement, no new blocker 
 of forgoing highlight separation and HDR entirely. That is a scheduling option, not a
 destination.
 
+### 2026-09-03 — review round: one real output bug behind five green gates
+
+Twelve findings from the ship review, all acted on. Two were substantive; the rest were
+doc/robustness. Recording the first because it is the harness failure mode this file keeps
+re-learning.
+
+**The `bias EV` column printed the wrong sign.** The comment read "an anchor error `dA` in
+density is a gain of `10^(−contrast·dA)`, i.e. `contrast·dA·log2(10)` **stops**" — the gain
+is right, the "i.e." drops the minus. `stops` implemented the comment, so every bias figure
+came out inverted: the shipped placement anchors *above* the solved one and therefore renders
+**darker**, which the table reported as positive. Magnitudes (and so the 0.21-0.28 EV figure
+quoted downstream) were never affected, and `spread`/`worst` are magnitudes, so nothing
+already concluded moves — but the direction was wrong wherever it was read, including
+`split-default-migration`'s open-questions bullet, which now states "0.21-0.28 EV **darker**".
+The column's sign convention is now stated at the definition rather than left to be re-derived.
+
+**The `linear-render` row was the one fallible render in the loop and it `unwrap`ped.**
+`DisplayTone::None` refuses any sample above reference white, and the composite film-RGB →
+P3-luma functional sums to **1.0000000468**, so a near-white pixel can round over 1.0 even
+with the shoulder holding film RGB at ≤ 1.0. One such pixel would have aborted the whole
+seven-frame run instead of printing a refusal for that row. Now matched; a refusal is a
+result, not a reason to lose six other frames.
+
+Also fixed: the probe's rustdoc summary described the original two-question probe rather than
+the shipped one (three black-point rows, `crushed%`, the `linear-render` row); the scalar
+model's justification named only `linear_range` when it leans on the white-balance and
+exposure defaults too — the WB one load-bearing, since an auto mode re-estimates per candidate
+and the solve stops commuting; `SUBSAMPLE`'s raster stride is column-aliased on both fixture
+widths (documented, not changed — the assert bounds it); the placement table's rows sat two
+characters off its header; `wins` printed no denominator. Outside the probe: two stale
+task-owner references (`output`'s epic summary still said the split "explores" moving tone
+shaping out — the same sentence CLAUDE.md had already been corrected for, missed because the
+grep was run before that edit; and `types.rs` credited this task with a coupling now owned by
+`split-default-migration`), and this task's `How to Verify` bullet 2 was half-unmet on an
+`[x]` task without saying the version bump had moved downstream.
+
+**One remedy was declined.** The reviewer proposed fixing two misfiled progress entries with a
+pointer entry rather than relocating them, on append-only grounds. Checked first: the branch
+had **zero commits** and every one of those lines was a `+` in the uncommitted diff, so there
+was no committed history to preserve. Append-only protects what others may have read; it is
+not a reason to make a filing mistake permanent before it has ever been published. Moved.
+
 ## split-default-migration
 
 **Status:** not started

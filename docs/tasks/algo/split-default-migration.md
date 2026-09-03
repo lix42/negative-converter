@@ -23,9 +23,10 @@ of work: a version bump, a drift-gate row, a measured report, and a guide update
 
 - **How much of the shape moves?** The measured answer is "both knees off", but the
   migration has to decide whether the default anchor placement moves with it. Keeping
-  `MidAtDmaxFraction(0.5)` costs a measured ~0.21–0.28 EV of exposure bias against the
-  lightness-matched anchor — inside what `print.print_exposure` corrects, so plausibly
-  fine, and it avoids shipping the uncalibrated 0.626 offset as a constant.
+  `MidAtDmaxFraction(0.5)` costs a measured **0.21–0.28 EV darker** than the
+  lightness-matched anchor (it anchors above the solved one) — inside what
+  `print.print_exposure` corrects, so plausibly fine, and it avoids shipping the
+  uncalibrated 0.626 offset as a constant.
 - **Is the default display tone the same one?** `--display-tone reinhard` at the
   6-stop default is what was reviewed. Its **1.000-stop cost at diffuse white** is a
   rendering-intent call that was accepted for one rendition and explicitly not

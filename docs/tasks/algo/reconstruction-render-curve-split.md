@@ -168,6 +168,10 @@ is `blown%`, separation in **code values** on clamped output, and `crushed%`.
   the sigmoid stays" is a complete outcome and must be recorded as one.
 - If it lands: a `pipeline_version` bump with a before/after report, and
   `film-master`'s definition reconciled explicitly rather than left to drift.
+  **Half-met, deliberately.** The reconciliation is done (chunk B). The version bump is
+  **not** — it moved to `algo/split-default-migration` with the rest of the default
+  activation, because it inherits a colour-model blocker this task does not own. Closing
+  this task with that bullet outstanding is the agreed scope, not an oversight.
 - Whatever the outcome, the HDR headroom question is answered as a side effect —
   record what the chosen split does to it.
 
