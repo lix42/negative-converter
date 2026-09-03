@@ -244,7 +244,11 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   each variant as `shipped(v)/f(v)`, so when the shipped base became asymptotic all three
   collapsed onto it and the evidence *this file* cites stopped reproducing — silently, since
   a probe only prints. Build each variant from its parts, and assert the one mirroring the
-  shipped design equals the shipped function),
+  shipped design equals the shipped function. **A matched-exposure probe may solve the
+  anchor as a scalar gain only when `shoulder = 0`** — `t − floor` is `contrast·d`, so the
+  anchor factors out of the toe but *not* the shoulder's fixed-ceiling soft-min (69-81% off
+  at the default 0.6); `algo::sigmoid`'s `anchor_is_a_pure_gain_only_without_the_shoulder`
+  pins both directions),
   `algo/{mod,simple,density,sigmoid}.rs`, `telemetry.rs`, `version.rs`
   (build/pipeline identity + `stable_hash`, the crate's only params-hash
   implementation — `telemetry::params_hash` delegates to it so the core report
@@ -335,9 +339,14 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   *print rendering* decides whether output exceeds diffuse white, and today's
   default declines to. So HDR is a rendering-intent option, not a correctness gap —
   it is **not a blocker** for the sigmoid path (user decision 2026-08-10). The HDR
-  presets stay first-class and stay the default *precisely* to keep that door open
-  while the reconstruction/render split is explored
-  (`algo/reconstruction-render-curve-split`). Do not "fix" this by widening the
+  presets stay first-class and stay the default *precisely* to keep that door open.
+  `algo/reconstruction-render-curve-split` **settled that split affirmatively on
+  2026-09-02** — the default reconstruction should shed both knees, leaving the
+  display operator to carry the character — but **no default has moved**, so the
+  paragraph above still describes what nc ships. Activation is
+  `algo/split-default-migration`, blocked on `film-base/dmax-per-channel-reduction`
+  because the shoulder it removes is what currently hides a 17-83% off-neutral
+  channel error on the grey leader. Do not "fix" this by widening the
   container or by re-deriving headroom in the gain-map stage.
 - **nc writes the AVIF container itself; libaom only makes the codestream.**
   `io/avif.rs` is the `hdr-pq`/`hdr-hlg` encoder. There is **no libavif

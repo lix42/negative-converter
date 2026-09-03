@@ -2291,6 +2291,427 @@ fn tone_map_match_point_probe() {
     );
 }
 
+/// `algo/reconstruction-render-curve-split`, chunk A: **what does reconstruction keep?**
+///
+/// The split's direction is settled — `output/display-tone-mapping` closed on a user
+/// verdict for shoulder-less reconstruction under the unbounded display operator. The
+/// shoulder leaves reconstruction. What is *not* settled is the rest of the curve's
+/// shape, and this probe measures the two open choices against the shipped default:
+///
+/// - **The toe.** `algo/exponential-anchor-placement` refuted it as a black-recovery
+///   device (widening it 0.2 → 0.6 *raised* the floor 38 → 44) and measured a display
+///   stage `print.black_point` doing what it cannot. So the toe may be redundant once
+///   the shoulder is gone. Untested in combination with the operator.
+/// - **The anchor.** The reviewed config keeps `MidAtDmaxFraction(0.5)`, which reads the
+///   resolved `Dmax`. `MidAtBaseOffset` does not, so it keeps the leader anchor's
+///   roll-to-roll error out of the render — a real architectural win *if* it costs
+///   nothing in the picture. Its 0.626 offset is a starting point with known provenance,
+///   **not** a calibration (`output/display-tone-mapping`, 2026-09-01), so this measures
+///   the placement's shape, not a shippable constant.
+///
+/// **Every candidate is matched to the benchmark's mean encoded lightness**, which is the
+/// protocol `tone_map_match_point_probe` established: an unmatched comparison is not weak
+/// evidence, it is evidence for a different claim, and this task's log records that
+/// mistake being made twice. Matching is exact rather than fitted here — with
+/// `shoulder = 0` the anchor is a **pure gain** (`t − floor` is `contrast·d`, so the toe
+/// term carries no anchor; pinned by `algo::sigmoid`'s
+/// `anchor_is_a_pure_gain_only_without_the_shoulder`, which also shows the shipped
+/// shoulder breaks it by 69–81%). So the gain is solved on a scalar sample array and only
+/// then rendered, and every row asserts the render hit the lightness it solved for.
+///
+/// It also sweeps three **black-point** values, because the one previously measured as
+/// dominating every reconstruction-side form turns out to crush several percent of the
+/// frame; and it carries the `output/linear-render` pairing (the shipped reconstruction with
+/// the display tone skipped) as the fourth quadrant of (shoulder in reconstruction?) x (tone
+/// at display?), which nothing had benchmarked against the split.
+///
+/// Metrics: `blown%` and highlight separation in **code values**, both on clamped output,
+/// plus the black **floor** — the axis the toe question turns on — and **`crushed%`**, added
+/// here as `blown%`'s shadow counterpart because neither `|EV|` nor a floor percentile can
+/// see shadow clipping. That makes five metric traps this harness has produced (`sat%`,
+/// `flat%`, linear-ratio separation, unclamped separation, and a floor percentile read as if
+/// it were a clipping count); all are avoided by construction.
+///
+/// ```text
+/// cargo test --release shadow_metrics::reconstruction_shape_probe \
+///   -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires ../nc-assets; run with --ignored --nocapture"]
+fn reconstruction_shape_probe() {
+    const SUBSAMPLE: usize = 8;
+
+    let Some(assets) = assets_root() else {
+        eprintln!("SKIP: no ../nc-assets/manifest.json");
+        return;
+    };
+    let fx: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_root().join("scripts/sigmoid-baseline/fixtures.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let only = std::env::var("NC_TONEMAP_FRAME").ok();
+    let reinhard = DisplayTone::ExtendedReinhard(Headroom::new((64.0f32).log2()).unwrap());
+    let apply = scalar_operator(reinhard);
+
+    // The candidate grid. Each is built from its parts rather than derived from a shipped
+    // helper: a probe whose variants are expressed through the function under test stops
+    // measuring the moment that function changes (`hdr_gain_probe`'s recorded defect).
+    // `shoulder` is 0 throughout — that half is decided; these are the open choices.
+    struct Shape {
+        label: &'static str,
+        toe: f32,
+        black_point: f32,
+    }
+    // Two questions, one grid. Rows 1-2 are the toe; rows 3-5 sweep the black point at the
+    // toe setting rows 1-2 select, because 0.019 — the value
+    // `algo/exponential-anchor-placement` measured as dominating every reconstruction-side
+    // form — turns out to crush several percent of the frame, which its metrics (|EV| and
+    // the base code value) could not see. A refuted value is not a refuted knob, so this
+    // brackets it rather than stopping at "no".
+    const SHAPES: &[Shape] = &[
+        Shape {
+            label: "s0 (as reviewed)",
+            toe: 0.2,
+            black_point: 0.0,
+        },
+        Shape {
+            label: "s0, no toe",
+            toe: 0.0,
+            black_point: 0.0,
+        },
+        Shape {
+            label: "  + bp 0.005",
+            toe: 0.0,
+            black_point: 0.005,
+        },
+        Shape {
+            label: "  + bp 0.010",
+            toe: 0.0,
+            black_point: 0.010,
+        },
+        Shape {
+            label: "  + bp 0.019",
+            toe: 0.0,
+            black_point: 0.019,
+        },
+    ];
+
+    // The **anchor placement** deliberately does not appear in that grid. Matching to a
+    // common lightness solves the anchor, and the anchor is a pure gain here, so every
+    // placement converges on the *same* rendered pixels — measured: `MidAtBaseOffset(0.626)`
+    // and `MidAtDmaxFraction(0.5)` agreed to four decimals on every metric. A placement's
+    // value is therefore not visible in one frame; it is how well the rule *predicts* that
+    // solved anchor across a roll, since a rule that misses spends the error as exposure.
+    // That is the second table, and it is the question `reads_reference()` exists for.
+    /// The measured mid-above-base offset that pairs with this operator
+    /// (`output/display-tone-mapping`, 2026-09-01: 0.595-0.673 over seven frames, mean
+    /// 0.626). Explicitly **not** a calibrated constant — each row was matched to that
+    /// frame's own sigmoid render, so the spread inherits the reference's own variation.
+    const BASE_OFFSET: f32 = 0.626;
+
+    let mut per_roll: std::collections::BTreeMap<String, Vec<(String, f32, f32, f32)>> =
+        std::collections::BTreeMap::new();
+    let mut wins = (0usize, 0usize, 0usize);
+    for (key, f) in fx["frames"].as_object().unwrap() {
+        if only.as_deref().is_some_and(|k| k != key) {
+            continue;
+        }
+        // The lightness match needs no patch, but the mid patch is still what separates a
+        // measurable frame from one the earlier probes could not match, so the frame set
+        // stays comparable with the tables already on file.
+        if rect_of(f, "mid").is_none() {
+            continue;
+        }
+        let roll = f["roll"].as_str().unwrap();
+        let base_arr = fx["rolls"][roll]["dmin"].as_array().unwrap();
+        let base = FilmBase {
+            r: base_arr[0].as_f64().unwrap() as f32,
+            g: base_arr[1].as_f64().unwrap() as f32,
+            b: base_arr[2].as_f64().unwrap() as f32,
+        };
+        let path = assets
+            .join("rolls")
+            .join(roll)
+            .join(f["file"].as_str().unwrap());
+        let Ok((image, _)) = crate::io::decode::decode_within(&path, DECODE_BUDGET_BYTES) else {
+            continue;
+        };
+        let dmax = f["roll_dmax"].as_f64().unwrap() as f32;
+
+        // blown% / code separation / black floor / mean encoded lightness, all on the
+        // clamped render — what `io::encode` actually writes.
+        let measure = |img: &LinearImage| {
+            let mut lum: Vec<f32> = (0..img.rgb.len() / 3)
+                .map(|i| p3_luma(&img.rgb[i * 3..i * 3 + 3]))
+                .filter(|v| v.is_finite())
+                .map(|v| v.clamp(0.0, 1.0))
+                .collect();
+            lum.sort_by(f32::total_cmp);
+            let code = |p: f64| srgb_encode(pct(&lum, p)) * 255.0;
+            let n = lum.len() as f32;
+            (
+                100.0 * lum.iter().filter(|v| **v >= 0.999).count() as f32 / n,
+                code(0.99) - code(0.90),
+                code(0.001),
+                // Crushed is blown%'s shadow counterpart, and it is the term that makes a
+                // black point's cost visible: the floor percentile alone reads "0.0" for
+                // both a perfectly placed black and a badly clipped one.
+                100.0
+                    * lum
+                        .iter()
+                        .filter(|v| srgb_encode(**v) * 255.0 < 0.5)
+                        .count() as f32
+                    / n,
+                (lum.iter().map(|v| f64::from(srgb_encode(*v))).sum::<f64>() / lum.len() as f64)
+                    as f32,
+            )
+        };
+
+        let shared_for = |recon: &Reconstruction, print: &PrintParams| {
+            let (film, _) = crate::algo::reconstruct(&image, &base, recon).unwrap();
+            crate::pipeline::render_split::display_source(
+                crate::pipeline::working_space::map_nc_film_rgb_v1(film),
+                print,
+            )
+            .unwrap()
+        };
+        let render = |recon: &Reconstruction, print: &PrintParams, tone: DisplayTone| {
+            crate::pipeline::sdr::render(
+                &shared_for(recon, print),
+                crate::pipeline::sdr::SdrGamut::DisplayP3,
+                tone,
+            )
+            .unwrap()
+        };
+
+        let bench = render(
+            &benchmark_sigmoid(dmax),
+            &PrintParams::default(),
+            DisplayTone::DEFAULT,
+        );
+        let (b_blown, b_sep, b_floor, b_crush, b_light) = measure(bench.image());
+        drop(bench);
+
+        println!("\nframe {key}  {roll}  {}", f["file"].as_str().unwrap());
+        println!(
+            "{:<22}{:>9}{:>10}{:>9}{:>10}{:>8}{:>9}",
+            "shape", "anchor", "lightness", "blown%", "code sep", "floor", "crushed%"
+        );
+        println!(
+            "{:<22}{:>9}{b_light:>10.4}{b_blown:>9.2}{b_sep:>10.1}{b_floor:>8.1}{b_crush:>9.2}   \
+             <- BENCHMARK",
+            "[shipped sigmoid]", "-"
+        );
+
+        // `output/linear-render`'s pairing: the **shipped** reconstruction with the display
+        // tone curve skipped. It is the fourth quadrant of (shoulder in reconstruction?) x
+        // (tone at display?), and the one the split never benchmarked against — it measured
+        // itself against the old default, and chunk A measured the split against the same.
+        //
+        // It needs **no exposure matching and cannot use the scalar solve anyway**: it shares
+        // the benchmark's reconstruction exactly, so only the operator differs, which is the
+        // cleanest comparison available; and with `shoulder > 0` the anchor is not a gain, so
+        // the bisection the shape rows use would be invalid here. Its lightness is printed so
+        // the difference against the benchmark is visible rather than assumed away.
+        //
+        // This is the **only fallible render in the loop**, so it is the one that must not
+        // `unwrap`. `DisplayTone::None` refuses any sample above reference white, and the
+        // composite film-RGB → P3-luma functional sums to 1.0000000468 — so a near-white
+        // pixel can round over 1.0 even with the shoulder holding film RGB at <= 1.0. That
+        // is a legitimate result for this row, not a reason to abandon six other frames.
+        {
+            let shared = shared_for(&benchmark_sigmoid(dmax), &PrintParams::default());
+            match crate::pipeline::sdr::render(
+                &shared,
+                crate::pipeline::sdr::SdrGamut::DisplayP3,
+                DisplayTone::None,
+            ) {
+                Ok(out) => {
+                    let (blown, sep, floor, crush, light) = measure(out.image());
+                    println!(
+                        "{:<22}{:>9}{light:>10.4}{blown:>9.2}{sep:>10.1}{floor:>8.1}\
+                         {crush:>9.2}   <- linear-render",
+                        "[shipped + tone none]", "-"
+                    );
+                }
+                Err(e) => println!("{:<22}{:>9}   REFUSED: {e}", "[shipped + tone none]", "-"),
+            }
+        }
+
+        for shape in SHAPES {
+            let contrast = crate::types::REFERENCE_CONTRAST;
+            // Any starting anchor reaches the same solved one (it is a pure gain), so this
+            // is a starting point for the bisection, not a choice under test.
+            let reference = 0.5 * dmax + MID_OUTPUT_DECADES / contrast;
+            let sigmoid = |anchor: f32| Reconstruction::Density {
+                density: DensityParams::default(),
+                curve: DensityCurve::Sigmoid(SigmoidParams {
+                    contrast,
+                    toe: shape.toe,
+                    shoulder: 0.0,
+                    dmax: DmaxSource::Explicit(anchor),
+                    anchor: crate::types::AnchorPlacement::WhiteAtDmax,
+                }),
+            };
+            let print = PrintParams {
+                black_point: shape.black_point,
+                ..PrintParams::default()
+            };
+
+            // Solve the matching gain on a scalar sample array. Two properties make that
+            // exact rather than fitted, and both are needed:
+            //
+            // - the anchor is a pure gain at `shoulder = 0` (see `algo::sigmoid`'s
+            //   `anchor_is_a_pure_gain_only_without_the_shoulder`), so it commutes out of
+            //   reconstruction; and
+            // - the print stage reduces to `v − black_point` per channel, so on luminance
+            //   it is a *subtraction* of `black_point · k` (`k` = destination luma of ACEScg
+            //   white). It does **not** commute with the gain, so it is modelled here rather
+            //   than folded into the samples. That reduction needs **all three** of
+            //   `PrintParams`'s other defaults, not just `linear_range`: the stage is
+            //   `(v·wb·2^EV − black − low)/span`. The white-balance one is load-bearing —
+            //   under an auto `WbSource` the gains are re-estimated from each candidate's
+            //   own buffer, so the solve would stop commuting entirely.
+            //
+            // The samples therefore come from the reference render with the print stage
+            // neutral, and the black point is applied in the scalar model.
+            // `pre_operator_luma_samples` strides raster-ordered pixels, and both fixture
+            // widths (5184, 10368) are multiples of `SUBSAMPLE`, so this is one column phase
+            // in eight rather than a uniform 1-in-8 sample. Left as is: the target is a mean
+            // over the whole frame and the `light` assert below bounds the consequence.
+            let samples = pre_operator_luma_samples(
+                &shared_for(&sigmoid(reference), &PrintParams::default()),
+                SUBSAMPLE,
+            );
+            let lift = shape.black_point * acescg_white_luma();
+            let apply_print = |v: f32| apply(v - lift);
+
+            let (mut lo, mut hi) = (1e-6f32, 1e6f32);
+            for _ in 0..80 {
+                let g = 0.5 * (lo + hi);
+                if mean_lightness(&samples, g, &apply_print) < b_light {
+                    lo = g;
+                } else {
+                    hi = g;
+                }
+            }
+            let gain = 0.5 * (lo + hi);
+            let anchor = reference - gain.log10() / contrast;
+
+            let out = render(&sigmoid(anchor), &print, reinhard);
+            let (blown, sep, floor, crush, light) = measure(out.image());
+            let flag = match (blown < b_blown, sep > b_sep) {
+                (true, true) => "both",
+                (true, false) => "blown",
+                (false, true) => "sep",
+                _ => "-",
+            };
+            wins.2 += 1;
+            if blown < b_blown {
+                wins.0 += 1;
+            }
+            if sep > b_sep {
+                wins.1 += 1;
+            }
+            println!(
+                "{:<22}{anchor:>9.4}{light:>10.4}{blown:>9.2}{sep:>10.1}{floor:>8.1}\
+                 {crush:>9.2}   {flag}",
+                shape.label
+            );
+            // Record the reviewed shape's solved anchor as the roll's "correct" exposure
+            // for this frame, beside what each placement rule would have chosen without a
+            // benchmark to match against.
+            if shape.label == SHAPES[0].label {
+                per_roll.entry(roll.to_string()).or_default().push((
+                    key.to_string(),
+                    anchor,
+                    0.5 * dmax + MID_OUTPUT_DECADES / contrast,
+                    BASE_OFFSET + MID_OUTPUT_DECADES / contrast,
+                ));
+            }
+            // The solve is only meaningful if the render confirms the statistic it aimed
+            // at; a quietly-missed target would make every number above a comparison
+            // between two different exposures.
+            assert!(
+                (light - b_light).abs() < 0.005,
+                "{key} / {}: solved for lightness {b_light:.4}, rendered {light:.4}",
+                shape.label
+            );
+        }
+    }
+    println!(
+        "\nblown% lower is better, code sep higher is better, floor lower is darker black.\n\
+         Shapes beating the benchmark: blown% {}/{n} / sep {}/{n} (all frames, all shapes).",
+        wins.0,
+        wins.1,
+        n = wins.2
+    );
+
+    // Which placement rule predicts the solved exposure? An anchor error `dA = rule −
+    // solved` is a gain of `10^(−contrast·dA)`, i.e. **`−contrast·dA·log2(10)` stops** —
+    // the unit the error is actually spent in. `stops` below returns that signed value, so
+    // a **negative** bias means the rule anchors *above* the solved one and therefore
+    // renders **darker**; positive is brighter. (The sign is easy to drop: a higher anchor
+    // is a smaller gain.)
+    //
+    // **Read the bias column with the confound in mind, stated here so it is not
+    // rediscovered as a result.** The solved anchor is whatever matches *the shipped
+    // sigmoid's* lightness, and that benchmark reads the roll `Dmax` itself. So a rule that
+    // also reads `Dmax` is being scored against a target built from it, and its apparent
+    // accuracy is partly circular. This probe can show the *structure* of the two rules'
+    // errors; it cannot adjudicate between them. That needs a content-independent target —
+    // a grey card on a bracketed roll — which is `algo/sigmoid-parameter-calibration`'s
+    // recorded precondition.
+    //
+    // The spread column is not confounded in the same way and is the useful one: within a
+    // roll `Dmax` is constant, so the two rules differ by a constant and their spreads are
+    // **identical by construction**. Frame-to-frame exposure disagreement is what neither
+    // placement can fix, and it bounds what any single-anchor rule can deliver.
+    let contrast = crate::types::REFERENCE_CONTRAST;
+    let stops = |d: f32| -contrast * d * std::f32::consts::LOG2_10;
+    println!(
+        "\n{:<28}{:>8}{:>10}{:>12}{:>12}",
+        "placement rule vs solved", "frames", "bias EV", "spread EV", "worst EV"
+    );
+    for (roll, rows) in &per_roll {
+        if rows.is_empty() {
+            continue;
+        }
+        println!(
+            "  {roll}  (solved anchors: {})",
+            rows.iter()
+                .map(|(k, a, _, _)| format!("{k} {a:.4}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (name, pick) in [
+            ("mid-at-dmax-fraction 0.5", 2usize),
+            ("mid-at-base-offset", 3usize),
+        ] {
+            let errs: Vec<f32> = rows
+                .iter()
+                .map(|r| stops(if pick == 2 { r.2 } else { r.3 } - r.1))
+                .collect();
+            let mean = errs.iter().sum::<f32>() / errs.len() as f32;
+            let spread = errs.iter().fold(f32::MIN, |a, b| a.max(*b))
+                - errs.iter().fold(f32::MAX, |a, b| a.min(*b));
+            let worst = errs.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+            println!(
+                "  {name:<26}{:>8}{mean:>10.2}{spread:>12.2}{worst:>12.2}",
+                errs.len()
+            );
+        }
+    }
+    println!(
+        "\nspread is identical between the rules by construction (constant Dmax within a\n\
+         roll) and is the exposure error no single-anchor rule can remove. The bias column\n\
+         is CONFOUNDED: the solved anchor is matched to the shipped sigmoid, which reads\n\
+         Dmax, so a Dmax-reading rule is scored against a target built from it. Adjudicating\n\
+         the placement needs a grey card on a bracketed roll, not this probe."
+    );
+}
+
 /// The HDR half of `output/display-tone-mapping`: does the highlight-lifted operator
 /// produce a **live** gain map, and does the HDR rendition stay under its ceiling?
 ///
@@ -2564,6 +2985,26 @@ fn pre_operator_luma_samples(
             luma.is_finite().then_some(luma)
         })
         .collect()
+}
+
+/// Destination luma of ACEScg white, `dot(DISPLAY_P3_LUMA, ACESCG_TO_DISPLAY_P3 · [1,1,1])`.
+///
+/// The print stage subtracts `black_point` from each **ACEScg** channel, so the shift it
+/// produces in *destination* luminance is `black_point` times this factor — not
+/// `black_point` itself. Close to 1 but deliberately not assumed: the mapping carries a
+/// chromatic adaptation, so the row sums do not have to be 1, and a probe that assumed
+/// they were would bias every black-point row by a term it never showed.
+fn acescg_white_luma() -> f32 {
+    use crate::pipeline::colorimetry::pinned::{ACESCG_TO_DISPLAY_P3, DISPLAY_P3_LUMA};
+    let white = [1.0f32, 1.0, 1.0];
+    dot3(
+        DISPLAY_P3_LUMA,
+        [
+            dot3(ACESCG_TO_DISPLAY_P3[0], white),
+            dot3(ACESCG_TO_DISPLAY_P3[1], white),
+            dot3(ACESCG_TO_DISPLAY_P3[2], white),
+        ],
+    )
 }
 
 /// Mean **encoded** lightness of a rendered set: the display transfer approximates the

@@ -783,7 +783,7 @@ pub enum DisplayToneCurve {
         /// Display-referred deliberately. The alternative was density above the
         /// reconstruction's anchor, which would make a *print* key read the
         /// reconstruction's anchor and contrast — the stage coupling
-        /// `algo/reconstruction-render-curve-split` exists to remove — and cannot
+        /// `algo/split-default-migration` exists to remove — and cannot
         /// resolve under `simple` at all.
         ///
         /// `0` makes the operator the exact **identity** (`W = 1` gives

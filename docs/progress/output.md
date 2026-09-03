@@ -154,9 +154,10 @@ What other epics need to know about `output`:
   `output` defect, and do not add headroom in the gain-map stage to compensate;
   **(b)** HDR is now explicitly **lower priority** and must not block the sigmoid
   path, but the HDR presets stay first-class and `gain-map-hdr` stays the default,
-  deliberately, so the capability stays exercised while
-  `algo/reconstruction-render-curve-split` explores moving tone shaping out of
-  reconstruction. Measured in
+  deliberately, so the capability stays exercised.
+  `algo/reconstruction-render-curve-split` **settled** (2026-09-02) that tone shaping should
+  move out of reconstruction, but **no default has moved** — so the paragraph above still
+  describes what nc ships. Activation is `algo/split-default-migration`. Measured in
   [reports/render-defaults-v3.md](../reports/render-defaults-v3.md).
 - **`definitions::ICC_PCS_WHITE_XYZ` is not `D50.to_xyz()`.** ICC declares its PCS
   white as `[0.9642, 1, 0.8249]`; deriving XYZ from D50's rounded four-decimal

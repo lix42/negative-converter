@@ -162,7 +162,14 @@ further knob work.
 - [Negative reconstruction and density curves](negative-reconstruction-density-curves.md)
 
 Blocks nothing formally: the exponential is the explicit diagnostic straight line since
-the sigmoid became the default curve. But
-[`algo/reconstruction-render-curve-split`](reconstruction-render-curve-split.md) is
-waiting on this task's outcome for what "modified exponential" means — settled here
-rather than duplicated there.
+the sigmoid became the default curve.
+[`algo/reconstruction-render-curve-split`](reconstruction-render-curve-split.md) consumed
+this task's outcome and **closed 2026-09-02**.
+
+**Downstream note — this task's verdict was rescoped, not reversed.** "Not competitive at
+any anchor" was measured under the *shipped fixed-ceiling knee*. The curve-split task then
+measured the same straight line under the unbounded display operator at lightness-matched
+anchors and got **3.89-5.95% blown with 10.9-120.1 code separation**, against the shipped
+sigmoid's 6.11-6.87. So the pairing failed, not the curve — and since `toe = shoulder = 0`
+is bit-exactly this curve, the split's own endpoint *is* a straight-line reconstruction.
+The anchor findings recorded here are unaffected.
