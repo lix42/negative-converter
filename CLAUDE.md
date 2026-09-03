@@ -482,10 +482,18 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
   **negation** of the claim you just falsified — `grep -rn "SDR only\|is refused" src docs
   CLAUDE.md` — not for the code you changed; the stale sentence is never in your diff.
 - **The Rust four-gate sequence does not itself cover `scripts/analysis/`.** CI
-  runs its stdlib `nctool` Python suite as a separate gate on Linux and macOS:
-  `PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis
-  -p "test_*.py"`. Run that command by hand after touching it; the suite includes
-  fixture-backed black-box coverage of `scripts/real-scan-verify/harness.sh`.
+  runs the `nctool` Python suite as a separate gate on Linux and macOS:
+  `NCTOOL_REQUIRE_DEPS=1 PYTHONPATH=scripts/analysis python3 -m unittest discover
+  -s scripts/analysis -p "test_*.py"`. Run that command by hand after touching it;
+  the suite includes fixture-backed black-box coverage of
+  `scripts/real-scan-verify/harness.sh` (which needs `target/debug/nc`, so
+  `cargo build` first — release alone leaves that one test failing).
+  **`nctool` is stdlib-only *except* `metrics`**, which reads output pixels and
+  needs `numpy`/`tifffile` from `scripts/analysis/requirements.txt` (CI installs
+  them; locally, a `.venv`). The import is lazy, so every other command still runs
+  without them — which is exactly why its tests `skipUnless` the packages are
+  importable, and why `NCTOOL_REQUIRE_DEPS=1` exists to turn a forgotten install
+  into a failure instead of ~29 silent skips under a green `ok`.
 - **`tests/pipeline.rs`'s `run()` injects `--output-preset legacy`** into a
   `convert` that names no preset, loads no `--params`, and writes `.tif`/`.tiff` —
   ~87 tests predate the gain-map default and assert TIFF-path behaviour. A test

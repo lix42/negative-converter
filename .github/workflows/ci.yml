@@ -59,8 +59,22 @@ jobs:
       - name: Build
         run: cargo build --all-targets --all-features --verbose
 
+      - name: Install analysis dependencies
+        # `nctool metrics` reads output pixels and needs numpy/tifffile; the rest
+        # of the toolkit is stdlib-only. A venv, not `pip install --user`: both
+        # runner images ship an externally-managed interpreter (PEP 668), which
+        # refuses a --user install outright, and a venv is also the workflow
+        # scripts/analysis/README.md documents locally — one shape, not two.
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet -r scripts/analysis/requirements.txt
+
       - name: Analysis and harness tests
-        run: PYTHONPATH=scripts/analysis python3 -m unittest discover -s scripts/analysis -p "test_*.py"
+        # NCTOOL_REQUIRE_DEPS turns a missing install into a failure rather than
+        # ~30 silent skips under a green `ok`.
+        env:
+          NCTOOL_REQUIRE_DEPS: "1"
+        run: PYTHONPATH=scripts/analysis .venv/bin/python -m unittest discover -s scripts/analysis -p "test_*.py"
 
       - name: Test
         run: cargo test --all-features --verbose

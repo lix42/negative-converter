@@ -1,14 +1,29 @@
 # `nctool` analysis toolkit
 
 `nctool` is the repository's Python command line for asset inventory, repeatable
-roll conversion, and conversion analysis. It uses only the Python standard
-library today.
+roll conversion, and conversion analysis.
 
 Run it from the repository root:
 
 ```sh
 PYTHONPATH=scripts/analysis python3 -m nctool --help
 ```
+
+### Dependencies
+
+Every command except `metrics` uses only the Python standard library, and stays
+that way. `metrics` reads output pixels, which needs `numpy` and `tifffile`:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r scripts/analysis/requirements.txt
+PYTHONPATH=scripts/analysis .venv/bin/python -m nctool metrics image --help
+```
+
+The import is lazy, so a checkout without the venv still runs every other
+command. The metrics tests skip when the packages are absent; CI installs them
+and sets `NCTOOL_REQUIRE_DEPS=1`, which turns a missing install into a failure
+instead of a silent skip.
 
 The default asset root is `../nc-assets`. Override it with `--asset-root` or the
 `NC_ASSET_ROOT` environment variable.
@@ -133,6 +148,65 @@ absolute input/output paths, which would create irrelevant diffs. It does not
 reread pixels, so equal analysis files mean the recorded conversion facts agree;
 they do not prove that output files are byte- or pixel-identical.
 
+## Measure a converted image's own pixels
+
+Every command above derives its numbers from `nc`'s JSON report, so they exist
+only for nc outputs. `metrics` reads the output *image*, so an NLP conversion, a
+SmartConvert TIFF, or an export edited by hand can be measured on the same
+footing:
+
+```sh
+PYTHONPATH=scripts/analysis .venv/bin/python -m nctool metrics image \
+  ../nc-assets/converted/nlp/2026-08-04/20260803-film-1235-positive.tif \
+  --space linear-srgb --inset 0.05
+```
+
+`--space` is required and never inferred. A TIFF's samples do not say whether
+they are transfer-encoded — the NLP exports are 32-bit float with a *linear*
+sRGB profile, nc writes transfer-encoded u16, and SmartConvert writes u16 with
+no profile at all — so guessing produces a plausible wrong table rather than an
+error. Supported: `srgb`, `linear-srgb`, `display-p3`, `linear-display-p3`,
+`adobe-rgb`, `linear-adobe-rgb`, `prophoto`, `linear-prophoto`, `linear-bt2020`
+— which covers the usual Lightroom export choices. PQ and HLG are recognized and
+refused with a reason: they are absolute or display-referred, so comparing them
+with an SDR rendition needs a reference-white normalization this command does not
+implement yet.
+
+`--inset F` trims that fraction off each edge and `--region x,y,w,h` takes an
+explicit rectangle; both are **fractions**, because the images being compared do
+not share dimensions. Use them to keep the film holder and rebate out of the
+statistics until `film-base/ir-holder-detection` can supply a mask — and check
+the inset actually clears the holder, which can occupy 10-15% of an edge.
+
+It reads every sample in the region rather than subsampling, so peak memory
+scales with the frame: ~1.2 GB at 18.7 MP, ~4.7 GB extrapolated to a 10368x7200
+scan. Runtime is ~1.4 s at 18.7 MP.
+
+The record reports endpoint occupancy on the stored (encoded) samples, then
+tone statistics in log2 stops relative to 0.18 after decoding to linear light:
+the key (geometric mean), a percentile vector, contrast spreads, toe and
+shoulder spans, and band occupancy. Colour metrics are not implemented yet.
+
+Two things the numbers mean, which are easy to misread:
+
+- `endpoints.at_or_above_white` is an **upper bound** on what the producer
+  clipped: a sample that legitimately landed on the endpoint is indistinguishable
+  from one clamped to it. On an nc output the report's `loss.*` counters are the
+  independent check, and the two agree to rounding when clipping is what happened.
+- `tone.shoulder_span_stops` of 0 means p95, p99 and p99.9 are the same value —
+  the top of the distribution is one flat step. On an uncropped scan that is
+  usually **the film holder**, not the render: the holder blocks all light, so it
+  is maximum density in the negative and renders to white. On one measured frame,
+  tightening the inset from 0 to 0.15 took the top-code population from 9.5% to
+  0% and the shoulder span from 0.000 to 0.417. Measure a region before concluding
+  anything about highlights.
+
+Colorimetry is not restated here: the primaries, white points and Bradford matrix
+are transcribed from `src/pipeline/colorimetry/definitions.rs`, and the tests
+re-read that file and the generated `derived-artifacts.txt` and fail if the
+Python drifts from either. To support a new space, define it there first — that
+is why `definitions::ADOBE_RGB` exists although nc renders to no such space.
+
 ## Compare two builds
 
 The older `compare run|diff` workflow answers a different question: how one fixed
@@ -157,9 +231,13 @@ are informational and never decide the deterministic-statistics verdict.
 The CI command is:
 
 ```sh
-PYTHONPATH=scripts/analysis python3 -m unittest discover \
+NCTOOL_REQUIRE_DEPS=1 PYTHONPATH=scripts/analysis python3 -m unittest discover \
   -s scripts/analysis -p "test_*.py"
 ```
 
-The tests are hermetic: they use temporary asset manifests and committed tiny
-TIFF fixtures rather than the Drive-hosted scans.
+The tests are hermetic: they use temporary asset manifests, committed tiny TIFF
+fixtures, and images synthesized in the test itself, rather than the Drive-hosted
+scans. `NCTOOL_REQUIRE_DEPS=1` makes a missing `numpy`/`tifffile` a failure
+instead of letting the metrics tests skip while the run still prints `ok`; leave
+it unset locally if you have not made the venv. The harness tests additionally
+need `cargo build` to have produced `target/debug/nc`.

@@ -1,8 +1,15 @@
 """`python -m nctool` entry point.
 
-Three command groups: `manifest` (generate / validate / roles), `compare`
-(build-version run / diff), and `roll` (manifest-driven calibrate / convert /
-deterministic analysis artifacts).
+Four command groups: `manifest` (generate / validate / roles), `compare`
+(build-version run / diff), `roll` (manifest-driven calibrate / convert /
+deterministic analysis artifacts), and `metrics` (pixel-derived measurement of a
+converted image, whatever produced it).
+
+`metrics` is the one group that needs third-party packages; see
+`scripts/analysis/requirements.txt`. Importing the module is still free — it
+pulls `numpy`/`tifffile` inside the functions that touch pixels — so a checkout
+without the venv builds the same parser and gets a real error only if it runs the
+command.
 """
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ import sys
 
 from . import compare as _compare
 from . import manifest as _manifest
+from . import metrics as _metrics
 from . import roll as _roll
 
 ASSET_ROOT_HELP = ("asset root (the folder containing manifest.json); defaults to "
@@ -134,6 +142,39 @@ def build_parser() -> argparse.ArgumentParser:
     ranalyze.add_argument(
         "--out", help="write analysis JSON here (default: analysis.json beside tags.json)")
     ranalyze.set_defaults(func=_roll.cmd_analyze)
+
+    # --- metrics: pixel-derived measurement of one output image --------------
+    met = sub.add_parser(
+        "metrics",
+        help="measure a converted image's own pixels (any producer: nc, NLP, "
+             "SmartConvert, a hand-edited export)")
+    esub = met.add_subparsers(dest="cmd", required=True)
+
+    mimage = esub.add_parser(
+        "image", help="measure one image and emit its metric record as JSON")
+    mimage.add_argument("image", help="path to a single-page RGB TIFF")
+    mimage.add_argument(
+        "--space", required=True,
+        # Listed from the table itself: a hand-written list here went stale the
+        # moment Adobe RGB was added, and `--help` is what a user reads.
+        help="the image's colour space, declared (" + ", ".join(sorted(_metrics.SPACES))
+             + "). Never inferred: a TIFF's samples do not say whether they are "
+               "transfer-encoded, and guessing wrong yields a plausible wrong answer")
+    mimage.add_argument(
+        "--region",
+        help="measure this rectangle, as FRACTIONS of the frame: x,y,w,h. "
+             "Fractions, not pixels, because compared images differ in size")
+    mimage.add_argument(
+        "--inset", type=float,
+        help="measure all but this fraction of each edge (0.05 trims 5%% per side). "
+             "Use it to keep the film holder and rebate out of the statistics — but "
+             "check it actually clears them: a holder can occupy 10-15%% of an edge")
+    mimage.add_argument("--out", help="write the record here (default: stdout)")
+    mimage.add_argument(
+        "--no-checksum", action="store_true",
+        help="skip hashing the image bytes (the record then cannot identify which "
+             "file it described)")
+    mimage.set_defaults(func=_metrics.cmd_image)
 
     return ap
 

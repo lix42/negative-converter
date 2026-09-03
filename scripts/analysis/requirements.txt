@@ -1,0 +1,14 @@
+# Dependencies for `nctool metrics` (scripts/analysis/nctool/metrics.py).
+#
+# The rest of the toolkit is stdlib-only and stays that way: manifest, roll and
+# compare import nothing from here. Only the pixel reader needs these, because
+# reading TIFF variants and taking percentiles over 18-75 megapixels in pure
+# Python is neither short nor fast.
+#
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install -r scripts/analysis/requirements.txt
+#
+# Versions are floors, not pins: the metrics are defined by this repository's
+# code, not by a library's release, and the tests assert the numbers.
+numpy>=1.26
+tifffile>=2024.1.30

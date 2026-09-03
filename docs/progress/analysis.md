@@ -17,6 +17,17 @@ What other epics need to know about `analysis`:
   `scripts/`, and the hard invariant is that **only derived numbers and
   downscaled thumbnails leave the tools** — never sample pixels into context.
   Metadata comes from `nc inspect`; bytes are streamed only to hash.
+- **`nctool metrics` reads output pixels (2026-09-02), and is the toolkit's only
+  command that does.** Every other number here comes from `nc`'s own JSON report
+  and therefore exists only for nc outputs; `metrics` measures any producer's
+  image — NLP, SmartConvert, a hand-edited export — on the same footing. It is
+  also the only command that is not stdlib-only (`numpy`, `tifffile`, via
+  `scripts/analysis/requirements.txt`; CI installs them into a venv and sets
+  `NCTOOL_REQUIRE_DEPS=1`). It still emits derived numbers only. Two facts other
+  epics may want: an input's colour space must be **declared**, never inferred, and
+  a full-frame measurement of an uncropped scan measures the **film holder** as
+  much as the picture (it renders to white; excluding it moved one frame's median
+  by 3.1 stops).
 - **Real-scan core verification is done (2026-07-22/23)** across five rolls; the
   write-up is [`docs/reports/real-scan-verification.md`](../reports/real-scan-verification.md)
   and the rerunnable harness plus frozen recipes are under
@@ -320,8 +331,8 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 
 ## conversion-metrics
 
-**Status:** not started
-**Updated:** 2026-08-12
+**Status:** in progress
+**Updated:** 2026-09-02
 
 - Goal: Formalize the ad-hoc image-library analysis from real-scan verification into the reusable Python toolkit that is the toolkit's single documented entry point.
 - 2026-08-12: Folded the briefly separate `photographic-result-analysis` follow-up into this
@@ -330,6 +341,117 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
   establish that the runs differ, but do not explain color and tone distribution,
   shadow/highlight occupancy, range use, or proximity to the endpoints. Metric definitions and
   the final artifact design remain opening questions for implementation.
+- 2026-09-02: Task file rewritten; three decisions taken before implementation.
+  (1) `numpy` + `tifffile` in a venv, replacing the stdlib-only assumption the old
+  Design section carried — that section also claimed `harness.sh` would be retired,
+  which never happened (it is fixture-tested in CI). The Python CI gate will have to
+  install the dependencies on both platforms. (2) Every input's color space is
+  declared, never guessed; unstated is a loud refusal. Verified motive: the manifest's
+  `encoding` field records depth (`f32`) but not transfer, while the NLP files
+  themselves carry a *linear* sRGB profile — measuring them against nc's
+  transfer-encoded u16 without decoding would have produced a plausible, wrong table.
+  (3) Tone metrics live in log2 stops relative to 0.18, where exposure is an offset and
+  contrast is a slope. Also confirmed by survey that nothing in `scripts/` reads output
+  pixels today: `roll analyze`, `compare run`, and the `render-defaults` scripts all
+  derive their numbers from nc's own JSON report, so they cover nc outputs only. The
+  film-holder problem is handled by an explicit fractional region, with the note that a
+  5% inset does not clear a real holder and that excluding dark pixels as a holder proxy
+  would bias the very shadow statistics being measured.
+- 2026-09-02: Tone slice implemented — `nctool metrics image`, the toolkit's first
+  reader of output pixels. `scripts/analysis/nctool/metrics.py` declares the colour
+  space (never infers it), decodes to linear, adapts to D65, and reports endpoint
+  occupancy on the stored samples plus tone statistics in log2 stops relative to
+  0.18: key (geometric mean), an eleven-point percentile vector, contrast spreads,
+  toe/shoulder spans, and band occupancy. Regions are fractional (`--inset`,
+  `--region`). `numpy`/`tifffile` arrive via `scripts/analysis/requirements.txt`;
+  the import is lazy so every stdlib command still runs without them, CI installs
+  them, and `NCTOOL_REQUIRE_DEPS=1` turns a forgotten install into a failure rather
+  than 29 skips under a green `ok` (the guard was checked by running it against an
+  interpreter without the packages).
+  Colorimetry is not restated: primaries, whites and Bradford are transcribed from
+  `definitions.rs`, and tests re-read that file plus the generated
+  `derived-artifacts.txt`. Python's independent derivation reproduces the Rust
+  audit's binary64 `SRGB_LUMA` and `DISPLAY_P3_LUMA` exactly; a test also pins that
+  the BT.2020 derivation from primaries deliberately stays ~2e-6 from the tabulated
+  vector, since a linear-light luminance weighting is not the non-constant-luminance
+  luma.
+  **Verified against an independent source of truth.** On a legacy-preset render of
+  Ektar 971 nc reported `clipped_high` = 0.103282844 of samples; the tool measured
+  0.103283 at the top code — agreement to the artifact's own rounding. Measuring the
+  same file declared `linear-srgb` instead of `srgb` moved the key by 2.22 stops with
+  no error raised either way, which is why the declaration is mandatory.
+- 2026-09-02: Finding — **on an uncropped frame the film holder *is* the highlight
+  distribution, and it is measurable.** The opaque holder blocks all light, so it is
+  maximum density in the negative and renders to white in the positive; it therefore
+  lands at the top code and dominates every highlight statistic. Measured on Ektar 971
+  (`display-p3`, default sigmoid) as the region tightens: samples at the top code
+  0.0950 → 0.0134 → 0.0018 → 0.0000 for insets 0 / 0.05 / 0.10 / 0.15, with
+  `shoulder_span_stops` recovering 0.000 → 0.186 → 0.385 → 0.417 and the
+  `above_diffuse_white` band going 0.0541 → 0. So the render has real highlight
+  separation; the full-frame numbers were the holder. The same effect on Portra160
+  1102 moves the *median* by 3.1 stops between the full frame and a centre-76% region
+  (-2.30 → -5.42), because the white border was holding the whole distribution up.
+  Two consequences. **A full-frame measurement of an uncropped scan is not a
+  measurement of the picture** — the region parameter is not a convenience, and this
+  quantifies what `film-base/ir-holder-detection` would automate. And a first pass at
+  this entry read the same pile-up as evidence that `loss.clipped_high` cannot see
+  highlight compression on the bounded display shoulder; that was wrong, and the inset
+  sweep is what falsified it. `clipped_high: 0` was accurate. The `legacy` render on
+  that frame does genuinely clip (nc: 10.3 % of samples), and unlike the sigmoid its
+  top-code population survives the holder's removal (2.85 % at inset 0.15).
+- 2026-09-02: Adobe RGB support, and where a colour space's definition lives. User
+  asked for it (Lightroom exports reach us in that space). Defined as
+  `definitions::ADOBE_RGB` in the **Rust**, not in the Python, even though nc renders
+  to no such space: primaries living only in `metrics.py` would be a second
+  colorimetry source of truth by construction, which is the arrangement CLAUDE.md's
+  rule exists to prevent. The metrics tests re-read `definitions.rs`, so a one-sided
+  edit now fails on both sides. No `allow(dead_code)` was needed — `cargo build` and
+  `clippy --all-targets -D warnings` are clean with the constant unused by the
+  runtime — and `derived-artifacts.txt` is untouched, since no pinned artifact derives
+  from it. Its red and blue primaries are Rec.709's exactly and only green moves, so
+  both suites assert that relationship rather than just the values; that is the pair
+  most likely to be transcribed wrongly. Transfer is the pure 563/256 power law with
+  no linear segment, verified end to end: a file encoding exactly 18% linear grey
+  measures 0.000 stops.
+  Two process notes. A first version of the luma test asserted the published
+  `[0.2974, 0.6273, 0.0753]` from memory and failed at 5.5e-5; published RGB→XYZ
+  tables round D65 to five decimals where `definitions::D65` rounds to four, and the
+  remembered digits could not be checked against any source in the repo. It was
+  replaced by the checkable relationship (weight moves off green onto red versus
+  Rec.709) plus a deliberately coarse three-decimal bound. And adding the space left
+  `--help`'s hand-written space list stale with every gate green — the same defect
+  CLAUDE.md records for `OutputPreset`'s help text. The parser now builds that list
+  from `metrics.SPACES`, and a test asserts it; the test was confirmed to fail when
+  the list is hardcoded again. It has to collapse whitespace first, because argparse
+  wraps a long name across lines at its hyphen.
+- 2026-09-02: Review round on the tone slice (`/code-review`), 11 findings, all
+  fixed. Three were real defects that produced a *plausible wrong answer* rather
+  than an error, which is the failure class this module exists to avoid.
+  **(a)** A planar-layout TIFF (`PLANARCONFIG=2`) was accepted and measured. The
+  guard tested the decoded array's shape, but tifffile hands a planar file back as
+  `(samples, height, width)`, which passes `ndim == 3 and shape[2] >= 3` — so a
+  30x20 RGB file measured as a 20x3 image with 27 of its 30 rows silently dropped,
+  exit 0. Reproduced three ways before fixing; note the finding as first written
+  did *not* reproduce, because writing an `(H, W, 3)` array with
+  `planarconfig="separate"` produces a malformed file rather than a planar one —
+  the real reproduction needs the array already in planar order. The check now
+  reads the file's own `planarconfig`/`samplesperpixel`/dimensions instead of
+  trusting the array's shape.
+  **(b)** `parse_region` let NaN through every bound check (NaN compares false
+  against all of them) and died later in `int(round(nan * width))`.
+  **(c)** `--region ""` bypassed the region/inset mutual exclusion via a truthiness
+  test, so a run silently measured the inset while the user had asked for a region.
+  Also: a non-TIFF input escaped as a `TiffFileError` traceback instead of exit 2
+  (pointing this at a JPEG is the likeliest mistake there is); `bands` did not
+  actually partition the frame when any sample was non-finite, and the test
+  asserting that it did used `rng.random`, which never produces a NaN; two fields
+  named `non_finite_fraction` used different denominators (samples vs pixels) and
+  are now named for their base; CI's `pip install --user` would hit PEP 668 on both
+  runner images and now builds the same venv the README documents.
+  Memory measured rather than guessed while fixing the decode's temporaries: 1.18 GB
+  peak at 18.66 MP (~63 B/px), ~4.7 GB extrapolated to 10368x7200. The rewritten
+  decode is bit-identical on the real frame — same percentiles, same key, and the
+  nc `loss.*` cross-check still agrees to rounding.
 
 
 ## drive-asset-migration
@@ -343,9 +465,24 @@ Addressed the `asset-manifest` review findings (all uncommitted, in worktree):
 ## nlp-comparison
 
 **Status:** not started
-**Updated:** —
+**Updated:** 2026-09-02
 
 - Goal: Ingest Negative Lab Pro (NLP) conversion outputs (the user adds them to `nc-assets`) and compare them against nc's outputs: global per-image metrics side by side, plus side-by-side downscaled thumbnails.
+- 2026-09-02: Task rewritten and widened from "NLP vs nc" to reference comparison,
+  after the user pointed out that NLP is not ground truth — they edit its results and
+  can contribute those edits as assets. References therefore carry a role: `reference`
+  (another tool's output as it came) versus `target` (an image edited to the wanted
+  result). That yields three deltas per axis, and makes `|nc − target| < |NLP − target|`
+  the acceptance question; the NLP→target spread also supplies the scale for what counts
+  as a meaningful difference, instead of a picked tolerance. Re-verified the asset facts
+  the no-registration design rests on: `nlp/2026-07-23` is 4406×2930 against a 5184×3600
+  source and its **aspect ratio differs** (1.504 vs 1.44), so the crop cannot be undone
+  arithmetically — but `nlp/2026-08-04` is full-frame 5184×3600, so an opt-in pixel-wise
+  section gated on exact dimension equality will genuinely engage on some sets.
+  `converted/SmartConvert/TIFF` is present but carries neither a `source_frame` nor an
+  ICC profile, so it is unpaired until both are declared by hand. Noted that nc's default
+  gain-map JPEG is unreadable by the planned metric reader, so comparison runs go through
+  a TIFF preset.
 
 
 ## display-output-acceptance (continued)

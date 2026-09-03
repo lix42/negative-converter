@@ -53,8 +53,8 @@
 
 use super::audit::ulps_f32;
 use super::definitions::{
-    ACESCG, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, BT2020_LUMA_TABULATED, ColorSpace, D50,
-    D65, DISPLAY_P3, ICC_PCS_WHITE_XYZ, PROPHOTO, REC709,
+    ACESCG, ADOBE_RGB, BRADFORD, BRADFORD_PUBLISHED_INVERSE, BT2020, BT2020_LUMA_TABULATED,
+    Chromaticity, ColorSpace, D50, D65, DISPLAY_P3, ICC_PCS_WHITE_XYZ, PROPHOTO, REC709,
 };
 use super::derive::{self, Matrix3, inverse, multiply, rgb_to_rgb, transform};
 use super::pinned;
@@ -911,7 +911,7 @@ fn apply_f32(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 
 #[test]
 fn every_defined_space_has_a_sane_gamut() {
-    for space in [REC709, DISPLAY_P3, BT2020, ACESCG] {
+    for space in [REC709, DISPLAY_P3, ADOBE_RGB, BT2020, ACESCG] {
         let npm = derive::normalized_primary_matrix(space);
         // White maps to the adopted white.
         let white = transform(npm, [1.0, 1.0, 1.0]);
@@ -934,11 +934,28 @@ fn every_defined_space_has_a_sane_gamut() {
 }
 
 #[test]
+fn adobe_rgb_differs_from_rec709_in_green_only() {
+    // Adobe RGB (1998) shares Rec.709's red and blue primaries exactly; only its
+    // green moves. Asserting both halves catches the two ways this gets
+    // transcribed wrongly: copying Rec.709 wholesale (green never moves), and
+    // "correcting" red or blue to match some other space's.
+    assert_eq!(ADOBE_RGB.primaries.red, REC709.primaries.red);
+    assert_eq!(ADOBE_RGB.primaries.blue, REC709.primaries.blue);
+    assert_ne!(ADOBE_RGB.primaries.green, REC709.primaries.green);
+    assert_eq!(ADOBE_RGB.white, D65);
+
+    // The wider green really does widen the gamut: Adobe RGB's green primary
+    // sits further from the white point than Rec.709's.
+    let reach = |c: Chromaticity| (c.x - D65.x).hypot(c.y - D65.y);
+    assert!(reach(ADOBE_RGB.primaries.green) > reach(REC709.primaries.green));
+}
+
+#[test]
 fn color_space_names_are_unique() {
     // PROPHOTO belongs here even though it is absent from
     // `every_defined_space_has_a_sane_gamut`: a name collision is a name
     // collision regardless of whether the space's gamut invariants apply.
-    let spaces: [ColorSpace; 5] = [REC709, DISPLAY_P3, BT2020, ACESCG, PROPHOTO];
+    let spaces: [ColorSpace; 6] = [REC709, DISPLAY_P3, ADOBE_RGB, BT2020, ACESCG, PROPHOTO];
     for (i, a) in spaces.iter().enumerate() {
         for b in &spaces[i + 1..] {
             assert_ne!(a.name, b.name, "duplicate colour-space name {}", a.name);
