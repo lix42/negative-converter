@@ -837,7 +837,8 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     auto-base run) leaves all three hashes untouched. Extending the gate with an
     IR-carrying frozen scan belongs to `core/conversion-versioning`; until then, an
     IR-path change is verified by same-machine before/after, not by the gate.
-    **Never edit a historical row's `render` in place** — that silently makes one version label two behaviors. A new
+    **Never edit a historical row's `render` in place** — that silently makes one
+    version label two behaviors. A new
     *opt-in* knob with a neutral default legitimately moves only the `recipe`
     hash; refresh that row without bumping. The gate stops before lcms2, so it
     covers neither the output transform nor `io::{decode,encode}`.

@@ -2408,7 +2408,7 @@ mod tests {
                 assert!((got - want).abs() < 0.02, "candidate base {:?}", c.base);
             }
         }
-        // And the estimate resolves to the rebate under the chromogenic path.
+        // And the estimate resolves to the rebate once the mask applies.
         let est = estimate(&img, &FilmBaseSource::Auto).unwrap();
         assert_close(est.base, REBATE, 0.02);
     }

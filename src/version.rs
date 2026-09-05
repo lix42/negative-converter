@@ -56,6 +56,30 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 /// | 0 | the Step-1 MVP baseline recorded in `docs/reports/v0-baseline.md`: per-frame `auto` `Dmax` (99.5th-percentile density), exponential curve, no auto WB |
 /// | 1 | every default change since that baseline, collapsed into one label: `film-base/dmax-reference` replaced the per-frame anchor with the roll-fixed nominal `Dmax = 2.0` **density**, `film-base/auto-base-redesign` replaced the auto film-base detector with the inward-scan rebate detector, and `core/input-semantics` added the stage-1b transfer/meaning resolution. The tagged-`reconstruction` split was proven bit-identical and is *not* part of the change. |
 /// | 3 | **current** — the output-preset default migration (2026-08-09, `output/presets`): the default `output.preset` became **`gain-map-hdr`**, a dual-dialect gain-map JPEG, where it was `legacy` (16-bit TIFF). This is a **container** change as much as a render one — `nc convert -o out.tif` with no preset is now a usage error — and the pixels differ because the default path crosses the ACEScg boundary into the SDR/HDR display renderers instead of running `finish_print` before the ICC transform. `legacy` is unchanged and still reachable by name. The row's `render`/`base` fingerprints are **unmoved**: they measure `reconstruct_and_print` and `film_base::estimate`, neither of which the preset selects — which is exactly the coverage limit `PipelineFingerprint` documents, so this row's evidence is the report in `docs/reports/render-defaults-v3.md`, not the gate. |
+/// **Contested, and deliberately left at 3 — read this before assuming it settled.**
+/// `film-base/ir-usability-detection` (2026-09-04) turned the IR holder-mask
+/// detector from opt-in behind `--film-type chromogenic` into the default for every
+/// HDRi `auto` run. That is not covered by the "never for a new opt-in knob"
+/// exemption above, and "the film-base source **and its detector**" is listed as a
+/// trigger — so the written rule points at a bump. The reasons it did not get one,
+/// and the case against them:
+///
+/// - *For 3:* bumping is not free. `pipeline_version_warning` fires on **any**
+///   mismatch with the text "the output will not match the original", so replaying
+///   an archived sidecar that states an explicit `--film-base` — which renders
+///   bit-identically — would exit 1 under `--strict` on a false claim. And on the
+///   assets to hand, `--auto-base` refuses on every real frame tried (11 frames, 6
+///   rolls), so no frame has been *demonstrated* to change output.
+/// - *Against:* "not demonstrated" is not "cannot". Where auto does resolve a base
+///   on an HDRi scan and the mask changes which candidate wins, two files both
+///   labelled `3` differ — exactly what this label exists to prevent. The
+///   `ir-holder-detection` precedent cited for staying is **not parallel**: it
+///   shipped behind a flag, which this doc exempts. The `estimation` precedent
+///   (v1 staying v1) is not parallel either — there, no pixel moved at all.
+///
+/// Whoever next changes the film-base detector should settle this rather than
+/// inherit it; a bump to 4 would be cheap to record and hard to argue against.
+///
 /// | 2 | three render defaults moved together (2026-08-08, `algo/negative-reconstruction-density-curves`): the nominal `Fixed` anchor `Dmax = 2.0` → **1.3**, the default density curve exponential → **sigmoid** (mid-grey anchored), and `ExponentialParams::gamma` 1.0 → **2.0** for anyone still selecting that curve explicitly. Measured in `docs/reports/render-defaults-v2.md`. Film-base estimation is untouched, which is why the row's `base` fingerprint is unchanged. |
 ///
 /// **The v1 row is a collapse, not a single step.** `docs/reports/v0-baseline.md`

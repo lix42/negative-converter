@@ -1344,6 +1344,38 @@ on request. Eight fixed, one already done, one kept with reasons.
   threading a verdict through stage 2 purely to save it. `inspect`'s double *mask*
   build, flagged in the same finding, was already gone.
 
+### 2026-09-04 — ship review-fix pass, third round (uncommitted)
+
+Closing findings (11-13) plus one substantive challenge to the versioning call.
+
+- **`docs/using-nc.md` had stopped saying what `--film-type` is *for*.** Replacing
+  the old bullet wholesale left the flag mentioned only to say it gates nothing,
+  while it still exists on three subcommands and still appears as a recipe key in
+  the guide's own example. Now described as what it is: a provenance declaration,
+  kept because IR dust removal will need it.
+- A stale "under the chromogenic path" test comment, and a 118-column line in
+  CLAUDE.md left by the previous pass's own rewrap.
+
+**`PIPELINE_VERSION` stays 3, and the counter-argument is now recorded in
+`version.rs` rather than only here.** The review agreed with the outcome but
+found two real holes in the reasoning, and both are worth keeping:
+
+- `version.rs` names "the film-base source **and its detector**" as a bump
+  trigger, and exempts only *opt-in* knobs. This change flips that detector from
+  opt-in to default-on for every HDRi `auto` run, so the written rule points at a
+  bump.
+- The `ir-holder-detection` precedent cited for staying is **not parallel** — it
+  shipped behind a flag, which the doc explicitly exempts. Nor is the `estimation`
+  precedent (v1 staying v1): there, no pixel moved at all. Here the honest
+  statement is narrower — no frame has been *demonstrated* to change output,
+  because `--auto-base` refuses on all 11 real frames tried, which is not the same
+  as "cannot".
+
+So the note in `version.rs` states both sides and says the next person to touch
+the film-base detector should settle it rather than inherit it. Recording a
+contested call where the next reader looks is the point; burying it in a progress
+log it would not be read from is how it becomes permanent by accident.
+
 ## holder-masked-measurement
 
 **Status:** not started

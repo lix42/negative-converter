@@ -4568,6 +4568,12 @@ fn convert_frame(
     // measurement, not the `--film-type chromogenic` declaration that used to gate
     // this (`ir-usability-detection`): chemistry mispredicts separability in both
     // directions, so the plane is asked directly. `None` when there is no IR plane.
+    //
+    // Measured here even though `ir_holder_mask` measures again inside stage 2: the
+    // fallback note below must fire even when `estimate` then *errors* — auto
+    // refusing to find a rebate is exactly when "the IR plane could not help" is
+    // worth reading — and a failed stage 2 returns no `BaseEstimate` to carry it.
+    // Both calls are bounded strided samples, so the duplication is ~100k reads.
     let ir_separability = film_base::ir_separability(&image);
     let ir_usable = ir_separability.is_some_and(|s| s.usable);
 

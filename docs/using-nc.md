@@ -980,6 +980,13 @@ exception that needs nothing from you:
   IR-transparent, masks the opaque holder off before the auto rebate search.
   There is nothing to declare — `--film-type` does **not** gate it.
 
+  `--film-type silver|chromogenic|unknown` still exists on `convert`, `estimate`
+  and `inspect` (recipe key `input.film_type`), as a **provenance declaration**:
+  it records what stock a run was made from, and nothing reads it. Set it if you
+  want the film chemistry captured in the recipe or report you keep beside the
+  output; leave it out otherwise. Planned IR dust removal will need the same
+  declaration, which is why it stays.
+
   `nc inspect` and `nc estimate` report the verdict, and `inspect` adds the
   per-edge mask when it passes:
 
