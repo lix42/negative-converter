@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 /// Values are in a linear working space, range ~`[0, 1]`. `rgb` is interleaved
 /// (`r,g,b, r,g,b, …`) with `len == width * height * 3`. The IR plane, when
 /// present (HDRi input), is `len == width * height`. It is exported verbatim
-/// (`--export-ir`) and, since `ir-holder-detection`, consumed by the chromogenic
-/// film-base holder mask — but **only when [`ir_verified`](Self::ir_verified) is
-/// true** (design-spec §6.1).
+/// (`--export-ir`) and, since `ir-holder-detection`, consumed by the film-base
+/// holder mask — but **only when [`ir_verified`](Self::ir_verified) is true**, and
+/// only when the plane measures able to separate holder from film on that frame
+/// (`pipeline::film_base::ir_separability`; design-spec §6.1).
 #[derive(Clone, Debug)]
 pub struct LinearImage {
     pub width: u32,
@@ -334,49 +335,40 @@ pub enum GammaFact {
     Malformed(String),
 }
 
-/// Declared film chemistry (design-spec §9 `input.film_type`, §6.1) — the axis
-/// that governs whether the IR plane can be trusted to separate film from the
-/// opaque scanner holder (and, later, dust). **Chromogenic** dyes (C-41 colour
-/// *and* C-41-process B&W) are transparent to infrared, so all film — base,
-/// rebate, picture, even fully-exposed leader — reads bright in IR while the
-/// opaque holder reads dark; the IR-assisted paths work. **Silver** halide B&W
-/// blocks IR (dense silver reads dark, indistinguishable from the holder), so the
-/// IR path must stay off. `Unknown` (default) is also off: the decoded scan
-/// carries no reliable film-chemistry signal, and an IR plane's mere presence does
-/// **not** imply chromogenic (a silver B&W scan can be HDRi with an IR plane) —
-/// declare it explicitly with `--film-type`.
+/// Declared film chemistry (design-spec §9 `input.film_type`, §6.1) — a
+/// **provenance declaration that gates nothing today**. **Chromogenic** dyes (C-41
+/// colour *and* C-41-process B&W) are transparent to infrared; **silver** halide
+/// B&W blocks IR in proportion to accumulated density.
 ///
-/// This is a **shared input-medium declaration**, not an `ir-holder-detection`
-/// knob: other roadmap tasks reuse this same film-type axis — the black & white
-/// `bw-support` task (roadmap item 3) for its B&W handling and the auto-`Dmax`
-/// holder-border exclusion, and the separate IR dust-removal task (roadmap item 1)
-/// gates its defect map on it (silver blocks IR like dust). Keep it cleanly named
-/// and consumer-agnostic. Serializes kebab-case (`"unknown"` / `"silver"` /
-/// `"chromogenic"`); parsed the same on the CLI via `ValueEnum`.
+/// It used to gate IR-assisted film-holder detection. It no longer does
+/// (`ir-usability-detection`): chemistry is the wrong predictor, because
+/// separability is a property of the *frame's* density, not the stock's — an
+/// unexposed silver frame is IR-transparent against an opaque holder (measured
+/// ~20:1) while its own fully-exposed leader is opaque throughout. The two
+/// disagree on exactly the frames the calibration workflow uses, so
+/// `film_base::ir_separability` measures the plane instead and this declaration
+/// takes no part in the decision.
+///
+/// It is kept as a **shared input-medium declaration** the roadmap still needs:
+/// the black & white `bw-support` task (roadmap item 3) for its B&W handling, and
+/// the separate IR dust-removal task (roadmap item 1), which gates its defect map
+/// on chemistry (silver blocks IR like dust). Whether *that* gate should also be a
+/// measurement is an open question for those tasks — dust separability is not the
+/// same question as holder separability. Serializes kebab-case (`"unknown"` /
+/// `"silver"` / `"chromogenic"`); parsed the same on the CLI via `ValueEnum`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum FilmType {
-    /// Film chemistry not declared — the IR-assisted paths stay off (safe default).
+    /// Film chemistry not declared (default).
     #[default]
     Unknown,
-    /// Silver-halide B&W — silver blocks IR, so IR cannot separate holder from
-    /// film; the IR-assisted paths stay off.
+    /// Silver-halide B&W — silver blocks IR in proportion to accumulated density,
+    /// so an *unexposed* frame is still IR-transparent while a leader is opaque.
     Silver,
-    /// Chromogenic dye film (C-41 colour or C-41-process B&W) — IR-transparent, so
-    /// the IR-assisted holder mask (and later dust map) is usable.
+    /// Chromogenic dye film (C-41 colour or C-41-process B&W) — IR-transparent at
+    /// any exposure (measured 0.58-0.73 interior IR transmission over 25 frames,
+    /// 9 rolls, leaders included).
     Chromogenic,
-}
-
-impl FilmType {
-    /// Whether the film's dye chemistry is transparent to infrared, i.e. IR can be
-    /// trusted to separate film from the opaque holder. True only for
-    /// [`Chromogenic`](Self::Chromogenic); silver blocks IR and unknown is off by
-    /// default. The IR plane must *also* be present — this is only the
-    /// film-chemistry half of the gate. Shared with later roadmap consumers — the
-    /// `bw-support` B&W task and the separate IR dust-removal task.
-    pub fn ir_transparent(self) -> bool {
-        matches!(self, FilmType::Chromogenic)
-    }
 }
 
 /// Input / decode knobs (design-spec §9, stage 1).
@@ -393,11 +385,10 @@ pub struct InputParams {
     pub transfer: TransferAssertion,
     /// Measurement-meaning assertion (default `auto`).
     pub meaning: MeaningAssertion,
-    /// Declared film chemistry (default `unknown`). Gates the IR-assisted
-    /// film-holder detection (`ir-holder-detection`) and is reused by later roadmap
-    /// tasks (`bw-support` B&W handling; the separate IR dust-removal task): only
-    /// `chromogenic` enables the IR path; `silver` / `unknown` keep it off. See
-    /// [`FilmType`].
+    /// Declared film chemistry (default `unknown`). Provenance only — it no longer
+    /// gates IR-assisted film-holder detection, which measures the IR plane instead
+    /// (`ir-usability-detection`). Reserved for the roadmap tasks that still need a
+    /// chemistry axis (`bw-support`; IR dust removal). See [`FilmType`].
     pub film_type: FilmType,
     /// Write the decoded IR plane to this path (HDRi only); `None` skips export.
     /// An input/decode-domain artifact (design-spec §9, Input/decode) — carried
@@ -2917,15 +2908,12 @@ mod tests {
     }
 
     #[test]
-    fn film_type_defaults_to_unknown_and_gates_the_ir_path() {
-        // The default is the safe off state, and only chromogenic reports the film
-        // as IR-transparent (the shared gate `ir-holder-detection` / `bw-support`
-        // key on). Silver and unknown keep the IR path off.
+    fn film_type_defaults_to_unknown_and_declares_nothing() {
+        // Undeclared is the default, and the declaration is provenance only: since
+        // `ir-usability-detection` it gates nothing, so there is no predicate here
+        // to assert — `film_base::ir_separability` measures the plane instead.
         assert_eq!(FilmType::default(), FilmType::Unknown);
         assert_eq!(InputParams::default().film_type, FilmType::Unknown);
-        assert!(FilmType::Chromogenic.ir_transparent());
-        assert!(!FilmType::Silver.ir_transparent());
-        assert!(!FilmType::Unknown.ir_transparent());
     }
 
     #[test]

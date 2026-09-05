@@ -122,7 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="measure Dmin with a five-cell grid or one region "
                                "aggregate (default: grid)")
     rconvert.add_argument("--film-type", choices=("unknown", "silver", "chromogenic"),
-                          help="declare film chemistry in estimation and the frozen recipe")
+                          help="record film chemistry in the estimate reports and "
+                               "the frozen recipe (provenance; it gates nothing)")
     rconvert.add_argument("--output-preset", help="override output.preset in the recipe")
     rconvert.add_argument("--print-exposure", type=float,
                           help="override print.print_exposure in the recipe")

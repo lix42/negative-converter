@@ -664,13 +664,30 @@ common linear Display P3 domain used by the SDR rendition.
 
 The IR plane (when present) is decoded and carried alongside RGB. With one
 exception it is **not consumed** by any conversion stage in Step 1: when the scan
-is declared chromogenic (`--film-type chromogenic`) **and** carries an IR plane,
-**film-base estimation (stage 2) consumes it** — the opaque scanner holder reads
-dark in IR while all film (base, rebate, picture, leader) reads bright, so
-holder-occluded spans are excluded from the auto rebate/`Dmin` search (the
-`ir-holder-detection` feature, adjacent to the roadmap's IR item 1; §9 film base).
-Silver B&W (IR-opaque) and the `unknown` default keep this path off, and a scan
-with no IR plane always falls back to RGB-only detection. Otherwise the IR plane
+carries a marker-verified IR plane that **measures able to separate holder from
+film on that frame**, **film-base estimation (stage 2) consumes it** — the opaque
+scanner holder reads dark in IR while IR-transparent film (base, rebate, picture)
+reads bright, so holder-occluded spans are excluded from the auto rebate/`Dmin`
+search (the `ir-holder-detection` feature, adjacent to the roadmap's IR item 1;
+§9 film base).
+
+The usability verdict is **measured, not declared** (`ir-usability-detection`).
+The interior IR transmission is sampled and compared against a threshold
+(2.5x the holder classifier's); below it, film and holder cannot be told apart and
+detection falls back to RGB-only with a report warning naming the measurement.
+`--film-type` does not gate this: silver-halide blocks IR *in proportion to
+accumulated density*, so an unexposed silver frame is IR-transparent against an
+opaque holder (measured ~20:1) while its own fully-exposed leader is opaque
+throughout — the declared chemistry mispredicts both, and on exactly the frames
+`Dmin` and `Dmax` are calibrated from.
+
+Detection falls back to RGB-only in **four** cases: no IR plane; an IR page
+identified by shape alone; a frame measured unable to separate holder from film;
+and a mask that classifies *every* edge entirely as holder, which would leave the
+rebate search no span to scan on any edge and is therefore strictly worse than not
+masking (the RGB-only search still scans inward past the holder). In the last case
+the plane is carried but unconsumed, and the report says so — the orchestrator
+reads what stage 2 actually did rather than predicting it from the inputs. Otherwise the IR plane
 is only carried, and can be exported with `--export-ir <path>` for inspection or
 downstream tooling. The broader dust-removal stage that *consumes* the IR mask for
 defect inpainting is a deliberate follow-up (§12).
@@ -1665,20 +1682,20 @@ object (§8). Names are binding and unknown keys are rejected
   change: the plane is carried through the pipeline untouched (Step-1 rule: preserve,
   don't consume), so only the quantization headroom differs.
 - `--film-type <silver|chromogenic|unknown>` ⇒ `input.film_type` (default
-  `"unknown"`) — the declared film chemistry. `chromogenic` (C-41 colour or
-  C-41-process B&W) is IR-transparent, so on an HDRi scan that carries an IR plane
-  it enables **IR-assisted film-holder detection** for the film base (§6.1): the
-  opaque scanner holder reads dark in IR while all film reads bright, so
-  holder-occluded spans are excluded from the auto rebate search. `silver`
-  (silver-halide blocks IR) and the `unknown` default keep the IR path off; a scan
-  with no IR plane (HDR 48-bit) always falls back to RGB-only detection. Shared
-  input-medium axis — the deferred IR dust-removal stage (§12 item 1) gates on the
-  same declaration. Accepted on `convert`, `estimate`, and `inspect`; declaring
-  `chromogenic` on a scan with no IR plane (where auto detection runs) is a report
-  warning (RGB-only fallback), promotable under `--strict`. `nc inspect
-  --film-type chromogenic` additionally reports a `holder_mask`: the per-edge
-  along-edge segments, each with its span `[start, end)`, holder/film class, and
+  `"unknown"`) — the declared film chemistry. **Provenance only: it gates nothing.**
+  IR-assisted film-holder detection (§6.1) is enabled by *measuring* the IR plane,
+  not by this declaration. Kept as a shared input-medium axis for the deferred IR
+  dust-removal stage (§12 item 1) and `bw-support`; accepted on `convert`,
+  `estimate`, and `inspect`, which echo it back as the report's `film_type` — those
+  two resolve no recipe, so echoing is what keeps a declaration from being parsed
+  and dropped. `nc inspect` and `nc estimate` report `ir_separability` (the measured
+  interior IR transmission and the verdict) on any scan carrying an IR plane, and
+  on a usable one additionally reports a `holder_mask`: the per-edge along-edge
+  segments, each with its span `[start, end)`, holder/film class, and
   representative median IR transmission, so the occluded spans are inspectable.
+  Where auto detection runs and the IR plane is present but unusable — shape-only
+  provenance, or a frame whose own film is IR-opaque — the RGB-only fallback is a
+  report warning promotable under `--strict`.
 - Input color is resolved as **two independent axes** before Dmin/density — the
   transfer encoding and the measurement meaning — never a single combined
   assertion. Each is a mutually-exclusive assertion with its own recipe key; the
@@ -2808,11 +2825,10 @@ the NLP feature comparison, Phase 6).
     dark — a content-independent holder mask that RGB can't produce (holder and
     dense film are both dark in RGB). The mask is classified in **sub-edge
     segments** (a holder may cover only part of an edge), and holder segments are
-    excluded before the RGB rebate search. Gated by an **explicit film-type signal
-    (silver vs chromogenic)** — chromogenic B&W keeps a usable IR plane; silver
-    B&W / no-IR (HDR 48-bit) → RGB-only fallback — *not* by color model or IR-plane
-    presence. Also sidesteps holder *color* (item 9), since opacity, not color, is
-    the IR signal. Tracked: `ir-holder-detection`.
+    excluded before the RGB rebate search. Gated by **measuring the IR plane**
+    (§6.1, `ir-usability-detection`) — not by a declared film type, not by color
+    model, and not by IR-plane presence. Also sidesteps holder *color* (item 9),
+    since opacity, not color, is the IR signal. Tracked: `ir-holder-detection`.
 16. **Conversion versioning & baseline comparison.** *(Built, not yet shipped —
     `conversion-versioning`.)* Every report carries an `identity` block (§9):
     build identity (crate semver + git commit + dirty flag + target), a behavioral
