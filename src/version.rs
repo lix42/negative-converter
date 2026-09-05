@@ -77,8 +77,17 @@ const GIT_DIRTY_RAW: &str = env!("NC_GIT_DIRTY");
 ///   shipped behind a flag, which this doc exempts. The `estimation` precedent
 ///   (v1 staying v1) is not parallel either — there, no pixel moved at all.
 ///
-/// Whoever next changes the film-base detector should settle this rather than
-/// inherit it; a bump to 4 would be cheap to record and hard to argue against.
+/// **Raised in review and reaffirmed (2026-09-05, PR #104):** an automated
+/// reviewer filed this as a P1 to bump, arguing that explicit-base recipes
+/// replaying unchanged is the normal tradeoff of a *pipeline-wide* version. The
+/// owner's decision was to stay at 3, on the narrower ground above: `--auto-base`
+/// is best-effort and refuses on every real frame tried (11 frames, 6 rolls), the
+/// supported workflow is measure-once-and-reuse with an explicit base, and a v4
+/// row would carry render/base/recipe hashes **identical** to v3's — a new label
+/// with nothing the gate can point at. Whoever next changes the film-base detector
+/// inherits a live question, not a settled one: if a frame is ever found where
+/// auto resolves a base and the mask changes which candidate wins, that is the
+/// evidence this decision was missing, and the bump follows.
 ///
 /// | 2 | three render defaults moved together (2026-08-08, `algo/negative-reconstruction-density-curves`): the nominal `Fixed` anchor `Dmax = 2.0` → **1.3**, the default density curve exponential → **sigmoid** (mid-grey anchored), and `ExponentialParams::gamma` 1.0 → **2.0** for anyone still selecting that curve explicitly. Measured in `docs/reports/render-defaults-v2.md`. Film-base estimation is untouched, which is why the row's `base` fingerprint is unchanged. |
 ///

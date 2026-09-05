@@ -1376,6 +1376,26 @@ the film-base detector should settle it rather than inherit it. Recording a
 contested call where the next reader looks is the point; burying it in a progress
 log it would not be read from is how it becomes permanent by accident.
 
+### 2026-09-05 — `pipeline_version` stays 3, reaffirmed under review (PR #104)
+
+An automated reviewer filed the bump as a **P1** on the PR, with the one argument
+that actually rebuts the case for staying: explicit-base recipes replaying
+unchanged is *the normal tradeoff of a pipeline-wide behavioral version*, not a
+reason against a bump. That is correct as far as it goes — the objection recorded
+here earlier (a false "the output will not match the original" on replay) applies
+to every bump this project has ever made, so it was never specific to this change.
+
+**Decision (owner, 2026-09-05): stay at 3.** The ground is narrower than the
+original note claimed: `--auto-base` is best-effort and refuses on all 11 real
+frames tried across 6 rolls, the supported workflow is measure-once-and-reuse with
+an explicit base, and a v4 row would carry render/base/recipe hashes *identical*
+to v3's — a new label with nothing the drift gate can point at.
+
+Recorded in `version.rs` beside the bump triggers, framed as a live question rather
+than a settled one: the evidence this decision lacks is a single frame where auto
+resolves a base **and** the mask changes which candidate wins. Find one and the
+bump follows.
+
 ## holder-masked-measurement
 
 **Status:** not started
