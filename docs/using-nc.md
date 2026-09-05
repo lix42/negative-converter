@@ -975,15 +975,50 @@ you can do with it:
 - `--export-ir PATH` writes the decoded plane out. **`convert` only** — `roll`
   rejects `input.export_ir`, because one path cannot serve every frame, so IR
   planes have to be exported frame by frame.
-- `--film-type chromogenic` enables **IR-assisted film-holder detection**:
-  chromogenic dyes (C-41 colour and C-41-process B&W) are IR-transparent, so the
-  holder can be masked off before the rebate search. `silver` (IR-opaque) and the
-  `unknown` default keep the IR path off.
+- **IR-assisted film-holder detection** runs by itself when the plane can do the
+  job. nc measures the interior IR transmission and, if the film reads
+  IR-transparent, masks the opaque holder off before the auto rebate search.
+  There is nothing to declare — `--film-type` does **not** gate it.
+
+  `nc inspect` reports the verdict, and — when it passes — the per-edge mask:
+
+  ```sh
+  nc inspect scan.tif | jq -c '.ir_separability'
+  ```
+  ```json
+  {"interior_median":0.67963684,"usable":true}
+  ```
+
+  ```sh
+  nc inspect scan.tif | jq -c '.holder_mask[0].segments[0]'
+  ```
+  ```json
+  {"span":[0,20],"class":"film","ir":0.6301823}
+  ```
+
+  When the film itself is opaque to IR — a fully-exposed silver-halide frame, say
+  — holder and film cannot be told apart, so detection falls back to RGB-only and
+  says so, naming the measurement. The same happens for an IR page identified by
+  shape alone (no `NewSubfileType=4` marker), which is never trusted for
+  detection, and for a holder that wraps all four edges: masking it away would
+  leave nothing to search, so the RGB-only search runs instead.
+
+  Why measured and not declared: silver blocks IR *in proportion to accumulated
+  density*, so an **unexposed** silver frame is IR-transparent against an opaque
+  holder (~20:1) while its own **leader** is opaque throughout. Film chemistry
+  mispredicts both — and on exactly the two frames you calibrate `Dmin` and
+  `Dmax` from.
 
 IR-based dust removal is not implemented.
 
-> Any scan carrying an IR plane emits an "IR preserved but not used" warning, so
-> **`--strict` will always fail on an IR scan** unless the IR path is engaged.
+> A scan carrying an IR plane that nothing consumes emits an "IR preserved but
+> not used" warning, which **`--strict` promotes to a failure**. The plane is
+> consumed only by holder detection, and only when it actually masked something:
+> the base source must be `auto`, the plane marker-verified and measured usable,
+> *and* the resulting mask must leave some film to search (a holder wrapping all
+> four edges falls back to RGB-only). So a frozen explicit `--film-base` — the
+> recommended roll workflow — still warns. Either drop `--strict` for those runs,
+> or use `--export-ir` so the plane is consumed.
 
 ---
 
@@ -1103,11 +1138,12 @@ type you actually intended — normally `"sigmoid"`, the default. Adding
 other curve and changes your pixels.
 
 **`--strict` fails on every frame of an IR scan**
-Expected — see §9: an unconsumed IR plane warns, and `--strict` promotes it.
-`--film-type chromogenic` alone does **not** clear it: the plane is consumed only
-when the base source is `auto` *and* the plane is marker-verified, so a frozen
-explicit `--film-base` — the recommended roll workflow — still warns. Either drop
-`--strict` for those runs, or use `--export-ir` so the plane is consumed.
+Expected — see §9: an unconsumed IR plane warns, and `--strict` promotes it. The
+plane is consumed only when the base source is `auto` *and* the plane is
+marker-verified *and* it measures able to separate holder from film, so a frozen
+explicit `--film-base` — the recommended roll workflow — still warns. Passing
+`--film-type` does not change this; it gates nothing. Either drop `--strict` for
+those runs, or use `--export-ir` so the plane is consumed.
 
 **Output differs between two machines**
 Determinism is scoped to one build and architecture. Transcendental FP and the

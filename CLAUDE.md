@@ -125,9 +125,29 @@ decode → film-base → tagged reconstruction + density curve → FilmRgbImage
   the render. The exponential's default stays `white-at-dmax`.
 - The **IR channel** (HDRi 64-bit input) is decoded and, by default, **preserved
   but not acted on**; carry it through, don't consume it. The one exception is
-  **IR-assisted film-holder detection** (`ir-holder-detection`): under an explicit
-  `--film-type chromogenic` declaration on an IR scan, `film_base::estimate`
-  consumes the IR plane to mask the opaque holder before the auto rebate search.
+  **IR-assisted film-holder detection** (`ir-holder-detection`): on a scan whose
+  marker-verified IR plane **measures** able to separate holder from film,
+  `film_base::estimate` consumes the IR plane to mask the opaque holder before the
+  auto rebate search. The verdict is `film_base::ir_separability` (interior IR
+  transmission vs `2.5x` the holder classifier's threshold), **not** a
+  `--film-type` declaration (`ir-usability-detection`): silver blocks IR in
+  proportion to *accumulated density*, so an unexposed silver frame separates
+  ~20:1 while its own leader is uniformly opaque — chemistry mispredicts on
+  exactly the two frames `Dmin` and `Dmax` are calibrated from. `--film-type` is
+  now provenance only and gates nothing; `FilmType::ir_transparent()` is gone.
+  **Whether the mask applied is *returned*, not re-derived** —
+  `BaseEstimate::ir_mask_applied`, with `rebate_candidates` taking the mask as a
+  parameter so it is built once. A caller that re-derives "was IR consumed?" from
+  the inputs (plane present + verified + usable) goes wrong the moment the stage
+  gains a new way to decline: that is how the all-holder fallback below silently
+  suppressed the "IR preserved but not used" warning — and `--strict` with it — on
+  22 of 25 real frames, with `inspect` reporting it correctly all along.
+  **An all-holder mask falls back to RGB-only rather than emptying the search** —
+  when the holder wraps the whole frame (22 of 25 real chromogenic frames at the
+  0.5% probe depth) every segment reads holder, `film_along_ranges` yields no range
+  on any edge, and auto would refuse on a frame whose RGB-only search still scans
+  inward *past* the holder. The guard asks `film_along_ranges` itself, not "are all
+  segments holder", so the corner-trim case counts too; don't "simplify" it back.
   IR-based dust removal remains a roadmap follow-up.
 - Current module map (`src/`, all implemented): `types.rs` (shared types),
   `io/{decode,encode,ultra_hdr,avif}.rs`,
@@ -811,8 +831,13 @@ the memory preflight's warn tier; Linux reads `/proc/meminfo` with no dep)
     `version::PIPELINE_FINGERPRINTS` pairs each `pipeline_version` with hashes over
     `film_base::estimate`, `reconstruct_and_print` on the curated `stages::golden`
     vectors, and the default recipe JSON. Bumping is deliberately **not** free: a
-    version with no recorded row panics. **Never edit a historical row's `render`
-    in place** — that silently makes one version label two behaviors. A new
+    version with no recorded row panics. **The `base` fingerprint cannot see the IR
+    path at all** — `golden::scan()` carries no IR plane, so any change to
+    `ir_separability` / `ir_holder_mask` (i.e. to the film base of every HDRi
+    auto-base run) leaves all three hashes untouched. Extending the gate with an
+    IR-carrying frozen scan belongs to `core/conversion-versioning`; until then, an
+    IR-path change is verified by same-machine before/after, not by the gate.
+    **Never edit a historical row's `render` in place** — that silently makes one version label two behaviors. A new
     *opt-in* knob with a neutral default legitimately moves only the `recipe`
     hash; refresh that row without bumping. The gate stops before lcms2, so it
     covers neither the output transform nor `io::{decode,encode}`.

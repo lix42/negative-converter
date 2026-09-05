@@ -41,13 +41,21 @@ What other epics need to know about `film-base`:
   supported workflow is measure once from an unexposed reference, then reuse:
   `nc estimate` emits paste-ready `--film-base` / recipe-fragment forms (only when
   the measurement would actually be accepted by `convert`).
-- **IR is consumed here, and only here so far.** Under an explicit
-  `--film-type chromogenic` on a scan with a *marker-verified* IR plane,
-  `ir_holder_mask` masks the opaque holder before the RGB rebate search. `FilmType`
-  (recipe key `input.film_type`) is a shared input-medium axis — `algo/bw-support`
-  is expected to reuse it for IR dust removal. Known limitation: a thin holder
-  margin that is IR-dark only in the shallow probe can hide a rebate behind it;
-  the workaround is `--base-region`.
+- **IR is consumed here, and only here so far.** On a scan with a *marker-verified*
+  IR plane that **measures** able to separate holder from film on that frame
+  (`ir_separability`, interior IR median vs 2.5x the holder classifier threshold),
+  `ir_holder_mask` masks the opaque holder before the RGB rebate search.
+  `--film-type` gates nothing since `ir-usability-detection` — chemistry
+  mispredicts, because separability tracks the frame's own density (an unexposed
+  silver frame separates ~20:1; its own leader is opaque). `FilmType` (recipe key
+  `input.film_type`) survives as a provenance axis `algo/bw-support` and IR dust
+  removal are expected to use; whether *those* gates should also be measurements is
+  open. Known limitation, in the mask rather than the verdict: a thin holder margin
+  that is IR-dark only in the shallow probe can hide a rebate behind it; the
+  workaround is `--base-region`. The related case — a holder covering *every* edge,
+  which is 22 of 25 real chromogenic frames at the 0.5% probe depth — **is**
+  handled: `ir_holder_mask` returns no mask when no edge would yield a film range,
+  so the search falls back to RGB-only instead of getting nothing to scan.
 - **`Dmax` is roll-fixed, not per-frame.** The default is `Fixed` (nominal 2.0 in
   corrected-density units); `nc estimate --d-max-region` measures a calibrated
   scalar from a fully-exposed leader frame and emits it as `{"explicit": d}`.
@@ -1093,8 +1101,8 @@ Four real findings on PR #56, plus one document-only deferral.
 
 ## ir-usability-detection
 
-**Status:** not started
-**Updated:** 2026-08-11
+**Status:** done
+**Updated:** 2026-09-04
 
 - Goal: decide whether IR can separate holder from film by measuring the plane, not by
   trusting `--film-type`.
@@ -1112,6 +1120,193 @@ Four real findings on PR #56, plus one document-only deferral.
   unexposed frame is IR-transparent against an opaque holder while its own leader is
   opaque throughout. `silver → IR off` is therefore wrong for exactly the frame `Dmin`
   is measured from, and right for the frame `Dmax` is measured from.
+
+### 2026-09-04 — measured usability replaces the `--film-type` gate
+
+`film_base::ir_separability` (interior IR median vs `IR_USABLE_MIN_INTERIOR = 2.5 x
+IR_HOLDER_MAX_TRANSMISSION = 0.25`) now gates `ir_holder_mask`. `--film-type` gates
+nothing; `FilmType::ir_transparent()` is deleted, and `estimate` /
+`rebate_candidates` / `ir_holder_mask` no longer take a `FilmType`. `nc inspect`
+reports the verdict as `ir_separability`. No `pipeline_version` bump — see below.
+
+**The evidence (2026-09-04, IR planes read directly from `../nc-assets`, derived
+numbers only; the probe reproduced the recorded HP5 table to 4 decimals, which is
+what validated the method).** Interior = outer 10% of the short edge trimmed,
+strided sample, median.
+
+| set | interior median |
+|---|---|
+| 25 chromogenic frames, 9 rolls, every role, 8 leaders among them | **0.576 - 0.728** |
+| HP5 1364 unexposed / 1330 half-leader | 0.4730 / 0.4602 |
+| HP5 1335 / 1339 (mid-density) | 0.2711 / 0.1238 |
+| HP5 1354 regular / 1341 / 1329 leader | 0.0748 / 0.0607 / 0.0165 |
+
+Chromogenic dye stays IR-transparent at **any** exposure — even leaders — which is
+what makes the demotion safe: the threshold sits 2.3x below the lowest of 25
+frames. Silver is a *continuum* from 0.0165 to 0.4730, not the clean two-mode split
+the four-frame table suggested; the threshold reproduces every verdict the task
+recorded, and the tightest real margin is 1335 at 1.08x. A wrong verdict there is
+harmless in the safe direction: dense edges classify holder and drop out of the
+search, losing film the search never wanted rather than admitting holder.
+
+**The geometry trap that killed the obvious design.** A predicate built from the
+numbers the mask *already computes* is impossible: the shipped probe depth is 0.5%
+of the short edge (18 px on these scans) and the HP5 holder runs 2-5%, so the probe
+sits inside the holder and reads **24/24 segments holder on all four edges of every
+HP5 frame — 1364 included**, the frame the whole task exists to enable. The verdict
+needs its own sampling geometry, and it must read the *interior*. Verified against
+the binary on phoenix 933, where the emulation and `nc inspect` agree exactly
+(top 25/25, bottom 1/25, left 1/25, right 25/25).
+
+**Open questions, answered.**
+1. *Statistic and threshold* — interior median against `2.5x` the classifier
+   threshold. What would move it: a chromogenic frame below ~0.4 (none of 25), or
+   evidence that silver separability is decided by something other than the frame's
+   own density. Not moved by more frames of the kinds already measured.
+2. *Partially-separable frames* — use the separable edges; no refusal. `EdgeHolderMask`
+   is already per-segment, so 1330's opaque half classifies holder and drops out.
+   Costs conservatism, never correctness. No code needed.
+3. *Should `--film-type` override?* **No — not even to force it off.** The task
+   guessed "off only"; the measurement says a silver declaration would re-break
+   exactly the unexposed frame `Dmin` comes from. A user who distrusts a verdict has
+   `--base-region` / `--film-base`, which skip detection entirely.
+4. *Does the verdict serve IR dust removal?* Not answered here, and deliberately not
+   assumed: dust separability is a different question (dust is opaque *against* film,
+   holder separability is film against holder). The dust task should decide for
+   itself whether its gate is also a measurement — `FilmType` is kept for it.
+
+**No `pipeline_version` bump — and the gate is blind here, which is a separate
+problem.** Two facts, deliberately not conflated. (a) The stage-2 `base` fingerprint
+runs on `golden::scan()`, which has no IR plane, so *no* IR-path change can move any
+hash; CI staying green is not evidence that nothing moved. That blindness is a real
+gap and belongs to `core/conversion-versioning` — an IR-carrying frozen scan would
+let the gate see this whole class. (b) The version still should not move. Bumping is
+not free and is actively harmful in the common case: `pipeline_version_warning`
+fires on *any* mismatch with the text "the output will not match the original", so
+replaying an archived sidecar that states an explicit base — which renders
+bit-identically — would exit 1 under `--strict` on a false claim. That harm lands on
+every recipe, while the behaviour change here reaches only runs whose base source is
+`auto` on an HDRi input: the path the project already documents as best-effort,
+against a supported workflow of measure-once-and-reuse. The precedent is this epic's
+own on both counts — a bump was tried and reverted under `estimation` (2026-08-08)
+for exactly that false-warning reason, and `ir-holder-detection` itself changed
+auto-base output for declared chromogenic runs without bumping.
+
+**Two findings this work turned up and did *not* fix.**
+- **An all-holder mask empties the rebate search.** When the holder covers every
+  edge entirely, every segment classifies holder, `film_along_ranges` returns nothing
+  for all four edges, and auto-base refuses — on a frame where the RGB-only path
+  would have searched inward past the holder and possibly found the rebate. This is
+  not hypothetical: at the 0.5% probe depth **22 of the 25 chromogenic frames** read
+  24/24 holder on all four edges. A mask that leaves no film anywhere is not a usable
+  mask and should fall back to RGB-only. Left alone because it is `ir-holder-detection`
+  behaviour, not the gate this task owns — and because the fix interacts with
+  `holder-masked-measurement`, which redesigns masking anyway. It is why the
+  end-to-end test fixture uses a partially-occluded border.
+- **`--auto-base` refuses on every real frame tried** (11 frames, 6 rolls, with and
+  without the IR mask, before any change). So the mask has no observable end-to-end
+  effect on real scans today; its surface is `nc inspect`'s `holder_mask`. Any claim
+  that this task "improves real-scan auto-base" would be unfounded — it makes the
+  *gate* correct, which is what `holder-masked-measurement` builds on.
+
+**Verification.** Unit tests pin the four recorded HP5 verdicts, the chromogenic
+minimum, the threshold from both sides, and that the verdict reads film not border.
+Two CLI tests: one proves the mask builds undeclared and that `--film-type
+silver|chromogenic` produce byte-identical reports; one drives `convert --auto-base
+--strict` end to end on a synthetic HDRi scan, showing a consumed plane leaves
+`--strict` clean and an IR-opaque frame falls back with the measurement named.
+Falsifiability checked by neutralizing the threshold — the CLI test fails.
+
+### 2026-09-04 — review-fix pass (uncommitted)
+
+Seven findings from `/code-review`; five fixed, one rejected with reasons, one
+(the fingerprint blindness) folded into the entry above.
+
+- **`--export-ir` broke.** Both new fallback notes (unusable plane; shape-only
+  plane, which lost its `chromogenic` condition and so now fires undeclared) were
+  pushed unconditionally, while the generic "IR preserved but not used" note is
+  suppressed under `--export-ir`. So `nc convert --strict --export-ir` on an HDRi
+  scan started exiting 1 where it exited 0 — falsifying the remedy `using-nc.md`
+  itself prints. Both notes now respect `export_ir.is_none()`, with a CLI test.
+  The general shape of the bug: a new warning inherits none of the exemptions the
+  warning it replaces had earned.
+- **The all-holder mask now falls back to RGB-only** (`ir_holder_mask` returns
+  `None` when no edge yields a film range). The finding above about this was
+  recorded as out of scope; the reviewer's counter is right and decided it — this
+  change is what makes the failure reachable *by default*, so leaving a known
+  "auto-base refuses where RGB-only would have searched" regression behind a
+  default-on path is not a defensible scope line. The guard is computed from
+  `film_along_ranges` itself rather than from "all segments holder", so it catches
+  the corner-trim case too.
+- **A test had gone vacuous.** `all_holder_frame_drives_the_loud_empty_candidates_error`
+  used a uniform IR plane at the *holder* level (0.02), which the new verdict
+  refuses outright — so no mask was built and the test passed for the wrong reason
+  while its comment described the opposite. Split in two: it now covers the
+  no-rebate refusal on an IR-free frame, and a new test covers the all-holder
+  fallback with a falsifiability control (un-occlude one edge ⇒ a mask is built).
+  Worth remembering: changing a *gate* can silently empty a fixture that was built
+  to exercise what the gate now rejects.
+- **`inspect`'s third IR branch was unreachable**, because `ir_consumed` was derived
+  from the same predicate the two branches above it had already excluded — so
+  "preserved but not used" could never fire there, and a `ir_holder_mask` error was
+  reported as consumption. The mask is now built *before* the notes and
+  `ir_consumed` reads the actual outcome, which makes the branch reachable (the
+  all-holder fallback lands in it) and is covered by a CLI test.
+- **Four comments outlived the behaviour** ("the auto chromogenic path", "the
+  chromogenic film-base path is consuming it", "a chromogenic declaration there
+  degrades to RGB-only", "the declared film type lets the `auto` source use the IR
+  holder mask"). The earlier sweep grepped for `chromogenic` in gate-shaped phrases
+  and missed prose that merely *mentions* it — CLAUDE.md's rule is to grep for the
+  negation of the claim, and these are why.
+- **`using-nc.md`'s jq example** printed two JSON values but showed one output.
+  Split into two examples, both copied verbatim from the binary.
+- **Rejected: bump `pipeline_version`.** Reasons in the entry above — the harm of a
+  false "output will not match" on every replayed sidecar outweighs labelling a
+  best-effort auto-base path, and both precedents in this epic went the same way.
+
+### 2026-09-04 — ship review-fix pass (uncommitted)
+
+`ship:diff-reviewer` on the working tree. (The Codex reviewer could not run —
+workspace spend cap — so this pass had one engine, not two.)
+
+- **The all-holder fallback broke `--strict`, and the fix was in the wrong place.**
+  Adding a third way for `ir_holder_mask` to return `None` falsified the
+  orchestrator's *prediction* of consumption: `convert` computed
+  `ir_used_for_holder = auto_base && ir_present && ir_verified && ir_usable`, which
+  is still true on a fallback frame, so it suppressed the "IR preserved but not
+  used" warning for a plane that demonstrably was not used — and `--strict` passed.
+  Reproduced on a synthetic all-holder scan: `inspect` correctly reported no mask
+  and warned, while `convert --auto-base --strict` on the same file exited 0 with
+  `warnings: null`. By this task's own measurement that shape is 22 of 25 real
+  chromogenic frames.
+
+  The durable fix is to stop predicting: `film_base::estimate` now returns
+  `BaseEstimate::ir_mask_applied` — a fact about what stage 2 did — and
+  `rebate_candidates` takes the mask as a parameter instead of building it
+  internally, so the mask is built exactly once and its outcome is available to the
+  caller. `convert` and `estimate` emit the note *after* stage 2, keyed on that
+  field. (`inspect` had already been moved to the fact in the previous pass, which
+  is why only it was correct; the same fix simply had not been carried across.)
+  Incidentally removes a double mask build in `inspect`.
+
+  **The general lesson, worth more than the bug:** when a stage gains a new way to
+  decline, every caller that re-derives "did the stage do it?" from the stage's
+  *inputs* becomes wrong, silently, and only for the new case. Return the fact.
+- **A test asserted the predicate, not the fact.** The consumed-plane CLI test
+  compared against the same boolean the code computed, so it passed either way. It
+  now also drives the all-holder frame through `convert --strict` and asserts
+  exit 1 plus the warning — the case that was silently broken.
+- **Docs restated the wrong rule.** `using-nc.md` told users the plane is consumed
+  "when the base source is `auto` and the plane is both marker-verified and
+  measured usable" — all three hold on a fallback frame. Both it and design-spec
+  §6.1 now enumerate all four fallback causes. Design-spec §12 roadmap item 15 still
+  described the film-type gate this task removed, contradicting §6.1 in the same
+  document.
+- **Two stale claims of my own**, caught while reviewing the diff rather than by a
+  reviewer: the CLAUDE.md IR bullet and this file's `Epic summary` both still said
+  the all-holder gap was *not* fixed, written before the previous pass fixed it.
+  Prose that describes a limitation is exactly what goes stale when the limitation
+  is removed in the same session.
 
 ## holder-masked-measurement
 

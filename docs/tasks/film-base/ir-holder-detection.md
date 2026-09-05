@@ -46,6 +46,12 @@ holder, bottom/left = film, right = partial, matching the RGB heatmap.
   whole-edge label is just the degenerate all-segments-agree case.
 - IR finds the holder, **not** the rebate — base / picture / leader are all bright
   in IR — so this is a masking pre-step, not a base estimator on its own.
+- **Superseded (2026-09-04) by [ir-usability-detection](ir-usability-detection.md):**
+  the film-type gate below shipped as designed, then was replaced by a measurement
+  of the IR plane itself. Chemistry predicts the wrong thing — separability tracks
+  the *frame's* accumulated density, so an unexposed silver frame separates ~20:1
+  while its own leader is opaque. `--film-type` is now provenance only. The
+  reasoning below is kept as the record of what shipped here.
 - **Gate on film type (silver vs chromogenic) — by an explicit signal, not
   IR-plane presence and not `color_model`.** The axis that matters is IR
   transmission: **chromogenic** dyes (C-41 — colour *and* C-41 B&W) are

@@ -19,11 +19,17 @@ chromogenic (C-41) — IR separates the opaque holder from film *regardless of h
 colour* (a light holder is still opaque, so it reads dark in IR), so holder polarity
 stops mattering and this knob is unnecessary (`ir-holder-detection` is the primary,
 more robust path). This task covers the cases IR can't: **HDR 48-bit scans with no
-IR plane**; **silver B&W film** (which blocks IR); and — because `ir-holder-detection`
-defaults **off** unless the film type is explicitly declared chromogenic — any
-**HDRi scan whose `--film-type` is unknown/undeclared** (the default C-41 workflow,
-until the user opts in). It is the RGB path that `ir-holder-detection`'s dispatch
-falls back to, which is why it now builds on that task.
+IR plane**; scans whose IR page is identified by shape alone; and **any frame whose
+own film is IR-opaque** — a fully-exposed silver-halide frame, and silver film
+generally past the density at which accumulated silver blocks IR. It is the RGB
+path that `ir-holder-detection`'s dispatch falls back to, which is why it builds on
+that task.
+
+**Premise updated by `ir-usability-detection` (2026-09-04):** this task used to also
+cover "any HDRi scan whose `--film-type` is unknown/undeclared", because IR
+detection was off unless declared. It no longer is — usability is measured per
+frame and `--film-type` gates nothing — so the undeclared C-41 workflow now takes
+the IR path, and this task's remaining scope is the genuinely IR-less cases above.
 
 ## Design
 

@@ -88,7 +88,7 @@ under, and the parenthesized paths are the modules it owns.
 - **Normally 32-bit float linear image buffers:** scanner measurement coordinates before reconstruction, typed NC film RGB after the density curve, and linear ACEScg after the versioned working-space mapping; bit-depth reduction only at encode.
 - **Pluggable algorithms** behind the tagged `reconstruction` recipe object, resolved by `algo::reconstruct` / `algo::finish_print`, so more can be added later.
 - Density conversion and print rendering are **separate sub-stages** (core fidelity rule).
-- IR channel is **preserved and not acted on by the conversion path**, with one exception: under an explicit `--film-type chromogenic` on a marker-verified IR plane, `film_base::estimate` consumes IR to mask the opaque holder before the auto rebate search (`film-base/ir-holder-detection`). IR dust removal remains a roadmap follow-up.
+- IR channel is **preserved and not acted on by the conversion path**, with one exception: on a marker-verified IR plane that *measures* able to separate holder from film on that frame (`film-base/ir-usability-detection`), `film_base::estimate` consumes IR to mask the opaque holder before the auto rebate search (`film-base/ir-holder-detection`). `--film-type` is provenance only and gates nothing. IR dust removal remains a roadmap follow-up.
 
 ## Dependencies
 
@@ -821,7 +821,7 @@ Dependency list (a task is executable when all its deps are `[x]` done):
   **not** under the sigmoid default, where it shifts each channel's toe/shoulder position.
   Investigation + impact verdict; ships no pixel change
 
-- [ ] [Decide IR usability by measurement](tasks/film-base/ir-usability-detection.md) — key IR holder
+- [x] [Decide IR usability by measurement](tasks/film-base/ir-usability-detection.md) — key IR holder
   detection on the **plane itself** rather than `--film-type`, which becomes a hint. Measured 2026-08-11 on
   real Ilford HP5: separability tracks the *frame's density*, not the stock's chemistry — an unexposed silver
   frame separates 20:1 while its own leader is uniformly opaque. So today's `silver → IR off` rule is wrong

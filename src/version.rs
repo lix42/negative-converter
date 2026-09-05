@@ -477,8 +477,7 @@ mod drift_gate {
     use crate::pipeline::film_base;
     use crate::pipeline::stages::{golden, reconstruct_and_print};
     use crate::types::{
-        DensityCurve, DensityParams, ExponentialParams, FilmBaseSource, FilmType, PrintParams,
-        Reconstruction,
+        DensityCurve, DensityParams, ExponentialParams, FilmBaseSource, PrintParams, Reconstruction,
     };
 
     /// Format an `f32` as its raw bit pattern in hex — no decimal formatting, so
@@ -535,7 +534,7 @@ mod drift_gate {
     /// nothing to do with the estimator. (`Auto` was that default, so the
     /// recorded hash is unchanged by the switch.)
     fn base_fingerprint_text(source: &FilmBaseSource) -> String {
-        let est = film_base::estimate(&film_base::golden::scan(), source, FilmType::default())
+        let est = film_base::estimate(&film_base::golden::scan(), source)
             .expect("the `auto` film-base estimate must succeed on the frozen scan");
         let rgb: Vec<String> = <[f32; 3]>::from(est.base)
             .iter()

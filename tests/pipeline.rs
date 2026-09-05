@@ -96,6 +96,100 @@ fn write_rgb16(path: &Path, xmp: Option<&str>, software: Option<&str>, with_ir: 
     }
 }
 
+/// Write an HDRi-shaped TIFF: an RGB16 image plus a **marker-verified** Gray16 IR
+/// page (`NewSubfileType = 4`, the provenance the holder detector requires),
+/// filled with one uniform IR level. Big enough that the rebate scan window and
+/// the holder probe band are both real bands.
+fn write_hdri_with_uniform_ir(path: &Path, w: u32, h: u32, rgb: [u16; 3], ir: u16) {
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..(w * h) {
+        pixels.extend_from_slice(&rgb);
+    }
+    write_hdri(path, w, h, &pixels, &vec![ir; (w * h) as usize]);
+}
+
+/// Write an HDRi-shaped TIFF from explicit RGB and IR buffers.
+fn write_hdri(path: &Path, w: u32, h: u32, pixels: &[u16], plane: &[u16]) {
+    use tiff::tags::Tag;
+    assert_eq!(pixels.len(), (w * h * 3) as usize);
+    assert_eq!(plane.len(), (w * h) as usize);
+    let mut enc = TiffEncoder::new(std::fs::File::create(path).unwrap()).unwrap();
+    let image = enc.new_image::<colortype::RGB16>(w, h).unwrap();
+    image.write_data(pixels).unwrap();
+
+    let mut ir_page = enc.new_image::<colortype::Gray16>(w, h).unwrap();
+    ir_page
+        .encoder()
+        .write_tag(Tag::NewSubfileType, 4u32)
+        .unwrap();
+    ir_page.write_data(plane).unwrap();
+}
+
+/// An HDRi scan with the real `dark holder -> thin inset rebate -> picture`
+/// geometry auto-base detection looks for: a 4 px opaque holder ring, a 6 px
+/// unexposed rebate band inset behind it on the bottom and left, and a varied
+/// picture interior. `ir_interior` sets the IR transmission of the film itself,
+/// which is what the usability verdict measures. `ir_dark_all_edges` puts the
+/// IR-dark holder on all four edges (the all-holder case, where the mask would
+/// leave the rebate search nothing) rather than only where it really sits.
+fn write_hdri_scan_with_rebate(path: &Path, ir_interior: u16, ir_dark_all_edges: bool) {
+    const W: u32 = 200;
+    const H: u32 = 200;
+    const HOLDER: [u16; 3] = [655, 655, 655]; // ~0.01 transmission
+    const REBATE: [u16; 3] = [34734, 17040, 10486]; // 0.53 / 0.26 / 0.16
+    const IR_HOLDER: u16 = 1300; // ~0.02, as real holders measure
+
+    let mut rgb = vec![0u16; (W * H * 3) as usize];
+    let mut ir = vec![ir_interior; (W * H) as usize];
+    let put = |buf: &mut Vec<u16>, x: u32, y: u32, v: [u16; 3]| {
+        let i = ((y * W + x) * 3) as usize;
+        buf[i..i + 3].copy_from_slice(&v);
+    };
+    for y in 0..H {
+        for x in 0..W {
+            // Picture: a varied gradient, dimmer than the rebate on every channel
+            // so the brightness gate can tell them apart.
+            let t = (x + y) as f32 / (W + H) as f32;
+            let px = [
+                (3300.0 + 13000.0 * t) as u16,
+                (2000.0 + 7000.0 * t) as u16,
+                (1300.0 + 3300.0 * t) as u16,
+            ];
+            put(&mut rgb, x, y, px);
+        }
+    }
+    // Rebate band, inset behind the holder on the bottom and left edges. Rippled
+    // along the edge so a percentile has something to choose between.
+    for x in 0..W {
+        for y in H - 10..H - 4 {
+            let f = 0.93 + 0.07 * (x % 10) as f32 / 9.0;
+            put(&mut rgb, x, y, REBATE.map(|c| (c as f32 * f) as u16));
+        }
+    }
+    for y in 0..H {
+        for x in 4..10 {
+            let f = 0.93 + 0.07 * (y % 10) as f32 / 9.0;
+            put(&mut rgb, x, y, REBATE.map(|c| (c as f32 * f) as u16));
+        }
+    }
+    // A dark RGB border on all four edges — but IR-dark on only the top and right,
+    // where the opaque holder actually sits. The bottom and left border is dense
+    // *film* (dark in RGB, transparent in IR) in front of the rebate: the
+    // disambiguation RGB alone cannot make, and the reason a full IR-dark ring
+    // would leave the search nothing to look at.
+    for y in 0..H {
+        for x in 0..W {
+            if x < 4 || y < 4 || x >= W - 4 || y >= H - 4 {
+                put(&mut rgb, x, y, HOLDER);
+                if ir_dark_all_edges || y < 4 || x >= W - 4 {
+                    ir[(y * W + x) as usize] = IR_HOLDER;
+                }
+            }
+        }
+    }
+    write_hdri(path, W, H, &rgb, &ir);
+}
+
 /// A unique temp directory that removes itself (and its contents) on drop, so a
 /// failing test can't leak output TIFFs.
 struct TempDir(PathBuf);
@@ -9185,5 +9279,266 @@ fn a_stray_headroom_remedy_can_be_followed_to_success() {
     assert_eq!(
         code, 0,
         "following the remedy verbatim still failed:\n{err}"
+    );
+}
+
+/// IR-assisted holder detection is decided by measuring the IR plane, not by a
+/// declared `--film-type` (`film-base/ir-usability-detection`). Chemistry is the
+/// wrong predictor: separability tracks the *frame's* accumulated density, so an
+/// unexposed silver frame separates ~20:1 while its own leader is opaque.
+#[test]
+fn ir_holder_detection_is_decided_by_measurement_not_by_declaration() {
+    let dir = TempDir::new("ir-usability");
+
+    // A frame whose film is IR-transparent — 0.63, where real chromogenic scans
+    // measure (0.576-0.728 over 25 frames). No `--film-type` is passed.
+    let clear = dir.path("clear.tif");
+    write_hdri_with_uniform_ir(&clear, 200, 200, [20000, 12000, 8000], 41_000);
+    let (code, stdout, _err) = run_exact(&["inspect", clear.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let report = json(&stdout);
+    assert_eq!(
+        report["ir_separability"]["usable"], true,
+        "an IR-transparent frame must measure usable undeclared: {report}"
+    );
+    assert!(
+        report["holder_mask"].is_array(),
+        "the holder mask must build with no --film-type: {report}"
+    );
+
+    // The declaration is inert now: `silver` used to force this path off, and
+    // `chromogenic` used to be the only way to turn it on. Both must produce the
+    // same report as stating nothing.
+    for declared in ["silver", "chromogenic"] {
+        let (code, out, _err) =
+            run_exact(&["inspect", "--film-type", declared, clear.to_str().unwrap()]);
+        assert_eq!(code, 0);
+        let mut with_flag = json(&out);
+        let mut without = report.clone();
+        // Wall-clock is the one field that legitimately differs run to run.
+        with_flag["elapsed_ms"] = serde_json::Value::Null;
+        without["elapsed_ms"] = serde_json::Value::Null;
+        assert_eq!(
+            with_flag, without,
+            "--film-type {declared} must change nothing"
+        );
+    }
+
+    // A frame whose own film is IR-opaque — the Ilford HP5 leader, interior median
+    // 0.0165. Holder and film are indistinguishable, so the plane is refused and
+    // detection falls back to RGB-only rather than labelling the film holder.
+    let opaque = dir.path("opaque.tif");
+    write_hdri_with_uniform_ir(&opaque, 200, 200, [20000, 12000, 8000], 1_081);
+    let (code, stdout, _err) = run_exact(&["inspect", opaque.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let report = json(&stdout);
+    assert_eq!(report["ir_separability"]["usable"], false);
+    assert!(
+        report["holder_mask"].is_null(),
+        "an opaque IR plane must build no mask: {report}"
+    );
+    let warnings = report["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("cannot separate the film holder")
+            && w.as_str().unwrap().contains("0.016")),
+        "the fallback must name the measurement that caused it: {warnings:?}"
+    );
+}
+
+/// The measured verdict is not just reported — it decides whether `convert`
+/// actually consumes the IR plane for the film base, which is what clears the
+/// "IR preserved but not used" warning under `--strict`.
+#[test]
+fn a_usable_ir_plane_is_consumed_by_the_auto_film_base() {
+    let dir = TempDir::new("ir-usability-convert");
+
+    // Film IR-transparent (0.63): the holder mask applies, so the plane is
+    // consumed and no "carried but unused" warning is left for --strict to promote.
+    let usable = dir.path("usable.tif");
+    write_hdri_scan_with_rebate(&usable, 41_000, false);
+    let out = dir.path("usable-out.tif");
+    let (code, stdout, err) = run_exact(&[
+        "convert",
+        "--auto-base",
+        "--strict",
+        // The synthetic fixture carries no SilverFast XMP, so state the input
+        // semantics the provenance gate would otherwise resolve from it.
+        "--input-transfer",
+        "linear",
+        "--input-meaning",
+        "scanner-device",
+        "--output-preset",
+        "legacy",
+        usable.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "a consumed IR plane must leave --strict clean:\n{err}"
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["ir_separability"]["usable"],
+        serde_json::Value::Null,
+        "the verdict is an `inspect` diagnostic, not a convert report field"
+    );
+    assert!(
+        report["warnings"].as_array().is_none_or(|ws| ws
+            .iter()
+            .all(|w| !w.as_str().unwrap().contains("preserved but not used"))),
+        "the IR plane was consumed, so it must not be reported unused: {report}"
+    );
+
+    // The other side of that claim, and why consumption must be read off stage 2
+    // rather than predicted from the inputs: the same frame with the holder on
+    // *every* edge is marker-verified and measures usable, yet produces no mask
+    // (the all-holder fallback). Predicting consumption from those three facts
+    // suppressed this warning — and with it `--strict` — on exactly this case.
+    let all_holder = dir.path("all-holder.tif");
+    write_hdri_scan_with_rebate(&all_holder, 41_000, true);
+    let (code, stdout, err) = run_exact(&[
+        "convert",
+        "--auto-base",
+        "--strict",
+        "--input-transfer",
+        "linear",
+        "--input-meaning",
+        "scanner-device",
+        "--output-preset",
+        "legacy",
+        all_holder.to_str().unwrap(),
+        "-o",
+        dir.path("all-holder-out.tif").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 1,
+        "an unconsumed IR plane must still fail --strict:\n{err}"
+    );
+    assert!(
+        json(&stdout)["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("preserved but not used")),
+        "the fallback leaves the plane unused, and that must be reported:\n{stdout}"
+    );
+
+    // The same geometry with IR-opaque film: the plane cannot separate holder from
+    // film, so detection falls back to RGB-only and says why. The base still
+    // resolves — the fallback is the path that was always there.
+    let opaque = dir.path("opaque.tif");
+    write_hdri_scan_with_rebate(&opaque, 1_081, false);
+    let out = dir.path("opaque-out.tif");
+    let (code, stdout, err) = run_exact(&[
+        "convert",
+        "--auto-base",
+        "--input-transfer",
+        "linear",
+        "--input-meaning",
+        "scanner-device",
+        "--output-preset",
+        "legacy",
+        opaque.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "the RGB-only fallback must still convert:\n{err}");
+    let report = json(&stdout);
+    let warnings = report["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("cannot separate the film holder")),
+        "the fallback must be reported, not silent: {warnings:?}"
+    );
+    // Both frames resolve the same base: the rebate is where it always was, and
+    // the mask only ever restricted *where* the search looked.
+    let usable_base =
+        json(&run_exact(&["estimate", "--auto-base", usable.to_str().unwrap()]).1)["film_base"]
+            .clone();
+    assert_eq!(usable_base, report["film_base"]);
+}
+
+/// `--export-ir` is the documented escape hatch that keeps `--strict` usable on an
+/// HDRi scan: the user is taking the plane themselves, so no IR note may fire —
+/// including the fallback notes for a plane that cannot serve holder detection.
+#[test]
+fn export_ir_keeps_strict_clean_when_the_plane_cannot_serve_detection() {
+    let dir = TempDir::new("ir-export-strict");
+    let opaque = dir.path("opaque.tif");
+    write_hdri_scan_with_rebate(&opaque, 1_081, false); // film itself IR-opaque
+    let (code, _stdout, err) = run_exact(&[
+        "convert",
+        "--auto-base",
+        "--strict",
+        "--export-ir",
+        dir.path("ir.tif").to_str().unwrap(),
+        "--input-transfer",
+        "linear",
+        "--input-meaning",
+        "scanner-device",
+        "--output-preset",
+        "legacy",
+        opaque.to_str().unwrap(),
+        "-o",
+        dir.path("out.tif").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 0,
+        "--strict --export-ir must stay usable on an HDRi scan:\n{err}"
+    );
+}
+
+/// A holder that occludes every edge leaves the masked rebate search nothing to
+/// scan, which is strictly worse than not masking. The mask falls back, and
+/// `inspect` reports the plane as unconsumed rather than claiming a mask it
+/// doesn't have.
+#[test]
+fn an_all_holder_border_falls_back_instead_of_emptying_the_search() {
+    let dir = TempDir::new("ir-all-holder");
+    let path = dir.path("ringed.tif");
+    const W: u32 = 200;
+    const H: u32 = 200;
+    let mut rgb = vec![0u16; (W * H * 3) as usize];
+    let mut ir = vec![41_000u16; (W * H) as usize]; // film: IR-transparent
+    for y in 0..H {
+        for x in 0..W {
+            let i = ((y * W + x) * 3) as usize;
+            let holder = x < 6 || y < 6 || x >= W - 6 || y >= H - 6;
+            rgb[i..i + 3].copy_from_slice(&if holder {
+                [655, 655, 655]
+            } else {
+                [12000, 7000, 4000]
+            });
+            if holder {
+                ir[(y * W + x) as usize] = 1_300; // holder: IR-dark, all four edges
+            }
+        }
+    }
+    write_hdri(&path, W, H, &rgb, &ir);
+
+    let (code, stdout, _err) = run_exact(&["inspect", path.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let report = json(&stdout);
+    assert_eq!(
+        report["ir_separability"]["usable"], true,
+        "the frame's film is IR-transparent, so the verdict must be usable: {report}"
+    );
+    assert!(
+        report["holder_mask"].is_null(),
+        "an all-holder mask must fall back rather than be reported: {report}"
+    );
+    assert!(
+        report["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("preserved but not used")),
+        "a plane that produced no mask is unconsumed and must say so: {report}"
     );
 }
