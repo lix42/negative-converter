@@ -1308,6 +1308,42 @@ workspace spend cap — so this pass had one engine, not two.)
   Prose that describes a limitation is exactly what goes stale when the limitation
   is removed in the same session.
 
+### 2026-09-04 — ship review-fix pass, second round (uncommitted)
+
+The reviewer's report arrived truncated; the remainder (findings 2-10) came back
+on request. Eight fixed, one already done, one kept with reasons.
+
+- **`--film-type` became accepted-and-ignored on `inspect`/`estimate`.** The
+  demotion left both flags parsed and dropped — no code path read them, and
+  neither command resolves a recipe, so unlike `convert` the declaration vanished
+  entirely. That is the shape CLAUDE.md calls a bug, and *this task created it*.
+  Both now echo it as `report.film_type` (absent, not null, when undeclared), which
+  also keeps `nctool roll` — which passes `--film-type` to `nc estimate` — honest.
+  Note no lint could have caught this: clap's derived code reads the field, so it
+  is never dead.
+- **The `golden` determinism rationale denied a primitive the module had gained.**
+  It read "no transcendental anywhere in this module — no `powf`, `10^`, `log10`,
+  `exp`, or `sqrt`", and `ir_separability`'s stride is a `sqrt`. The conclusion
+  survives — IEEE-754 requires `sqrt` to be *correctly rounded*, unlike the libm
+  functions, and it is `ceil`ed to an integer stride — but that sentence is exactly
+  what the next person consults before adding one, so it now states the bar rather
+  than denying the case.
+- **`estimate` reports `ir_separability` too.** It had the measurement only inside
+  a warning string while emitting the same `Report` type as `inspect` — the wrong
+  way round for the command whose entire job is calibration.
+- Smaller: a stale "chromogenic ... holder mask" claim in `LinearImage`'s rustdoc
+  (missed because it mentions chromogenic without being gate-*shaped*); a leftover
+  narration comment in `run_inspect`; `ir_separability` reserving the full 400 KB
+  cap to sample a 6x6 frame, and its "lands at or just under the cap" claim, which
+  holds only for near-square interiors (both axes round their stride up
+  independently); a `using-nc` lead-in ("Two things you can do with it") introducing
+  a bullet about something that now happens by itself.
+- **Kept, with reasons:** `convert` calls `ir_separability` twice — once for the
+  measurement its fallback warning prints, once inside `ir_holder_mask`. Both are
+  bounded strided samples (~100k values), and removing the duplicate would mean
+  threading a verdict through stage 2 purely to save it. `inspect`'s double *mask*
+  build, flagged in the same finding, was already gone.
+
 ## holder-masked-measurement
 
 **Status:** not started

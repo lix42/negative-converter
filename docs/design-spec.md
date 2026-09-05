@@ -1686,7 +1686,9 @@ object (§8). Names are binding and unknown keys are rejected
   IR-assisted film-holder detection (§6.1) is enabled by *measuring* the IR plane,
   not by this declaration. Kept as a shared input-medium axis for the deferred IR
   dust-removal stage (§12 item 1) and `bw-support`; accepted on `convert`,
-  `estimate`, and `inspect`. `nc inspect` reports `ir_separability` (the measured
+  `estimate`, and `inspect`, which echo it back as the report's `film_type` — those
+  two resolve no recipe, so echoing is what keeps a declaration from being parsed
+  and dropped. `nc inspect` and `nc estimate` report `ir_separability` (the measured
   interior IR transmission and the verdict) on any scan carrying an IR plane, and
   on a usable one additionally reports a `holder_mask`: the per-edge along-edge
   segments, each with its span `[start, end)`, holder/film class, and

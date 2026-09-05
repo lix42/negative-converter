@@ -152,9 +152,11 @@ const IR_USABLE_MIN_INTERIOR: f32 = 2.5 * IR_HOLDER_MAX_TRANSMISSION;
 /// verdict about the film must not read the border it exists to detect.
 const IR_USABLE_INTERIOR_MARGIN: f32 = 0.10;
 
-/// Upper bound on the samples the usability verdict gathers. It strides the
-/// interior instead of materializing it, so the check costs a fixed ~400 KB at
-/// any frame size and `pipeline/memory.rs` owes it no term.
+/// Target sample count for the usability verdict — a bound on the *work*, not an
+/// exact size: both axes round their stride up independently, so an elongated
+/// interior lands somewhat above it. It strides the interior instead of
+/// materializing it, so the check costs a few hundred KB at any frame size
+/// (10368x7200 samples 98,774 values) and `pipeline/memory.rs` owes it no term.
 const IR_USABLE_MAX_SAMPLES: usize = 100_000;
 
 /// Number of along-edge segments the IR holder mask splits each edge into. A
@@ -763,7 +765,7 @@ pub struct IrSeparability {
 ///
 /// Reads only the **interior**: the holder occludes the edges, so a verdict about
 /// the film must not sample the border it exists to detect. The interior is
-/// strided to at most [`IR_USABLE_MAX_SAMPLES`] values rather than materialized,
+/// strided to roughly [`IR_USABLE_MAX_SAMPLES`] values rather than materialized,
 /// which keeps the check a fixed small cost at any frame size — deliberately, so
 /// the hand-maintained peak-memory model in `pipeline::memory` owes it no term.
 ///
@@ -783,15 +785,20 @@ pub fn ir_separability(image: &LinearImage) -> Option<IrSeparability> {
         (0, 0, w, h)
     };
 
-    // Stride both axes so the sample stays bounded and evenly spread. `step` is
-    // the ceiling of the square root of the reduction factor, so the sampled
-    // count lands at or just under the cap.
+    // Stride both axes so the sample stays bounded and evenly spread. `step` is the
+    // ceiling of the square root of the reduction factor. That puts the count near
+    // the cap without pinning it there: each axis rounds *up* independently, so an
+    // elongated interior can sit somewhat over it (a square one lands just under).
+    // The cap bounds the work, it is not an exact sample size — so allocate the
+    // count actually taken rather than the cap, which would otherwise reserve
+    // ~400 KB to sample a 6x6 frame.
     let interior = (x1 - x0) * (y1 - y0);
     let step = ((interior as f64 / IR_USABLE_MAX_SAMPLES as f64)
         .sqrt()
         .ceil() as usize)
         .max(1);
-    let mut vals = Vec::with_capacity(IR_USABLE_MAX_SAMPLES + 1);
+    let sampled = (x1 - x0).div_ceil(step) * (y1 - y0).div_ceil(step);
+    let mut vals = Vec::with_capacity(sampled);
     for y in (y0..y1).step_by(step) {
         let row = y * w;
         for x in (x0..x1).step_by(step) {
@@ -1244,10 +1251,17 @@ fn percentile(values: &mut Vec<f32>, p: f32) -> f32 {
 /// cross-platform determinism rule, design-spec §8): the whole stage-2 path is
 /// integer indexing, comparisons, `+`/`-`/`*`/`/` on IEEE floats, and nearest-rank
 /// order-statistic selection ([`percentile`], whose result is the k-th smallest
-/// *value* and so is independent of tie order). There is **no transcendental**
-/// anywhere in this module — no `powf`, `10^`, `log10`, `exp`, or `sqrt` — which is
-/// precisely why the ~1-ULP libm divergence that rules out a whole-frame
-/// reconstruct hash does not apply here.
+/// *value* and so is independent of tie order). No **libm transcendental** runs on
+/// it — no `powf`, `10^`, `log10`, `exp` — which is precisely why the ~1-ULP
+/// divergence that rules out a whole-frame reconstruct hash does not apply here.
+///
+/// The module's one `sqrt` ([`ir_separability`]'s sample stride) is not an
+/// exception to that: IEEE-754 requires `sqrt` to be **correctly rounded**, so
+/// unlike the libm functions above it is bit-identical on every conforming target,
+/// and its result is immediately `ceil`ed to an integer stride besides. This scan
+/// carries no IR plane, so the fingerprinted path never reaches it either. Before
+/// adding another `sqrt`, check it clears the same bar — and note that `powf` and
+/// friends never do.
 #[cfg(test)]
 pub(crate) mod golden {
     use super::*;

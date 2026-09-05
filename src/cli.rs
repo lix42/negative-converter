@@ -1574,8 +1574,16 @@ pub struct Report {
     /// and a future UI draws its highlight rectangles from the same data.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_candidates: Option<Vec<film_base::RebateCandidate>>,
-    /// The measured IR usability verdict (`inspect`, only on a scan carrying an IR
-    /// plane): the interior IR transmission and whether it clears the bar for
+    /// The declared film chemistry, echoed back (`inspect` / `estimate`). Those two
+    /// commands resolve no recipe, so without this the flag would be parsed and
+    /// dropped — accepted-and-ignored, which this project treats as a bug. It gates
+    /// nothing (`ir-usability-detection`); it is recorded so a declaration a user
+    /// made is visible in the artifact that run produced. `convert`/`roll` carry it
+    /// in the resolved recipe instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub film_type: Option<FilmType>,
+    /// The measured IR usability verdict (`inspect` / `estimate`, only on a scan
+    /// carrying an IR plane): the interior IR transmission and whether it clears the bar for
     /// telling the opaque holder from film on **this frame**. Reported so the
     /// verdict — and the threshold behind it — is falsifiable from a run rather
     /// than only from the source (`ir-usability-detection`).
@@ -6623,10 +6631,7 @@ fn run_inspect(args: IoArgs) -> Result<()> {
     let ir_separability = film_base::ir_separability(&image);
     let ir_usable = ir_separability.is_some_and(|s| s.usable);
     report.ir_separability = ir_separability;
-    // Whether the holder mask actually consumes the IR plane here — the one Step-1
-    // consumer. Tailor the IR-status note to what happens so it never contradicts
-    // the `holder_mask` output below (the old unconditional "preserved but not
-    // used" note fired even when the mask was using it).
+    report.film_type = args.film_type;
     // Build the mask *before* the notes, so each one describes what actually
     // happened rather than predicting it: a usable plane can still produce no mask
     // (a too-small image errors on `scan_depth`; an all-holder mask falls back).
@@ -6829,9 +6834,14 @@ fn run_estimate(args: EstimateArgs) -> Result<()> {
     // IR holder mask, so it degrades to RGB-only when the IR plane is shape-only
     // (unverified provenance) or measures unable to separate holder from film. The
     // `--grid` and explicit/region paths never touch IR, so they need no note.
+    report.film_type = args.film_type;
+    // The calibration command reports the measurement itself, not just a warning
+    // about it: `estimate` is where a user decides how to acquire a base, so the
+    // number that drove the decision belongs in its artifact too.
+    report.ir_separability = film_base::ir_separability(&image);
     let mut ir_note_pending = !args.grid && matches!(source, FilmBaseSource::Auto);
     if ir_note_pending && info.ir_present {
-        let sep = film_base::ir_separability(&image);
+        let sep = report.ir_separability;
         if !image.ir_verified {
             ir_note_pending = false;
             push_warning(

@@ -9306,6 +9306,37 @@ fn ir_holder_detection_is_decided_by_measurement_not_by_declaration() {
         "the holder mask must build with no --film-type: {report}"
     );
 
+    // A declaration is echoed back rather than parsed and dropped: `inspect` and
+    // `estimate` resolve no recipe, so the report is the only place a declaration
+    // they were given can survive. Absent when not declared — not `null`.
+    let (_, declared_out, _) = run_exact(&[
+        "inspect",
+        "--film-type",
+        "chromogenic",
+        clear.to_str().unwrap(),
+    ]);
+    assert_eq!(json(&declared_out)["film_type"], "chromogenic");
+    assert!(
+        report.get("film_type").is_none(),
+        "an undeclared run must omit the field, not report null: {report}"
+    );
+    let (_, est_out, _) = run_exact(&[
+        "estimate",
+        "--film-type",
+        "silver",
+        // A region, not `--auto-base`: this fixture is uniform, so auto has no
+        // rebate to find and would refuse before emitting a report.
+        "--base-region",
+        "20,20,40,40",
+        clear.to_str().unwrap(),
+    ]);
+    let est = json(&est_out);
+    assert_eq!(est["film_type"], "silver");
+    assert_eq!(
+        est["ir_separability"]["usable"], true,
+        "the calibration command must carry the measurement, not just warn: {est}"
+    );
+
     // The declaration is inert now: `silver` used to force this path off, and
     // `chromogenic` used to be the only way to turn it on. Both must produce the
     // same report as stating nothing.
@@ -9315,12 +9346,17 @@ fn ir_holder_detection_is_decided_by_measurement_not_by_declaration() {
         assert_eq!(code, 0);
         let mut with_flag = json(&out);
         let mut without = report.clone();
-        // Wall-clock is the one field that legitimately differs run to run.
-        with_flag["elapsed_ms"] = serde_json::Value::Null;
-        without["elapsed_ms"] = serde_json::Value::Null;
+        // Wall-clock legitimately differs run to run, and `film_type` is the
+        // declaration itself echoed back as provenance. Everything else — the
+        // verdict, the mask, the candidates — must be identical: the declaration
+        // is recorded, and it decides nothing.
+        for k in ["elapsed_ms", "film_type"] {
+            with_flag[k] = serde_json::Value::Null;
+            without[k] = serde_json::Value::Null;
+        }
         assert_eq!(
             with_flag, without,
-            "--film-type {declared} must change nothing"
+            "--film-type {declared} must change nothing but its own echo"
         );
     }
 

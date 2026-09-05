@@ -13,9 +13,10 @@ use serde::{Deserialize, Serialize};
 /// Values are in a linear working space, range ~`[0, 1]`. `rgb` is interleaved
 /// (`r,g,b, r,g,b, …`) with `len == width * height * 3`. The IR plane, when
 /// present (HDRi input), is `len == width * height`. It is exported verbatim
-/// (`--export-ir`) and, since `ir-holder-detection`, consumed by the chromogenic
-/// film-base holder mask — but **only when [`ir_verified`](Self::ir_verified) is
-/// true** (design-spec §6.1).
+/// (`--export-ir`) and, since `ir-holder-detection`, consumed by the film-base
+/// holder mask — but **only when [`ir_verified`](Self::ir_verified) is true**, and
+/// only when the plane measures able to separate holder from film on that frame
+/// (`pipeline::film_base::ir_separability`; design-spec §6.1).
 #[derive(Clone, Debug)]
 pub struct LinearImage {
     pub width: u32,

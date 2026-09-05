@@ -969,8 +969,8 @@ has no validated placement in the pipeline yet.
 
 ### IR (HDRi 64-bit input)
 
-The IR plane is decoded and **preserved but not acted on** by default. Two things
-you can do with it:
+The IR plane is decoded and **preserved but not acted on** by default, with one
+exception that needs nothing from you:
 
 - `--export-ir PATH` writes the decoded plane out. **`convert` only** — `roll`
   rejects `input.export_ir`, because one path cannot serve every frame, so IR
@@ -980,7 +980,8 @@ you can do with it:
   IR-transparent, masks the opaque holder off before the auto rebate search.
   There is nothing to declare — `--film-type` does **not** gate it.
 
-  `nc inspect` reports the verdict, and — when it passes — the per-edge mask:
+  `nc inspect` and `nc estimate` report the verdict, and `inspect` adds the
+  per-edge mask when it passes:
 
   ```sh
   nc inspect scan.tif | jq -c '.ir_separability'
