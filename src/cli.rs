@@ -22,13 +22,16 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use crate::algo::fixed;
+use crate::destination::{
+    Axis, Container, DisplayAxes, Encoding, Gamut, OutputSection, Range, Transfer,
+};
 use crate::flow::{self, Flow};
 use crate::io::decode::{DecodeInfo, decode_within, probe};
 use crate::io::{avif, encode, staged, ultra_hdr};
 use crate::pipeline::chain;
 use crate::pipeline::display_tone::Headroom;
 use crate::pipeline::fit_gamut::DestinationGamut;
-use crate::pipeline::fit_range::{self, DisplayPeak};
+use crate::pipeline::fit_range;
 use crate::pipeline::input_semantics::{
     self, ContainerColorFacts, InputAssertions, InputColorReport, RawMode,
 };
@@ -344,6 +347,8 @@ pub struct ConvertArgs {
     pub simple: SimpleOverrides,
     #[command(flatten)]
     pub output_opts: OutputOverrides,
+    #[command(flatten)]
+    pub destination: DestinationOverrides,
 
     /// Load a JSON recipe; individual `--flag`s override its values.
     #[arg(long = "params", value_name = "JSON")]
@@ -377,7 +382,8 @@ pub struct ConvertArgs {
     /// chain cannot honour is refused rather than accepted and ignored. A --params
     /// recipe must be the new chain's own document (`"recipe_version": 2`; `hanten
     /// params --new-flow` writes one) — each chain refuses the other's recipe by name.
-    /// It writes one destination, a Display P3 16-bit TIFF, with no sidecar.
+    /// Its destination is chosen with --range, --transfer, --gamut and --container
+    /// (or --film-master), and it writes no sidecar.
     // Plain prose on purpose: clap renders a doc comment verbatim as `--help` text,
     // so markdown emphasis would print as asterisks.
     #[arg(long = "new-flow")]
@@ -444,6 +450,59 @@ pub struct RollArgs {
 }
 
 // --- per-stage override groups (all-Option; presence flags for booleans) ----
+
+/// The new chain's destination (`crate::destination`): four axes, or the film master.
+///
+/// Each axis is optional: one left unset is derived from the destination table (its
+/// default where a destination fits, else the one value left), and a combination the
+/// table does not have is refused, naming what to change. The accepted values and the
+/// help lists come from the axes themselves (`Axis::ALL`).
+#[derive(Args, Debug, Default)]
+pub struct DestinationOverrides {
+    /// The dynamic range to render for: `sdr` (the default) or `hdr` (a 1000 cd/m²
+    /// peak over 203 cd/m² reference white). Recipe key `output.display.range`.
+    /// `--new-flow` only.
+    #[arg(long, value_enum, ignore_case = true, value_name = "RANGE")]
+    pub range: Option<Range>,
+    /// How samples are stored: `native` (the gamut's own display curve — the
+    /// default), `linear` (no transfer; a 32-bit float TIFF), `pq` or `hlg` (Rec.2100
+    /// signals). Recipe key `output.display.transfer`. `--new-flow` only.
+    #[arg(long, value_enum, ignore_case = true, value_name = "TRANSFER")]
+    pub transfer: Option<Transfer>,
+    /// The primaries to render into: `display-p3` (the default), `adobe-rgb` (SDR
+    /// only) or `bt2020` (HDR only). Recipe key `output.display.gamut`. `--new-flow`
+    /// only.
+    #[arg(long, value_enum, ignore_case = true, value_name = "GAMUT")]
+    pub gamut: Option<Gamut>,
+    /// The file container: `tiff` (the default), `jpeg` or `avif` (PQ/HLG only).
+    /// Destinations: SDR `native` TIFF in Display P3 or Adobe RGB; HDR BT.2020 as a
+    /// `linear` float TIFF, or `pq`/`hlg` in a 16-bit TIFF or a 10-bit AVIF. JPEG
+    /// (SDR, and HDR with a gain map) is not written yet. Recipe key
+    /// `output.display.container`. `--new-flow` only.
+    #[arg(long, value_enum, ignore_case = true, value_name = "CONTAINER")]
+    pub container: Option<Container>,
+    /// Write the fixed decode's linear ACEScg, unclamped 32-bit float TIFF, with no
+    /// rendering stage (recipe `output`: `"film-master"`). Refuses a rendering stage
+    /// the recipe or flags ask for (scene correction, the look, fit range).
+    /// `--new-flow` only.
+    #[arg(long = "film-master", conflicts_with_all = ["range", "transfer", "gamut", "container"])]
+    pub film_master: bool,
+}
+
+impl DestinationOverrides {
+    /// Whether any axis flag was passed.
+    pub fn any_axis(&self) -> bool {
+        self.range.is_some()
+            || self.transfer.is_some()
+            || self.gamut.is_some()
+            || self.container.is_some()
+    }
+
+    /// Whether any destination flag was passed.
+    pub fn any(&self) -> bool {
+        self.any_axis() || self.film_master
+    }
+}
 
 /// Input / decode overrides (design-spec §9, stage 1).
 ///
@@ -956,11 +1015,12 @@ fn removed_output_selector(key: &str) -> &'static RemovedOutputSelector {
 
 /// The remedy for a retired selector, on the chain the command line selects. The
 /// preset advice holds only without `--new-flow`, which refuses every preset flag: there,
-/// the one destination is already a Display P3 16-bit TIFF, so dropping the flag works.
+/// the destination's axes decide depth and profile, so dropping the flag works.
 fn removed_output_remedy(s: &RemovedOutputSelector, new_flow: bool) -> String {
     if new_flow {
-        "drop it — under `--new-flow` the one destination is a Display P3 16-bit TIFF, and \
-         there is no output policy to choose yet"
+        "drop it — under `--new-flow` the destination's axes decide depth and profile \
+         (--range, --transfer, --gamut, --container; a float TIFF is --transfer linear \
+         or --film-master)"
             .to_string()
     } else {
         s.replacement.to_string()
@@ -1965,20 +2025,29 @@ pub struct HdrCodedTiffResult {
 pub struct NewFlowResult {
     /// The fixed decode's resolved parameters, as the render used them.
     pub decode: fixed::DecodeReport,
-    /// Each stage of the new chain in order, with what it applied.
-    pub stages: [NewFlowStageResult; 4],
+    /// Each stage of the new chain in order, with what it applied. Empty for the film
+    /// master, which runs none.
+    pub stages: Vec<NewFlowStageResult>,
     /// Scene correction's values: the white-balance gains and the exposure applied.
-    pub scene_correction: scene_correction::SceneCorrection,
+    /// Absent for the film master.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_correction: Option<scene_correction::SceneCorrection>,
     /// The look's controls as applied — the contrast, and highlight desaturation's
-    /// strength, start and band.
-    pub look: look::LookSection,
+    /// strength, start and band. Absent for the film master.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub look: Option<look::LookSection>,
     /// Fit range's operator by name, with the headroom, white point and display peak
-    /// it ran at — what a non-default `fit_range.headroom_stops` changes.
-    pub fit_range: fit_range::FitRange,
-    /// The destination written — one today (`nf-destinations/preset-set` owns the set).
-    pub destination: &'static str,
-    /// The gamut the chain rendered into, read off its exit.
-    pub gamut: &'static str,
+    /// it ran at — what a non-default `fit_range.headroom_stops` changes. Absent for
+    /// the film master.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit_range: Option<fit_range::FitRange>,
+    /// The destination written, every axis resolved — the recipe `output` section that
+    /// replays it exactly (`crate::destination`).
+    pub destination: OutputSection,
+    /// What fitting an HDR rendition to its peak clamped, per sample. Counted into
+    /// `loss` too; absent for an SDR destination and the film master.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_clamp: Option<hdr::PeakClamp>,
     /// Always `false`: no sidecar is written under `--new-flow` yet. The new chain's
     /// recipe exists (`crate::recipe`); writing it here is `nf-core/report-contract`'s.
     pub sidecar_written: bool,
@@ -3616,6 +3685,7 @@ pub fn validate_convert(
     cfg: &ResolvedConfig,
     args: &ConvertArgs,
     recipe_preset: RecipePreset,
+    new: Option<&Recipe>,
 ) -> Result<()> {
     // Flag-shape first: "these two requests contradict each other" is a clearer
     // diagnosis than whatever value rule the same config might also trip.
@@ -3630,9 +3700,9 @@ pub fn validate_convert(
     // omission is the least specific diagnosis available. Without this ordering,
     // `-o out.jpg --output-preset hdr-pq` with no base demands a base first and
     // only then mentions the suffix, making the user fix two things in series.
-    // Under `--new-flow` the rule is judged against the new flow's one destination
-    // rather than the (refused) output preset — see [`OutputTarget`].
-    reject_output_suffix_mismatch(cfg, args, recipe_preset)?;
+    // Under `--new-flow` the rule is judged against the resolved destination rather
+    // than the (refused) output preset — see [`OutputTarget`].
+    reject_output_suffix_mismatch(cfg, args, recipe_preset, new)?;
     validate(cfg)?;
     Ok(())
 }
@@ -3737,10 +3807,16 @@ fn reject_output_suffix_mismatch(
     cfg: &ResolvedConfig,
     args: &ConvertArgs,
     recipe_preset: RecipePreset,
+    new: Option<&Recipe>,
 ) -> Result<()> {
     resolve_output_path(
         &args.output,
-        OutputTarget::resolve(Flow::from_flag(args.new_flow), cfg.output.preset),
+        OutputTarget::resolve(
+            cfg.output.preset,
+            new,
+            KnobNames::FlagAndKey,
+            args.destination.film_master,
+        )?,
         convert_suffix_context(args, recipe_preset),
     )
     .map(|_| ())
@@ -3820,6 +3896,12 @@ fn resolve_output_path(
         // No dot-segment, or one no preset claims: the whole path is the stem.
         _ => append_suffix(given, container.canonical(), context),
     }
+}
+
+/// The container a path's stated suffix names, if it names one.
+fn given_container(given: &Path) -> Option<Container> {
+    let ext = given.extension()?;
+    Container::ALL.iter().copied().find(|c| accepts(*c, ext))
 }
 
 /// Whether `container` accepts this spelling, in any case.
@@ -3968,18 +4050,66 @@ fn suffix_mismatch_error(
         .join(" or ");
     let preset = match target {
         OutputTarget::Preset(preset) => preset,
-        // One destination and no selector, so there is no preset to blame and no
-        // flag to point at — the same sentence whichever command stated the path.
-        OutputTarget::NewFlow => {
-            let frame = match context {
-                SuffixContext::RollFrame(input) => format!("frame {}: ", input.display()),
-                SuffixContext::Chosen | SuffixContext::Default => String::new(),
+        // No preset to blame: name the destination the axes resolved to. Dropping the
+        // suffix is the one remedy that always works — changing an axis may not.
+        OutputTarget::NewFlow {
+            destination,
+            stated: stated_axes,
+            film_master_flag,
+        } => {
+            // A roll takes no conversion flags, so its frame names the recipe keys.
+            let (frame, names) = match context {
+                SuffixContext::RollFrame(input) => {
+                    (format!("frame {}: ", input.display()), KnobNames::KeyOnly)
+                }
+                SuffixContext::Chosen | SuffixContext::Default => {
+                    (String::new(), KnobNames::FlagAndKey)
+                }
             };
+            // A destination that writes the stated suffix is offered only when a ready
+            // one does, derived from the table (`destination::writing`) — never a
+            // container nothing can write yet — and as the axes to state **over** what
+            // the run stated, since a flag overrides a recipe's axis but never removes
+            // it. The film master states no axes; its offer replaces it.
+            let offers = given_container(output)
+                .map(|c| crate::destination::writing(c, &stated_axes))
+                .unwrap_or_default();
+            // Only a typed `--film-master` needs dropping (it conflicts with the axis
+            // flags at the parser); a recipe's is replaced by the axis flags themselves,
+            // which start from no stated axes (`recipe::merge`).
+            let lead = match (destination, names) {
+                (recipe::Destination::FilmMaster, KnobNames::FlagAndKey) if film_master_flag => {
+                    "or drop --film-master and state a destination that writes it"
+                }
+                (recipe::Destination::FilmMaster, KnobNames::FlagAndKey) => {
+                    "or state a destination that writes it — these flags replace the \
+                     recipe's `output` \"film-master\""
+                }
+                (recipe::Destination::FilmMaster, KnobNames::KeyOnly) => {
+                    "or replace `output` \"film-master\" with a destination that writes it"
+                }
+                (recipe::Destination::Display(_), _) => "or state a destination that writes it",
+            };
+            let instead = match offers.as_slice() {
+                [] => String::new(),
+                list => format!(
+                    ", {lead}: {}",
+                    list.iter()
+                        .map(|a| recipe::complete_destination(names, a))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            };
+            let suffix = output
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
             return NcError::Usage(format!(
-                "{frame}the output path {} does not end in {list}: under --new-flow, Hanten \
-                 writes its one destination, a Display P3 16-bit TIFF. Hanten never renames \
-                 a suffix you state — drop it and the path is completed for you",
-                output.display()
+                "{frame}the output path {} does not end in {list}: under --new-flow the \
+                 destination is {}, which writes {list}. Hanten never renames a suffix you \
+                 state — drop {suffix} and the path is completed for you{instead}",
+                output.display(),
+                recipe::destination_label(destination, names),
             ));
         }
     };
@@ -4018,15 +4148,6 @@ fn suffix_mismatch_error(
     })
 }
 
-/// The set of file containers nc writes. Which spellings a path may state, and
-/// which one nc supplies when it completes or derives a name, both hang off this.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Container {
-    Tiff,
-    Jpeg,
-    Avif,
-}
-
 /// The file container a preset's encoder writes.
 ///
 /// **The only preset-shaped step in output-path handling** — but *not* the only
@@ -4039,10 +4160,9 @@ enum Container {
 /// Exhaustive on purpose, and it must stay that way: a new preset has to *fail to
 /// compile* here rather than inherit a container from a `_` arm or a lookup map.
 /// [`OutputTarget::container`] routes every legacy-flow path through this, and
-/// [`required_extensions`] and [`derived_extension`] hang off that — so a future
-/// destination set changes `OutputTarget` and this function and nothing under them
-/// (`nf-destinations/preset-set`). The new flow's arm lives in `OutputTarget`, not
-/// here, because it is not a preset.
+/// [`required_extensions`] and [`derived_extension`] hang off that. The new flow's
+/// container is its destination's `container` axis (`crate::destination`), read in
+/// `OutputTarget`, because a destination there is not a preset.
 fn container_for(preset: OutputPreset) -> Container {
     match preset {
         OutputPreset::UltraHdrV1 | OutputPreset::GainMapHdr => Container::Jpeg,
@@ -4056,58 +4176,62 @@ fn container_for(preset: OutputPreset) -> Container {
     }
 }
 
-impl Container {
-    /// Every spelling accepted on a *stated* output path, in any case.
-    fn accepted(self) -> &'static [&'static str] {
-        match self {
-            Self::Tiff => &["tif", "tiff"],
-            Self::Jpeg => &["jpg", "jpeg"],
-            Self::Avif => &["avif"],
-        }
-    }
-
-    /// The one spelling nc writes when it supplies the suffix itself — a completed
-    /// `convert` path or a derived `roll` name.
-    ///
-    /// Deliberately **not** `accepted()[0]`: that lists `tif` first, and taking the
-    /// head would have renamed every existing roll output from `_positive.tiff`.
-    fn canonical(self) -> &'static str {
-        match self {
-            Self::Tiff => "tiff",
-            Self::Jpeg => "jpg",
-            Self::Avif => "avif",
-        }
-    }
-}
-
 /// What an output path is judged against: a legacy-flow output preset, or the new
-/// flow's one destination.
+/// flow's resolved destination (`crate::destination`).
 ///
 /// Under `--new-flow` the output preset is refused, so judging a path against the
 /// resolved (default) preset would blame a preset nobody selected and point at a flag
-/// the flow rejects. The new flow's destination is a Display P3 16-bit TIFF
-/// (`nf-core/minimal-end-to-end`); `nf-destinations/preset-set` replaces this with the
-/// real destination set, whose selection rules are its to settle.
+/// the flow rejects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputTarget {
     Preset(OutputPreset),
-    NewFlow,
+    /// The resolved destination; the axes the run stated (after flags merged over the
+    /// recipe), which a suffix remedy has to work on top of; and whether the film master
+    /// came from a typed `--film-master` rather than the recipe, which decides how the
+    /// remedy says to leave it.
+    NewFlow {
+        destination: recipe::Destination,
+        stated: DisplayAxes,
+        film_master_flag: bool,
+    },
 }
 
 impl OutputTarget {
-    /// The target a run's output is judged against.
-    fn resolve(flow: Flow, preset: OutputPreset) -> Self {
-        match flow {
-            Flow::Legacy => Self::Preset(preset),
-            Flow::New => Self::NewFlow,
-        }
+    /// The target a run's output is judged against: the new chain's recipe's
+    /// destination when there is one (`--new-flow`), else the resolved preset.
+    /// `film_master_flag` is whether `--film-master` was typed (always `false` on `roll`,
+    /// which takes no conversion flags).
+    fn resolve(
+        preset: OutputPreset,
+        new: Option<&Recipe>,
+        names: KnobNames,
+        film_master_flag: bool,
+    ) -> Result<Self> {
+        Ok(match new {
+            None => Self::Preset(preset),
+            Some(r) => Self::NewFlow {
+                destination: recipe::destination(r, names)?,
+                stated: match r.output {
+                    OutputSection::Display(axes) => axes,
+                    OutputSection::FilmMaster => DisplayAxes::default(),
+                },
+                film_master_flag,
+            },
+        })
     }
 
     /// The file container the target's encoder writes.
     fn container(self) -> Container {
         match self {
             Self::Preset(preset) => container_for(preset),
-            Self::NewFlow => Container::Tiff,
+            Self::NewFlow {
+                destination: recipe::Destination::Display(d),
+                ..
+            } => d.container,
+            Self::NewFlow {
+                destination: recipe::Destination::FilmMaster,
+                ..
+            } => Container::Tiff,
         }
     }
 }
@@ -5377,13 +5501,13 @@ fn convert_frame(
     let export_ir_planned = cfg.input.export_ir.is_some();
     let mem = preflight_memory(
         input,
-        // The new flow renders into one destination whatever `output.preset`
-        // resolves (that section is refused under the flag), so its profile is
-        // chosen by the flow, not by the preset.
-        if flow == Flow::New {
-            RunProfile::NewFlowSdrTiff {
-                export_ir: export_ir_planned,
-            }
+        // The new flow's profile follows its destination, never `output.preset`
+        // (refused under the flag).
+        if let FrameChain::New(recipe) = chain {
+            new_flow_profile(
+                recipe::destination(recipe, KnobNames::FlagAndKey)?,
+                export_ir_planned,
+            )
         } else {
             match cfg.output.preset {
                 OutputPreset::UltraHdrV1 => RunProfile::UltraHdrV1 {
@@ -5899,7 +6023,8 @@ fn convert_frame(
     // here, before the encode consumes the render, because the measurement rides on
     // the rendition and only two of the four HDR arms surface it in their summary.
     if let Some(content_light) = rendered.hdr_content_light()
-        && let Some(message) = hdr::sdr_range_warning(content_light)
+        && let Some(message) =
+            hdr::sdr_range_warning(content_light, hdr::SdrRangeLevers::PrintExposureAndPreset)
     {
         push_warning_buf(warnings, log, message);
     }
@@ -5953,136 +6078,13 @@ fn convert_frame(
     }
     let encode_ms = elapsed_ms(stage_started);
     if let Some(summary) = avif_summary {
-        // A general-brand-only file is valid but is never advertised as Advanced
-        // Profile, and the downgrade is surfaced (and `--strict`-promotable) rather
-        // than left for someone to discover by inspecting brands.
-        let profile_reason = match &summary.profile {
-            avif::AvifProfile::Advanced => None,
-            avif::AvifProfile::GeneralOnly { reason } => {
-                push_warning_buf(
-                    warnings,
-                    log,
-                    format!(
-                        "AVIF written without the MA1A brand (not AVIF v1.2 Advanced \
-                         Profile): {reason}"
-                    ),
-                );
-                Some(reason.clone())
-            }
-        };
-        report.avif = Some(AvifResult {
-            profile: match summary.profile {
-                avif::AvifProfile::Advanced => "advanced",
-                avif::AvifProfile::GeneralOnly { .. } => "general-brand-only",
-            },
-            profile_reason,
-            bit_depth: summary.bit_depth,
-            seq_profile: summary.seq_profile,
-            seq_level_idx: summary.seq_level_idx,
-            level: avif::level_name(summary.seq_level_idx),
-            cicp: [summary.cicp.0, summary.cicp.1, summary.cicp.2],
-            full_range: summary.full_range,
-            codestream_bytes: summary.codestream_bytes,
-            rendering: AvifRenderingResult {
-                reference_white_nits: summary.metadata.linear.reference_white_nits,
-                target_peak_nits: summary.metadata.linear.target_peak_nits,
-                linear_headroom: summary.metadata.linear.linear_headroom,
-                tone_curve: summary.metadata.linear.tone_curve,
-                gamut_mapping: summary.metadata.linear.gamut_mapping,
-                linear_domain: summary.metadata.linear.linear_domain,
-                hlg_system_gamma: summary.metadata.hlg_system_gamma,
-                hlg_reference_display_peak_nits: summary.metadata.hlg_reference_display_peak_nits,
-                hlg_reference_display_black_nits: summary.metadata.hlg_reference_display_black_nits,
-            },
-        });
+        report_avif(&mut report, &summary, log, warnings);
     }
     if let Some(summary) = hdr_coded_summary {
-        // Same reason as the linear TIFF below: the profile is built inside the
-        // encode arm, so the `auto` BigTIFF promotion is reported from what the
-        // encoder resolved rather than predicted before it.
-        if summary.bigtiff {
-            push_warning_buf(
-                warnings,
-                log,
-                "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
-            );
-        }
-        let metadata = summary.metadata;
-        report.hdr_coded_tiff = Some(HdrCodedTiffResult {
-            pixel_contract: summary.pixel_contract,
-            bits_per_sample: summary.bits_per_sample,
-            sample_format: summary.sample_format,
-            bigtiff: summary.bigtiff,
-            icc_bytes: summary.icc_bytes,
-            // Deliberately **not** `metadata.cicp_matrix_coefficients`: that is the
-            // AVIF value (9, Y'CbCr). An RGB ICC profile requires 0, and the profile
-            // this file embeds writes 0 — so the report states what the artifact
-            // carries, not what the renderer declared for a different container.
-            cicp: [metadata.cicp_color_primaries, metadata.cicp_transfer, 0],
-            full_range: metadata.full_range,
-            max_quantization_error_codes: summary.max_quantization_error_codes,
-            rms_quantization_error_codes: summary.rms_quantization_error_codes,
-            reference_white_nits: metadata.linear.reference_white_nits,
-            target_peak_nits: metadata.linear.target_peak_nits,
-            tone_curve: metadata.linear.tone_curve,
-            // PQ only, for the same reason `io::avif` omits `clli` on HLG: HLG is
-            // display-referred, so absolute content-light values would be a false
-            // claim rather than a missing one.
-            max_cll_nits: match metadata.transfer {
-                hdr::HdrTransfer::Pq => Some(metadata.content_light.max_cll_nits),
-                hdr::HdrTransfer::Hlg => None,
-            },
-            max_fall_nits: match metadata.transfer {
-                hdr::HdrTransfer::Pq => Some(metadata.content_light.max_fall_nits),
-                hdr::HdrTransfer::Hlg => None,
-            },
-            hlg_system_gamma: metadata.hlg_system_gamma,
-            hlg_reference_display_peak_nits: metadata.hlg_reference_display_peak_nits,
-            hlg_reference_display_black_nits: metadata.hlg_reference_display_black_nits,
-            interoperability: "16-bit is TIFF's quantization, not one of BT.2100's specified bit \
-                 depths (10 and 12): the file carries BT.2100's transfer function at \
-                 TIFF's precision. The stored code values are exact and the single \
-                 quantization step is reported above. Automatic HDR presentation is \
-                 not claimed — TIFF has no CICP tag of its own, so the signalling \
-                 lives in the embedded ICC profile's `cicp` tag, which only a \
-                 CICP-aware colour-managed reader honours; treat this as \
-                 limited-interoperability interchange rather than a display-ready \
-                 deliverable, and see the AVIF or gain-map presets for delivery",
-        });
+        report_hdr_coded_tiff(&mut report, &summary, log, warnings);
     }
     if let Some(summary) = hdr_tiff_summary {
-        // Reported after the write, from what the encoder resolved — the `auto`
-        // BigTIFF promotion above cannot cover this preset, because its ICC is built
-        // inside the encode arm and `plans_bigtiff` would need the length first.
-        if summary.bigtiff {
-            push_warning_buf(
-                warnings,
-                log,
-                "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
-            );
-        }
-        let linear = summary.linear;
-        report.hdr_linear_tiff = Some(HdrLinearTiffResult {
-            pixel_contract: summary.pixel_contract,
-            bits_per_sample: summary.bits_per_sample,
-            sample_format: summary.sample_format,
-            bigtiff: summary.bigtiff,
-            icc_bytes: summary.icc_bytes,
-            reference_white_sample: 1.0,
-            reference_white_nits: linear.reference_white_nits,
-            target_peak_nits: linear.target_peak_nits,
-            linear_headroom: linear.linear_headroom,
-            tone_curve: linear.tone_curve,
-            gamut_mapping: linear.gamut_mapping,
-            linear_domain: linear.linear_domain,
-            max_cll_nits: summary.content_light.max_cll_nits,
-            max_fall_nits: summary.content_light.max_fall_nits,
-            interoperability: "the embedded ICC profile states the BT.2020/D65 \
-                               primaries and the linear transfer only; its PCS stops \
-                               at the media white, so the reference-white, peak and \
-                               headroom values in this block — not the profile — \
-                               define the luminance semantics of these samples",
-        });
+        report_hdr_linear_tiff(&mut report, &summary, log, warnings);
     }
     let loss = outcome.loss;
     report_encode_outcome(&mut report, &outcome, log, warnings);
@@ -6192,6 +6194,162 @@ fn report_encode_outcome(
     }
 }
 
+/// The AVIF report block, and the brand-downgrade warning. Shared by both chains: it
+/// reads only what the AVIF encoder resolved.
+fn report_avif(
+    report: &mut Report,
+    summary: &avif::AvifSummary,
+    log: &Log,
+    warnings: &mut Vec<String>,
+) {
+    // A general-brand-only file is valid but is never advertised as Advanced
+    // Profile, and the downgrade is surfaced (and `--strict`-promotable) rather
+    // than left for someone to discover by inspecting brands.
+    let profile_reason = match &summary.profile {
+        avif::AvifProfile::Advanced => None,
+        avif::AvifProfile::GeneralOnly { reason } => {
+            push_warning_buf(
+                warnings,
+                log,
+                format!(
+                    "AVIF written without the MA1A brand (not AVIF v1.2 Advanced \
+                     Profile): {reason}"
+                ),
+            );
+            Some(reason.clone())
+        }
+    };
+    report.avif = Some(AvifResult {
+        profile: match summary.profile {
+            avif::AvifProfile::Advanced => "advanced",
+            avif::AvifProfile::GeneralOnly { .. } => "general-brand-only",
+        },
+        profile_reason,
+        bit_depth: summary.bit_depth,
+        seq_profile: summary.seq_profile,
+        seq_level_idx: summary.seq_level_idx,
+        level: avif::level_name(summary.seq_level_idx),
+        cicp: [summary.cicp.0, summary.cicp.1, summary.cicp.2],
+        full_range: summary.full_range,
+        codestream_bytes: summary.codestream_bytes,
+        rendering: AvifRenderingResult {
+            reference_white_nits: summary.metadata.linear.reference_white_nits,
+            target_peak_nits: summary.metadata.linear.target_peak_nits,
+            linear_headroom: summary.metadata.linear.linear_headroom,
+            tone_curve: summary.metadata.linear.tone_curve,
+            gamut_mapping: summary.metadata.linear.gamut_mapping,
+            linear_domain: summary.metadata.linear.linear_domain,
+            hlg_system_gamma: summary.metadata.hlg_system_gamma,
+            hlg_reference_display_peak_nits: summary.metadata.hlg_reference_display_peak_nits,
+            hlg_reference_display_black_nits: summary.metadata.hlg_reference_display_black_nits,
+        },
+    });
+}
+
+/// The coded-HDR TIFF report block, and the BigTIFF note. Shared by both chains: it
+/// reads only what the encoder resolved.
+fn report_hdr_coded_tiff(
+    report: &mut Report,
+    summary: &encode::HdrCodedTiffSummary,
+    log: &Log,
+    warnings: &mut Vec<String>,
+) {
+    // Same reason as the linear TIFF below: the profile is built inside the
+    // encode arm, so the `auto` BigTIFF promotion is reported from what the
+    // encoder resolved rather than predicted before it.
+    if summary.bigtiff {
+        push_warning_buf(
+            warnings,
+            log,
+            "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+        );
+    }
+    let metadata = summary.metadata;
+    report.hdr_coded_tiff = Some(HdrCodedTiffResult {
+        pixel_contract: summary.pixel_contract,
+        bits_per_sample: summary.bits_per_sample,
+        sample_format: summary.sample_format,
+        bigtiff: summary.bigtiff,
+        icc_bytes: summary.icc_bytes,
+        // Deliberately **not** `metadata.cicp_matrix_coefficients`: that is the
+        // AVIF value (9, Y'CbCr). An RGB ICC profile requires 0, and the profile
+        // this file embeds writes 0 — so the report states what the artifact
+        // carries, not what the renderer declared for a different container.
+        cicp: [metadata.cicp_color_primaries, metadata.cicp_transfer, 0],
+        full_range: metadata.full_range,
+        max_quantization_error_codes: summary.max_quantization_error_codes,
+        rms_quantization_error_codes: summary.rms_quantization_error_codes,
+        reference_white_nits: metadata.linear.reference_white_nits,
+        target_peak_nits: metadata.linear.target_peak_nits,
+        tone_curve: metadata.linear.tone_curve,
+        // PQ only, for the same reason `io::avif` omits `clli` on HLG: HLG is
+        // display-referred, so absolute content-light values would be a false
+        // claim rather than a missing one.
+        max_cll_nits: match metadata.transfer {
+            hdr::HdrTransfer::Pq => Some(metadata.content_light.max_cll_nits),
+            hdr::HdrTransfer::Hlg => None,
+        },
+        max_fall_nits: match metadata.transfer {
+            hdr::HdrTransfer::Pq => Some(metadata.content_light.max_fall_nits),
+            hdr::HdrTransfer::Hlg => None,
+        },
+        hlg_system_gamma: metadata.hlg_system_gamma,
+        hlg_reference_display_peak_nits: metadata.hlg_reference_display_peak_nits,
+        hlg_reference_display_black_nits: metadata.hlg_reference_display_black_nits,
+        interoperability: "16-bit is TIFF's quantization, not one of BT.2100's specified bit \
+             depths (10 and 12): the file carries BT.2100's transfer function at \
+             TIFF's precision. The stored code values are exact and the single \
+             quantization step is reported above. Automatic HDR presentation is \
+             not claimed — TIFF has no CICP tag of its own, so the signalling \
+             lives in the embedded ICC profile's `cicp` tag, which only a \
+             CICP-aware colour-managed reader honours; treat this as \
+             limited-interoperability interchange rather than a display-ready \
+             deliverable, and see the AVIF or gain-map presets for delivery",
+    });
+}
+
+/// The linear-HDR TIFF report block, and the BigTIFF note. Shared by both chains: it
+/// reads only what the encoder resolved.
+fn report_hdr_linear_tiff(
+    report: &mut Report,
+    summary: &encode::HdrLinearTiffSummary,
+    log: &Log,
+    warnings: &mut Vec<String>,
+) {
+    // Reported after the write, from what the encoder resolved — the `auto`
+    // BigTIFF promotion above cannot cover this preset, because its ICC is built
+    // inside the encode arm and `plans_bigtiff` would need the length first.
+    if summary.bigtiff {
+        push_warning_buf(
+            warnings,
+            log,
+            "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+        );
+    }
+    let linear = summary.linear;
+    report.hdr_linear_tiff = Some(HdrLinearTiffResult {
+        pixel_contract: summary.pixel_contract,
+        bits_per_sample: summary.bits_per_sample,
+        sample_format: summary.sample_format,
+        bigtiff: summary.bigtiff,
+        icc_bytes: summary.icc_bytes,
+        reference_white_sample: 1.0,
+        reference_white_nits: linear.reference_white_nits,
+        target_peak_nits: linear.target_peak_nits,
+        linear_headroom: linear.linear_headroom,
+        tone_curve: linear.tone_curve,
+        gamut_mapping: linear.gamut_mapping,
+        linear_domain: linear.linear_domain,
+        max_cll_nits: summary.content_light.max_cll_nits,
+        max_fall_nits: summary.content_light.max_fall_nits,
+        interoperability: "the embedded ICC profile states the BT.2020/D65 \
+                           primaries and the linear transfer only; its PCS stops \
+                           at the media white, so the reference-white, peak and \
+                           headroom values in this block — not the profile — \
+                           define the luminance semantics of these samples",
+    });
+}
+
 /// Whether `path` holds one of nc's sidecars, recognised by its provenance rather
 /// than by key names: the `{meta, params}` envelope with `params` an object and
 /// `meta` carrying the identity every sidecar stamps (`nc_version`,
@@ -6213,15 +6371,224 @@ fn is_nc_sidecar(path: &Path) -> bool {
         && meta["target"].is_string()
 }
 
-/// The new flow's one destination, as the report names it. Provisional —
-/// `nf-destinations/preset-set` owns the set and its names.
-const NEW_FLOW_DESTINATION: &str = "display-p3-u16-tiff";
+/// The memory profile a new-flow destination is sized with: one per shape of buffers
+/// it holds, not one per destination (`nf-destinations/memory-profiles` measures them).
+fn new_flow_profile(destination: recipe::Destination, export_ir: bool) -> RunProfile {
+    match destination {
+        recipe::Destination::FilmMaster => RunProfile::NewFlowF32Tiff { export_ir },
+        recipe::Destination::Display(d) => match d.encoding {
+            Encoding::SdrTiff | Encoding::HdrCodedTiff(_) => {
+                RunProfile::NewFlowU16Tiff { export_ir }
+            }
+            Encoding::HdrLinearTiff => RunProfile::NewFlowF32Tiff { export_ir },
+            Encoding::HdrAvif(_) => RunProfile::NewFlowAvif { export_ir },
+        },
+    }
+}
 
-/// The gamut the new flow's one destination renders into.
-const NEW_FLOW_GAMUT: DestinationGamut = DestinationGamut::DisplayP3;
+/// The new flow's render for its destination, before the encode.
+enum NewFlowRender {
+    /// The fixed decode's linear ACEScg, and the profile naming it.
+    FilmMaster { image: LinearImage, icc: Vec<u8> },
+    /// Through the chain: what it applied, and the pixels its destination encodes.
+    /// Boxed: the account and the HDR metadata dwarf the film master's two handles.
+    Rendered {
+        rendered: Box<ChainAccount>,
+        pixels: NewFlowPixels,
+    },
+}
 
-/// The peak fit range compresses against for that destination: an SDR display.
-const NEW_FLOW_PEAK: DisplayPeak = DisplayPeak::SDR;
+/// What the chain applied, kept once its image has moved to the encoder — the report's
+/// account of the run.
+struct ChainAccount {
+    applied: [(&'static str, &'static str); 4],
+    scene_correction: scene_correction::SceneCorrection,
+    look: look::LookSection,
+    fit_range: fit_range::FitRange,
+}
+
+/// A rendered destination's pixels, in its encoder's input type. One arm per
+/// `destination::Encoding`, matched exhaustively on both sides.
+enum NewFlowPixels {
+    /// The destination's display curve applied, with its ICC profile.
+    Sdr { image: LinearImage, icc: Vec<u8> },
+    /// Display-linear BT.2020, clamped to the peak.
+    HdrLinear(hdr::LinearBt2020Hdr, hdr::PeakClamp),
+    /// A Rec.2100 signal for the 16-bit TIFF.
+    HdrCoded(hdr::RenderedHdr, hdr::PeakClamp),
+    /// A Rec.2100 signal for the AVIF.
+    HdrAvif(hdr::RenderedHdr, hdr::PeakClamp),
+}
+
+impl NewFlowRender {
+    /// What the HDR hand-off clamped to the peak, for an HDR destination.
+    fn peak_clamp(&self) -> Option<hdr::PeakClamp> {
+        match self {
+            Self::Rendered {
+                pixels:
+                    NewFlowPixels::HdrLinear(_, clamp)
+                    | NewFlowPixels::HdrCoded(_, clamp)
+                    | NewFlowPixels::HdrAvif(_, clamp),
+                ..
+            } => Some(*clamp),
+            Self::Rendered {
+                pixels: NewFlowPixels::Sdr { .. },
+                ..
+            }
+            | Self::FilmMaster { .. } => None,
+        }
+    }
+
+    /// The measured content light of an HDR rendition, for the "nothing above
+    /// reference white" warning the legacy HDR presets carry too.
+    fn hdr_content_light(&self) -> Option<hdr::ContentLightLevel> {
+        match self {
+            Self::Rendered { pixels, .. } => match pixels {
+                NewFlowPixels::HdrLinear(h, _) => Some(h.content_light()),
+                NewFlowPixels::HdrCoded(r, _) | NewFlowPixels::HdrAvif(r, _) => {
+                    Some(r.metadata().content_light)
+                }
+                NewFlowPixels::Sdr { .. } => None,
+            },
+            Self::FilmMaster { .. } => None,
+        }
+    }
+
+    /// The depth an `--export-ir` plane is written at: the primary's, as on the legacy
+    /// path — f32 beside a float TIFF, u16 otherwise.
+    fn ir_depth(&self) -> OutDepth {
+        match self {
+            Self::FilmMaster { .. }
+            | Self::Rendered {
+                pixels: NewFlowPixels::HdrLinear(..),
+                ..
+            } => OutDepth::F32,
+            Self::Rendered { .. } => OutDepth::U16,
+        }
+    }
+}
+
+/// Render the fixed decode's ACEScg for `destination`: nothing for the film master; the
+/// chain, then the destination's transfer, for a rendered one.
+fn render_new_flow_destination(
+    aces: AcesCgImage,
+    recipe: &Recipe,
+    destination: recipe::Destination,
+) -> Result<NewFlowRender> {
+    let d = match destination {
+        recipe::Destination::FilmMaster => {
+            // Profile only — no transform: the tag names the space the pixels are in.
+            return Ok(NewFlowRender::FilmMaster {
+                image: aces.into_linear(),
+                icc: color::icc_profile(&color::OutputSpace::AcesCg)?,
+            });
+        }
+        recipe::Destination::Display(d) => d,
+    };
+    let params = recipe.chain_params(d.range.peak()?, d.gamut.destination());
+    let chain::Rendered {
+        image,
+        applied,
+        scene_correction,
+        look,
+        fit_range,
+    } = chain::render(aces, &params)?;
+    let (linear, gamut) = image.into_parts();
+    // Every HDR encoding here is a BT.2020 one; the destination table pairs them, and
+    // this names the break rather than encoding other primaries under a BT.2020 tag.
+    let bt2020 = |linear: LinearImage| {
+        if gamut != DestinationGamut::Bt2020 {
+            return Err(NcError::Other(format!(
+                "an HDR destination reached its encoder in {} rather than BT.2020",
+                gamut.name()
+            )));
+        }
+        hdr::from_new_chain(linear, fit_range.operator, applied[3].1)
+    };
+    let pixels = match d.encoding {
+        Encoding::SdrTiff => {
+            let (image, icc) = color::encode_display_linear(linear, gamut)?;
+            NewFlowPixels::Sdr { image, icc }
+        }
+        Encoding::HdrLinearTiff => {
+            let (hdr, clamp) = bt2020(linear)?;
+            NewFlowPixels::HdrLinear(hdr, clamp)
+        }
+        Encoding::HdrCodedTiff(transfer) => {
+            let (hdr, clamp) = bt2020(linear)?;
+            NewFlowPixels::HdrCoded(hdr::encode_transfer(hdr, transfer)?, clamp)
+        }
+        Encoding::HdrAvif(transfer) => {
+            let (hdr, clamp) = bt2020(linear)?;
+            NewFlowPixels::HdrAvif(hdr::encode_transfer(hdr, transfer)?, clamp)
+        }
+    };
+    Ok(NewFlowRender::Rendered {
+        rendered: Box::new(ChainAccount {
+            applied,
+            scene_correction,
+            look,
+            fit_range,
+        }),
+        pixels,
+    })
+}
+
+/// Encode a new-flow render into its container, filling the report block its encoder
+/// owns. Consumes the render, so no encoder stages a second full-frame buffer.
+fn encode_new_flow_render(
+    render: NewFlowRender,
+    output: &Path,
+    report: &mut Report,
+    log: &Log,
+    warnings: &mut Vec<String>,
+) -> Result<(staged::Staged, EncodeOutcome)> {
+    let bigtiff_note = |big: bool, warnings: &mut Vec<String>| {
+        if big {
+            push_warning_buf(
+                warnings,
+                log,
+                "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
+            );
+        }
+    };
+    let pixels = match render {
+        NewFlowRender::FilmMaster { image, icc } => {
+            let (staged, outcome, big) = encode::encode_f32(&image, &icc, output)?;
+            bigtiff_note(big, warnings);
+            return Ok((staged, outcome));
+        }
+        NewFlowRender::Rendered { pixels, .. } => pixels,
+    };
+    Ok(match pixels {
+        NewFlowPixels::Sdr { image, icc } => {
+            let (staged, outcome, big) = encode::encode_u16(&image, &icc, output)?;
+            bigtiff_note(big, warnings);
+            (staged, outcome)
+        }
+        NewFlowPixels::HdrLinear(hdr, _) => {
+            let icc = color::hdr_linear_bt2020_icc()?;
+            let (staged, outcome, summary) = encode::encode_hdr_linear(hdr, &icc, output)?;
+            report_hdr_linear_tiff(report, &summary, log, warnings);
+            (staged, outcome)
+        }
+        NewFlowPixels::HdrCoded(rendered, _) => {
+            // Keyed off the transfer the render applied, as on the legacy path.
+            let icc = match rendered.metadata().transfer {
+                hdr::HdrTransfer::Pq => color::hdr_pq_tiff_icc()?,
+                hdr::HdrTransfer::Hlg => color::hdr_hlg_tiff_icc()?,
+            };
+            let (staged, outcome, summary) = encode::encode_hdr_coded(rendered, &icc, output)?;
+            report_hdr_coded_tiff(report, &summary, log, warnings);
+            (staged, outcome)
+        }
+        NewFlowPixels::HdrAvif(rendered, _) => {
+            let (staged, outcome, summary) = avif::encode(rendered, output)?;
+            report_avif(report, &summary, log, warnings);
+            (staged, outcome)
+        }
+    })
+}
 
 /// What [`convert_frame`] has resolved by the time the new flow's render takes
 /// over: everything up to and including the film base, which both flows share.
@@ -6240,8 +6607,8 @@ struct NewFlowFrame<'a> {
 }
 
 /// The new flow's render, encode and commit for one frame: the fixed decode
-/// (`algo::fixed`) → NC film RGB v1 → `pipeline::chain` → its one destination, a
-/// Display P3 16-bit TIFF (`nf-core/minimal-end-to-end`).
+/// (`algo::fixed`) → NC film RGB v1 → `pipeline::chain` → the destination the recipe's
+/// `output` resolves to (`crate::destination`), or straight to the film master.
 ///
 /// The same staging discipline as the legacy path — the optional IR export and the
 /// primary are staged, then committed together with the primary last — but **no
@@ -6266,7 +6633,9 @@ fn render_new_flow_frame(
         read_inputs,
     } = frame;
     let decode_params = recipe.reconstruction;
-    let chain_params = recipe.chain_params(NEW_FLOW_PEAK, NEW_FLOW_GAMUT);
+    // Validated before anything was decoded; resolved again here from the same recipe,
+    // so what renders is what was checked.
+    let destination = recipe::destination(recipe, KnobNames::FlagAndKey)?;
 
     // Reconstruction: the fixed decode, then the pinned NC film RGB v1 3×3.
     let stage_started = Instant::now();
@@ -6274,57 +6643,77 @@ fn render_new_flow_frame(
     let aces = working_space::map_nc_film_rgb_v1(film);
     let algorithm_ms = elapsed_ms(stage_started);
 
+    // The NC film RGB v1 3×3 into ACEScg runs on this flow too, so the pinned
+    // interpretation is a fact about the run.
+    report.working_mapping = Some(working_space::WORKING_MAPPING_ID);
+
     // The chain, then the destination's transfer. Clear any stale lcms2 flag first so
     // only a fault from *this* transform is counted.
     let _ = cms_error_occurred();
     let stage_started = Instant::now();
-    let rendered = chain::render(aces, &chain_params)?;
-    let (linear, gamut) = rendered.image.into_parts();
-    let (encoded, icc) = color::encode_display_linear(linear, gamut)?;
+    let render = render_new_flow_destination(aces, recipe, destination)?;
     let color_ms = elapsed_ms(stage_started);
     if cms_error_occurred() {
         return Err(NcError::Other(
             "color management (lcms2) reported a runtime error; see stderr".into(),
         ));
     }
-
-    // The NC film RGB v1 3×3 into ACEScg runs on this flow too, so the pinned
-    // interpretation is a fact about the run.
-    report.working_mapping = Some(working_space::WORKING_MAPPING_ID);
+    if let Some(content_light) = render.hdr_content_light()
+        && let Some(message) =
+            hdr::sdr_range_warning(content_light, hdr::SdrRangeLevers::ExposureAndDestination)
+    {
+        push_warning_buf(warnings, log, message);
+    }
+    let peak_clamp = render.peak_clamp();
+    let rendered = match &render {
+        NewFlowRender::Rendered { rendered, .. } => Some(rendered),
+        NewFlowRender::FilmMaster { .. } => None,
+    };
     report.new_flow = Some(NewFlowResult {
         decode: decoded,
-        stages: rendered
-            .applied
-            .map(|(stage, applied)| NewFlowStageResult { stage, applied }),
-        scene_correction: rendered.scene_correction,
-        look: rendered.look,
-        fit_range: rendered.fit_range,
-        destination: NEW_FLOW_DESTINATION,
-        gamut: gamut.name(),
+        stages: rendered.map_or_else(Vec::new, |r| {
+            r.applied
+                .map(|(stage, applied)| NewFlowStageResult { stage, applied })
+                .to_vec()
+        }),
+        scene_correction: rendered.map(|r| r.scene_correction),
+        look: rendered.map(|r| r.look),
+        fit_range: rendered.map(|r| r.fit_range),
+        destination: match destination {
+            recipe::Destination::FilmMaster => OutputSection::FilmMaster,
+            recipe::Destination::Display(d) => OutputSection::Display(d.axes()),
+        },
+        peak_clamp,
         sidecar_written: false,
         removed_sidecar: None,
     });
 
     // The IR export reads the *decoded* image and is staged before the primary, at
-    // the destination's depth (u16), as on the legacy path.
+    // the destination's depth (f32 for a float TIFF, else u16), as on the legacy path.
     let mut pending: Vec<staged::Staged> = Vec::new();
     let mut ir_export_ms = None;
     if let Some(path) = &export_ir {
         let stage_started = Instant::now();
-        pending.push(encode::export_ir(&image, OutDepth::U16, path)?);
+        pending.push(encode::export_ir(&image, render.ir_depth(), path)?);
         ir_export_ms = Some(elapsed_ms(stage_started));
         report.ir_exported = Some(path.clone());
     }
 
     let stage_started = Instant::now();
-    let (primary, outcome, bigtiff) = encode::encode_u16(&encoded, &icc, output)?;
+    let (primary, mut outcome) =
+        encode_new_flow_render(render, output, &mut report, log, warnings)?;
     let encode_ms = elapsed_ms(stage_started);
-    if bigtiff {
-        push_warning_buf(
-            warnings,
-            log,
-            "output promoted to BigTIFF (would exceed the classic 4 GiB TIFF limit)".into(),
-        );
+    if cms_error_occurred() {
+        return Err(NcError::Other(
+            "color management (lcms2) reported a runtime error; see stderr".into(),
+        ));
+    }
+    // What the HDR hand-off clamped to the peak is lost range like the encoder's own
+    // clip, so it is counted there: the warning, the report's `loss` and `--strict` all
+    // see it.
+    if let Some(clamp) = peak_clamp {
+        outcome.loss.clipped_high += clamp.above_peak;
+        outcome.loss.clipped_low += clamp.below_zero;
     }
     report_encode_outcome(&mut report, &outcome, log, warnings);
 
@@ -6449,15 +6838,20 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     };
     // The *complete* convert gate: `validate`'s resolved-config rules plus the two
     // provenance-sensitive rules that cannot live there (see `validate_convert`).
-    validate_convert(&cfg, &args, recipe_preset)?;
+    validate_convert(&cfg, &args, recipe_preset, new_recipe.as_ref())?;
 
     // The path nc actually writes: `-o out` under the default becomes `out.jpg`.
     // Resolved **here**, before anything derives from it — the write-target guard,
     // the sidecar, the report's `output` and telemetry's `output_bytes` must all
     // see the completed path, never the stem. (`validate_convert` ran the same rule
     // and discarded the value; this is the one call that keeps it.) Under
-    // `--new-flow` the container is the new flow's one destination's — a TIFF.
-    let target = OutputTarget::resolve(flow, cfg.output.preset);
+    // `--new-flow` the container is the resolved destination's.
+    let target = OutputTarget::resolve(
+        cfg.output.preset,
+        new_recipe.as_ref(),
+        KnobNames::FlagAndKey,
+        args.destination.film_master,
+    )?;
     let output = resolve_output_path(
         &args.output,
         target,
@@ -6466,7 +6860,10 @@ fn run_convert(args: ConvertArgs) -> Result<()> {
     if output != args.output {
         let from = match target {
             OutputTarget::Preset(preset) => format!("the resolved preset `{}`", preset.name()),
-            OutputTarget::NewFlow => "the new flow's destination".to_string(),
+            OutputTarget::NewFlow { destination: d, .. } => format!(
+                "the destination {}",
+                recipe::destination_label(d, KnobNames::FlagAndKey)
+            ),
         };
         log.info(format!(
             "output path completed from {from}: writing {}",
@@ -6972,10 +7369,8 @@ fn resolve_frame_output(
     explicit: Option<&Path>,
     input: &Path,
     out_dir: &Path,
-    preset: OutputPreset,
-    flow: Flow,
+    target: OutputTarget,
 ) -> Result<PathBuf> {
-    let target = OutputTarget::resolve(flow, preset);
     let path = match explicit {
         Some(o) if o.is_absolute() => o.to_path_buf(),
         Some(o) => out_dir.join(o),
@@ -7042,10 +7437,22 @@ fn merge_json(base: &mut serde_json::Value, overlay: &serde_json::Value) {
 /// no externally-tagged enum deserializes, so [`merge_json`] replaces it wholesale
 /// instead. A unit variant serializes as a bare string (`"auto"`), not an object,
 /// so switching to/from it never reaches here — the plain replace arm handles it.
+///
+/// **Not a struct of optional fields that happens to state one key.** The new chain's
+/// `output.display` serializes only its stated axes, so a shared `{"transfer": "pq"}`
+/// and a per-frame `{"container": "avif"}` have the same shape as a variant switch;
+/// replacing would drop the roll's transfer. Two keys that are both destination axes
+/// ([`crate::destination::AXIS_KEYS`]) are therefore merged field by field. No
+/// externally tagged enum in either recipe has a variant of those names.
 fn is_variant_switch(base: &serde_json::Value, overlay: &serde_json::Value) -> bool {
+    let axis =
+        |k: Option<&String>| k.is_some_and(|k| crate::destination::AXIS_KEYS.contains(&k.as_str()));
     match (base, overlay) {
         (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
-            b.len() == 1 && o.len() == 1 && b.keys().next() != o.keys().next()
+            b.len() == 1
+                && o.len() == 1
+                && b.keys().next() != o.keys().next()
+                && !(axis(b.keys().next()) && axis(o.keys().next()))
         }
         _ => false,
     }
@@ -7296,6 +7703,25 @@ fn resolve_frames(
                             log.warn(&msg);
                             roll_warnings.push(msg);
                         }
+                        // The new chain's counterpart: its `output` section is the
+                        // destination, so a per-frame one can switch this frame to the
+                        // film master (an unrendered linear ACEScg master) or to another
+                        // range, gamut or container. The same probe on the raw overlay, so
+                        // a restatement is surfaced too, for the same reason.
+                        if shared_recipe.is_some() && ov.get("output").is_some() {
+                            let msg = format!(
+                                "frame {}: a per-frame `params` override sets `output`, \
+                                 overriding the roll's destination — this frame may be a \
+                                 different image class (the unrendered film master vs a \
+                                 rendered destination) or a different range, gamut or \
+                                 container from the rest of the roll. Set `output` once in \
+                                 the shared --params recipe (and drop the per-frame \
+                                 `output`) if you want one consistent roll.",
+                                mf.input.display()
+                            );
+                            log.warn(&msg);
+                            roll_warnings.push(msg);
+                        }
                         let invalid = |e: serde_json::Error| {
                             NcError::Usage(format!(
                                 "frame {}: invalid params override: {e}",
@@ -7398,8 +7824,12 @@ fn resolve_frames(
                     mf.output.as_deref(),
                     &mf.input,
                     out_dir,
-                    cfg.output.preset,
-                    Flow::from_flag(args.new_flow),
+                    OutputTarget::resolve(
+                        cfg.output.preset,
+                        recipe.as_ref(),
+                        KnobNames::KeyOnly,
+                        false,
+                    )?,
                 )?;
                 planned.push(PlannedFrame {
                     input: mf.input,
@@ -7426,7 +7856,12 @@ fn resolve_frames(
                 let output = default_output_name(
                     &input,
                     out_dir,
-                    OutputTarget::resolve(Flow::from_flag(args.new_flow), shared.output.preset),
+                    OutputTarget::resolve(
+                        shared.output.preset,
+                        shared_recipe,
+                        KnobNames::KeyOnly,
+                        false,
+                    )?,
                 );
                 planned.push(PlannedFrame {
                     input,
@@ -11114,9 +11549,9 @@ mod tests {
             ..base_cfg()
         };
         let mut args = parse_convert(&["--output-preset", "ultra-hdr-v1"]);
-        assert!(validate_convert(&cfg, &args, RecipePreset::Unstated).is_err());
+        assert!(validate_convert(&cfg, &args, RecipePreset::Unstated, None).is_err());
         args.output = PathBuf::from("out.JPEG");
-        validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+        validate_convert(&cfg, &args, RecipePreset::Unstated, None).unwrap();
         // Roll-capable now that names are container-aware: it derives
         // `<stem>_positive.jpg` for this preset.
         reject_roll_unsupported(&cfg).unwrap();
@@ -11134,13 +11569,13 @@ mod tests {
             };
             // A `.tiff` (or the default) path is rejected; `.avif` in any case passes.
             let mut args = parse_convert(&["--output-preset", name]);
-            let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+            let err = validate_convert(&cfg, &args, RecipePreset::Unstated, None)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(".avif"), "{name}: {err}");
             assert!(err.contains(name), "{name}: {err}");
             args.output = PathBuf::from("out.AVIF");
-            validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+            validate_convert(&cfg, &args, RecipePreset::Unstated, None).unwrap();
 
             // Roll-capable now: `derived_extension` gives it `.avif`.
             reject_roll_unsupported(&cfg).unwrap();
@@ -11162,13 +11597,13 @@ mod tests {
             };
             let mut args = parse_convert(&["--output-preset", name]);
             args.output = PathBuf::from("out.avif");
-            let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+            let err = validate_convert(&cfg, &args, RecipePreset::Unstated, None)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(".tif"), "{name}: {err}");
             assert!(err.contains(name), "{name}: {err}");
             args.output = PathBuf::from("out.TIF");
-            validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+            validate_convert(&cfg, &args, RecipePreset::Unstated, None).unwrap();
 
             // Roll-capable since roll derives container-aware names. This used to
             // assert the opposite; the refusal existed only because roll hardcoded
@@ -11208,7 +11643,7 @@ mod tests {
         // `.jpg` is rejected and the message names both the preset and what it wants.
         let mut args = parse_convert(&["--output-preset", "hdr-linear-tiff"]);
         args.output = PathBuf::from("out.jpg");
-        let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+        let err = validate_convert(&cfg, &args, RecipePreset::Unstated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains(".tif"), "{err}");
@@ -11217,7 +11652,7 @@ mod tests {
         // Both spellings pass, in any case.
         for name in ["out.tif", "out.TIFF", "out.tiff"] {
             args.output = PathBuf::from(name);
-            validate_convert(&cfg, &args, RecipePreset::Unstated)
+            validate_convert(&cfg, &args, RecipePreset::Unstated, None)
                 .unwrap_or_else(|e| panic!("{name} should be accepted: {e}"));
         }
 
@@ -11292,14 +11727,14 @@ mod tests {
             // rejected *every* path would pass the first assertion alone).
             let mut args = parse_convert(&["--output-preset", name]);
             args.output = PathBuf::from("out.jpg");
-            let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+            let err = validate_convert(&cfg, &args, RecipePreset::Unstated, None)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(".tif"), "{name}: {err}");
             assert!(err.contains(name), "{name}: {err}");
             for path in ["out.tif", "out.TIFF", "out.tiff"] {
                 args.output = PathBuf::from(path);
-                validate_convert(&cfg, &args, RecipePreset::Unstated)
+                validate_convert(&cfg, &args, RecipePreset::Unstated, None)
                     .unwrap_or_else(|e| panic!("{name}: {path} should be accepted: {e}"));
             }
 
@@ -11333,7 +11768,7 @@ mod tests {
         let cfg = base_cfg();
         let mut args = parse_convert(&[]);
         args.output = PathBuf::from("positive");
-        validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+        validate_convert(&cfg, &args, RecipePreset::Unstated, None).unwrap();
         assert_eq!(
             resolve_output_path(&args.output, cfg.output.preset, SuffixContext::Default).unwrap(),
             PathBuf::from("positive.jpg")
@@ -11362,7 +11797,7 @@ mod tests {
         let cfg = base_cfg();
         let mut args = parse_convert(&[]);
         args.output = PathBuf::from("positive.tiff");
-        let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+        let err = validate_convert(&cfg, &args, RecipePreset::Unstated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains(".jpg"), "{err}");
@@ -11377,7 +11812,7 @@ mod tests {
         // The same mismatch *with* the flag blames the preset by name.
         let mut chosen = parse_convert(&["--output-preset", "gain-map-hdr"]);
         chosen.output = PathBuf::from("positive.tiff");
-        let err = validate_convert(&cfg, &chosen, RecipePreset::Unstated)
+        let err = validate_convert(&cfg, &chosen, RecipePreset::Unstated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("output preset `gain-map-hdr`"), "{err}");
@@ -11391,11 +11826,11 @@ mod tests {
             ..base_cfg()
         };
         args.output = PathBuf::from("positive.jpg");
-        let err = validate_convert(&named, &args, RecipePreset::Unstated)
+        let err = validate_convert(&named, &args, RecipePreset::Unstated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("film-master"), "{err}");
-        validate_convert(&cfg, &args, RecipePreset::Unstated).unwrap();
+        validate_convert(&cfg, &args, RecipePreset::Unstated, None).unwrap();
     }
 
     #[test]
@@ -11571,7 +12006,7 @@ mod tests {
         };
         let mut args = parse_convert(&[]);
         args.output = PathBuf::from("out.jpg");
-        let err = validate_convert(&cfg, &args, RecipePreset::Stated)
+        let err = validate_convert(&cfg, &args, RecipePreset::Stated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("output preset `display-p3`"), "{err}");
@@ -11581,7 +12016,7 @@ mod tests {
         );
         // Falsifiable: the *same* config with nothing stated is the genuine default
         // arm, and that message does name the no-preset default.
-        let err = validate_convert(&cfg, &args, RecipePreset::Unstated)
+        let err = validate_convert(&cfg, &args, RecipePreset::Unstated, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("with no --output-preset"), "{err}");
@@ -12849,6 +13284,37 @@ mod tests {
     }
 
     #[test]
+    fn merge_json_merges_destination_axes_but_switches_the_output_variant() {
+        // One stated axis each, different keys: the shape of a variant switch, but a
+        // struct of optional fields — the frame's container joins the roll's transfer.
+        let mut base = serde_json::json!({"output": {"display": {"transfer": "pq"}}});
+        let overlay = serde_json::json!({"output": {"display": {"container": "avif"}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(
+            base,
+            serde_json::json!({"output": {"display": {"transfer": "pq", "container": "avif"}}})
+        );
+        // The genuine enum level still switches: the film master replaces the display
+        // arm, and a display arm replaces the film master.
+        let mut base = serde_json::json!({"output": {"display": {"transfer": "pq"}}});
+        merge_json(&mut base, &serde_json::json!({"output": "film-master"}));
+        assert_eq!(base, serde_json::json!({"output": "film-master"}));
+        let overlay = serde_json::json!({"output": {"display": {"gamut": "adobe-rgb"}}});
+        merge_json(&mut base, &overlay);
+        assert_eq!(base, overlay);
+        // An externally tagged enum elsewhere is unaffected.
+        let mut base = serde_json::json!({"film_base": {"region": [1, 2, 3, 4]}});
+        merge_json(
+            &mut base,
+            &serde_json::json!({"film_base": {"explicit": [0.9, 0.5, 0.4]}}),
+        );
+        assert_eq!(
+            base,
+            serde_json::json!({"film_base": {"explicit": [0.9, 0.5, 0.4]}})
+        );
+    }
+
+    #[test]
     fn merge_json_replaces_enum_variant_switch_but_deep_merges_same_tag() {
         // An externally-tagged enum variant switch (`region` → `explicit`) must
         // REPLACE the one-key map, not union the tags — a `{"region":…,
@@ -13173,8 +13639,7 @@ mod tests {
                 Some(Path::new("custom.tiff")),
                 Path::new("/s/f.tif"),
                 Path::new("/out"),
-                OutputPreset::DisplayP3,
-                Flow::Legacy,
+                OutputTarget::Preset(OutputPreset::DisplayP3),
             )
             .unwrap(),
             PathBuf::from("/out/custom.tiff")
@@ -13184,8 +13649,7 @@ mod tests {
                 Some(Path::new("/abs/c.tiff")),
                 Path::new("/s/f.tif"),
                 Path::new("/out"),
-                OutputPreset::DisplayP3,
-                Flow::Legacy,
+                OutputTarget::Preset(OutputPreset::DisplayP3),
             )
             .unwrap(),
             PathBuf::from("/abs/c.tiff")
@@ -13195,8 +13659,7 @@ mod tests {
                 None,
                 Path::new("/s/f.tif"),
                 Path::new("/out"),
-                OutputPreset::DisplayP3,
-                Flow::Legacy,
+                OutputTarget::Preset(OutputPreset::DisplayP3),
             )
             .unwrap(),
             PathBuf::from("/out/f_positive.tiff")
@@ -13252,8 +13715,7 @@ mod tests {
             Some(Path::new("frame.tiff")),
             Path::new("/s/f.tif"),
             Path::new("/out"),
-            OutputPreset::GainMapHdr,
-            Flow::Legacy,
+            OutputTarget::Preset(OutputPreset::GainMapHdr),
         )
         .unwrap_err()
         .to_string();
@@ -13272,8 +13734,7 @@ mod tests {
                     Some(Path::new("chosen")),
                     Path::new("/s/f.tif"),
                     Path::new("/out"),
-                    preset,
-                    Flow::Legacy,
+                    OutputTarget::Preset(preset),
                 )
                 .unwrap(),
                 PathBuf::from(want),

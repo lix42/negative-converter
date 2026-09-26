@@ -31,7 +31,8 @@ What is known:
 
 Open:
 
-- **`RunProfile`: does it share `NewFlowSdrTiff`?** Same buffers and shape as the
+- **`RunProfile`: does it share `NewFlowU16Tiff`** (named `NewFlowSdrTiff` until
+  2026-09-25)? Same buffers and shape as the
   Display P3 destination (a matrix change inside an in-place map, and a transfer), so
   it should — confirm by measurement, as `nf-destinations/memory-profiles` requires.
 - **Is it a named destination or a rendering profile** that other destinations can
@@ -43,6 +44,11 @@ Open:
 - Whether the empty look is genuinely empty — the 2026-09-17 measurement is that
   per-channel highlight compression flatters any cast, which is precisely what this
   destination must not do.
+
+- **2026-09-25 (`preset-set`):** a destination is now separate knobs, so Adobe RGB is a
+  value of `--gamut` (`--new-flow --gamut adobe-rgb` writes the SDR TIFF). What is
+  left here is the *rendering*, and the "named destination or rendering profile"
+  question now leans profile: range and gamut are knob values, not part of a name.
 
 ## How to Verify
 

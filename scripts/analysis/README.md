@@ -417,9 +417,15 @@ so the two cannot drift.
 
 Four rules it holds to, each of which has a reason rather than a preference:
 
-- **The matrix states the preset once**, as `output_preset`; a config may not
-  restate it or any other flag the generator supplies (`-o`, `--report`), because
-  `nc` takes the last occurrence of such a flag and the override would be silent.
+- **The matrix states the preset once**, as `output_preset` — or, for the new
+  chain, the `destination` it renders (the recipe `output` value with all four axes
+  stated, `{"display": {"range", "transfer", "gamut", "container"}}`, or
+  `"film-master"`; the generator then passes `--new-flow` and the destination flags).
+  A config may not restate it or any other flag the generator supplies (`-o`,
+  `--report`, `--new-flow`, the destination flags), because `nc` takes the last
+  occurrence of such a flag and the override would be silent. Every axis is stated
+  rather than left to `nc`'s derivation, so the suffix and the metrics' colour space
+  are read off the matrix, keyed on the container and on (gamut, transfer).
 - **Each cell is measured in the space its own resolved recipe reports**, not in
   whatever the preset's name usually implies — the reference build's `legacy` and
   `custom` accept `--output-profile`, and measuring ProPhoto pixels as sRGB yields a

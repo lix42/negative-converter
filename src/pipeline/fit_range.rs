@@ -90,7 +90,6 @@ impl DisplayPeak {
     const MAX: f32 = 10_000.0 / 203.0;
 
     /// Check a peak, or refuse it.
-    #[cfg_attr(not(test), allow(dead_code))] // the HDR destinations (`nf-destinations/preset-set`)
     pub fn new(peak: f32) -> Result<Self> {
         if !peak.is_finite() || !(1.0..=Self::MAX).contains(&peak) {
             return Err(NcError::Other(format!(

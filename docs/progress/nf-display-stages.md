@@ -37,7 +37,7 @@ white they are bit-identical except where the SDR cube binds, which
 headroom measured. `pipeline::gain_ratio` is the pair's per-channel gain, ratioed
 against the base as stored. No hard HDR ceiling above `W`: the encoder clamps and
 counts what passes the peak — a gain-map destination must do that itself
-(`nf-destinations/preset-set`), since `gain_ratio` does not.
+(`nf-destinations/gain-map-destination`), since `gain_ratio` does not.
 
 **The gamut map's share of highlight desaturation is near zero where it matters**
 (`gamut-map-share`, done 2026-09-23; `docs/reports/gamut-map-share.md`). It moves no

@@ -10,8 +10,8 @@
 //! that retiring the old path is a deletion and not a rename.
 //!
 //! `--new-flow` reaches the new chain (`nf-core/minimal-end-to-end`): the fixed decode
-//! (`algo::fixed`) feeds it, and it renders into one destination, a Display P3 16-bit
-//! TIFF. Scene correction applies white balance and exposure, the look highlight
+//! (`algo::fixed`) feeds it, and it renders into the destination `crate::destination`
+//! resolves. Scene correction applies white balance and exposure, the look highlight
 //! desaturation, fit range compresses the scene's range against the destination's peak,
 //! and fit gamut maps into the destination's gamut; the stage epics fill the rest.
 //! [`white_balance`] holds the white-balance statistics: the current chain's per-frame

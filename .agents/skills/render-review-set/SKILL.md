@@ -87,7 +87,8 @@ every cell whose `common_args` reference `{dmin}`.
   `<assets>/rolls/<roll>/<file>`, so copying the manifest's own `rolls/<roll>/<serial>.tif`
   produces a doubled path and every frame is reported missing and skipped.
 - **matrix copy** — `schema_version` (must be `1`; the loader refuses the document
-  otherwise), `output_dir`, `output_preset`, `common_args` (usually `["--film-base",
+  otherwise), `output_dir`, `output_preset` (or, for `--new-flow`, `destination` — see
+  below), `common_args` (usually `["--film-base",
   "{dmin}"]`), `metrics.inset`, a `rolls` block mapping roll → `film_stock` if any config uses
   `{film_stock}`, and one entry per configuration under `configs`.
 - **a build axis, when comparing two binaries** — an optional top-level `builds`, one
@@ -110,6 +111,11 @@ Rules, each with a reason:
   override would be silent, and redirecting the report to a file stops the generator reading
   the resolved recipe back from stdout. State the preset once as `output_preset`. The loader
   rejects all five by name, so a config that restates one fails before anything renders.
+- A new-chain set states `destination` instead of `output_preset`: the recipe `output` value
+  with **every** axis stated (`{"display": {"range": "sdr", "transfer": "native", "gamut":
+  "display-p3", "container": "tiff"}}`) or `"film-master"`. The generator passes `--new-flow`
+  and the destination flags itself, so a config may not state them either. A reference-build
+  arm (the pre-migration binary) cannot render a `destination` set — it has no `--new-flow`.
 - A cell that fails costs only itself; the app draws the gap.
 - Re-measuring is keyed to the image's **checksum**, not mtime, because a rerun re-renders
   everything.

@@ -103,6 +103,21 @@ impl SceneCorrectionParams {
         self.gains().map(|_| ())
     }
 
+    /// Whether the user asked for a correction — whether the stage would move a pixel.
+    /// The one predicate a destination that runs no scene correction (`film-master`)
+    /// reads to refuse, rather than one rule per knob (the refusal is
+    /// `recipe::destination`; the look's is `LookSection::asks_for_a_look`).
+    ///
+    /// Keyed on the folded **gains**, the test [`apply`] and the report use: the
+    /// default is the identity, so there is no default to spare separately, and a
+    /// stated identity — an exposure too small to move `2^EV` off `1.0`, a white
+    /// balance the exposure cancels — renders exactly what such a destination does.
+    /// A value [`check`](Self::check) refuses asks for one too; validation names it
+    /// first.
+    pub fn asks_for_a_correction(&self) -> bool {
+        self.gains() != Ok([1.0, 1.0, 1.0])
+    }
+
     /// The one per-channel multiplier the stage applies — white balance times
     /// `2^exposure` — or the first rule it breaks.
     fn gains(&self) -> std::result::Result<[f32; 3], SceneFault> {
@@ -324,6 +339,13 @@ mod tests {
             let before = bits(aces.rgb());
             let (out, resolved) = run(aces, &params).unwrap();
             assert_eq!(resolved.applied(), want, "{params:?}");
+            // A destination that runs no scene correction refuses exactly the
+            // parameters that would move a pixel.
+            assert_eq!(
+                params.asks_for_a_correction(),
+                want != "identity",
+                "{params:?}"
+            );
             // The label and the pixels agree: "identity" exactly when nothing moved.
             assert_eq!(want == "identity", bits(&out) == before, "{params:?}");
         }

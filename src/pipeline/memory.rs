@@ -223,7 +223,7 @@
 //! so the pair of frame sizes covers both.
 //!
 //! The four `--new-flow` rows (2026-09-22, `nf-core/minimal-end-to-end`) are what
-//! [`RunProfile::NewFlowSdrTiff`]'s shared arithmetic rests on: a legacy u16 `convert`
+//! [`RunProfile::NewFlowU16Tiff`]'s shared arithmetic rests on: a legacy u16 `convert`
 //! of the same two frames measured within 0.1 MB of each, and the pair solves to
 //! ~42 B/px with ~10 MB fixed against the 38 B/px the enumerated buffers account —
 //! `accounted` 0.89–0.94x of measured, the allowance covering the rest. The largest
@@ -375,7 +375,7 @@ pub enum RunProfile {
     /// `convert` / `roll` for `film-master` (always `f32`): decode → film-base →
     /// render → encode. The `u16` arm is no longer reached by a preset — `legacy`
     /// and `custom` retired — but stays the arithmetic
-    /// [`NewFlowSdrTiff`](Self::NewFlowSdrTiff) is measured against.
+    /// [`NewFlowU16Tiff`](Self::NewFlowU16Tiff) is measured against.
     Convert {
         /// Output depth — a `u16` encode stages a whole extra quantize buffer,
         /// `f32` writes the working buffer verbatim.
@@ -460,9 +460,10 @@ pub enum RunProfile {
         /// Whether a u16 IR TIFF is staged before the primary TIFF.
         export_ir: bool,
     },
-    /// `convert --new-flow` / `roll --new-flow`: the fixed decode, the new chain,
-    /// and its one destination — a Display P3 16-bit TIFF
-    /// (`nf-core/minimal-end-to-end`).
+    /// `convert --new-flow` / `roll --new-flow` into a **16-bit TIFF**: the fixed decode,
+    /// the new chain (one branch, `chain::render`), and an SDR destination or a coded
+    /// HDR one (PQ/HLG codes; `hdr::from_new_chain` and `hdr::encode_transfer` both
+    /// work in place).
     ///
     /// **Shares [`Convert`](Self::Convert)'s u16 arithmetic exactly**, because it
     /// holds the same buffers: the decoded image (kept for `--export-ir`), the
@@ -470,16 +471,34 @@ pub enum RunProfile {
     /// the legacy staged pair into one pass, so there is no second intermediate), a
     /// chain that moves that buffer through every boundary and transforms it in
     /// place, and a 3x2 B quantize buffer with `tiff` streaming strips. Its peak is
-    /// the **encode** phase, like `Convert`'s. Measured rather than inherited: see
-    /// the module doc's calibration table. A separate variant so a chain stage that
+    /// the **encode** phase, like `Convert`'s. Measured rather than inherited for the
+    /// SDR destination (see the module doc's calibration table); the coded HDR TIFF
+    /// shares it by the same buffer count and is **not yet measured**
+    /// (`nf-destinations/memory-profiles`). A separate variant so a chain stage that
     /// gains a full-frame buffer has an arm of its own to move.
     ///
-    /// **One branch only** (`chain::render`). A gain-map pair (`chain::render_pair`)
-    /// copies the graded image and holds two working buffers through fit range and fit
-    /// gamut, so a destination that renders one needs an arm of its own
-    /// (`nf-destinations/memory-profiles`), not this one.
-    NewFlowSdrTiff {
+    /// **One branch only.** A gain-map pair (`chain::render_pair`) copies the graded
+    /// image and holds two working buffers through fit range and fit gamut, so a
+    /// destination that renders one needs an arm of its own, not this one.
+    NewFlowU16Tiff {
         /// Whether a u16 IR TIFF is staged before the primary TIFF.
+        export_ir: bool,
+    },
+    /// `--new-flow` into a **32-bit float TIFF**: the linear HDR destination, or the
+    /// film master. [`NewFlowU16Tiff`](Self::NewFlowU16Tiff)'s buffers with no
+    /// quantize buffer — f32 is written verbatim — so `Convert`'s f32 arithmetic.
+    /// **Provisional**: counted, not measured (`nf-destinations/memory-profiles`).
+    NewFlowF32Tiff {
+        /// Carried for the uniform shape; an f32 IR plane is written verbatim from
+        /// the decoded image, so it stages nothing (as for `Convert` at f32).
+        export_ir: bool,
+    },
+    /// `--new-flow` into a **10-bit AVIF** (PQ/HLG): the decoded image and the chain's
+    /// buffer, then the AVIF encoder's own staging on top at encode —
+    /// [`HdrAvif`](Self::HdrAvif)'s encode term over the new flow's render buffers.
+    /// **Provisional**: counted, not measured (`nf-destinations/memory-profiles`).
+    NewFlowAvif {
+        /// Whether a u16 IR TIFF is staged before the primary.
         export_ir: bool,
     },
     /// `inspect` / `estimate`: decode, then sample — no render, no encode.
@@ -487,7 +506,7 @@ pub enum RunProfile {
     /// `measure-roll`, per frame: the fixed decode into linear ACEScg, then a strided
     /// sample of it — no chain, no encode.
     ///
-    /// Holds [`NewFlowSdrTiff`](Self::NewFlowSdrTiff)'s render-phase buffers — the
+    /// Holds [`NewFlowU16Tiff`](Self::NewFlowU16Tiff)'s render-phase buffers — the
     /// decoded image and the decode's one output buffer with its cloned IR plane,
     /// mapped into ACEScg in place — and nothing after them, so it peaks at the
     /// **render** phase. The roll's pooled sample (~1.5 MB a frame,
@@ -852,7 +871,7 @@ pub fn estimate_peak(
     let film_base_bytes = sum(image, sampled)?;
 
     // `Convert`'s phases, as a closure because the new flow holds exactly the same
-    // buffer set at a fixed u16 depth (see `RunProfile::NewFlowSdrTiff`).
+    // buffer set at a fixed u16 depth (see `RunProfile::NewFlowU16Tiff`).
     let convert_phases = |depth: OutDepth, export_ir: bool| -> Result<(u64, u64)> {
         // Render: the decoded image (held for `--export-ir` / the report) plus
         // the density→positive buffer and its cloned IR plane. The output
@@ -889,7 +908,25 @@ pub fn estimate_peak(
         RunProfile::DecodeOnly => (0, 0),
         RunProfile::MeasureRoll => (sum(mul(image, 2)?, sampled)?, 0),
         RunProfile::Convert { depth, export_ir } => convert_phases(depth, export_ir)?,
-        RunProfile::NewFlowSdrTiff { export_ir } => convert_phases(OutDepth::U16, export_ir)?,
+        RunProfile::NewFlowU16Tiff { export_ir } => convert_phases(OutDepth::U16, export_ir)?,
+        RunProfile::NewFlowF32Tiff { export_ir } => convert_phases(OutDepth::F32, export_ir)?,
+        RunProfile::NewFlowAvif { export_ir } => {
+            // Render: the decoded image and the chain's one buffer (image-shaped: it
+            // carries the decode's cloned IR plane until the HDR hand-off drops it).
+            let render = mul(image, 2)?;
+            // Encode: both, plus the AVIF encoder's staging and the optional u16 IR
+            // plane — `HdrAvif`'s encode terms.
+            let avif_staging = mul(pixels, AVIF_STAGING_BYTES_PER_PX)?;
+            let ir_export = if export_ir && shape.ir_present {
+                mul(pixels, 2)?
+            } else {
+                0
+            };
+            (
+                sum(render, sampled)?,
+                sum(sum(sum(render, avif_staging)?, ir_export)?, sampled)?,
+            )
+        }
         // One arm for both dialects: see `RunProfile::GainMapHdr`'s note on why they
         // share it, and what in the staging term covers the ISO half.
         RunProfile::UltraHdrV1 { export_ir } | RunProfile::GainMapHdr { export_ir } => {
@@ -1613,7 +1650,10 @@ mod tests {
                 },
                 "encode",
             ),
-            (RunProfile::NewFlowSdrTiff { export_ir: false }, "encode"),
+            (RunProfile::NewFlowU16Tiff { export_ir: false }, "encode"),
+            // f32 is written verbatim, so encode adds nothing and render is the peak.
+            (RunProfile::NewFlowF32Tiff { export_ir: false }, "render"),
+            (RunProfile::NewFlowAvif { export_ir: false }, "encode"),
             (RunProfile::MeasureRoll, "render"),
         ] {
             assert_eq!(peak_phase(profile), expected, "{profile:?}");
@@ -1622,7 +1662,7 @@ mod tests {
 
     #[test]
     fn the_new_flow_is_sized_exactly_like_a_u16_convert() {
-        // `RunProfile::NewFlowSdrTiff`'s claim, pinned: the same buffer set as the
+        // `RunProfile::NewFlowU16Tiff`'s claim, pinned: the same buffer set as the
         // legacy u16 TIFF path, with and without an IR export and a sampled base. The
         // calibration table is what shows the arithmetic is *true*; this shows the arm
         // is wired to it, so a new-flow buffer added later has to move this test too.
@@ -1630,7 +1670,7 @@ mod tests {
             for export_ir in [false, true] {
                 for sampling in [SamplePlan::none(), SamplePlan::auto()] {
                     let s = shape(5184, 3600, ir);
-                    let new = estimate_peak(&s, RunProfile::NewFlowSdrTiff { export_ir }, sampling)
+                    let new = estimate_peak(&s, RunProfile::NewFlowU16Tiff { export_ir }, sampling)
                         .unwrap();
                     let legacy = estimate_peak(
                         &s,

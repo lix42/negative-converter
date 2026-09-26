@@ -41,6 +41,11 @@ On 2026-09-13 the user set the product shape: **SDR lossless is the default**
 4. The telemetry `output_depth` label for an 8-bit primary already exists (`u8`);
    confirm the report's other depth claims.
 
+- **2026-09-25 (`nf-destinations/preset-set`):** on the new chain an SDR JPEG is a
+  knob combination (`--range sdr --container jpeg`, a row refused as "not yet"), so
+  open question 1 (one preset per gamut) is moot there; it stands only for the legacy
+  chain, which retires at `nf-core/default-flip`.
+
 ## How to Verify
 
 - `hanten convert --output-preset <name> -o out.jpg` writes an 8-bit JPEG whose decoded

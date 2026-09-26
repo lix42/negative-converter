@@ -84,6 +84,17 @@ pub struct ContentLightLevel {
     pub max_fall_nits: u16,
 }
 
+/// Which command-line levers [`sdr_range_warning`]'s remedy names — the caller's to say,
+/// since a stage does not know which chain ran it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SdrRangeLevers {
+    /// The current chain's: `--print-exposure`, and an SDR output preset.
+    PrintExposureAndPreset,
+    /// The new chain's (`--new-flow`): scene correction's `--exposure`, and an SDR
+    /// destination (`--range sdr`).
+    ExposureAndDestination,
+}
+
 /// Warn when a single-rendition HDR container would carry a signal that never rises
 /// above SDR reference white.
 ///
@@ -104,18 +115,32 @@ pub struct ContentLightLevel {
 ///
 /// `None` for a frame with real highlights — that is the falsifiable half, and the
 /// reason this takes the measurement rather than the preset.
-pub fn sdr_range_warning(content_light: ContentLightLevel) -> Option<String> {
+///
+/// The remedies follow `levers`, since each chain refuses the other's ([`SdrRangeLevers`]).
+pub fn sdr_range_warning(
+    content_light: ContentLightLevel,
+    levers: SdrRangeLevers,
+) -> Option<String> {
     let reference_white = REFERENCE_WHITE_NITS.round() as u16;
+    let (exposure, sdr) = match levers {
+        SdrRangeLevers::PrintExposureAndPreset => (
+            "`--print-exposure`, which every display preset and curve accepts",
+            "an SDR preset",
+        ),
+        SdrRangeLevers::ExposureAndDestination => (
+            "`--exposure` (recipe `scene_correction.exposure`)",
+            "an SDR destination (`--range sdr` in place of the HDR axes, recipe \
+             `output.display.range`)",
+        ),
+    };
     (content_light.max_cll_nits <= reference_white).then(|| {
         format!(
             "HDR output carries an SDR-range signal: the brightest pixel measures {} nits, \
              at or below the {reference_white}-nit reference white, so nothing in this frame \
              uses the {:.0}-nit headroom the container and report advertise. Two common \
-             causes: the render is placed too dark for this roll — raise \
-             `--print-exposure`, which every display preset and curve accepts — or the \
-             frame's content genuinely \
-             never rises above reference white, in which case an SDR preset delivers the \
-             same picture in a more compatible container.",
+             causes: the render is placed too dark for this roll — raise {exposure} — or \
+             the frame's content genuinely never rises above reference white, in which \
+             case {sdr} delivers the same picture in a more compatible container.",
             content_light.max_cll_nits, TARGET_PEAK_NITS,
         )
     })
@@ -305,25 +330,7 @@ pub fn render_linear(shared: &SharedDisplaySource, tone: Headroom) -> Result<Lin
     let rgb = pixels::try_map(shared.source.rgb(), |index, px| {
         render_pixel_checked(px, index, tone)
     })?;
-    // MaxCLL/MaxFALL are reductions over the rendered frame. The `f64` sum depends
-    // on its order, so it stays one sequential pass in pixel order (the rule
-    // `pipeline::pixels` exists to keep); the max is order-free but rides along.
-    let mut peak_luminance = 0.0_f32;
-    let mut luminance_sum = 0.0_f64;
-    for rendered in rgb.as_chunks::<3>().0 {
-        // Gamut mapping is luminance-preserving, so this is the rendered pixel's
-        // luminance whether or not it was moved to the cube boundary.
-        let luminance = dot(*rendered, BT2020_LUMA).max(0.0);
-        peak_luminance = peak_luminance.max(luminance);
-        luminance_sum += f64::from(luminance);
-    }
-    let content_light = ContentLightLevel {
-        max_cll_nits: whole_nits(f64::from(peak_luminance)),
-        max_fall_nits: match rgb.len() / 3 {
-            0 => 0,
-            count => whole_nits(luminance_sum / count as f64),
-        },
-    };
+    let content_light = measure_content_light(&rgb);
     let image = LinearImage::new(shared.source.width(), shared.source.height(), rgb, None)?;
     Ok(LinearBt2020Hdr {
         image,
@@ -334,9 +341,100 @@ pub fn render_linear(shared: &SharedDisplaySource, tone: Headroom) -> Result<Lin
             linear_headroom: LINEAR_HEADROOM,
             tone_curve: tone.operator(REFERENCE_WHITE_CROSSOVER),
             gamut_mapping: "bt2020-neutral-axis-radial-boundary-v1",
-            linear_domain: "bt2020-linear-relative-to-203-nit-reference-white",
+            linear_domain: LINEAR_DOMAIN,
         },
     })
+}
+
+/// The linear domain every HDR rendition here is stated in.
+const LINEAR_DOMAIN: &str = "bt2020-linear-relative-to-203-nit-reference-white";
+
+/// MaxCLL/MaxFALL of reference-white-relative linear BT.2020 pixels.
+///
+/// Reductions over the rendered frame. The `f64` sum depends on its order, so it stays
+/// one sequential pass in pixel order (the rule `pipeline::pixels` exists to keep); the
+/// max is order-free but rides along. Gamut mapping is luminance-preserving, so this is
+/// each pixel's rendered luminance whether or not it was moved to the cube boundary.
+fn measure_content_light(rgb: &[f32]) -> ContentLightLevel {
+    let mut peak_luminance = 0.0_f32;
+    let mut luminance_sum = 0.0_f64;
+    for rendered in rgb.as_chunks::<3>().0 {
+        let luminance = dot(*rendered, BT2020_LUMA).max(0.0);
+        peak_luminance = peak_luminance.max(luminance);
+        luminance_sum += f64::from(luminance);
+    }
+    ContentLightLevel {
+        max_cll_nits: whole_nits(f64::from(peak_luminance)),
+        max_fall_nits: match rgb.len() / 3 {
+            0 => 0,
+            count => whole_nits(luminance_sum / count as f64),
+        },
+    }
+}
+
+/// What fitting the new chain's HDR rendition into `[0, peak]` clamped, per sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PeakClamp {
+    /// Samples above the 1000-nit peak, clamped down to it.
+    pub above_peak: u64,
+    /// Samples below zero, clamped up to it — fit gamut writes none that matter, but a
+    /// channel tied on the cube's black face can land an ulp below.
+    pub below_zero: u64,
+}
+
+/// The new chain's HDR rendition, handed to the HDR encoders (`nf-destinations/preset-set`).
+///
+/// `image` is fit gamut's output in linear BT.2020, relative to reference white. **Every
+/// channel is clamped to `[0, LINEAR_HEADROOM]` here, and what that clamps is counted and
+/// returned**: fit range sets no hard ceiling above diffuse white (the branch contract),
+/// so content can sit above the peak, and the PQ encode would otherwise store it past the
+/// peak the file declares — with nothing counting it. The caller folds the counts into
+/// the report's clip count, where `--strict` sees them. The content light is measured on
+/// the clamped pixels, which are what is stored.
+///
+/// `tone_curve` and `gamut_mapping` name the new chain's fit range and fit gamut for the
+/// report; the luminance contract (reference white, peak, linear domain) is this module's,
+/// shared with the legacy renderer. A non-finite sample is refused: the chain never writes
+/// one.
+pub fn from_new_chain(
+    mut image: LinearImage,
+    tone_curve: &'static str,
+    gamut_mapping: &'static str,
+) -> Result<(LinearBt2020Hdr, PeakClamp)> {
+    image.ir = None;
+    // Integer counts, so the order they are folded in does not matter; one sequential
+    // pass keeps the first non-finite pixel's index the lowest.
+    let mut clamp = PeakClamp::default();
+    for (index, px) in pixels::triples(&image.rgb)?.iter().enumerate() {
+        for v in px {
+            if !v.is_finite() {
+                return Err(NcError::Other(format!(
+                    "the HDR rendition has a non-finite sample at pixel {index} ({px:?})"
+                )));
+            }
+            clamp.above_peak += u64::from(*v > LINEAR_HEADROOM);
+            clamp.below_zero += u64::from(*v < 0.0);
+        }
+    }
+    pixels::map_in_place(&mut image.rgb, |px| {
+        *px = px.map(|v| v.clamp(0.0, LINEAR_HEADROOM));
+    });
+    let content_light = measure_content_light(&image.rgb);
+    Ok((
+        LinearBt2020Hdr {
+            image,
+            content_light,
+            metadata: LinearHdrMetadata {
+                reference_white_nits: REFERENCE_WHITE_NITS,
+                target_peak_nits: TARGET_PEAK_NITS,
+                linear_headroom: LINEAR_HEADROOM,
+                tone_curve,
+                gamut_mapping,
+                linear_domain: LINEAR_DOMAIN,
+            },
+        },
+        clamp,
+    ))
 }
 
 /// Apply the selected Rec.2100 transfer in place.
@@ -895,7 +993,8 @@ mod tests {
             .unwrap()
             .content_light();
         assert_eq!(at_white.max_cll_nits, REFERENCE_WHITE_NITS as u16);
-        let message = sdr_range_warning(at_white).expect("a 203-nit peak must warn");
+        let message = sdr_range_warning(at_white, SdrRangeLevers::PrintExposureAndPreset)
+            .expect("a 203-nit peak must warn");
         assert!(message.contains("203"), "{message}");
         // The remedy names a lever every curve accepts; it used to advise measuring
         // `--d-max`, which the base-derived default never consults.
@@ -904,12 +1003,24 @@ mod tests {
         // Nor an `--anchor-*` flag: the characteristic curve refuses the whole family,
         // and this warning cannot see which curve ran.
         assert!(!message.contains("--anchor"), "{message}");
+        // The new chain refuses both of the current chain's levers, so its remedy names
+        // its own: scene correction's exposure, and an SDR destination.
+        let message = sdr_range_warning(at_white, SdrRangeLevers::ExposureAndDestination)
+            .expect("a 203-nit peak must warn");
+        assert!(
+            message.contains("`--exposure`") && message.contains("--range sdr"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("--print-exposure") && !message.contains("SDR preset"),
+            "{message}"
+        );
 
         // Darker still, obviously.
         let dark = render_linear(&shared_from_film_rgb(&[0.05; 3]), identity())
             .unwrap()
             .content_light();
-        assert!(sdr_range_warning(dark).is_some());
+        assert!(sdr_range_warning(dark, SdrRangeLevers::PrintExposureAndPreset).is_some());
 
         // The falsifiable half: one pixel above reference white silences it, so the
         // warning tracks the frame rather than the preset.
@@ -927,13 +1038,26 @@ mod tests {
         .unwrap()
         .content_light();
         assert!(bright.max_cll_nits > REFERENCE_WHITE_NITS as u16);
-        assert_eq!(sdr_range_warning(bright), None);
+        assert_eq!(
+            sdr_range_warning(bright, SdrRangeLevers::PrintExposureAndPreset),
+            None
+        );
+        assert_eq!(
+            sdr_range_warning(bright, SdrRangeLevers::ExposureAndDestination),
+            None
+        );
 
         // The transfer encode carries the same measurement, so PQ and HLG renditions
         // reach the identical verdict from the identical number.
         for transfer in [HdrTransfer::Pq, HdrTransfer::Hlg] {
             let rendered = render(&shared_from_film_rgb(&[0.05; 3]), transfer, identity()).unwrap();
-            assert!(sdr_range_warning(rendered.metadata().content_light).is_some());
+            assert!(
+                sdr_range_warning(
+                    rendered.metadata().content_light,
+                    SdrRangeLevers::PrintExposureAndPreset
+                )
+                .is_some()
+            );
         }
     }
 
@@ -1067,6 +1191,76 @@ mod tests {
         // Content between reference white and the peak is headroom, not an overshoot.
         let within = shared_from_film_rgb(&[3.0; 3]);
         assert!(render_linear(&within, identity()).is_ok());
+    }
+
+    #[test]
+    fn the_new_chain_hand_off_clamps_to_the_peak_and_counts_what_it_clamped() {
+        let over = LINEAR_HEADROOM * 2.0;
+        let rgb = vec![
+            over,
+            1.0,
+            -0.01, // one sample above the peak, one below zero
+            0.5,
+            0.5,
+            0.5, // within range: untouched
+            LINEAR_HEADROOM,
+            0.0,
+            0.0, // exactly at the peak: not counted
+        ];
+        let ir = Some(vec![0.1; 3]);
+        let image = LinearImage::new(3, 1, rgb.clone(), ir).unwrap();
+        let (hdr, clamp) = from_new_chain(image, "reinhard", "radial").unwrap();
+        assert_eq!(
+            clamp,
+            PeakClamp {
+                above_peak: 1,
+                below_zero: 1
+            }
+        );
+        let clamped = [
+            LINEAR_HEADROOM,
+            1.0,
+            0.0,
+            0.5,
+            0.5,
+            0.5,
+            LINEAR_HEADROOM,
+            0.0,
+            0.0,
+        ];
+        assert_eq!(
+            hdr.image()
+                .rgb
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            clamped.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(
+            hdr.image().ir.is_none(),
+            "the IR plane is not an HDR channel"
+        );
+        // Measured on what is stored: the clamped pixels, not the chain's output.
+        assert_eq!(hdr.content_light(), measure_content_light(&clamped));
+        assert_ne!(hdr.content_light(), measure_content_light(&rgb));
+        let m = hdr.metadata();
+        assert_eq!((m.tone_curve, m.gamut_mapping), ("reinhard", "radial"));
+        assert_eq!(m.linear_headroom, LINEAR_HEADROOM);
+
+        // Nothing out of range: nothing counted.
+        let image = LinearImage::new(1, 1, vec![0.2, 0.3, 0.4], None).unwrap();
+        assert_eq!(
+            from_new_chain(image, "reinhard", "radial").unwrap().1,
+            PeakClamp::default()
+        );
+
+        // A non-finite sample is refused, naming the pixel — never clamped into range.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let image = LinearImage::new(2, 1, vec![0.1, 0.1, 0.1, 0.2, bad, 0.2], None).unwrap();
+            let err = from_new_chain(image, "reinhard", "radial").unwrap_err();
+            assert!(err.to_string().contains("pixel 1"), "{bad}: {err}");
+            assert!(err.to_string().contains("non-finite"), "{bad}: {err}");
+        }
     }
 
     #[test]

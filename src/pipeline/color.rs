@@ -122,6 +122,14 @@ pub fn encode_display_linear(
     let (linear, output) = match gamut {
         DestinationGamut::DisplayP3 => display_p3_transfer_profiles()?,
         DestinationGamut::AdobeRgb => adobe_rgb_transfer_profiles()?,
+        // BT.2020 is rendered only for HDR, whose transfers (PQ, HLG, or none) and
+        // profiles are `pipeline::hdr`'s and the HDR encoders'. The destination table
+        // (`crate::destination::ROWS`) has no SDR row in it.
+        DestinationGamut::Bt2020 => {
+            return Err(NcError::Other(
+                "BT.2020 has no SDR display encoding; its destinations are HDR".into(),
+            ));
+        }
     };
     transform_in_place(&mut image, &linear, &output)?;
     Ok((image, profile_icc(&output)?))

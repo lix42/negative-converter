@@ -132,10 +132,9 @@ consumes** (see the warning in step 4). Build the binary before and after — a
 `git worktree add --detach <tmp> <base>` gives you a clean "before" without
 disturbing your tree — convert the same fixture through `film-master` (ACEScg),
 `display-p3` and `compatibility` (Display P3, sRGB), `hdr-linear-tiff` (BT.2020) and
-`ultra-hdr-v1`, and compare output checksums. Adobe RGB has no preset yet: until a
-destination selects it (`nf-destinations/direct-preset`), build each side with
-`cli::NEW_FLOW_GAMUT` temporarily set to `DestinationGamut::AdobeRgb` — never
-committed — and compare `hanten convert --new-flow` outputs.
+`ultra-hdr-v1`, and compare output checksums. Adobe RGB has no preset: compare
+`hanten convert --new-flow --gamut adobe-rgb` outputs, and the new chain's BT.2020
+with `--new-flow --transfer linear`.
 
 ### 6. Decide: representation-only, or a pixel change?
 

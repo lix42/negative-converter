@@ -1288,6 +1288,58 @@ PROFILE_SPACES: dict[str, str] = {
 }
 
 
+#: The new chain's destinations (`crate::destination` in nc), keyed on what fixes the
+#: pixels' space — the gamut and the transfer. The range and the container do not
+#: change it. Verified against the profiles nc embeds (`pipeline::color`).
+DESTINATION_SPACES: dict[tuple[str, str], str] = {
+    ("display-p3", "native"): "display-p3",
+    ("adobe-rgb", "native"): "adobe-rgb",
+    ("bt2020", "linear"): "linear-bt2020",
+}
+
+#: New-chain transfers this command cannot read, with the reason.
+DESTINATION_UNREADABLE: dict[str, str] = {
+    "pq": PRESET_UNREADABLE["hdr-pq-tiff"],
+    "hlg": PRESET_UNREADABLE["hdr-hlg-tiff"],
+}
+
+#: The four axes of a new-chain destination, as its recipe `output.display` names them.
+DESTINATION_AXES = ("range", "transfer", "gamut", "container")
+
+
+def space_for_destination(output: object) -> tuple[str, str]:
+    """The colour space a new-chain destination writes, and why.
+
+    `output` is the recipe's `output` value — `"film-master"`, or `{"display": {...}}`
+    with **every** axis stated, as nc's report records the resolved destination
+    (`new_flow.destination`). An axis left to nc's derivation is refused rather than
+    derived here: a second copy of the destination table is the drift the table exists
+    to prevent.
+    """
+    if output == "film-master":
+        return PRESET_SPACES["film-master"], "film-master destination"
+    display = output.get("display") if isinstance(output, dict) else None
+    if not isinstance(display, dict):
+        raise MetricsError(
+            f"unrecognised new-chain destination {output!r}; declare the space with --space")
+    missing = [axis for axis in DESTINATION_AXES if not isinstance(display.get(axis), str)]
+    if missing:
+        raise MetricsError(
+            "the destination leaves " + ", ".join(missing) + " to nc's derivation; read "
+            "the resolved one from the report's new_flow.destination, or declare --space")
+    if display["container"] == "avif":
+        raise MetricsError("the destination writes AVIF")
+    if display["transfer"] in DESTINATION_UNREADABLE:
+        raise MetricsError(
+            f"the destination {DESTINATION_UNREADABLE[display['transfer']]}")
+    key = (display["gamut"], display["transfer"])
+    if key not in DESTINATION_SPACES:
+        raise MetricsError(
+            f"no verified colour space for gamut {key[0]!r} with transfer {key[1]!r}; "
+            "declare the space with --space")
+    return DESTINATION_SPACES[key], f"{key[0]} {key[1]} destination"
+
+
 def space_for_recipe(recipe: dict) -> tuple[str, str]:
     """The colour space a frozen recipe's output is in, and why.
 
@@ -1295,6 +1347,9 @@ def space_for_recipe(recipe: dict) -> tuple[str, str]:
     under-determined space is exactly the condition that makes every number in
     the artifact wrong while every number still looks reasonable.
     """
+    if recipe.get("recipe_version") == 2:
+        # The new chain's recipe: its `output` is a destination, not a preset.
+        return space_for_destination(recipe.get("output", {"display": {}}))
     output = recipe.get("output") if isinstance(recipe.get("output"), dict) else {}
     preset = output.get("preset", "gain-map-hdr")
     if preset in PRESET_UNREADABLE:

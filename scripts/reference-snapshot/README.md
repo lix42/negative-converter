@@ -159,8 +159,9 @@ flag added after the tag, `"builds": ["ref"]` for one retired since. `--preset
 sigmoid-knees` is the latter: the candidate refuses it since `nf-retire/sigmoid-and-simple`,
 so it renders only on the reference arm.
 
-**Known gap: a `--new-flow` cell cannot go in a matrix yet.** The generator passes
-`--output-preset <matrix output_preset>` to every cell, and `--new-flow` refuses that
-flag while it has only one destination. Until `nf-destinations/preset-set` gives it one
-to name, render the new-flow side with `hanten convert --new-flow` directly and add its
-cell to `review.json` by hand.
+**Known gap: one matrix cannot hold a reference cell and a `--new-flow` cell.** A
+matrix states one output target for every cell: an `output_preset` (the current chain,
+which the reference arm needs) or a `destination` (the new chain, which passes
+`--new-flow` and the destination flags — a flag the reference build does not have).
+Render the new-flow side as its own `destination` matrix, or with `hanten convert
+--new-flow` directly, and add its cell to the reference set's `review.json` by hand.

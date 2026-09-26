@@ -22,10 +22,11 @@
 //! carries one because it once had to tell several shapes apart inside a single
 //! object; here the document version does that for every section at once.
 //!
-//! **No `output` section yet.** The new chain writes one fixed destination, so there is
-//! no output policy to choose, and a section nothing reads is the defect this module
-//! exists to prevent. `nf-destinations/preset-set` adds it with the destination set. Each key lands with the task that ships its knob — design-spec
-//! §9 states the shape, not keys written ahead of the code.
+//! **`output` is the destination, not a stage**: the four axes of the destination set
+//! (`crate::destination`) under `output.display`, or `"film-master"`. It is written after
+//! the stages, and each axis is optional — an unset one is derived from the destination
+//! table, so the section says only what the user chose. Each key lands with the task that
+//! ships its knob — design-spec §9 states the shape, not keys written ahead of the code.
 //!
 //! Named for what it will be rather than for the migration: after
 //! `nf-core/default-flip` this is *the* recipe, and the current chain's
@@ -35,6 +36,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::algo::fixed::{AnchorRule, DecodeFault, DecodeParams, LINEARIZATION};
 use crate::cli::ResolvedConfig;
+use crate::destination::{self, Change, DisplayAxes, Fault, OutputSection, Resolved};
 use crate::pipeline::chain::{ChainParams, DisplayTarget, SharedParams};
 use crate::pipeline::fit_gamut::DestinationGamut;
 use crate::pipeline::fit_range::DisplayPeak;
@@ -80,6 +82,8 @@ pub struct Recipe {
     pub fit_range: FitRange,
     #[serde(default)]
     pub fit_gamut: FitGamut,
+    #[serde(default)]
+    pub output: OutputSection,
 }
 
 /// The document version — a type with exactly one value, so a recipe cannot
@@ -131,6 +135,18 @@ impl Default for FitRange {
     }
 }
 
+impl FitRange {
+    /// Whether the user asked for a fit — a headroom that is neither the default nor
+    /// the identity `0`. The one predicate a destination that runs no fit range
+    /// (`film-master`) reads to refuse ([`destination()`]), as the look's is
+    /// [`LookSection::asks_for_a_look`]: the default is spared because every recipe
+    /// carries it, the identity because it asks for nothing such a destination does
+    /// not already do, and refusing it would kill the flags-win reset.
+    pub fn asks_for_a_fit(&self) -> bool {
+        self.headroom_stops != crate::types::DEFAULT_HEADROOM_STOPS && self.headroom_stops != 0.0
+    }
+}
+
 /// Fit gamut's recipe section: empty, and refuses any key. The map has no knob — its
 /// ceiling is fit range's output and its target the destination's — and no off switch
 /// (decided 2026-09-23, `nf-display-stages/gamut-map-share`).
@@ -163,23 +179,18 @@ pub struct Calibration {
 /// The current chain's sections this recipe does not have, and where each one's
 /// knobs go. `reconstruction` is not here: the name survives with a different
 /// shape, and [`check_body`] diagnoses its old keys one by one.
-const SECTIONS_WITH_NO_COUNTERPART: &[(&str, &str)] = &[
-    (
-        "print",
-        "white balance and exposure are `scene_correction.white_balance` and \
+const SECTIONS_WITH_NO_COUNTERPART: &[(&str, &str)] = &[(
+    "print",
+    "white balance and exposure are `scene_correction.white_balance` and \
          `scene_correction.exposure`; the display tone is fit range, whose one \
          operator is reinhard and whose headroom is `fit_range.headroom_stops`; the \
          black point splits between scene correction and fit range \
          (`nf-scene-correction/flare-removal`), and `linear_range` has no home yet \
          (`nf-scene-correction/levels-knob`) — neither of those two has a key yet",
-    ),
-    (
-        "output",
-        "the new chain writes one fixed destination, so there is no output policy to \
-         choose; its output section arrives with the destination set \
-         (`nf-destinations/preset-set`)",
-    ),
-];
+)];
+
+/// The current chain's `output` keys, live and retired: a destination is its axes here.
+const OLD_OUTPUT_KEYS: &[&str] = &["preset", "depth", "hdr", "output_profile", "bigtiff"];
 
 /// The current chain's `reconstruction` keys, and each one's fate here.
 const OLD_RECONSTRUCTION_KEYS: &[(&str, &str)] = &[
@@ -297,6 +308,21 @@ pub fn check_body(body: &serde_json::Value, whole: bool, context: &str) -> Resul
                  `{VERSION_KEY}`"
             ));
         }
+    }
+    // The current chain's `output` keys. The section name is shared, so it is diagnosed
+    // key by key rather than refused whole.
+    if let Some(key) = body
+        .get("output")
+        .and_then(|o| o.as_object())
+        .and_then(|o| OLD_OUTPUT_KEYS.iter().find(|k| o.contains_key(**k)))
+    {
+        return usage(format!(
+            "`output.{key}` belongs to the current chain's recipe, not the new one's: a \
+             destination here is its axes, `output.display` with `range`, `transfer`, \
+             `gamut` and `container` (each optional — an unset one is derived), or \
+             `\"film-master\"`. Drop it — the current chain reads it only in a recipe with \
+             no `{VERSION_KEY}`"
+        ));
     }
     let old_key = |section: &str, table: &[(&'static str, &'static str)]| {
         let fields = body.get(section)?.as_object()?;
@@ -437,6 +463,24 @@ pub fn merge(mut r: Recipe, args: &crate::cli::ConvertArgs) -> Recipe {
     if let Some(stops) = args.print.display_tone_headroom {
         r.fit_range.headroom_stops = stops;
     }
+    // The destination. `--film-master` and the axis flags are exclusive at the parser,
+    // so at most one arm fires. An axis flag over a recipe's `"film-master"` starts
+    // from no stated axes: the flag chose a rendered destination, and the recipe stated
+    // none of its axes.
+    let d = &args.destination;
+    if d.film_master {
+        r.output = OutputSection::FilmMaster;
+    } else if d.any_axis() {
+        let mut axes = match r.output {
+            OutputSection::Display(axes) => axes,
+            OutputSection::FilmMaster => DisplayAxes::default(),
+        };
+        axes.range = d.range.or(axes.range);
+        axes.transfer = d.transfer.or(axes.transfer);
+        axes.gamut = d.gamut.or(axes.gamut);
+        axes.container = d.container.or(axes.container);
+        r.output = OutputSection::Display(axes);
+    }
     r
 }
 
@@ -469,7 +513,8 @@ pub fn validate(r: &Recipe, names: KnobNames) -> Result<()> {
             validate_scene_correction(&r.scene_correction, names)?;
             validate_look(&r.look, names)?;
             validate_whole_contrast(d.linearization, &r.look, names)?;
-            return validate_fit_range(&r.fit_range, names);
+            validate_fit_range(&r.fit_range, names)?;
+            return destination(r, names).map(|_| ());
         }
         Err(DecodeFault::Offset { channel, value }) => format!(
             "{} must be finite on every channel, got {value} on channel {channel}",
@@ -629,6 +674,266 @@ fn validate_fit_range(p: &FitRange, names: KnobNames) -> Result<()> {
     )))
 }
 
+/// Where the recipe renders to — its `output` section resolved against the destination
+/// table (`crate::destination`), or the film master. [`validate`] runs this, and the run
+/// reads the value it returns.
+///
+/// `film-master` runs no rendering stage, so a stage the user asked for is refused,
+/// naming the stage: **one** rule per stage, never one per knob — scene correction
+/// keyed on [`SceneCorrectionParams::asks_for_a_correction`], the look on
+/// [`LookSection::asks_for_a_look`], fit range on [`FitRange::asks_for_a_fit`]. Each
+/// spares its default, which every recipe carries, and its identity, which renders
+/// exactly what the film master does (refusing that would kill the flags-win reset).
+/// Fit gamut has no knob to ask with. Every stage asked for is named in one refusal, in
+/// chain order, so removing one does not uncover the next.
+pub fn destination(r: &Recipe, names: KnobNames) -> Result<Destination> {
+    match &r.output {
+        OutputSection::FilmMaster => {
+            let asked = stages_the_master_cannot_run(r, names);
+            if asked.is_empty() {
+                return Ok(Destination::FilmMaster);
+            }
+            let master = match names {
+                KnobNames::FlagAndKey => "--film-master (recipe `output`: `\"film-master\"`)",
+                KnobNames::KeyOnly => "`output` \"film-master\"",
+            };
+            let (drop, identity) = match (names, asked.len()) {
+                (KnobNames::FlagAndKey, 1) => {
+                    ("the flags and recipe keys that ask for it", "its identity")
+                }
+                (KnobNames::FlagAndKey, _) => (
+                    "the flags and recipe keys that ask for them",
+                    "each one's identity",
+                ),
+                (KnobNames::KeyOnly, 1) => ("the keys that ask for it", "its identity"),
+                (KnobNames::KeyOnly, _) => ("the keys that ask for them", "each one's identity"),
+            };
+            let (stages, identities): (Vec<&str>, Vec<&str>) = asked.into_iter().unzip();
+            Err(NcError::Usage(format!(
+                "{master} writes the fixed decode's linear ACEScg with no rendering stage, \
+                 so it cannot apply {} this recipe asks for. Either drop {drop}, or state \
+                 {identity} ({}), or choose a rendered destination",
+                stages.join(" and "),
+                identities.join("; "),
+            )))
+        }
+        OutputSection::Display(axes) => destination::resolve(axes)
+            .map(Destination::Display)
+            .map_err(|fault| NcError::Usage(fault_message(axes, &fault, names))),
+    }
+}
+
+/// The rendering stages `r` asks for that the film master does not run, in chain order,
+/// each as `(the stage as the message names it, its identity as the command states it)`.
+fn stages_the_master_cannot_run(r: &Recipe, names: KnobNames) -> Vec<(&'static str, &'static str)> {
+    let flags = names == KnobNames::FlagAndKey;
+    let pick = |flag: (&'static str, &'static str), key: (&'static str, &'static str)| {
+        if flags { flag } else { key }
+    };
+    let mut asked = Vec::new();
+    if r.scene_correction.asks_for_a_correction() {
+        asked.push(pick(
+            (
+                "scene correction (--exposure, --white-balance, recipe `scene_correction`)",
+                "--exposure 0 --white-balance 1,1,1",
+            ),
+            (
+                "scene correction (`scene_correction`)",
+                "`scene_correction.exposure` 0, `scene_correction.white_balance` \
+                 {\"explicit\": [1, 1, 1]}",
+            ),
+        ));
+    }
+    if r.look.asks_for_a_look() {
+        asked.push(pick(
+            (
+                "the look (--contrast, --channel-grade, --highlight-desaturation*, \
+                 recipe `look`)",
+                "--contrast 1 --channel-grade 1,1 --highlight-desaturation 0",
+            ),
+            (
+                "the look (`look`)",
+                "`look.contrast` 1, `look.channel_grade` [1, 1], \
+                 `look.highlight_desaturation.strength` 0",
+            ),
+        ));
+    }
+    if r.fit_range.asks_for_a_fit() {
+        asked.push(pick(
+            (
+                "fit range (--display-tone-headroom, recipe `fit_range`)",
+                "--display-tone-headroom 0",
+            ),
+            ("fit range (`fit_range`)", "`fit_range.headroom_stops` 0"),
+        ));
+    }
+    asked
+}
+
+/// A recipe's resolved destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination {
+    Display(Resolved),
+    FilmMaster,
+}
+
+/// One axis value as a message names it: the flag on `convert`, the key on `roll`.
+fn axis_value(names: KnobNames, flag: &str, key: &str, value: &str) -> String {
+    match names {
+        KnobNames::FlagAndKey => format!("{flag} {value}"),
+        KnobNames::KeyOnly => format!("`output.display.{key}` \"{value}\""),
+    }
+}
+
+/// A resolved destination as a message names it: every axis (or the film master) as the
+/// flags `convert` takes, or as the recipe keys `roll` takes.
+pub fn destination_label(destination: Destination, names: KnobNames) -> String {
+    match (destination, names) {
+        // As the stage refusal names it: the film master may come from the flag or the
+        // recipe, and this label does not know which.
+        (Destination::FilmMaster, KnobNames::FlagAndKey) => {
+            "--film-master (recipe `output`: `\"film-master\"`)".to_string()
+        }
+        (Destination::FilmMaster, KnobNames::KeyOnly) => "`output` \"film-master\"".to_string(),
+        (Destination::Display(d), _) => complete_destination(names, &d.axes()),
+    }
+}
+
+/// A complete destination as a message names it.
+pub fn complete_destination(names: KnobNames, axes: &DisplayAxes) -> String {
+    let parts: Vec<String> = axes
+        .stated_axes()
+        .iter()
+        .map(|a| axis_value(names, a.flag, a.key, a.value))
+        .collect();
+    match names {
+        KnobNames::FlagAndKey => parts.join(" "),
+        KnobNames::KeyOnly => parts.join(", "),
+    }
+}
+
+/// The recipe-key footnote a flag message carries, so a recipe author can act on it too.
+fn keys_note(names: KnobNames) -> &'static str {
+    match names {
+        KnobNames::FlagAndKey => {
+            " (recipe keys `output.display.range`, `.transfer`, `.gamut`, \
+                                  `.container`)"
+        }
+        KnobNames::KeyOnly => "",
+    }
+}
+
+/// A destination fault as a usage message. Every remedy it names resolves as written
+/// (`crate::destination`'s `every_offered_remedy_resolves`).
+fn fault_message(axes: &DisplayAxes, fault: &Fault, names: KnobNames) -> String {
+    let stated = complete_destination(names, axes);
+    let or_list = |items: &[String]| match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{}, or {last}", init.join(", ")),
+    };
+    let choices = |flag: &str, key: &str, values: &[&str]| match names {
+        KnobNames::FlagAndKey => format!("{flag} {}", values.join("|")),
+        KnobNames::KeyOnly => format!(
+            "`output.display.{key}` {}",
+            values
+                .iter()
+                .map(|v| format!("\"{v}\""))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    };
+    let destinations = |list: &[DisplayAxes]| {
+        list.iter()
+            .map(|a| match complete_destination(names, a) {
+                none if none.is_empty() => "nothing (the default destination)".to_string(),
+                some => some,
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let note = keys_note(names);
+    match fault {
+        Fault::Conflict {
+            conflicting,
+            changes,
+            instead,
+        } => {
+            let named: Vec<String> = conflicting
+                .iter()
+                .map(|a| axis_value(names, a.flag, a.key, a.value))
+                .collect();
+            let remedy = if changes.is_empty() {
+                format!(
+                    "No one change fixes it with the rest of what is stated; state instead \
+                     one of: {}",
+                    destinations(instead)
+                )
+            } else {
+                let options: Vec<String> = changes
+                    .iter()
+                    .map(|c: &Change| {
+                        let head = axis_value(names, c.flag, c.key, c.value);
+                        match &c.then {
+                            None => head,
+                            Some((flag, key, values)) => {
+                                format!("{head} with {}", choices(flag, key, values))
+                            }
+                        }
+                    })
+                    .collect();
+                format!("Use {}", or_list(&options))
+            };
+            format!(
+                "no destination combines {}{note}. {remedy}",
+                named.join(" and "),
+            )
+        }
+        Fault::Ambiguous {
+            flag,
+            key,
+            choices: values,
+        } => format!(
+            "{stated} leaves {} open: more than one destination fits. State one — {}{note}",
+            match names {
+                KnobNames::FlagAndKey => (*flag).to_string(),
+                KnobNames::KeyOnly => format!("`output.display.{key}`"),
+            },
+            choices(flag, key, values),
+        ),
+        Fault::NotYet {
+            row,
+            arriving_with,
+            adding,
+            instead,
+        } => {
+            let full = complete_destination(
+                names,
+                &DisplayAxes {
+                    range: Some(row.range),
+                    transfer: Some(row.transfer),
+                    gamut: Some(row.gamut),
+                    container: Some(row.container),
+                },
+            );
+            let what = if stated == full {
+                full
+            } else {
+                format!("{stated} resolves to {full}, which")
+            };
+            let ready = if adding.is_empty() {
+                format!("Written today, stated instead: {}", destinations(instead))
+            } else {
+                format!(
+                    "Written today, adding to what is stated: {}",
+                    destinations(adding)
+                )
+            };
+            format!("{what} is not written yet — it arrives with {arriving_with}. {ready}{note}")
+        }
+    }
+}
+
 impl Recipe {
     /// One rendition's parameters for `pipeline::chain::render` — the recipe's shared
     /// half ([`Recipe::shared_params`]) plus the destination's peak and gamut, which
@@ -730,6 +1035,7 @@ mod tests {
                 "look",
                 "fit_range",
                 "fit_gamut",
+                "output",
             ]
         );
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -740,6 +1046,8 @@ mod tests {
         // stops for fit range. (Fit gamut's map runs at every setting; it simply has
         // nothing for a recipe to set.)
         assert_eq!(json["fit_gamut"], serde_json::json!({}));
+        // Nothing stated: every axis is derived, so a written recipe states none.
+        assert_eq!(json["output"], serde_json::json!({"display": {}}));
         assert_eq!(
             serde_json::to_string(&Recipe::default().look).unwrap(),
             r#"{"contrast":1.1111112,"channel_grade":[1.0,1.0],"highlight_desaturation":{"strength":0.8,"start_stops":-1.0,"band":[0.015,0.025]}}"#
@@ -907,11 +1215,21 @@ mod tests {
             err.contains("`print`") && err.contains("scene_correction"),
             "{err}"
         );
-        let err = check(r#"{"recipe_version": 2, "output": {}}"#, true).unwrap_err();
-        assert!(
-            err.contains("`output`") && err.contains("preset-set"),
-            "{err}"
-        );
+        // `output` is shared by name, so the current chain's keys under it are named
+        // one by one, pointing at the destination's axes.
+        for key in OLD_OUTPUT_KEYS {
+            let body = format!(r#"{{"recipe_version": 2, "output": {{"{key}": "x"}}}}"#);
+            let err = check(&body, true).unwrap_err();
+            assert!(
+                err.contains(&format!("`output.{key}`")) && err.contains("output.display"),
+                "{err}"
+            );
+        }
+        check(
+            r#"{"recipe_version": 2, "output": {"display": {"gamut": "adobe-rgb"}}}"#,
+            true,
+        )
+        .unwrap();
         let err = check(
             r#"{"recipe_version": 2, "reconstruction": {"density": {"scale": [1, 1, 1]}}}"#,
             true,
@@ -987,7 +1305,8 @@ mod tests {
                 _ => &[],
             };
             for key in fields.as_object().unwrap().keys() {
-                let diagnosed = table.iter().any(|(k, _)| k == key);
+                let diagnosed = table.iter().any(|(k, _)| k == key)
+                    || (section == "output" && OLD_OUTPUT_KEYS.contains(&key.as_str()));
                 assert!(
                     shared.get(key).is_some() != diagnosed,
                     "`{section}.{key}` must be exactly one of shared or diagnosed"
@@ -1202,6 +1521,115 @@ mod tests {
         let err = with(25.0, KnobNames::KeyOnly).unwrap_err();
         assert!(err.contains("`fit_range.headroom_stops` is 25"), "{err}");
         assert!(!err.contains("--display-tone-headroom"), "{err}");
+    }
+
+    /// `convert --new-flow` with `extra`, merged over the recipe `json`.
+    fn merged(json: &str, extra: &[&str]) -> Recipe {
+        use crate::cli::{Cli, Command};
+        use clap::Parser;
+        let argv = ["hanten", "convert", "in.tif", "-o", "out", "--new-flow"]
+            .iter()
+            .chain(extra)
+            .copied();
+        let Command::Convert(args) = Cli::try_parse_from(argv).unwrap().command else {
+            unreachable!()
+        };
+        merge(parse(json).unwrap(), &args)
+    }
+
+    #[test]
+    fn an_axis_flag_over_a_recipe_film_master_states_only_its_own_axes() {
+        // The flag chose a rendered destination; the recipe stated none of its axes.
+        let r = merged(
+            r#"{"recipe_version": 2, "output": "film-master"}"#,
+            &["--transfer", "pq"],
+        );
+        assert_eq!(
+            r.output,
+            OutputSection::Display(DisplayAxes {
+                transfer: Some(destination::Transfer::Pq),
+                ..DisplayAxes::default()
+            })
+        );
+    }
+
+    #[test]
+    fn the_film_master_flag_replaces_a_recipes_axes() {
+        let r = merged(
+            r#"{"recipe_version": 2, "output": {"display": {"transfer": "pq", "container": "avif"}}}"#,
+            &["--film-master"],
+        );
+        assert_eq!(r.output, OutputSection::FilmMaster);
+        assert_eq!(
+            destination(&r, KnobNames::FlagAndKey).unwrap(),
+            Destination::FilmMaster
+        );
+    }
+
+    #[test]
+    fn an_axis_flag_joins_the_recipes_other_axes() {
+        // Flags win per axis, and the recipe's other axes stay stated: a flag that
+        // contradicts one of them is a conflict naming both, never a silent override.
+        let r = merged(
+            r#"{"recipe_version": 2, "output": {"display": {"gamut": "adobe-rgb"}}}"#,
+            &["--transfer", "pq"],
+        );
+        assert_eq!(
+            r.output,
+            OutputSection::Display(DisplayAxes {
+                transfer: Some(destination::Transfer::Pq),
+                gamut: Some(destination::Gamut::AdobeRgb),
+                ..DisplayAxes::default()
+            })
+        );
+        let err = destination(&r, KnobNames::FlagAndKey).unwrap_err();
+        let msg = err.message();
+        assert!(msg.contains("--transfer pq and --gamut adobe-rgb"), "{msg}");
+        // The same axis stated twice: the flag wins.
+        let r = merged(
+            r#"{"recipe_version": 2, "output": {"display": {"gamut": "adobe-rgb"}}}"#,
+            &["--gamut", "display-p3"],
+        );
+        let Destination::Display(d) = destination(&r, KnobNames::FlagAndKey).unwrap() else {
+            panic!("expected a rendered destination")
+        };
+        assert_eq!(d.gamut, destination::Gamut::DisplayP3);
+    }
+
+    #[test]
+    fn the_film_master_refuses_each_stage_it_does_not_run_by_its_keys_on_roll() {
+        let master = || Recipe {
+            output: OutputSection::FilmMaster,
+            ..Recipe::default()
+        };
+        assert_eq!(
+            destination(&master(), KnobNames::KeyOnly).unwrap(),
+            Destination::FilmMaster
+        );
+        let mut r = master();
+        r.scene_correction.exposure = 1.0;
+        r.fit_range.headroom_stops = 3.0;
+        let msg = destination(&r, KnobNames::KeyOnly).unwrap_err();
+        let msg = msg.message();
+        assert!(
+            msg.contains("scene correction (`scene_correction`)")
+                && msg.contains("fit range (`fit_range`)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("--"), "a roll names keys, not flags: {msg}");
+        // The identity scene correction and fit range are spared.
+        let mut r = master();
+        r.scene_correction.white_balance = WhiteBalance::Explicit([2.0, 2.0, 2.0]);
+        r.scene_correction.exposure = -1.0;
+        r.fit_range.headroom_stops = 0.0;
+        destination(&r, KnobNames::FlagAndKey).unwrap();
+        assert!(!FitRange::default().asks_for_a_fit());
+        assert!(
+            FitRange {
+                headroom_stops: 5.0
+            }
+            .asks_for_a_fit()
+        );
     }
 
     #[test]

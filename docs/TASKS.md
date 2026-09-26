@@ -353,6 +353,7 @@ graph TD
     nf-destinations/direct-preset
     nf-destinations/memory-profiles
     nf-destinations/default-destination
+    nf-destinations/gain-map-destination
   end
   subgraph nf-calibration
     nf-calibration/anchor-comparison
@@ -612,6 +613,7 @@ graph TD
   nf-destinations/preset-set --> nf-destinations/memory-profiles
   nf-destinations/preset-set --> nf-destinations/default-destination
   nf-destinations/direct-preset --> nf-destinations/default-destination
+  nf-destinations/preset-set --> nf-destinations/gain-map-destination
   nf-destinations/preset-set --> nf-calibration/scale-gamma-loop
   nf-verification/reference-snapshot --> nf-calibration/scale-gamma-loop
   nf-calibration/scale-gamma-loop --> nf-calibration/offset-question
@@ -1042,6 +1044,8 @@ the design in `docs/design-update.md`:
   — a `RunProfile` per destination; sharing an arm is measured, not assumed
 - `nf-destinations/default-destination` (new flow): `nf-destinations/preset-set`, `nf-destinations/direct-preset`
   — supersedes `output/display-p3-default`; one bump rather than two
+- `nf-destinations/gain-map-destination` (new flow): `nf-destinations/preset-set`
+  — the per-channel ISO 21496-1 gain-map JPEG, split out of the destination set
 - `nf-calibration/scale-gamma-loop` (new flow): `nf-destinations/preset-set`, `nf-verification/reference-snapshot`, `nf-calibration/scale-ladder`
   — the two knobs the decode owns, tuned against a held-fixed rendering.
   Supersedes `algo/sigmoid-parameter-calibration` and
@@ -1754,8 +1758,14 @@ the design in `docs/design-update.md`:
 > Where a render can go: the destination set, the direct Adobe RGB combination,
 > memory profiles, and which destination the default resolves.
 
-- [ ] [The destination set](tasks/nf-destinations/preset-set.md) — the
-  destinations and their suffix rules
+- [x] [The destination set](tasks/nf-destinations/preset-set.md) — **done
+  2026-09-26.** Under `--new-flow` a destination is four separate knobs — `--range`,
+  `--transfer`, `--gamut`, `--container` (recipe `output.display`) — or `--film-master`,
+  resolved against one table (`src/destination.rs`) that also drives refusals, remedies
+  and the container; unset axes are derived. Written: SDR `native` TIFF in Display P3
+  (default, unchanged) or Adobe RGB; HDR BT.2020 `linear` f32 TIFF, `pq`/`hlg` TIFF or
+  AVIF, clamped to the peak and counted. The film master refuses every stage it does
+  not run. The gain-map JPEG split to `gain-map-destination`
 - [ ] [The direct destination for external
   editing](tasks/nf-destinations/direct-preset.md) — minimal rendering into
   Adobe RGB for a workflow that continues in an editor
@@ -1765,6 +1775,9 @@ the design in `docs/design-update.md`:
 - [ ] [Which destination the default
   resolves](tasks/nf-destinations/default-destination.md) — supersedes
   `output/display-p3-default`; one bump rather than two
+- [ ] [The gain-map
+  destination](tasks/nf-destinations/gain-map-destination.md) — the new chain's HDR
+  JPEG: a per-channel ISO 21496-1 gain map, which needs a multichannel container
 
 ### nf-calibration — [progress](progress/nf-calibration.md)
 > The numbers rather than the machinery: an early `scale` ladder, the `scale`/`gamma`

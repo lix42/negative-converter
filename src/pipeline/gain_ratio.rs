@@ -7,7 +7,7 @@
 //! whatever was clamped, and the highlight rebuilds dark with nothing counting it.
 //!
 //! This is the arithmetic only. Downsampling, quantization and the container (Ultra
-//! HDR / ISO 21496-1) are the destination's (`nf-destinations/preset-set`), and so is
+//! HDR / ISO 21496-1) are the destination's (`nf-destinations/gain-map-destination`), and so is
 //! the offset, which is format policy rather than a conversion knob.
 //! Clamping the HDR rendition to the destination's peak, and counting what that
 //! clamps, is also the caller's: [`between`] clamps the alternate only to `≥ 0`.
@@ -27,7 +27,7 @@ use crate::types::{LinearImage, NcError, Result};
 
 /// Full-resolution per-channel gains from a base (SDR) to an alternate (HDR)
 /// rendition.
-#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`)
+#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`)
 #[derive(Debug)]
 pub struct GainRatios {
     width: u32,
@@ -49,7 +49,7 @@ pub struct GainRange {
     pub flat: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`)
+#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`)
 impl GainRatios {
     /// The gains' extent.
     pub fn range(&self) -> GainRange {
@@ -89,7 +89,7 @@ impl GainRatios {
 /// sample is refused, naming the lowest pixel: the chain never writes one. So is a gain
 /// too large for an `f32`: the alternate is not clamped to a peak here (the
 /// destination's job), so a finite but huge HDR sample over a dark base can overflow.
-#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`)
+#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`)
 pub fn between(sdr: &LinearImage, hdr: &LinearImage, offset: f32) -> Result<GainRatios> {
     if !(offset.is_finite() && offset > 0.0) {
         return Err(NcError::Other(format!(

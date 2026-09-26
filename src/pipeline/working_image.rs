@@ -44,7 +44,7 @@ impl WorkingBuffer {
     /// is the SDR/HDR branch point (`look::GradedImage::split`), where a gain map needs
     /// both renditions; a new caller is a new full-frame buffer for
     /// `pipeline::memory`'s model.
-    #[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`), via `GradedImage::split`
+    #[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`), via `GradedImage::split`
     pub(in crate::pipeline) fn copy(&self) -> Self {
         Self {
             width: self.width,

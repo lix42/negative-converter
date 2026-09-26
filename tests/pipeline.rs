@@ -9857,7 +9857,8 @@ fn a_capped_holder_march_warns_and_strict_promotes_it() {
 // Every test below is scaffolding with the same expiry as the flag itself:
 // `nf-core/default-flip` deletes the flag and these tests with it. Since
 // `nf-core/minimal-end-to-end` the flag renders — the fixed decode, the new chain and
-// one destination, a Display P3 16-bit TIFF — so "accepted" means exit 0 and a file.
+// a destination (by default a Display P3 16-bit TIFF) — so "accepted" means exit 0 and
+// a file.
 
 #[test]
 fn without_new_flow_nothing_moves() {
@@ -9873,7 +9874,7 @@ fn without_new_flow_nothing_moves() {
     let dump_off = tmp.path("off.json");
     let dump_on = tmp.path("on.json");
     // `--output-preset display-p3` rides in `flow` rather than the shared list: the new
-    // flow refuses that flag (it has one fixed destination), while the current-chain run
+    // flow refuses that flag (a destination is its axes there), while the current-chain run
     // needs it to accept a `.tif` path.
     let args = |dump: &Path, out: &Path, flow: &[&str]| -> Vec<String> {
         let mut v: Vec<String> = vec![
@@ -9918,9 +9919,13 @@ fn without_new_flow_nothing_moves() {
     let dumped = std::fs::read_to_string(&dump_on).unwrap();
     let doc: serde_json::Value = serde_json::from_str(&dumped).unwrap();
     assert_eq!(doc["recipe_version"], 2, "{dumped}");
-    for gone in ["print", "output"] {
-        assert!(doc.get(gone).is_none(), "`{gone}` leaked into {dumped}");
-    }
+    assert!(doc.get("print").is_none(), "`print` leaked into {dumped}");
+    // `output` is the new chain's own section: the destination, nothing stated.
+    assert_eq!(
+        doc["output"],
+        serde_json::json!({"display": {}}),
+        "{dumped}"
+    );
     assert!(!dumped.contains("new_flow"), "{dumped}");
     assert!(
         !dumped.contains("\"dmax\""),
@@ -10202,8 +10207,14 @@ fn new_flow_renders_a_display_p3_tiff() {
         let report = json(&stdout);
         assert_eq!(report["output"], out.to_str().unwrap());
         let nf = &report["new_flow"];
-        assert_eq!(nf["destination"], "display-p3-u16-tiff", "{stdout}");
-        assert_eq!(nf["gamut"], "display-p3");
+        // Every axis resolved, as the recipe `output` that replays it.
+        assert_eq!(
+            nf["destination"],
+            serde_json::json!({"display": {
+                "range": "sdr", "transfer": "native", "gamut": "display-p3", "container": "tiff"
+            }}),
+            "{stdout}"
+        );
         assert_eq!(nf["decode"]["anchor_rule"], "mid-at-base-offset");
         assert_eq!(nf["decode"]["reads_reference"], false);
         let applied: Vec<&str> = nf["stages"]
@@ -11586,10 +11597,8 @@ fn every_print_control_is_accepted_without_the_flag() {
 
 #[test]
 fn new_flow_refuses_the_output_policy_flags() {
-    // The new flow renders into exactly one destination, so there is no output policy
-    // to choose. Refused for a different reason than the print family — not "the stage
-    // that carries it is empty" — and the message says so by naming the task that
-    // settles the destination set.
+    // A destination on the new flow is separate knobs, not a preset name, so the preset
+    // flag is refused and the message names the destination flags instead.
     //
     // The three selectors that retired with `legacy`/`custom` are not a new-flow
     // question at all: they are removed-flag errors on either chain.
@@ -11629,20 +11638,21 @@ fn new_flow_refuses_the_output_policy_flags() {
             assert!(err.contains("drop it"), "{extra:?}: {err}");
             assert!(!err.contains("`display-p3` preset"), "{extra:?}: {err}");
         } else {
+            // A destination is its axes on this chain, so the refusal names them.
             assert!(
-                err.contains("nf-destinations/preset-set"),
-                "{extra:?} must name the task that settles the destination set: {err}"
+                err.contains("--range") && err.contains("--film-master"),
+                "{extra:?} must name the destination flags: {err}"
             );
         }
     }
 }
 
 #[test]
-fn a_print_or_output_recipe_section_is_refused_whole() {
+fn a_print_section_or_an_output_preset_is_refused_by_name() {
     // The provenance no flag row can see, and the reason none of these knobs needs a
     // value rule: between the rows above and this, both spellings are covered. The
-    // new chain's recipe has neither section, and names each one so a user fixing a
-    // recipe knows which key to remove and where its knobs went.
+    // new chain's recipe has no `print` section, and its `output` is the destination's
+    // axes, so each is named with where its knobs went.
     let tmp = TempDir::new("new-flow-sections");
     for (name, body, went) in [
         (
@@ -11653,7 +11663,7 @@ fn a_print_or_output_recipe_section_is_refused_whole() {
         (
             "output",
             r#"{ "recipe_version": 2, "output": { "preset": "display-p3" } }"#,
-            "nf-destinations/preset-set",
+            "output.display",
         ),
     ] {
         let recipe = write_file(&tmp.path(&format!("{name}.json")), body);
@@ -11674,7 +11684,7 @@ fn a_print_or_output_recipe_section_is_refused_whole() {
         ];
         let (code, _out, err) = run(&argv);
         assert_eq!(code, 2, "a recipe `{name}` section must be refused: {err}");
-        assert!(err.contains(&format!("`{name}` is a section")), "{err}");
+        assert!(err.contains(&format!("`{name}")), "{err}");
         assert!(err.contains(went), "{err}");
 
         // Falsifiability: the same section is fine on the current chain, in a recipe
@@ -11700,7 +11710,7 @@ fn a_print_or_output_recipe_section_is_refused_whole() {
 #[test]
 fn the_new_flow_judges_the_suffix_against_its_own_destination() {
     // Under `--new-flow` the output preset is refused, so the suffix rule is judged
-    // against the new flow's one destination — a TIFF — never against the default
+    // against the resolved destination — the default a TIFF — never against the default
     // preset nobody selected. A stated TIFF suffix is kept, an absent one completed to
     // `.tiff`, and anything else refused with a remedy that does not name
     // `--output-preset` (a flag this flow rejects).
@@ -12082,7 +12092,10 @@ fn roll_under_the_new_flow_renders_every_frame() {
     assert!(report["identity"].get("params_hash").is_none(), "{stdout}");
     for frame in report["frames"].as_array().unwrap() {
         assert_eq!(frame["status"], "ok", "{frame}");
-        assert_eq!(frame["new_flow"]["destination"], "display-p3-u16-tiff");
+        assert_eq!(
+            frame["new_flow"]["destination"]["display"]["gamut"],
+            "display-p3"
+        );
     }
 }
 
@@ -13115,4 +13128,627 @@ fn highlight_desaturation_is_refused_where_it_cannot_apply() {
             "{flag:?}: {err}"
         );
     }
+}
+
+/// `convert --new-flow` on the 48-bit fixture with `extra`, writing to `out`.
+fn new_flow_convert(out: &Path, extra: &[&str]) -> (i32, String, String) {
+    let input = fixture("hdr-48bit.tif");
+    let mut argv = vec![
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--new-flow",
+    ];
+    argv.extend_from_slice(extra);
+    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    run(&argv)
+}
+
+#[test]
+fn every_new_flow_destination_renders_end_to_end() {
+    // Each ready row of the destination table, from the flags that name it: the path is
+    // completed from its container, the bytes are that container, the report names every
+    // resolved axis, and the encoder's own block is there. The look is named on each.
+    let tmp = TempDir::new("new-flow-destinations");
+    for (i, (extra, container, suffix, block)) in [
+        (vec![], "tiff", "tiff", None),
+        (vec!["--gamut", "adobe-rgb"], "tiff", "tiff", None),
+        (
+            vec!["--transfer", "linear"],
+            "tiff",
+            "tiff",
+            Some("hdr_linear_tiff"),
+        ),
+        (
+            vec!["--transfer", "pq"],
+            "tiff",
+            "tiff",
+            Some("hdr_coded_tiff"),
+        ),
+        (
+            vec!["--transfer", "hlg"],
+            "tiff",
+            "tiff",
+            Some("hdr_coded_tiff"),
+        ),
+        (
+            vec!["--transfer", "pq", "--container", "avif"],
+            "avif",
+            "avif",
+            Some("avif"),
+        ),
+        (
+            vec!["--transfer", "hlg", "--container", "avif"],
+            "avif",
+            "avif",
+            Some("avif"),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stem = tmp.path(&format!("d{i}"));
+        let (code, stdout, err) = new_flow_convert(&stem, &extra);
+        assert_eq!(code, 0, "{extra:?}: {err}");
+        let out = PathBuf::from(format!("{}.{suffix}", stem.display()));
+        assert_eq!(sniff_container(&out), container, "{extra:?}");
+        let report = json(&stdout);
+        assert_eq!(report["output"], out.to_str().unwrap(), "{extra:?}");
+        let nf = &report["new_flow"];
+        let axes = &nf["destination"]["display"];
+        for key in ["range", "transfer", "gamut", "container"] {
+            assert!(axes[key].is_string(), "{extra:?}: {key} unresolved: {nf}");
+        }
+        for pair in extra.chunks(2) {
+            assert_eq!(axes[pair[0].trim_start_matches("--")], pair[1], "{extra:?}");
+        }
+        assert_eq!(nf["stages"][1]["stage"], "look", "{extra:?}");
+        let hdr = axes["range"] == "hdr";
+        assert_eq!(nf["peak_clamp"].is_object(), hdr, "{extra:?}: {nf}");
+        if hdr {
+            assert_eq!(axes["gamut"], "bt2020", "{extra:?}");
+        }
+        if let Some(block) = block {
+            assert!(report[block].is_object(), "{extra:?}: no `{block}` block");
+        }
+        if extra.is_empty() || extra == ["--gamut", "adobe-rgb"] {
+            assert_eq!(read_tiff_bits(&out), 16, "{extra:?}");
+        }
+    }
+}
+
+#[test]
+fn the_new_flow_film_master_runs_no_rendering_and_refuses_a_look() {
+    let tmp = TempDir::new("new-flow-film-master");
+    let stem = tmp.path("master");
+    let (code, stdout, err) = new_flow_convert(&stem, &["--film-master"]);
+    assert_eq!(code, 0, "{err}");
+    let out = PathBuf::from(format!("{}.tiff", stem.display()));
+    assert_eq!(read_tiff_bits(&out), 32);
+    let nf = &json(&stdout)["new_flow"];
+    assert_eq!(nf["destination"], "film-master");
+    assert_eq!(nf["stages"], serde_json::json!([]));
+    assert!(nf.get("look").is_none(), "{nf}");
+
+    // A look the user asked for is refused, naming the look rather than a knob.
+    let (code, _, err) = new_flow_convert(&tmp.path("a"), &["--film-master", "--contrast", "1.3"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("the look"), "{err}");
+    assert!(
+        !err.contains("--contrast 1.3"),
+        "one rule, not one per knob: {err}"
+    );
+    // The empty look renders exactly what the film master does, so it is spared: the
+    // flags-win reset of a recipe's look.
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("b"),
+        &[
+            "--film-master",
+            "--contrast",
+            "1",
+            "--highlight-desaturation",
+            "0",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    // The film master and an axis are one choice, refused at the parser.
+    let (code, _, err) = new_flow_convert(&tmp.path("c"), &["--film-master", "--range", "hdr"]);
+    assert_eq!(code, 2, "{err}");
+}
+
+#[test]
+fn the_new_flow_hdr_hand_off_counts_what_it_clamps_and_strict_sees_it() {
+    // `hdr-48bit.tif` is the IR-free fixture, so a `--strict` exit 1 is this warning's.
+    let tmp = TempDir::new("new-flow-peak-clamp");
+    // The control: at the defaults nothing sits above the peak, and `--strict` passes.
+    let (code, stdout, err) = new_flow_convert(&tmp.path("a"), &["--transfer", "pq", "--strict"]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert_eq!(
+        report["new_flow"]["peak_clamp"]["above_peak"], 0,
+        "{report}"
+    );
+    // Three stops up with fit range at its identity puts content past the 1000-nit peak:
+    // clamped at the hand-off, counted there, folded into the report's clip count.
+    let over = [
+        "--transfer",
+        "pq",
+        "--exposure",
+        "3",
+        "--display-tone-headroom",
+        "0",
+    ];
+    let (code, stdout, err) = new_flow_convert(&tmp.path("b"), &over);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let above = report["new_flow"]["peak_clamp"]["above_peak"]
+        .as_u64()
+        .unwrap();
+    assert!(above > 0, "{report}");
+    assert_eq!(
+        report["loss"]["clipped_high"].as_u64(),
+        Some(above),
+        "{report}"
+    );
+    assert!(err.contains("clipped"), "{err}");
+    let (code, _, err) = new_flow_convert(&tmp.path("c"), &[&over[..], &["--strict"]].concat());
+    assert_eq!(code, 1, "--strict must promote the clamp: {err}");
+
+    // An HDR signal that never passes reference white is warned about with this chain's
+    // levers, not the current chain's, which `--new-flow` refuses.
+    let (code, stdout, err) =
+        new_flow_convert(&tmp.path("d"), &["--transfer", "pq", "--exposure=-5"]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    let warning = report["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w.as_str())
+        .find(|w| w.contains("SDR-range signal"))
+        .unwrap_or_else(|| panic!("no SDR-range warning: {report}"));
+    assert!(
+        warning.contains("`--exposure`") && warning.contains("--range sdr"),
+        "{warning}"
+    );
+    assert!(
+        !warning.contains("--print-exposure") && !warning.contains("SDR preset"),
+        "{warning}"
+    );
+}
+
+#[test]
+fn the_new_flow_film_master_refuses_every_stage_it_does_not_run() {
+    // The film master runs no rendering stage, so a request for any of them is refused
+    // — one rule per stage, naming the stage — never silently ignored.
+    let tmp = TempDir::new("new-flow-film-master-stages");
+    for (i, (extra, stage)) in [
+        (&["--exposure", "2"][..], "scene correction"),
+        (&["--white-balance", "1.2,1,1.1"][..], "scene correction"),
+        (&["--display-tone-headroom", "3"][..], "fit range"),
+        (&["--contrast", "1.3"][..], "the look"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let argv = [&["--film-master"][..], extra].concat();
+        let (code, _, err) = new_flow_convert(&tmp.path(&format!("r{i}")), &argv);
+        assert_eq!(code, 2, "{extra:?}: {err}");
+        assert!(err.contains(stage), "{extra:?}: {err}");
+        assert!(err.contains("choose a rendered destination"), "{err}");
+    }
+    // Every stage asked for is named at once, in chain order.
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("all"),
+        &[
+            "--film-master",
+            "--exposure",
+            "2",
+            "--white-balance",
+            "1.2,1,1.1",
+            "--display-tone-headroom",
+            "3",
+        ],
+    );
+    assert_eq!(code, 2, "{err}");
+    let scene = err.find("scene correction (").expect(&err);
+    let fit = err.find("fit range (").expect(&err);
+    assert!(scene < fit, "{err}");
+    assert!(
+        !err.contains("the look ("),
+        "the look was not asked for: {err}"
+    );
+    // The defaults and the identities render exactly what the master does, so they are
+    // spared — the flags-win reset of a recipe that asks for a stage.
+    for (i, extra) in [
+        &["--exposure", "0", "--white-balance", "1,1,1"][..],
+        &["--display-tone-headroom", "0"][..],
+        &["--display-tone-headroom", "6"][..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let argv = [&["--film-master"][..], extra].concat();
+        let (code, _, err) = new_flow_convert(&tmp.path(&format!("ok{i}")), &argv);
+        assert_eq!(code, 0, "{extra:?}: {err}");
+    }
+    let recipe = write_file(
+        &tmp.path("stages.json"),
+        r#"{"recipe_version": 2, "scene_correction": {"exposure": 1.5},
+            "fit_range": {"headroom_stops": 4}}"#,
+    );
+    let r = recipe.to_str().unwrap();
+    let (code, _, err) = new_flow_convert(&tmp.path("rec"), &["--film-master", "--params", r]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("scene correction") && err.contains("fit range"),
+        "{err}"
+    );
+    // Following the remedy — each stage's identity by flag — converts.
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("reset"),
+        &[
+            "--film-master",
+            "--params",
+            r,
+            "--exposure",
+            "0",
+            "--display-tone-headroom",
+            "0",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn a_destination_the_table_lacks_is_refused_with_a_remedy_that_works() {
+    let tmp = TempDir::new("new-flow-destination-refusals");
+    // A conflicting pair is named, not the bystander, and the remedy is a flag.
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("a"),
+        &[
+            "--range",
+            "hdr",
+            "--gamut",
+            "adobe-rgb",
+            "--container",
+            "tiff",
+        ],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--range hdr and --gamut adobe-rgb"), "{err}");
+    assert!(err.contains("--range sdr"), "{err}");
+    // Following that remedy converts.
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("a2"),
+        &[
+            "--range",
+            "sdr",
+            "--gamut",
+            "adobe-rgb",
+            "--container",
+            "tiff",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    // An axis the table cannot decide is asked for, offering only values that resolve.
+    let (code, _, err) = new_flow_convert(&tmp.path("b"), &["--gamut", "bt2020"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--transfer linear|pq|hlg"), "{err}");
+    // A planned row names its task and what is ready now.
+    let (code, _, err) = new_flow_convert(&tmp.path("c"), &["--range", "hdr"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("gain-map-destination"), "{err}");
+    // Each offered as the fewest flags to add to what was stated.
+    assert!(
+        err.contains("adding to what is stated: --transfer linear;"),
+        "{err}"
+    );
+    assert!(err.contains("--transfer pq --container avif"), "{err}");
+    // The destination flags mean nothing without `--new-flow`.
+    let input = fixture("hdr-48bit.tif");
+    let out = tmp.path("d.tiff");
+    let (code, _, err) = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--film-base",
+        "0.9,0.55,0.42",
+        "--gamut",
+        "adobe-rgb",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--new-flow"), "{err}");
+    // A stated suffix the destination does not write is refused, naming it.
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("e.tiff"),
+        &["--transfer", "pq", "--container", "avif"],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains(".avif") && err.contains("--container avif"),
+        "{err}"
+    );
+    // `--output-preset` is refused, and the preset's counterpart named.
+    let (code, _, err) = new_flow_convert(&tmp.path("f"), &["--output-preset", "hdr-pq"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--transfer pq --container avif"), "{err}");
+}
+
+#[test]
+fn a_new_flow_suffix_refusal_offers_only_a_destination_that_writes_it() {
+    let tmp = TempDir::new("new-flow-suffix-offers");
+    // A container a ready destination writes is offered as the flags that name it, and
+    // following the offer converts.
+    let (code, _, err) = new_flow_convert(&tmp.path("a.avif"), &[]);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("--transfer pq --container avif; --transfer hlg --container avif"),
+        "{err}"
+    );
+    let (code, _, err) = new_flow_convert(
+        &tmp.path("a.avif"),
+        &["--transfer", "pq", "--container", "avif"],
+    );
+    assert_eq!(code, 0, "{err}");
+    // An axis the recipe states cannot be unstated by a flag, only overridden, so the
+    // offer restates it — and the printed remedy, followed as written, converts.
+    let recipe = write_file(
+        &tmp.path("adobe.json"),
+        r#"{"recipe_version": 2, "output": {"display": {"gamut": "adobe-rgb"}}}"#,
+    );
+    let with_recipe = ["--params", recipe.to_str().unwrap()];
+    let (code, _, err) = new_flow_convert(&tmp.path("r.avif"), &with_recipe);
+    assert_eq!(code, 2, "{err}");
+    let (_, offers) = err
+        .split_once("state a destination that writes it: ")
+        .unwrap_or_else(|| panic!("no offer: {err}"));
+    for offer in offers.trim().split("; ") {
+        assert!(offer.contains("--gamut bt2020"), "{offer}: {err}");
+        let flags: Vec<&str> = offer.split_whitespace().collect();
+        let (code, _, err) = new_flow_convert(
+            &tmp.path("r.avif"),
+            &[&with_recipe[..], &flags[..]].concat(),
+        );
+        assert_eq!(code, 0, "following `{offer}` must convert: {err}");
+    }
+    // No ready destination writes a JPEG yet, so none is offered — only dropping it.
+    let (code, _, err) = new_flow_convert(&tmp.path("b.jpg"), &[]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("drop .jpg"), "{err}");
+    assert!(!err.contains("state a destination"), "{err}");
+
+    // A roll frame's explicit path is refused naming recipe keys: a roll takes no
+    // conversion flags.
+    let recipe = write_file(
+        &tmp.path("roll.json"),
+        r#"{"recipe_version": 2, "calibration": {"film_base": {"explicit": [0.9, 0.55, 0.42]}}}"#,
+    );
+    let frames = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{"frames": [{{"input": "{}", "output": "x.avif"}}]}}"#,
+            fixture("hdr-48bit.tif").display()
+        ),
+    );
+    let (code, _, err) = run(&[
+        "roll",
+        "--frames",
+        frames.to_str().unwrap(),
+        "--out-dir",
+        tmp.path("out").to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--new-flow",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("`output.display.container` \"tiff\""), "{err}");
+    assert!(err.contains("`output.display.container` \"avif\""), "{err}");
+    assert!(
+        !err.contains("--range") && !err.contains("--container"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_recipe_film_master_suffix_refusal_names_no_flag_the_user_did_not_type() {
+    let tmp = TempDir::new("new-flow-recipe-master-suffix");
+    let recipe = write_file(
+        &tmp.path("master.json"),
+        r#"{"recipe_version": 2, "output": "film-master"}"#,
+    );
+    let with_recipe = ["--params", recipe.to_str().unwrap()];
+    let (code, _, err) = new_flow_convert(&tmp.path("m.avif"), &with_recipe);
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        !err.contains("drop --film-master"),
+        "no such flag was typed: {err}"
+    );
+    assert!(
+        err.contains("replace the recipe's `output` \"film-master\""),
+        "{err}"
+    );
+    // The printed remedy, followed as written over the same recipe, converts.
+    let (_, offers) = err
+        .split_once("recipe's `output` \"film-master\": ")
+        .unwrap_or_else(|| panic!("no offer: {err}"));
+    for offer in offers.trim().split("; ") {
+        let flags: Vec<&str> = offer.split_whitespace().collect();
+        let (code, _, err) = new_flow_convert(
+            &tmp.path("m.avif"),
+            &[&with_recipe[..], &flags[..]].concat(),
+        );
+        assert_eq!(code, 0, "following `{offer}` must convert: {err}");
+    }
+    // With the flag typed, the remedy is to drop it.
+    let (code, _, err) = new_flow_convert(&tmp.path("f.avif"), &["--film-master"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("drop --film-master"), "{err}");
+}
+
+#[test]
+fn a_roll_frame_axis_joins_the_shared_recipes_axes() {
+    // `output.display` states only its axes, so a shared transfer and a per-frame
+    // container are two one-key objects — merged field by field, not switched.
+    let tmp = TempDir::new("new-flow-roll-axis-merge");
+    let recipe = write_file(
+        &tmp.path("roll.json"),
+        r#"{"recipe_version": 2,
+            "calibration": {"film_base": {"explicit": [0.9, 0.55, 0.42]}},
+            "output": {"display": {"transfer": "pq"}}}"#,
+    );
+    let frames = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{"frames": [
+  {{"input": "{}", "params": {{"output": {{"display": {{"container": "avif"}}}}}}}},
+  {{"input": "{}"}}
+]}}"#,
+            fixture("hdr-48bit.tif").display(),
+            fixture("hdri-64bit.tif").display()
+        ),
+    );
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        "--frames",
+        frames.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--new-flow",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        sniff_container(&out_dir.join("hdr-48bit_positive.avif")),
+        "avif"
+    );
+    let report = json(&stdout);
+    let axes = &report["frames"][0]["new_flow"]["destination"]["display"];
+    assert_eq!(axes["transfer"], "pq", "{report}");
+    assert_eq!(axes["container"], "avif", "{report}");
+    // The other frame keeps the roll's destination: a PQ TIFF.
+    let axes = &report["frames"][1]["new_flow"]["destination"]["display"];
+    assert_eq!(
+        (axes["transfer"].as_str(), axes["container"].as_str()),
+        (Some("pq"), Some("tiff")),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_roll_names_each_frame_from_its_destination() {
+    // The shared recipe's `output` picks the container, so derived names follow it; a
+    // per-frame override that changes the destination changes that frame's name.
+    let tmp = TempDir::new("new-flow-roll-destination");
+    let recipe = write_file(
+        &tmp.path("roll.json"),
+        r#"{
+  "recipe_version": 2,
+  "calibration": { "film_base": { "explicit": [0.9, 0.55, 0.42] } },
+  "output": { "display": { "transfer": "pq", "container": "avif" } }
+}"#,
+    );
+    let frames = write_file(
+        &tmp.path("frames.json"),
+        &format!(
+            r#"{{"frames": [
+  {{"input": "{}"}},
+  {{"input": "{}", "params": {{"output": "film-master"}}}}
+]}}"#,
+            fixture("hdr-48bit.tif").display(),
+            fixture("hdri-64bit.tif").display()
+        ),
+    );
+    let out_dir = tmp.path("out");
+    let (code, stdout, err) = run(&[
+        "roll",
+        "--frames",
+        frames.to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        recipe.to_str().unwrap(),
+        "--new-flow",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        sniff_container(&out_dir.join("hdr-48bit_positive.avif")),
+        "avif"
+    );
+    assert_eq!(
+        read_tiff_bits(&out_dir.join("hdri-64bit_positive.tiff")),
+        32
+    );
+    let report = json(&stdout);
+    assert_eq!(
+        report["frames"][1]["new_flow"]["destination"],
+        "film-master"
+    );
+    // A frame switching the roll's destination is warned about, naming the frame — the
+    // new chain's counterpart of the per-frame `output.preset` warning.
+    let warned: Vec<&str> = report["warnings"]
+        .as_array()
+        .expect("roll report must carry a warnings array")
+        .iter()
+        .filter_map(|w| w.as_str())
+        .filter(|w| w.contains("overriding the roll's destination"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{report}");
+    assert!(warned[0].contains("hdri-64bit.tif"), "{}", warned[0]);
+    // `--strict` promotes it; the same roll with no per-frame `output` is the control.
+    // (`hdr-48bit.tif` is IR-free; the control proves the other frame raises nothing.)
+    let strict_roll = |frames: &Path, out: &str| {
+        run(&[
+            "roll",
+            "--frames",
+            frames.to_str().unwrap(),
+            "--out-dir",
+            tmp.path(out).to_str().unwrap(),
+            "--params",
+            recipe.to_str().unwrap(),
+            "--new-flow",
+            "--strict",
+        ])
+    };
+    let one = |params: &str| {
+        format!(
+            r#"{{"frames": [{{"input": "{}"{params}}}]}}"#,
+            fixture("hdr-48bit.tif").display()
+        )
+    };
+    let overridden = write_file(
+        &tmp.path("overridden.json"),
+        &one(r#", "params": {"output": "film-master"}"#),
+    );
+    let (code, _, err) = strict_roll(&overridden, "strict-a");
+    assert_eq!(code, 1, "--strict must promote the warning: {err}");
+    assert!(err.contains("overriding the roll's destination"), "{err}");
+    let control = write_file(&tmp.path("control.json"), &one(""));
+    let (code, _, err) = strict_roll(&control, "strict-b");
+    assert_eq!(code, 0, "{err}");
+    // A roll names keys, not flags: it accepts no conversion flags.
+    let bad = write_file(
+        &tmp.path("bad.json"),
+        r#"{"recipe_version": 2, "calibration": {"film_base": {"explicit": [0.9, 0.55, 0.42]}},
+            "output": {"display": {"gamut": "bt2020"}}}"#,
+    );
+    let (code, _, err) = run(&[
+        "roll",
+        fixture("hdr-48bit.tif").to_str().unwrap(),
+        "--out-dir",
+        out_dir.to_str().unwrap(),
+        "--params",
+        bad.to_str().unwrap(),
+        "--new-flow",
+    ]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("`output.display.transfer`"), "{err}");
+    assert!(!err.contains("--transfer"), "{err}");
 }

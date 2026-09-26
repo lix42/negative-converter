@@ -35,6 +35,11 @@ Open:
   explicitly since `nf-retire/legacy-custom`, so moving the default does not silently
   retarget them.
 
+- **2026-09-25 (`preset-set`):** a destination is a set of axis values, not a preset
+  name, so the default is the axes' defaults (today `sdr`, `native`, `display-p3`,
+  `tiff`, resolved through `preset-set`'s table), and moving it means moving one or
+  more of those.
+
 ## How to Verify
 
 - A bare `hanten convert` resolves the intended destination with no output-selection

@@ -273,11 +273,10 @@ impl LookSection {
 
     /// Whether the user asked for a look — neither the default nor an empty one. The one
     /// predicate a destination that runs no look (`film-master`) reads to refuse, rather
-    /// than one rule per knob (`nf-look/stage`; the refusal is
-    /// `nf-destinations/preset-set`'s). The default is spared because every default
+    /// than one rule per knob (`nf-look/stage`; the refusal is `recipe::destination`).
+    /// The default is spared because every default
     /// recipe carries it; an empty look because it renders exactly what such a
     /// destination does, and refusing it would kill the flags-win reset.
-    #[cfg_attr(not(test), allow(dead_code))] // the film-master refusal (`nf-destinations/preset-set`)
     pub fn asks_for_a_look(&self) -> bool {
         !self.is_empty() && *self != Self::default()
     }
@@ -346,7 +345,7 @@ impl GradedImage {
     /// A second copy for the other display branch — a full-frame allocation, made once
     /// by `chain::render_pair`. Not `Clone`, so no caller outside `pipeline` can add a
     /// buffer the memory model does not count.
-    #[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`)
+    #[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`)
     pub(in crate::pipeline) fn split(&self) -> GradedImage {
         GradedImage(self.0.copy())
     }

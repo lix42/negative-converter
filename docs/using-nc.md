@@ -12,7 +12,8 @@ A practical guide to converting film negative scans to positives with `hanten`.
 > `b36ca64` (under `--new-flow` the decode's slope is `reconstruction.linearization`,
 > print contrast is `look.contrast` / `--contrast`, and the look's grade is
 > `--channel-grade`, §11) plus `nf-retire/regional-balance` (the balance flags and keys
-> retired, §5–§6). The staleness
+> retired, §5–§6) and `nf-destinations/preset-set` (the `--new-flow` destination
+> flags). The staleness
 > signal is `pipeline_version`: if
 > `hanten --version` reports a different one, treat this document as suspect and
 > re-verify.
@@ -1393,32 +1394,88 @@ the recipe rather than merely out of the image.
 **It renders a minimal picture, not a finished one.** The fixed decode feeds the new
 chain. Scene correction applies white balance and exposure, the look desaturates
 near-white highlights, fit range compresses the scene's range into the display's (all
-below), and fit gamut maps colour outside Display P3 onto its boundary, keeping hue.
-The result goes to **one destination, a Display P3 16-bit TIFF** — there is no other, and no way to
-choose one:
+below), and fit gamut maps colour outside the destination's gamut onto its boundary, keeping
+hue. With no destination flag the result is a Display P3 16-bit TIFF:
 
 ```console
 $ hanten convert scan.tif -o out --film-base 0.9,0.55,0.42 --new-flow
 ```
 
-That writes `out.tiff`. Colour outside Display P3 is never clipped channel by channel:
+That writes `out.tiff`. Colour outside the gamut is never clipped channel by channel:
 fit gamut moves it toward neutral at the same luminance until it fits. The one
-exception is a colour whose Display P3 luminance is zero or below, which has no
-in-gamut rendition and is written black. What can still clip is content brighter
+exception is a colour whose luminance there is zero or below, which has no in-gamut
+rendition and is written black. What can still clip is content brighter
 than fit range's headroom, which reaches the encoder above display white as a neutral
 (counted, and failed by `--strict`). Whether the picture *looks* right is not what
 this flow promises yet.
 
+**The destination is four separate knobs**, not a preset name — `--range`,
+`--transfer`, `--gamut`, `--container` (recipe `output.display`), or `--film-master`
+instead of all four. Only these combinations are written today:
+
+| `--range` | `--transfer` | `--gamut` | `--container` | writes |
+|---|---|---|---|---|
+| `sdr` | `native` | `display-p3` / `adobe-rgb` | `tiff` | 16-bit TIFF in the gamut's own curve (sRGB curve / `563/256`) — the default is Display P3 |
+| `hdr` | `linear` | `bt2020` | `tiff` | 32-bit float display-linear TIFF (1.0 = 203 cd/m²) |
+| `hdr` | `pq` / `hlg` | `bt2020` | `tiff` | Rec.2100 signal as full-range 16-bit TIFF codes |
+| `hdr` | `pq` / `hlg` | `bt2020` | `avif` | 10-bit 4:4:4 AVIF |
+
+`--film-master` writes the fixed decode's linear ACEScg as an unclamped 32-bit float TIFF
+with **no** rendering stage, so it refuses any stage you ask for — scene correction
+(`--exposure`, `--white-balance`), the look, or fit range (`--display-tone-headroom`) —
+naming the stage. Each stage's default and its identity are accepted, since neither
+asks for anything: `--exposure 0 --white-balance 1,1,1`, the empty look
+`--contrast 1 --highlight-desaturation 0`, and `--display-tone-headroom 0` (or its
+default 6).
+An HDR JPEG with a gain map (`--range hdr --container jpeg`) and an SDR JPEG are
+planned, and refused as not written yet.
+
+**Leave an axis unset and it is derived**, in the order range, transfer, gamut,
+container: its default when a destination fits, else the one value left, else a
+refusal listing the choices. So `--transfer pq` alone is an HDR BT.2020 TIFF and
+`--gamut adobe-rgb` alone the Adobe RGB TIFF, while `--gamut bt2020` asks which
+transfer. A value you **state** is never overridden — a combination the table lacks is
+refused, naming the conflicting pair and a flag that fixes it:
+
+```console
+$ hanten convert … --new-flow --range hdr --gamut adobe-rgb
+usage: no destination combines --range hdr and --gamut adobe-rgb (recipe keys
+`output.display.range`, `.transfer`, `.gamut`, `.container`). Use --range sdr, or
+--gamut bt2020 with --transfer linear|pq|hlg
+```
+
+The report records every resolved axis in `new_flow.destination`
+(`{"display": {"range": "hdr", "transfer": "pq", "gamut": "bt2020", "container": "avif"}}`,
+or `"film-master"`), which is exactly the recipe `output` that replays it. An HDR
+destination clamps its rendition to the 1000 cd/m² peak and counts what that clamped
+in `new_flow.peak_clamp` and in `loss`, where `--strict` sees it; one whose brightest
+pixel stays at or below reference white is warned about, naming `--exposure` and
+`--range sdr` as the remedies. On `roll`, each frame's derived name takes its
+destination's container, and a per-frame `params.output` changes that frame's
+destination (a per-frame `output.display` joins the shared recipe's axes, axis by axis)
+and raises a roll warning (failed by `--strict`), even when it restates the
+roll's.
+
 - **The suffix is judged against that destination**, on `convert` and on a `roll`
-  manifest's explicit `output`: `.tif`/`.tiff` is kept as typed, a missing suffix is
-  completed to `.tiff`, and anything else is refused:
+  manifest's explicit `output`: a suffix the container accepts is kept as typed, a
+  missing one is completed (`.tiff`, `.avif`), and anything else is refused:
 
   ```console
   $ hanten convert scan.tif -o out.jpg --film-base 0.9,0.55,0.42 --new-flow
-  usage: the output path out.jpg does not end in .tif or .tiff: under --new-flow,
-  Hanten writes its one destination, a Display P3 16-bit TIFF. Hanten never renames
-  a suffix you state — drop it and the path is completed for you
+  usage: the output path out.jpg does not end in .tif or .tiff: under --new-flow the
+  destination is --range sdr --transfer native --gamut display-p3 --container tiff,
+  which writes .tif or .tiff. Hanten never renames a suffix you state — drop .jpg and
+  the path is completed for you
   ```
+
+  When a destination written today has that container, the refusal offers it too, as
+  the flags to add on top of what you stated — restating any axis you (or `--params`)
+  stated that it needs changed. So `-o out.avif` adds `…, or state a destination that
+  writes it: --transfer pq --container avif; --transfer hlg --container avif`, and with a
+  recipe stating `"gamut": "adobe-rgb"` each offer also carries `--gamut bt2020`. With
+  a typed `--film-master` the offer says to drop it first; a recipe's `"film-master"` is
+  replaced by the offered flags themselves. A `roll` frame's refusal names the
+  recipe keys (`output.display.…`) instead of flags.
 
 - **No sidecar is written**, and the report carries no `recipe` echo and no
   `identity.params_hash`: all three were built around the *current* chain's config,
@@ -1437,9 +1494,12 @@ this flow promises yet.
   `"contrast"`, `"channel-grade"`, `"highlight-desaturation"` — so the default is
   `"contrast+highlight-desaturation"`, or `"identity"` when none ran; fit range's
   operator; `"acescg-to-display-p3-matrix+neutral-axis-radial-boundary-v2"` for fit
-  gamut), scene correction's resolved values in `scene_correction`, fit range's in
-  `fit_range` (below), the `destination` (`display-p3-u16-tiff`) and
-  `"sidecar_written": false`. Its final shape is
+  gamut, named for the destination's gamut), scene correction's resolved values in
+  `scene_correction`, fit range's in `fit_range` (below), the `destination` (above)
+  and `"sidecar_written": false`. The film master runs no stage, so its `stages` is
+  empty and those three blocks are absent. The HDR destinations also fill the same
+  `hdr_linear_tiff` / `hdr_coded_tiff` / `avif` block the current chain's HDR presets
+  do. Its final shape is
   `nf-core/report-contract`'s to decide.
 
 What *is* live is the availability rule: a knob the new chain cannot honour is
@@ -1447,9 +1507,10 @@ refused (exit 2) rather than accepted and ignored, and the message says whether 
 counterpart is missing **yet** or for good:
 
 ```console
-$ hanten convert … --new-flow --output-preset display-p3
-usage: --output-preset has no meaning under `--new-flow`: the new flow has no
-counterpart for it yet — one arrives with the new flow's destination set: …
+$ hanten convert … --new-flow --output-preset hdr-pq
+usage: --output-preset has no meaning under `--new-flow`: the new flow's counterpart
+is --range/--transfer/--gamut/--container, or --film-master: … For `hdr-pq`, pass
+--transfer pq --container avif.
 
 $ hanten convert … --new-flow --density-curve characteristic
 usage: --density-curve has no meaning under `--new-flow`: the new flow has no
@@ -1506,7 +1567,8 @@ $ hanten params --new-flow
     "highlight_desaturation": { "strength": 0.8, "start_stops": -1.0, "band": [0.015, 0.025] }
   },
   "fit_range": { "headroom_stops": 6.0 },
-  "fit_gamut": {}
+  "fit_gamut": {},
+  "output": { "display": {} }
 }
 ```
 
@@ -1516,8 +1578,9 @@ fixed decode reads no reference density. `reconstruction` spells the four decode
 knobs above (`--density-gamma` is `linearization` here). `scene_correction` holds white
 balance and exposure, `look` contrast, the per-channel grade and highlight desaturation, `fit_range` its
 headroom (all below); `fit_gamut` is empty for good — its ceiling comes from fit range and its gamut
-from the destination. There is no `output` section:
-the new chain writes one fixed destination. `--dump-params` under `--new-flow` writes this
+from the destination. `output` is the destination (above), with nothing stated
+by default — every axis derived. The current chain's `output.preset` is refused in
+this document by name. `--dump-params` under `--new-flow` writes this
 document with your values resolved, and it reloads under the flag unchanged.
 
 The version is what tells the two chains' recipes apart, and each refuses the other's
@@ -1570,7 +1633,7 @@ the knob went:
 | `--print-exposure` | renamed: `--exposure` (below) |
 | `--black-point` | split in two — flare/fog in scene correction, display black in fit range — which is why it is not a rename |
 | `--linear-range` | an affine levels remap needing a stage and a name; retiring it outright is a listed outcome |
-| `--output-preset` | the new flow's destination set (`nf-destinations/preset-set`) — it writes one destination today, so there is no output policy to choose |
+| `--output-preset` | the destination flags `--range`, `--transfer`, `--gamut`, `--container` or `--film-master` (above); the refusal names the preset's counterpart |
 | `--telemetry`, `--telemetry-file` | the new chain's report and telemetry shape — the record would name the current chain's preset and timing buckets |
 
 Unlike the decode's knees, **no value is spared here** — `--linear-range 0,1`
@@ -1708,7 +1771,7 @@ white it compresses:
 The flag and the key are the same on both chains (`--display-tone` and
 `--highlight-compress` are removed on both — §7). The display's peak
 is the operator's other argument and belongs to the destination, not the recipe — `1`
-for the one SDR destination. The report names what ran:
+for SDR, `1000/203 ≈ 4.93` for HDR. The report names what ran:
 
 ```console
 $ hanten convert scan.tif -o out --film-base 0.9,0.55,0.42 --new-flow \
@@ -1779,10 +1842,11 @@ What survives untouched is everything before the seam: `--film-base`,
 are shared by both chains.
 
 `--export-ir` works too: the IR plane is written from the decoded image at the
-destination's depth, 16-bit.
+destination's depth — 32-bit float beside a float TIFF, 16-bit otherwise.
 
 On `roll` the flag applies to every frame: each is written as
-`<stem>_positive.tiff`, with no sidecars and no `recipe` in the roll report. `roll`
+`<stem>_positive.<ext>`, the extension its destination's container's (`.tiff` by
+default), with no sidecars and no `recipe` in the roll report. `roll`
 takes no conversion flags, so its knobs come from the shared recipe and the
 per-frame overrides. The shared recipe must be the new chain's document, and each
 override is merged onto it and rendered with it, so an override uses the new

@@ -42,6 +42,12 @@ Open:
 - Whether the arms are per destination or per shape; fewer is better only if each
   sharing is measured.
 
+- **2026-09-25 (`preset-set`):** destinations are axis combinations, so the arms key on
+  the shape a row renders and encodes, not on names — three arms: the u16 TIFFs (the
+  SDR TIFF and the coded HDR TIFF share `NewFlowU16Tiff`), the f32 TIFF, and the AVIF.
+  `preset-set` gives each a provisional arm by counting its buffers; measuring them is
+  this task's.
+
 ## How to Verify
 
 - Every destination resolves a profile; a destination with none fails loudly at

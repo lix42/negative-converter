@@ -1107,6 +1107,38 @@ class SpaceFromRecipe(unittest.TestCase):
             self.assertEqual(space, "display-p3", preset)
             self.assertIn(preset, why)
 
+    def test_new_chain_destinations_resolve_on_gamut_and_transfer(self):
+        """A new-chain recipe (`recipe_version` 2) names a destination, not a preset:
+        its space comes from the gamut and the transfer, the row key of
+        `DESTINATION_SPACES`."""
+        def display(**axes):
+            full = {"range": "sdr", "transfer": "native", "gamut": "display-p3",
+                    "container": "tiff", **axes}
+            return {"recipe_version": 2, "output": {"display": full}}
+        for axes, expected in (({}, "display-p3"),
+                               ({"gamut": "adobe-rgb"}, "adobe-rgb"),
+                               ({"range": "hdr", "transfer": "linear", "gamut": "bt2020"},
+                                "linear-bt2020")):
+            space, _ = metrics.space_for_recipe(display(**axes))
+            self.assertEqual(space, expected, axes)
+        space, _ = metrics.space_for_recipe({"recipe_version": 2, "output": "film-master"})
+        self.assertEqual(space, "linear-acescg")
+        for axes, expected in (({"range": "hdr", "transfer": "pq", "gamut": "bt2020"},
+                                "reference-white"),
+                               ({"range": "hdr", "transfer": "pq", "gamut": "bt2020",
+                                 "container": "avif"}, "AVIF")):
+            with self.assertRaises(metrics.MetricsError) as caught:
+                metrics.space_for_recipe(display(**axes))
+            self.assertIn(expected, str(caught.exception), axes)
+
+    def test_a_new_chain_destination_left_to_derivation_is_refused(self):
+        """nc derives an unset axis from its destination table; a second copy of
+        that table here is the drift it exists to prevent, so the resolved one is
+        asked for instead."""
+        with self.assertRaises(metrics.MetricsError) as caught:
+            metrics.space_for_recipe({"recipe_version": 2})
+        self.assertIn("new_flow.destination", str(caught.exception))
+
     def test_the_default_preset_resolves(self):
         """A recipe with no output section is nc's default, `gain-map-hdr`."""
         space, why = metrics.space_for_recipe({})

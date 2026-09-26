@@ -40,7 +40,9 @@ authoritative for status and dependencies.
   after that there is nothing to select. `nf-core/default-flip` is the last of those
   changes plus the flag's removal. `nf-core/stage-skeleton` built the chain it
   selects and `nf-core/minimal-end-to-end` connected it: the fixed decode feeds it and
-  it writes one destination, a Display P3 16-bit TIFF. Scene correction has since
+  it wrote one destination, a Display P3 16-bit TIFF, until `nf-destinations/preset-set`
+  made the destination four knobs (`--range`, `--transfer`, `--gamut`, `--container`,
+  or `--film-master`). Scene correction has since
   gained white balance and exposure (`nf-scene-correction/stage`) and fit range its
   reinhard operator (`nf-display-stages/fit-range`), and the look highlight
   desaturation (`nf-look/path-to-white`, on by default). The availability refusals went live before the render did.

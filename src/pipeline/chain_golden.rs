@@ -968,9 +968,34 @@ fn golden_fit_gamut_adobe_rgb_is_bit_identical() {
     assert_eq!(out.ir.as_deref(), Some(&FILM_IR[..FINITE_PIXELS]));
 }
 
+/// [`FIT_GAMUT_P3`]'s input into BT.2020, the HDR destinations' gamut: the same map
+/// through BT.2020's pinned matrix and luma row. Run against the SDR peak, as its
+/// siblings are, so the vector stays bit-exact — fit range's HDR lift calls `log2`
+/// above diffuse white; what this pins is the gamut's arithmetic, not the peak's. The
+/// widest gamut takes pixel 2's negative P3 channel inside the cube, so it passes
+/// through the matrix alone. Captured 2026-09-25 with the destination set
+/// (`nf-destinations/preset-set`).
+const FIT_GAMUT_BT2020: [u32; 21] = [
+    0x3e3851ed, 0x3e3851ed, 0x3e3851ec, 0x3d2a344a, 0x3c661203, 0x3f4e7194, 0x3f0f4d19, 0x3d8a2a5d,
+    0x00000000, 0x3f800000, 0x3f800000, 0x3f800000, 0x404b4c7d, 0x404b4c7d, 0x404b4c7d, 0x00000000,
+    0x00000000, 0x00000000, 0x3b57596e, 0x3b80102d, 0x3b0faead,
+];
+
+#[test]
+fn golden_fit_gamut_bt2020_is_bit_identical() {
+    let fitted = through_fit_range(&fit_range_params(0.0, DisplayPeak::SDR));
+    let params = FitGamutParams {
+        target: DestinationGamut::Bt2020,
+    };
+    let (out, gamut) = fit_gamut::apply(fitted, &params).unwrap().into_parts();
+    assert_stage_bits("fit-gamut-bt2020", &out.rgb, &FIT_GAMUT_BT2020);
+    assert_eq!(gamut, DestinationGamut::Bt2020);
+    assert_eq!(out.ir.as_deref(), Some(&FILM_IR[..FINITE_PIXELS]));
+}
+
 // --- threaded ----------------------------------------------------------------
 
-/// The new flow's one destination today: an SDR display in Display P3.
+/// The new flow's default destination: an SDR display in Display P3.
 const SDR_P3: DisplayTarget = DisplayTarget {
     peak: DisplayPeak::SDR,
     gamut: DestinationGamut::DisplayP3,

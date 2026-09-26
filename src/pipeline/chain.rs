@@ -3,7 +3,7 @@
 //!
 //! The chain `--new-flow` selects (`docs/design-update.md` Part 2,
 //! `docs/nf-migration.md`), fed by the fixed decode (`algo::fixed`) and rendering
-//! into one destination (`cli::convert_frame`, `nf-core/minimal-end-to-end`). Scene
+//! into the destination `crate::destination` resolves (`cli::convert_frame`). Scene
 //! correction applies white balance and exposure; the look applies print contrast and
 //! the per-channel grade and desaturates near-neutral highlights (the rest of its epic
 //! fills it); fit range compresses the scene's range against the destination's peak,
@@ -119,7 +119,7 @@ pub struct Rendered {
 /// An SDR and an HDR rendition of one frame, split from one graded image — what a
 /// gain map is built from. Each carries the full account of its own render; the
 /// shared stages' entries are identical by construction.
-#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`)
+#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`)
 pub struct RenderedPair {
     pub sdr: Rendered,
     pub hdr: Rendered,
@@ -161,7 +161,7 @@ pub fn render(image: AcesCgImage, params: &ChainParams) -> Result<Rendered> {
 ///
 /// Costs one full-frame copy of the graded image — the branch point's only
 /// allocation — on top of what [`render`] holds.
-#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/preset-set`)
+#[cfg_attr(not(test), allow(dead_code))] // the gain-map destination (`nf-destinations/gain-map-destination`)
 pub fn render_pair(
     image: AcesCgImage,
     shared: &SharedParams,

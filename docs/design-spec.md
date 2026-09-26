@@ -1068,7 +1068,8 @@ top-level **document version** rather than per-object ones:
     "highlight_desaturation": {"strength": 0.8, "start_stops": -1.0, "band": [0.015, 0.025]}
   },
   "fit_range": {"headroom_stops": 6.0},
-  "fit_gamut": {}
+  "fit_gamut": {},
+  "output": {"display": {"gamut": "adobe-rgb"}}
 }
 ```
 
@@ -1087,13 +1088,34 @@ top-level **document version** rather than per-object ones:
   `fit_gamut` is empty and has no knob: it changes primaries into the destination's
   gamut and maps out-of-gamut colour radially toward neutral at constant luminance,
   against the cube `[0, max(peak, Y)]` — the peak is fit range's, and content above
-  it renders neutral at its own luminance and clips, counted, at the encode. A pixel
-  whose destination luminance is `≤ 0` renders black. The report names it
-  `acescg-to-display-p3-matrix+neutral-axis-radial-boundary-v2`. There is no
-  `output` section while the new chain writes one fixed destination.
+  it renders neutral at its own luminance and is clamped, counted: on an HDR
+  destination at the hand-off to the HDR encoder (`new_flow.peak_clamp`, folded into
+  the report's clip count), otherwise at the encode. A pixel whose destination
+  luminance is `≤ 0` renders black. The report names it after the destination's gamut,
+  `acescg-to-<gamut>-matrix+neutral-axis-radial-boundary-v2` (`display-p3`,
+  `adobe-rgb` or `bt2020`).
+- **`output` is the destination, as four separate axes** (`nf-destinations/preset-set`,
+  `crate::destination`): `output.display` with `range` (`sdr`|`hdr`), `transfer`
+  (`native`|`linear`|`pq`|`hlg`), `gamut` (`display-p3`|`adobe-rgb`|`bt2020`) and
+  `container` (`tiff`|`jpeg`|`avif`), flags `--range`/`--transfer`/`--gamut`/
+  `--container`; or `"film-master"` (`--film-master`), the fixed decode's linear
+  ACEScg with no rendering stage, which refuses any stage the recipe asks for — scene
+  correction, the look or fit range, one rule per stage, each sparing its default and
+  its identity — naming the stage. Not a name
+  per combination: **one table** of destinations drives resolution, refusals and the
+  container. Each axis is optional — an unset one is derived from the table in the
+  order range, transfer, gamut, container (its default when a consistent destination
+  has it, else the one value left, else a refusal listing the choices), so a stated
+  value is never overridden by another axis. The report records every resolved axis
+  (`new_flow.destination`), which replays exactly. Written today: SDR `native` TIFF in
+  Display P3 (the default) or Adobe RGB; HDR BT.2020 as a `linear` 32-bit float TIFF, or
+  `pq`/`hlg` as a 16-bit TIFF or a 10-bit AVIF. The HDR JPEG with a gain map
+  (`nf-destinations/gain-map-destination`) and the SDR JPEG are planned rows, refused
+  as not yet. The current chain's `output.preset` (and the retired selectors) are
+  refused by name under this document.
 - **The version is the chain declaration.** `recipe_version` is required and is
   exactly `2`. Under `--new-flow` a recipe without it is refused; without the flag,
-  a recipe stating it is refused. The current chain's `print`/`output` sections, its
+  a recipe stating it is refused. The current chain's `print` section and `output` keys, its
   `reconstruction`/`calibration` keys, and the keys both chains retired (top-level
   `algorithm`/`density`/`film_base`, `input.color`, …) are refused in a v2 document by
   name, each with where its knobs went — a migration error, no aliases.
@@ -2487,6 +2509,7 @@ nc/
     │   └── characteristic.rs # inverts a stock's published curve (`--film-stock`); retiring
     ├── film_stock/       # the digitized per-stock curves: evidence for the decode's constants
     ├── flow.rs           # the transitional --new-flow selector (deleted by the flip)
+    ├── destination.rs    # the new chain's destination set: four axes, one table
     ├── recipe.rs         # the new chain's recipe (recipe_version 2), one section per stage
     ├── telemetry.rs      # opt-in JSONL perf/context record (never perturbs output)
     ├── version.rs        # build identity, pipeline_version, params hash
@@ -2497,8 +2520,10 @@ The tree is the shipped module set, not a proposal — it had drifted by nine mo
 and is worth re-checking whenever one is added. The six new-flow modules are the
 migration's chain (`docs/design-update.md`, `docs/nf-migration.md`). `--new-flow`
 runs them — the fixed decode, scene correction's white balance and exposure, the
-identity look, fit range, fit gamut's radial map into Display P3, and one Display P3
-16-bit TIFF destination — but nothing in this spec's pipeline runs through them yet.
+look, fit range, fit gamut's radial map into the destination's gamut, and the
+destination set in `destination.rs` (SDR TIFFs in Display P3 or Adobe RGB, HDR
+BT.2020 as a float, PQ or HLG TIFF or a PQ or HLG AVIF, and the film master) — but
+nothing in this spec's pipeline runs through them yet.
 
 ### Candidate crates
 

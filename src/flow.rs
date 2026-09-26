@@ -16,7 +16,8 @@
 //!
 //! The knobs the new flow keeps reach the fixed decode through the new chain's own
 //! recipe (`crate::recipe`, which outlives this module), and the render itself —
-//! decode, `pipeline::chain`, and the one destination — is `cli::convert_frame`'s.
+//! decode, `pipeline::chain`, and the destination (`crate::destination`) — is
+//! `cli::convert_frame`'s.
 //!
 //! `Flow` is *orchestration state*, like an unresolved `calibration.film_base`: it
 //! never reaches a stage, and it is never a recipe key (`--new-flow` selects which
@@ -93,11 +94,6 @@ struct FlagEntry {
     availability: Availability,
 }
 
-/// Shared refusal reasons, so rows that say the same thing cannot drift apart.
-const DESTINATION_ARRIVES_WITH: &str = "the new flow's destination set: it renders into exactly one destination today \
-     (a Display P3 16-bit TIFF), so there is no output policy to choose or describe \
-     (`nf-destinations/preset-set`)";
-
 /// Knobs with no new-flow meaning, keyed on the **flag the user typed**.
 ///
 /// The presence tiebreaker: reject a flag when it *forces something the
@@ -115,8 +111,9 @@ const DESTINATION_ARRIVES_WITH: &str = "the new flow's destination set: it rende
 /// stating the current chain's keys there is refused at load and `--preset` is refused
 /// by presence. Nothing the user *asks for* in the new flow's **reconstruction** is
 /// silently dropped. The rest of the surface is closed by the same schema: it has no
-/// `print` or `output` section, so a recipe stating either is refused by name, and
-/// every flag under them has a row below. The shared sections (`input`,
+/// `print` section, and its `output` section is the destination's axes, so a recipe
+/// stating a `print` section or the current chain's `output` keys is refused by name,
+/// and every flag under them has a row below. The shared sections (`input`,
 /// `calibration`'s film base, `measure`) are read.
 ///
 /// [`DecodeParams`]: crate::algo::fixed::DecodeParams
@@ -286,20 +283,18 @@ const FLAG_ENTRIES: &[FlagEntry] = &[
                             (`nf-scene-correction/levels-knob`)",
         },
     },
-    // --- output (`nf-core/knob-availability-audit`) --------------------------------
+    // --- output (`nf-destinations/preset-set`) -------------------------------------
     //
-    // The new flow renders into **exactly one destination** (a Display P3 16-bit
-    // TIFF, `nf-core/minimal-end-to-end`); the set, and how one is selected, is
-    // `nf-destinations`'. So these are refused for a different reason than the print
-    // family: not "the stage that carries it is empty", but "there is no output policy
-    // to choose yet". Nothing under the flow reads `output.*` — not even the memory
-    // preflight, which sizes the new flow with its own `RunProfile::NewFlowSdrTiff`.
+    // A destination on the new chain is four separate knobs, not a preset name
+    // (`crate::destination`), so the preset is refused and its counterpart named —
+    // the specific flags for the preset given, when it has one.
     FlagEntry {
         knob: "--output-preset",
         covers: &["--output-preset"],
         present: |args| args.output_opts.output_preset.is_some(),
-        availability: Availability::NotYet {
-            arriving_with: DESTINATION_ARRIVES_WITH,
+        availability: Availability::Renamed {
+            to: "--range/--transfer/--gamut/--container, or --film-master",
+            why: "a destination is separate knobs (recipe `output`), not a name",
         },
     },
     // Operational, and refused because the record names the resolved output preset,
@@ -358,7 +353,7 @@ const KEPT_FLAGS: &[KeptEntry] = &[
     KeptEntry {
         covers: &["--export-ir"],
         why: "the IR plane is written from the decoded image after the render, at the \
-              destination's depth — u16 for the one destination the new flow has",
+              destination's depth — u16, or f32 for a float TIFF destination",
     },
     KeptEntry {
         covers: &["--measure-inset"],
@@ -420,6 +415,17 @@ const KEPT_FLAGS: &[KeptEntry] = &[
               reads",
     },
     KeptEntry {
+        covers: &[
+            "--range",
+            "--transfer",
+            "--gamut",
+            "--container",
+            "--film-master",
+        ],
+        why: "the destination (recipe `output`, `crate::destination`) — four separate \
+              knobs and the film master, new-flow only",
+    },
+    KeptEntry {
         covers: &["--anchor-mid-offset"],
         why: "the fixed decode's anchor (recipe `reconstruction.anchor`), `mid-at-base-offset`'s \
               `d`: every conversion knob is a flag and a recipe key, and \
@@ -438,10 +444,86 @@ pub fn reject_unavailable_flags(flow: Flow, args: &ConvertArgs) -> Result<()> {
     }
     for entry in FLAG_ENTRIES {
         if (entry.present)(args) {
-            return Err(refusal(entry.knob, entry.availability));
+            let err = refusal(entry.knob, entry.availability);
+            return Err(match output_preset_counterpart(args) {
+                Some(detail) if entry.knob == "--output-preset" => {
+                    NcError::Usage(format!("{} {detail}", err.message()))
+                }
+                _ => err,
+            });
         }
     }
     Ok(())
+}
+
+/// What the new chain offers for a stated `--output-preset`, as a sentence — `None` when
+/// the value is not a preset name (the table's general sentence then stands alone).
+fn output_preset_counterpart(args: &ConvertArgs) -> Option<String> {
+    let name = args.output_opts.output_preset.as_deref()?;
+    let preset = crate::types::OutputPreset::parse(name).ok()?;
+    Some(match counterpart(preset) {
+        Counterpart::Flags(flags) => format!("For `{}`, pass {flags}.", preset.name()),
+        Counterpart::Default => format!(
+            "`{}` is the new flow's default destination, so drop the flag.",
+            preset.name()
+        ),
+        Counterpart::NotYet { flags, instead }
+        | Counterpart::Unnamed {
+            what: flags,
+            instead,
+        } => {
+            format!(
+                "`{}`'s counterpart, {flags}, is not written yet; {instead}.",
+                preset.name()
+            )
+        }
+    })
+}
+
+/// The new chain's counterpart of a current-chain output preset.
+#[derive(Debug)]
+enum Counterpart {
+    /// These flags write the same kind of file.
+    Flags(&'static str),
+    /// The default destination is the counterpart: no flag needed.
+    Default,
+    /// Planned but not written yet; `instead` names what is.
+    NotYet {
+        flags: &'static str,
+        instead: &'static str,
+    },
+    /// Planned, but no axis value names it yet, so `what` is prose rather than flags;
+    /// `instead` names what is written. `counterparts_resolve` holds that no axis spells
+    /// it, so the variant moves to [`Counterpart::NotYet`] when one does.
+    Unnamed {
+        what: &'static str,
+        instead: &'static str,
+    },
+}
+
+/// Scaffolding with the rest of this module: the output presets retire with the current
+/// chain. `counterparts_resolve` holds each named flag set to a destination that is
+/// written, or to one that is refused as not yet.
+fn counterpart(preset: crate::types::OutputPreset) -> Counterpart {
+    use crate::types::OutputPreset as P;
+    match preset {
+        P::DisplayP3 => Counterpart::Default,
+        P::FilmMaster => Counterpart::Flags("--film-master"),
+        P::HdrLinearTiff => Counterpart::Flags("--transfer linear"),
+        P::HdrPqTiff => Counterpart::Flags("--transfer pq"),
+        P::HdrHlgTiff => Counterpart::Flags("--transfer hlg"),
+        P::HdrPq => Counterpart::Flags("--transfer pq --container avif"),
+        P::HdrHlg => Counterpart::Flags("--transfer hlg --container avif"),
+        P::GainMapHdr | P::UltraHdrV1 => Counterpart::NotYet {
+            flags: "--range hdr --container jpeg",
+            instead: "the HDR destinations written today are --transfer linear, pq or hlg",
+        },
+        P::Compatibility => Counterpart::Unnamed {
+            what: "an sRGB gamut",
+            instead: "the SDR destinations written today are --gamut display-p3 (the \
+                      default) and --gamut adobe-rgb",
+        },
+    }
 }
 
 /// A flag only the new chain reads, refused on the current one.
@@ -461,6 +543,20 @@ struct NewFlowOnlyEntry {
 /// complete: every kept flag either moves the current chain's resolved config or has a
 /// row here.
 const NEW_FLOW_ONLY_FLAGS: &[NewFlowOnlyEntry] = &[
+    NewFlowOnlyEntry {
+        covers: &[
+            "--range",
+            "--transfer",
+            "--gamut",
+            "--container",
+            "--film-master",
+        ],
+        present: |args| args.destination.any(),
+        message: "the destination flags (--range, --transfer, --gamut, --container, \
+                  --film-master) choose the new chain's destination (recipe `output`) and \
+                  have no meaning without `--new-flow`; the current chain's is \
+                  --output-preset",
+    },
     NewFlowOnlyEntry {
         covers: &["--exposure"],
         present: |args| args.scene.exposure.is_some(),
@@ -831,12 +927,34 @@ mod tests {
                 &["--highlight-desaturation-band", "0.01,0.03"],
                 |r| r.look.highlight_desaturation.band == [0.01, 0.03],
             ),
+            ("--range", &["--range", "hdr"], |r| {
+                r.output == display(|a| a.range = Some(crate::destination::Range::Hdr))
+            }),
+            ("--transfer", &["--transfer", "pq"], |r| {
+                r.output == display(|a| a.transfer = Some(crate::destination::Transfer::Pq))
+            }),
+            ("--gamut", &["--gamut", "adobe-rgb"], |r| {
+                r.output == display(|a| a.gamut = Some(crate::destination::Gamut::AdobeRgb))
+            }),
+            ("--container", &["--container", "avif"], |r| {
+                r.output == display(|a| a.container = Some(crate::destination::Container::Avif))
+            }),
+            ("--film-master", &["--film-master"], |r| {
+                r.output == crate::destination::OutputSection::FilmMaster
+            }),
             (
                 "--display-tone-headroom",
                 &["--display-tone-headroom", "4"],
                 |r| r.fit_range.headroom_stops == 4.0,
             ),
         ]
+    }
+
+    /// A rendered destination with the axes `set` states.
+    fn display(set: fn(&mut crate::destination::DisplayAxes)) -> crate::destination::OutputSection {
+        let mut axes = crate::destination::DisplayAxes::default();
+        set(&mut axes);
+        crate::destination::OutputSection::Display(axes)
     }
 
     /// Parse `convert` with `extra` appended, with or without `--new-flow`.
@@ -958,5 +1076,60 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), knobs.len(), "duplicate knob in FLAG_ENTRIES");
+    }
+
+    /// A counterpart's flags as the destination they state: `--film-master`, or axes.
+    fn stated(flags: &str) -> Option<crate::destination::DisplayAxes> {
+        use crate::destination::{Container, Gamut, Range, Transfer, parse};
+        let words: Vec<&str> = flags.split_whitespace().collect();
+        if words == ["--film-master"] {
+            return None;
+        }
+        let mut axes = crate::destination::DisplayAxes::default();
+        for pair in words.chunks(2) {
+            let [flag, value] = pair else {
+                panic!("`{flags}`: a flag without a value")
+            };
+            match *flag {
+                "--range" => axes.range = Some(parse::<Range>(value).unwrap()),
+                "--transfer" => axes.transfer = Some(parse::<Transfer>(value).unwrap()),
+                "--gamut" => axes.gamut = Some(parse::<Gamut>(value).unwrap()),
+                "--container" => axes.container = Some(parse::<Container>(value).unwrap()),
+                other => panic!("`{flags}`: {other} is not a destination flag"),
+            }
+        }
+        Some(axes)
+    }
+
+    #[test]
+    fn counterparts_resolve() {
+        use crate::destination::{Fault, Gamut, parse, resolve};
+        for preset in crate::types::OutputPreset::ALL {
+            match counterpart(preset) {
+                Counterpart::Default => {
+                    resolve(&Default::default()).unwrap();
+                }
+                Counterpart::Flags(flags) => {
+                    if let Some(axes) = stated(flags) {
+                        let r = resolve(&axes);
+                        assert!(r.is_ok(), "{preset:?}: `{flags}` must be written: {r:?}");
+                    }
+                }
+                Counterpart::NotYet { flags, .. } => {
+                    let axes = stated(flags).expect("the film master is written");
+                    let r = resolve(&axes);
+                    assert!(
+                        matches!(r, Err(Fault::NotYet { .. })),
+                        "{preset:?}: `{flags}` must name a planned row: {r:?}"
+                    );
+                }
+                // Prose because no axis spells it: when a gamut does, this fails and
+                // the counterpart becomes flags.
+                Counterpart::Unnamed { what, .. } => {
+                    assert_eq!(what, "an sRGB gamut", "{preset:?}");
+                    assert!(parse::<Gamut>("srgb").is_err(), "{preset:?}");
+                }
+            }
+        }
     }
 }

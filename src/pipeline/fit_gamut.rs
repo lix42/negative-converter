@@ -31,7 +31,8 @@ use std::fmt;
 
 use crate::pipeline::colorimetry::dot;
 use crate::pipeline::colorimetry::pinned::{
-    ACESCG_TO_ADOBE_RGB, ACESCG_TO_DISPLAY_P3, ADOBE_RGB_LUMA, DISPLAY_P3_LUMA,
+    ACESCG_TO_ADOBE_RGB, ACESCG_TO_BT2020, ACESCG_TO_DISPLAY_P3, ADOBE_RGB_LUMA, BT2020_LUMA,
+    DISPLAY_P3_LUMA,
 };
 use crate::pipeline::fit_range::RangeFittedImage;
 use crate::pipeline::pixels;
@@ -44,7 +45,7 @@ use crate::types::{LinearImage, NcError, Result};
 /// into ends at the display's peak. A scene-referred or unbounded working space
 /// (ACEScg, ProPhoto as nc used it) does not qualify, however often editors use it;
 /// `film-master` is the output for those. **Which destination renders into which gamut
-/// is `nf-destinations/preset-set`'s**, not this type's. An enum rather than a matrix
+/// is the destination table's** (`crate::destination::ROWS`), not this type's. An enum rather than a matrix
 /// field so the value can travel with the image to the encoder, which reads it off
 /// [`DisplayReferredImage`] instead of re-deriving it from a preset.
 ///
@@ -60,9 +61,11 @@ pub enum DestinationGamut {
     /// green. It qualifies as a display encoding (bounded at white, a fixed transfer);
     /// that editors expect it is why `nf-destinations/direct-preset` wants it, not
     /// why it belongs here.
-    // Constructed only by tests until `nf-destinations/direct-preset` selects it.
-    #[cfg_attr(not(test), allow(dead_code))]
     AdobeRgb,
+    /// ITU-R BT.2020 primaries, D65 white — the gamut of the Rec.2100 HDR signals (PQ,
+    /// HLG) and of the linear HDR interchange TIFF. Encoded only by the HDR encoders:
+    /// no SDR destination renders into it.
+    Bt2020,
 }
 
 impl DestinationGamut {
@@ -71,6 +74,7 @@ impl DestinationGamut {
         match self {
             DestinationGamut::DisplayP3 => ACESCG_TO_DISPLAY_P3,
             DestinationGamut::AdobeRgb => ACESCG_TO_ADOBE_RGB,
+            DestinationGamut::Bt2020 => ACESCG_TO_BT2020,
         }
     }
 
@@ -80,6 +84,7 @@ impl DestinationGamut {
         match self {
             DestinationGamut::DisplayP3 => DISPLAY_P3_LUMA,
             DestinationGamut::AdobeRgb => ADOBE_RGB_LUMA,
+            DestinationGamut::Bt2020 => BT2020_LUMA,
         }
     }
 
@@ -88,6 +93,7 @@ impl DestinationGamut {
         match self {
             DestinationGamut::DisplayP3 => "display-p3",
             DestinationGamut::AdobeRgb => "adobe-rgb",
+            DestinationGamut::Bt2020 => "bt2020",
         }
     }
 }
@@ -110,6 +116,7 @@ impl FitGamutParams {
             DestinationGamut::AdobeRgb => {
                 "acescg-to-adobe-rgb-matrix+neutral-axis-radial-boundary-v2"
             }
+            DestinationGamut::Bt2020 => "acescg-to-bt2020-matrix+neutral-axis-radial-boundary-v2",
         }
     }
 }
@@ -274,6 +281,7 @@ mod tests {
         let m = match gamut {
             DestinationGamut::DisplayP3 => ACESCG_TO_DISPLAY_P3,
             DestinationGamut::AdobeRgb => ACESCG_TO_ADOBE_RGB,
+            DestinationGamut::Bt2020 => ACESCG_TO_BT2020,
         };
         let pre_map = aces
             .as_chunks::<3>()

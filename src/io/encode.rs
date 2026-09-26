@@ -71,7 +71,7 @@ pub fn encode(
     })
 }
 
-/// Encode `image` as a 16-bit integer TIFF — the new flow's destination encode.
+/// Encode `image` as a 16-bit integer TIFF — the new flow's SDR destination encode.
 ///
 /// The same writer [`encode`] drives, reached without an [`OutputParams`]: that type
 /// resolves depth from the current chain's output preset, a section the new flow
@@ -84,18 +84,37 @@ pub fn encode_u16(
     icc: &[u8],
     path: &Path,
 ) -> Result<(Staged, EncodeOutcome, bool)> {
+    encode_at(image, OutDepth::U16, icc, path)
+}
+
+/// Encode `image` as an unclamped 32-bit float TIFF — the new flow's film master. As
+/// [`encode_u16`], at the depth that writes the working buffer verbatim.
+pub fn encode_f32(
+    image: &LinearImage,
+    icc: &[u8],
+    path: &Path,
+) -> Result<(Staged, EncodeOutcome, bool)> {
+    encode_at(image, OutDepth::F32, icc, path)
+}
+
+fn encode_at(
+    image: &LinearImage,
+    depth: OutDepth,
+    icc: &[u8],
+    path: &Path,
+) -> Result<(Staged, EncodeOutcome, bool)> {
     let big = resolve_bigtiff(
         BigTiff::Auto,
         image.width,
         image.height,
         3,
-        depth_bytes(OutDepth::U16),
+        depth_bytes(depth),
         icc.len() as u64,
     );
     // The writer is handed the decision itself, so it cannot re-derive a different one.
     let policy = if big { BigTiff::On } else { BigTiff::Off };
     let (staged, outcome) = staged::stage(path, |writer| {
-        encode_to_writer(writer, image, OutDepth::U16, policy, Some(icc))
+        encode_to_writer(writer, image, depth, policy, Some(icc))
     })?;
     Ok((staged, outcome, big))
 }

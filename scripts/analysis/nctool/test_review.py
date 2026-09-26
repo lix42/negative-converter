@@ -53,6 +53,39 @@ class TestMatrix(unittest.TestCase):
         self.assertEqual([c["id"] for c in matrix["configs"]], ["generic", "stock"])
         self.assertEqual(matrix["suffix"], "jpg")
 
+    def test_a_destination_matrix_renders_the_new_chain(self):
+        destination = {"display": {"range": "hdr", "transfer": "linear",
+                                   "gamut": "bt2020", "container": "tiff"}}
+        matrix = review.load_matrix(write({
+            **{k: v for k, v in MATRIX.items() if k != "output_preset"},
+            "destination": destination}))
+        self.assertEqual(matrix["suffix"], "tiff")
+        self.assertEqual(matrix["render_args"],
+                         ["--new-flow", "--range", "hdr", "--transfer", "linear",
+                          "--gamut", "bt2020", "--container", "tiff"])
+        self.assertEqual(review.destination_metrics_space(destination)[0], "linear-bt2020")
+        # The cell is measured only when nc reports the destination the matrix asked for.
+        report = {"new_flow": {"destination": destination}}
+        self.assertEqual(review.destination_cell_space(report, destination)[0],
+                         "linear-bt2020")
+        other = {"new_flow": {"destination": "film-master"}}
+        self.assertIsNone(review.destination_cell_space(other, destination)[0])
+        master = review.load_matrix(write({
+            **{k: v for k, v in MATRIX.items() if k != "output_preset"},
+            "destination": "film-master"}))
+        self.assertEqual(master["render_args"], ["--new-flow", "--film-master"])
+
+    def test_a_matrix_states_one_output_target(self):
+        with self.assertRaisesRegex(review.ReviewError, "exactly one of"):
+            load(destination="film-master")
+        with self.assertRaisesRegex(review.ReviewError, "destination.display.container"):
+            review.load_matrix(write({
+                **{k: v for k, v in MATRIX.items() if k != "output_preset"},
+                "destination": {"display": {"range": "sdr", "transfer": "native",
+                                            "gamut": "display-p3"}}}))
+        with self.assertRaisesRegex(review.ReviewError, "state it once as destination"):
+            load(common_args=["--new-flow"])
+
     def test_refuses_an_unknown_output_preset(self):
         with self.assertRaisesRegex(review.ReviewError, "unknown output_preset"):
             load(output_preset="gain-map-hrd")

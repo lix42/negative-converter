@@ -19,9 +19,10 @@ grid cell per (frame, config) — a genuine second axis would mean a second togg
 Five properties worth keeping:
 
 * **Every config renders through the path being measured.** The matrix states one
-  `output_preset` for the whole set, and both the file suffix and the colour space
-  the metrics are read in come from *that name* rather than from a guess about the
-  bytes.
+  `output_preset` for the whole set — or, for the new chain (`--new-flow`), one
+  `destination`: the recipe `output` value with every axis stated, or
+  `"film-master"` — and both the file suffix and the colour space the metrics are
+  read in come from *that* rather than from a guess about the bytes.
 * **A build's provenance is derived, never declared.** The matrix supplies a short
   name; the identity under it is read back off each render. A name a human typed is
   a claim, and a wrong claim about which binary made a cell is the one failure a
@@ -118,7 +119,13 @@ def check_id(value: str, what: str, at: str) -> str:
 #: stdout, which is where the generator reads each cell's resolved recipe from —
 #: so a matrix passing it would lose the measurement on every cell that rendered
 #: perfectly well, and every cell would overwrite the same report path.
-OWNED_FLAGS = ("--output-preset", "-o", "--output", "--report", "--report-file")
+OWNED_FLAGS = ("--output-preset", "-o", "--output", "--report", "--report-file",
+               # A `destination` matrix supplies these; a preset matrix cannot use them.
+               "--new-flow", "--range", "--transfer", "--gamut", "--container",
+               "--film-master")
+
+#: Suffix per new-chain container, mirroring `destination::Container::canonical`.
+CONTAINER_SUFFIX: dict[str, str] = {"tiff": "tiff", "jpeg": "jpg", "avif": "avif"}
 
 #: Placeholders a config's `args` may use, resolved per frame.
 #:
@@ -402,7 +409,43 @@ def reject_owned_flags(args: list[str], at: str) -> None:
         if name in OWNED_FLAGS:
             raise ReviewError(
                 f"{at}: {name} is set by the generator, not by the matrix"
-                + (" — state it once as output_preset" if name == "--output-preset" else ""))
+                + (" — state it once as output_preset" if name == "--output-preset" else "")
+                + (" — state it once as destination"
+                   if name in ("--new-flow", "--range", "--transfer", "--gamut",
+                               "--container", "--film-master") else ""))
+
+
+def destination_render(destination: object) -> tuple[str, list[str]]:
+    """A matrix `destination`'s file suffix and the flags that render it.
+
+    Every axis must be stated, so the suffix and the colour space are read off the
+    matrix rather than off a copy of nc's derivation.
+    """
+    if destination == "film-master":
+        return "tiff", ["--new-flow", "--film-master"]
+    display = destination.get("display") if isinstance(destination, dict) else None
+    if not isinstance(display, dict) or set(destination) != {"display"}:
+        raise ReviewError(
+            'destination must be "film-master" or {"display": {range, transfer, gamut, '
+            f"container}}}}, got {destination!r}")
+    _known_keys(display, set(_metrics.DESTINATION_AXES), "destination.display")
+    args = ["--new-flow"]
+    for axis in _metrics.DESTINATION_AXES:
+        value = _string(display.get(axis), f"destination.display.{axis}")
+        args += [f"--{axis}", value]
+    container = display["container"]
+    if container not in CONTAINER_SUFFIX:
+        known = ", ".join(sorted(CONTAINER_SUFFIX))
+        raise ReviewError(f"unknown destination container {container!r}; known: {known}")
+    return CONTAINER_SUFFIX[container], args
+
+
+def destination_label(destination: object) -> str:
+    """A destination as messages name it."""
+    if destination == "film-master":
+        return "film-master"
+    display = destination["display"]
+    return "/".join(display[axis] for axis in _metrics.DESTINATION_AXES)
 
 
 def expand_args(args: list[str], values: dict[str, str]) -> list[str]:
@@ -423,17 +466,31 @@ def load_matrix(path: Path) -> dict:
     """
     raw = _load_object(path, "matrix")
     _known_keys(raw, {"schema_version", "title", "description", "output_dir",
-                      "output_preset", "common_args", "rolls", "frames", "metrics",
-                      "builds", "configs"}, str(path))
+                      "output_preset", "destination", "common_args", "rolls", "frames",
+                      "metrics", "builds", "configs"}, str(path))
     version = raw.get("schema_version")
     if version != SCHEMA:
         raise ReviewError(
             f"{path}: schema_version must be {SCHEMA}, got {version!r}")
 
-    preset = _string(raw.get("output_preset"), "output_preset")
-    if preset not in PRESET_SUFFIX:
-        known = ", ".join(sorted(PRESET_SUFFIX))
-        raise ReviewError(f"unknown output_preset {preset!r}; known: {known}")
+    if ("output_preset" in raw) == ("destination" in raw):
+        raise ReviewError(
+            "state exactly one of output_preset (the current chain) or destination "
+            "(the new chain, --new-flow)")
+    if "destination" in raw:
+        preset = None
+        destination = raw["destination"]
+        suffix, render_args = destination_render(destination)
+        target = destination_label(destination)
+    else:
+        preset = _string(raw.get("output_preset"), "output_preset")
+        if preset not in PRESET_SUFFIX:
+            known = ", ".join(sorted(PRESET_SUFFIX))
+            raise ReviewError(f"unknown output_preset {preset!r}; known: {known}")
+        destination = None
+        suffix = PRESET_SUFFIX[preset]
+        render_args = ["--output-preset", preset]
+        target = preset
 
     common = _string_list(raw.get("common_args", []), "common_args")
     placeholders_in(common, "common_args")
@@ -494,7 +551,11 @@ def load_matrix(path: Path) -> dict:
         "title": _optional_string(raw.get("title"), "title"),
         "description": _optional_string(raw.get("description"), "description"),
         "output_preset": preset,
-        "suffix": PRESET_SUFFIX[preset],
+        "destination": destination,
+        "suffix": suffix,
+        # What the generator appends to every render, and how messages name it.
+        "render_args": render_args,
+        "target": target,
         "common_args": common,
         "builds": builds,
         # **Expanded, not declared.** Everything downstream — the collision check,
@@ -523,6 +584,27 @@ def metrics_space(preset: str) -> tuple[str | None, str]:
     if space is None:
         return None, f"no verified colour space for {preset}"
     return space, ""
+
+
+def destination_metrics_space(destination: object) -> tuple[str | None, str]:
+    """`metrics_space` for a new-chain destination matrix."""
+    try:
+        space, _why = _metrics.space_for_destination(destination)
+    except _metrics.MetricsError as error:
+        return None, str(error)
+    return space, ""
+
+
+def destination_cell_space(report: dict, expected: object) -> tuple[str | None, str]:
+    """`cell_space` for a new-chain cell: from the destination nc **reports** it
+    resolved (`new_flow.destination`), which must be the one the matrix asked for."""
+    new_flow = report.get("new_flow") if isinstance(report.get("new_flow"), dict) else {}
+    resolved = new_flow.get("destination")
+    if resolved != expected:
+        return None, (
+            f"the render reports destination {resolved!r}, not the matrix's "
+            f"{expected!r}; not measuring pixels this run cannot identify")
+    return destination_metrics_space(resolved)
 
 
 def cell_space(recipe: dict, expected_preset: str) -> tuple[str | None, str]:
@@ -1096,7 +1178,9 @@ def cmd_generate(args) -> int:
     for warning in duplicate_binary_warnings(builds):
         print(f"note: {warning}", file=sys.stderr)
 
-    readable, why_not = metrics_space(matrix["output_preset"])
+    readable, why_not = (metrics_space(matrix["output_preset"])
+                         if matrix["destination"] is None
+                         else destination_metrics_space(matrix["destination"]))
     measuring = readable is not None and not args.no_metrics
     if readable is None and not args.no_metrics:
         print(f"note: no metrics — {why_not}", file=sys.stderr)
@@ -1113,7 +1197,7 @@ def cmd_generate(args) -> int:
             measuring = False
 
     if matrix["suffix"] not in ("jpg", "avif"):
-        print(f"note: {matrix['output_preset']} writes {matrix['suffix'].upper()}, which most "
+        print(f"note: {matrix['target']} writes {matrix['suffix'].upper()}, which most "
               "browsers do not display in an <img> (Safari does); the set will render but "
               "most of it will show as broken images", file=sys.stderr)
 
@@ -1173,7 +1257,7 @@ def cmd_generate(args) -> int:
             try:
                 report = _render(Path(build["nc"]), source, dest,
                                  expand_args(matrix["common_args"] + config["args"], values)
-                                 + ["--output-preset", matrix["output_preset"]])
+                                 + matrix["render_args"])
             except ReviewError as error:
                 print(f"{cell}: {error}", file=sys.stderr)
                 failures.append(cell)
@@ -1187,7 +1271,10 @@ def cmd_generate(args) -> int:
             if measuring:
                 # The space this cell is measured in comes from the recipe `nc`
                 # reports it resolved — provenance, not the matrix's preset name.
-                space, why = cell_space(report.get("recipe", {}), matrix["output_preset"])
+                space, why = (
+                    cell_space(report.get("recipe", {}), matrix["output_preset"])
+                    if matrix["destination"] is None
+                    else destination_cell_space(report, matrix["destination"]))
                 record_path = dest.with_name(dest.name + ".metrics.json")
                 if space is None:
                     print(f"{cell}: metrics skipped — {why}", file=sys.stderr)
