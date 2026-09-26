@@ -249,8 +249,8 @@ not settle; today all of them are flags and recipe keys.
 | Method | Role |
 |---|---|
 | exponential (≡ sigmoid with `toe = shoulder = 0` at the same anchor, bit-exact) | **Default candidate.** A straight line in density against log exposure, with the toe passed through as recorded. |
-| `generic-c41` characteristic | **Alternative candidate** for the fixed decode. It is stock-agnostic but inverts an averaged toe. Needs a comparison against the exponential, or a toe-limited form. |
-| per-stock `characteristic` | **Leaves reconstruction** and becomes an optional per-stock normalization in rendering. |
+| `generic-c41` characteristic | **Alternative candidate** for the fixed decode. It is stock-agnostic but inverts an averaged toe. Needs a comparison against the exponential, or a toe-limited form. (The curve retired in `nf-retire/characteristic`; the reference build still renders it.) |
+| per-stock `characteristic` | **Leaves reconstruction** and becomes an optional per-stock normalization in rendering. **Left** in `nf-retire/characteristic`; the normalization is planned, not built. |
 | sigmoid with toe/shoulder | **Leaves reconstruction:** a decode with a rendering fused on top. Kept for now as the **visual reference** for the migration (see below). Retired from the product later. |
 | `simple` | **Remove.** `1 − T/T_base` is an affine inversion, not a decode of anything a print sees. |
 
@@ -673,10 +673,9 @@ This is the preset that makes Adobe RGB a must-have output (Part 2 decisions).
 f32 TIFF with an ACEScg profile. It runs no rendering stage at all, so it is the
 artifact on which a reconstruction is measured. Caveats:
 
-- **It contains whatever reconstruction was configured.** Today's default is the
-  knee'd sigmoid, so the intended decode must be named explicitly. `--preset
-  characteristic-generic` is refused on `film-master`, because it also sets
-  rendering knobs.
+- **It contains whatever reconstruction was configured.** Since `pipeline_version` 6
+  the default is the exponential at the fixed decode's configuration, and since
+  `nf-retire/characteristic` it is the only curve.
 - **The 3×3 treats the dye-layer channels as Rec.709.** Neutrality checks
   survive, since white maps to white. Per-layer slope measurements get slightly
   mixed. The cleanest measurement point is `FilmRgbImage`, before the matrix,

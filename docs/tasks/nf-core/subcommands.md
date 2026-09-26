@@ -11,8 +11,8 @@ nothing in the plan owns them.
 - **`roll` resolves defaults by hand, and a new decode reopens that trap.** Its
   planner merges the per-frame overlay onto the **serialized** shared config, so
   every key is present and deserialize-time resolution cannot fire — which is why
-  `density.scale` is re-resolved there in code, the third `default_scale_for` site.
-  Any new-flow default that keys off a key's *presence* breaks there silently, on a
+  `density.scale` used to be re-resolved there in code, per curve, until
+  `nf-retire/characteristic` left one curve and one default. Any new-flow default that keys off a key's *presence* breaks there silently, on a
   whole roll rather than one frame.
 - **Roll's per-frame recipe** (`nf-core/recipe-schema`, 2026-09-22): each `--new-flow`
   overlay is merged onto the serialized new `Recipe`, checked, and carried on

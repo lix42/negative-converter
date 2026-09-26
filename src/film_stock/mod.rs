@@ -8,55 +8,35 @@
 //! `scripts/analysis/digitize_datasheets.py` (see that directory's README for the
 //! pipeline). Nothing here transforms a pixel.
 //!
-//! Two consumers, with different lifetimes:
+//! **Test-only: its one consumer is the evidence for the fixed decode's constants.**
+//! The `characteristic` curve that inverted these tables at runtime retired
+//! (`nf-retire/characteristic`); the data outlives it (`nf-look/stock-data-home`) because
+//! `algo::fixed::MID_ABOVE_BASE` is `generic-c41`'s mid aim, and `docs/design-update.md`
+//! Part 1 argues for fixed, stock-agnostic values from these tables' own spread (`d`
+//! 0.542–0.699, red film gamma 0.53–0.61). The tests below are that provenance, checked on
+//! every run — the `pipeline::colorimetry::derive` precedent.
 //!
-//! - **The retiring `characteristic` curve** (`algo::characteristic`), which inverts a
-//!   table per channel — the only runtime reader, and the part
-//!   `nf-retire/characteristic` deletes.
-//! - **The evidence for the fixed decode's constants**, which is why the data outlives
-//!   that curve (`nf-look/stock-data-home`). `algo::fixed::MID_ABOVE_BASE` is
-//!   `generic-c41`'s mid aim, and `docs/design-update.md` Part 1 argues for fixed,
-//!   stock-agnostic values from these tables' own spread (`d` 0.542–0.699, red film
-//!   gamma 0.53–0.61). The tests below are that provenance, checked on every run.
-//!
-//! Once the curve retires, this module has no runtime consumer and should become
-//! `#[cfg(test)]` — the `pipeline::colorimetry::derive` precedent — until **per-stock
-//! normalization** arrives as an optional look control (design-update Part 2), its
-//! natural future reader. It must not come back as a decode: a per-stock value inside
-//! reconstruction is the per-stock normalization the fixed decode exists to refuse.
+//! Its natural future runtime reader is **per-stock normalization**, an optional look
+//! control (design-update Part 2), which brings its own flag. It must not come back as a
+//! decode: a per-stock value inside reconstruction is the per-stock normalization the
+//! fixed decode exists to refuse.
 //!
 //! No render path reads a sheet's published `D-min` (`algo/film-stock-profiles`,
 //! Constraint 1): the measured roll base stays authoritative.
 
 pub mod curves;
 
-use serde::{Deserialize, Serialize};
-
 use curves::{STOCKS, StockCurves};
 
 /// A film stock with a digitized characteristic curve — the registry's key.
 ///
-/// Recipe vocabulary (`reconstruction.curve.stock`, `--film-stock`) only while the
-/// `characteristic` curve exists; `types` re-exports it for that. `--film-stock` leaves
-/// with the curve, and per-stock normalization will bring its own flag
-/// (`nf-look/stock-data-home`).
+/// No longer recipe or CLI vocabulary: `--film-stock` and `reconstruction.curve.stock`
+/// left with the `characteristic` curve, and per-stock normalization will bring its own
+/// flag. A future wire spelling must be [`FilmStock::as_str`], not a serde rename —
+/// `kebab-case` turns `Portra400` into `portra400`, which is not the curve-table key.
 ///
-/// One enum field rather than parallel options, per the project rule for mutually
-/// exclusive knobs. **Naming a stock is a refinement, never a precondition**: an unnamed
-/// stock resolves to [`Self::GenericC41`], which is the average of the nine measured
-/// stocks and renders correctly on any of them. A stock that is *named but unknown* is a
-/// loud usage error listing the accepted spellings — silently falling back would hide a
-/// typo behind a plausible render.
-///
-/// The variants are exactly the entries in [`curves::STOCKS`]; a test
-/// pins that correspondence, because a variant with no table would panic at render time.
-///
-/// `Serialize`/`Deserialize` are written by hand against [`FilmStock::as_str`] and
-/// [`FilmStock::parse`] rather than derived: serde's `kebab-case` renames `Portra400` to
-/// `portra400` (it splits on case boundaries, and there is none before a digit), which
-/// would give the recipe a *different* spelling from the CLI flag and the curve-table key.
-/// An emitted recipe would then fail to load back — the round-trip nc's determinism
-/// contract rests on. One spelling, one function.
+/// The variants are exactly the entries in [`curves::STOCKS`]; a test pins that
+/// correspondence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FilmStock {
     /// The average of the nine measured stocks (ten ship; this one is derived) — red
@@ -99,8 +79,7 @@ impl FilmStock {
         FilmStock::Ultramax800,
     ];
 
-    /// The wire spelling — the recipe value, the CLI value, and the key into the pinned
-    /// curve table, which is why it is one function rather than three.
+    /// The stock's name — the key into the pinned curve table.
     pub fn as_str(self) -> &'static str {
         match self {
             FilmStock::GenericC41 => "generic-c41",
@@ -115,44 +94,12 @@ impl FilmStock {
             FilmStock::Ultramax800 => "ultramax-800",
         }
     }
-
-    /// Parse a CLI/recipe spelling, listing the accepted names on failure.
-    pub fn parse(name: &str) -> std::result::Result<Self, String> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|s| s.as_str() == name)
-            .ok_or_else(|| {
-                format!(
-                    "unknown film stock `{name}` (accepted: {})",
-                    Self::ALL
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-    }
-}
-
-impl Serialize for FilmStock {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for FilmStock {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        let name = String::deserialize(d)?;
-        FilmStock::parse(&name).map_err(serde::de::Error::custom)
-    }
 }
 
 /// The curve set for a resolved stock.
 ///
 /// Infallible: [`FilmStock`] is an enum whose every variant is generated alongside the
-/// table, and `stocks_cover_every_film_stock_variant` pins that. An unknown *name* is
-/// rejected at the CLI boundary, where the error can list the accepted spellings.
+/// table, and `stocks_cover_every_film_stock_variant` pins that.
 pub fn curves_for(stock: FilmStock) -> &'static StockCurves {
     let name = stock.as_str();
     STOCKS
@@ -164,9 +111,7 @@ pub fn curves_for(stock: FilmStock) -> &'static StockCurves {
 /// Decades between an 18 % grey card and a ~89 % paper white — `log10(0.89 / 0.18)`.
 ///
 /// The interval the *Judging Negative Exposures* aim pair spans, and therefore the
-/// interval any comparison against the curve has to use. Shared by
-/// `algo::characteristic::aim_red_scale` and the sheet-consistency test rather than restated: they are the
-/// same measurement read two ways, and a divergence between them would be invisible.
+/// interval any comparison against the curve has to use.
 pub(crate) const AIM_SEPARATION_DECADES: f32 = 0.694;
 
 /// The sheets whose two published halves disagree by too much for the aim table to
@@ -183,8 +128,7 @@ const NO_USABLE_AIM_DELTA: &[&str] = &["portra-800", "ultramax-800"];
 impl StockCurves {
     /// Density on one channel's published curve at relative log exposure `x`, linearly
     /// interpolated between table points and extrapolated from the end segment outside
-    /// them — the forward direction of `algo::characteristic::invert`, and the only reading
-    /// of a table that survives the curve's retirement.
+    /// them — the forward reading of a table.
     pub(crate) fn density_at(&self, channel: usize, x: f32) -> f32 {
         let t = self.channels[channel];
         let i = t.partition_point(|p| p.0 <= x).clamp(1, t.len() - 1);
@@ -225,8 +169,7 @@ pub(crate) const STOCK_MID_ABOVE_BASE: &[(&str, f32)] = &[
     ("ultramax-800", 0.542),
 ];
 
-// Every test here reads the tables **forward** (`density_at`), never through the
-// inversion, so the evidence survives `nf-retire/characteristic` deleting it.
+// Every test here reads the tables **forward** (`density_at`).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,8 +323,7 @@ mod tests {
     /// The invariants `curves` promises and anything reading a table relies on:
     /// **strictly increasing** in both coordinates (so the curve is single-valued either
     /// way), a **first point at `D′ = 0`** (the film base), and enough points to
-    /// interpolate — the same floor `algo::characteristic::check_tables` keeps, restated so
-    /// it survives that module.
+    /// interpolate.
     #[test]
     fn every_table_rises_strictly_from_the_base() {
         for sc in STOCKS {

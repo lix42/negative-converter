@@ -158,9 +158,9 @@ Read the module docs before changing these; they hold the traps.
 | output paths, suffixes, preset → container | `cli::resolve_output_path`, `container_for`, `Unappendable` |
 | knob merge, validation order, removed keys | `cli::merge`, `validate`, `validate_convert`, `validate_output_preset`, `strip_retired_keys_at_old_defaults` |
 | new-flow flags and recipe | `src/flow.rs`, `src/recipe.rs` |
-| reconstruction, density scale, anchors | `types.rs` (`DensityParams::default_scale_for`, `AnchorPlacement`), `algo/fixed.rs` |
+| reconstruction, density scale, anchors | `types.rs` (`DensityParams`, `ExponentialParams`, `AnchorPlacement`), `algo/fixed.rs` |
 | film base, IR holder mask, measurement region | `pipeline/film_base.rs` |
-| film-stock data and the retiring characteristic curve | `film_stock/` (evidence for the decode's constants; `docs/datasheets/`), `algo/characteristic.rs` |
+| film-stock data | `film_stock/` (test-only: evidence for the decode's constants; `docs/datasheets/`) |
 | display tone, SDR/HDR bounds | `pipeline/display_tone.rs`, `sdr.rs`, `hdr.rs`, `render_split.rs`; the new chain's SDR/HDR branch contract in `pipeline/chain.rs` |
 | gain map, Ultra HDR / ISO 21496-1 container | `pipeline/gain_map.rs` (legacy), `pipeline/gain_ratio.rs` (the new chain's per-channel gain), `gain_map/iso.rs`, `io/ultra_hdr.rs`, `scripts/iso-decoder-oracle/`, `Cargo.toml` (`ultrahdr-sys`'s `jpeg-max-dimension`) |
 | AVIF / libaom | `io/avif.rs`, `Cargo.toml` comments |
@@ -168,7 +168,7 @@ Read the module docs before changing these; they hold the traps.
 | memory preflight | `pipeline/memory.rs` |
 | lcms2 transforms and fault handler | `pipeline/color.rs`; `cli.rs`'s `CMS_ERROR` handler, cleared before and checked after each render |
 | goldens, cross-platform bounds, drift gate | `stages::golden`, `pipeline/chain_golden.rs`, `version.rs` (`PipelineFingerprint`) |
-| diagnostic probes | `pipeline/shadow_metrics.rs`, `algo/curve_probe.rs` |
+| diagnostic probes | `pipeline/shadow_metrics.rs` |
 | telemetry | `telemetry.rs`, the `perf-telemetry` skill |
 | build identity (`NC_GIT_*`) | `build.rs` |
 
@@ -238,8 +238,7 @@ committed.
   field (`types.rs`), a `merge` arm with a merge test (a missing arm is a silent
   no-op), and usually a `validate` rule. Flags win over the recipe. Exceptions:
   operational flags (`--report`, `--telemetry*`, `--max-memory`) never change the
-  image and are not recipe keys; `--preset` is a CLI-only expansion; `--new-flow`
-  selects the chain.
+  image and are not recipe keys; `--new-flow` selects the chain.
 - **Recipe shape follows design-spec §9** (every struct is `deny_unknown_fields`).
   Mutually exclusive knobs are one enum field, never parallel `Option`s or bools.
 - **Retiring a recipe key:** strip its old default (every sidecar serializes it),
@@ -271,8 +270,9 @@ committed.
   and lcms2 differ by target (design-spec §8). Pin bit-identity with curated
   per-pixel goldens (`stages::golden`, `chain_golden`); never checksum a full
   frame, an encoded file or post-lcms2 pixels in a cross-platform gate. When a
-  value cannot be pinned exactly, bound it by enumeration (`reachable_window`),
-  never by a rounding-margin argument. One documented exception, to the *exit
+  value cannot be pinned exactly, bound it by enumerating what a conforming libm can
+  return (the retired characteristic golden's `reachable_window`, in git), never by
+  a rounding-margin argument. One documented exception, to the *exit
   status* only: the memory preflight's warn tier compares against detected RAM, so
   under `--strict` the same run can pass on one machine and fail on another
   (`pipeline/memory.rs`) — keep `--strict` tests to small fixtures.

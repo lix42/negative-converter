@@ -103,17 +103,15 @@ const DESTINATION_ARRIVES_WITH: &str = "the new flow's destination set: it rende
 /// The presence tiebreaker: reject a flag when it *forces something the
 /// branch cannot produce*, and leave an identity value alone — but only where a recipe
 /// could have pinned the knob. The new chain's recipe (`crate::recipe`) has no field for
-/// any knob refused here, so an identity value has to earn its acceptance on its own:
-/// `--density-curve exponential` does (it names the curve the decode already is). When
-/// checking which refusals can still fire here, walk the reachable *values*, not the
+/// any knob refused here, so an identity value has to earn its acceptance on its own.
+/// When checking which refusals can still fire here, walk the reachable *values*, not the
 /// knobs: a refused knob's spared identity value is reachable too, and a `merge` refusal
 /// and a row here can otherwise send a user in a circle.
 ///
 /// **How a knob the user never typed is handled**, which this table alone cannot do.
 /// The fixed decode reads its own [`DecodeParams`], which is the new chain's recipe
 /// section `reconstruction` field for field (`nf-core/recipe-schema`), so a recipe
-/// stating the current chain's keys there is refused at load and `--preset` is refused
-/// by presence. Nothing the user *asks for* in the new flow's **reconstruction** is
+/// stating the current chain's keys there is refused at load. Nothing the user *asks for* in the new flow's **reconstruction** is
 /// silently dropped. The rest of the surface is closed by the same schema: it has no
 /// `print` or `output` section, so a recipe stating either is refused by name, and
 /// every flag under them has a row below. The shared sections (`input`,
@@ -155,61 +153,13 @@ const FLAG_ENTRIES: &[FlagEntry] = &[
     // `algo::fixed::DecodeParams` carries — the new chain's recipe section
     // `reconstruction`, into which `crate::recipe::merge` writes them and from which
     // the decode reads.
-    FlagEntry {
-        knob: "--density-curve",
-        covers: &["--density-curve"],
-        // `--density-curve exponential` names the curve this flow already decodes
-        // with, so it forces nothing and stays accepted — the tiebreaker's identity
-        // value. Not to preserve a reset: the new chain's recipe has no curve to pin,
-        // so there is none to preserve. `characteristic` selects a curve the fixed
-        // decode does not have.
-        present: |args| {
-            matches!(
-                args.density_curve,
-                Some(crate::types::DensityCurveType::Characteristic)
-            )
-        },
-        availability: Availability::Never {
-            reason: "reconstruction is one fixed decode for every negative — a straight \
-                     line in density against log exposure — so which curve to use is no \
-                     longer a choice the decode offers",
-            instead: Some("`--density-curve exponential`, which names what it already does"),
-        },
-    },
-    FlagEntry {
-        knob: "--film-stock",
-        covers: &["--film-stock"],
-        present: |args| args.density.film_stock.is_some(),
-        availability: Availability::NotYet {
-            // Planned, not scheduled, and it will choose its own spelling:
-            // `nf-look/stock-data-home` settled that `--film-stock` leaves with the
-            // `characteristic` curve rather than lingering as provenance.
-            arriving_with: "an optional per-stock normalization in the look stage, on top \
-                            of the fixed decode: inverting each stock's own curve returns \
-                            every stock to the same scene contrast, which is a choice about \
-                            how the picture should look rather than a decode of what the \
-                            negative holds",
-        },
-    },
     // The retired anchor placements and reference-density flags have no row: they are
     // removed on both chains (`nf-retire/dmax-machinery`), and `reject_removed_flags`
     // refuses them before this table runs. `--anchor-mid-offset` is absent on purpose
     // too: it *is* the rule's `d`. The regional balance's flags have none either, for
-    // the same reason (`nf-retire/regional-balance`).
-    // A preset sets knobs on **both** sides of the decode/rendering boundary — the
-    // curve, `density.scale`, `print_exposure` — so it cannot be
-    // resolved against a chain whose rendering knobs do not exist yet. It is also the
-    // one conversion flag with no recipe key, which is why it needs a presence row
-    // rather than a value one.
-    FlagEntry {
-        knob: "--preset",
-        covers: &["--preset"],
-        present: |args| args.preset.is_some(),
-        availability: Availability::NotYet {
-            arriving_with: "the look stage's presets, which is where a bundle spanning \
-                            decode and rendering can be defined again (`nf-look/look-presets`)",
-        },
-    },
+    // the same reason (`nf-retire/regional-balance`), and neither do `--density-curve`,
+    // `--film-stock` and `--preset`, removed with the `characteristic` curve
+    // (`nf-retire/characteristic`).
     // --- the print controls (`nf-core/knob-availability-audit`) --------------------
     //
     // The whole `print.*` family, by the same argument the decode settled: a stage
@@ -522,8 +472,7 @@ fn refusal(knob: &str, availability: Availability) -> NcError {
     // The trailing clause says only what this rule inspected. "…the current chain
     // still accepts it" was an unconditional claim about the *legacy* path made by a
     // rule that looked at the new one, and it is false whenever the same command line
-    // is independently invalid there (`--density-curve characteristic
-    // --anchor-mid-offset 0.6` is refused by the legacy merge).
+    // is independently invalid there.
     // Sending the user to a branch that then refuses them is the circular-advice
     // defect this module's ordering exists to avoid.
     NcError::Usage(format!(
@@ -577,6 +526,9 @@ mod tests {
         "--highlight-balance",
         "--balance-range",
         "--auto-balance-range",
+        "--density-curve",
+        "--film-stock",
+        "--preset",
         "--assume-linear",
         "--input-profile",
         "--invert-white-balance",

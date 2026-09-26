@@ -170,12 +170,9 @@ pub const BUNDLED_CONTRAST: f32 = 2.0;
 /// two developers — shipped as a **default prior**, not as anyone's calibration;
 /// the residual belongs to `io/scanner-density-calibration`.
 ///
-/// Deliberately its own constant rather than borrowed from
-/// [`DensityParams::default_scale_for`](crate::types::DensityParams::default_scale_for):
-/// the legacy default is what this decode is *tested against*, so inheriting it
-/// would make the equality test compare a value with itself.
-/// `tests::the_fresh_constants_agree_with_the_legacy_defaults` pins that they agree
-/// while both exist.
+/// The current chain's `DensityParams::default` reads this constant (since
+/// `pipeline_version` 6), so both chains default to one gain;
+/// `tests::the_current_chains_default_is_this_decode_at_the_bundled_contrast` pins it.
 pub const DENSITY_SCALE: [f32; 3] = [1.0, 0.84, 0.73];
 
 /// The per-channel density offset. `[0, 0, 0]` is **a pick, not a closed question**:
@@ -463,8 +460,8 @@ mod tests {
     use super::*;
     use crate::algo::reconstruct;
     use crate::types::{
-        AnchorPlacement, DensityCurve, DensityParams, ExponentialParams,
-        REFERENCE_MID_TO_WHITE_DELTA, Reconstruction,
+        AnchorPlacement, DensityParams, ExponentialParams, REFERENCE_MID_TO_WHITE_DELTA,
+        Reconstruction,
     };
 
     /// Bit patterns, not values: `NaN != NaN`, so an `==` comparison would pass over
@@ -525,10 +522,10 @@ mod tests {
                 scale: DENSITY_SCALE,
                 offset,
             },
-            curve: DensityCurve::Exponential(ExponentialParams {
+            curve: ExponentialParams {
                 gamma,
                 anchor: AnchorPlacement::MidAtBaseOffset(MID_ABOVE_BASE),
-            }),
+            },
         }
     }
 
@@ -665,10 +662,10 @@ mod tests {
                 scale: DENSITY_SCALE,
                 offset: DENSITY_OFFSET,
             },
-            curve: DensityCurve::Exponential(ExponentialParams {
+            curve: ExponentialParams {
                 gamma: LINEARIZATION,
                 anchor: AnchorPlacement::MidAtBaseOffset(0.5),
-            }),
+            },
         };
         let (legacy, _) = reconstruct(&img, &b, &other).unwrap();
         assert_ne!(bits(fresh.rgb()), bits(legacy.rgb()));

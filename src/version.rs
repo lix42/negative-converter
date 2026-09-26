@@ -330,7 +330,11 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
         // again by `nf-retire/regional-balance`, which removed the three regional-balance
         // keys from `reconstruction.density`: their neutral default skipped the pass
         // bit-exactly, so `render` and `base` held, and the neutral keys are dropped on load.
-        recipe: "8d1fc292f2e6c723",
+        // Refreshed a third time by `nf-retire/characteristic`, which collapsed the curve to
+        // its one variant and stopped writing `reconstruction.curve.type`: the default
+        // curve was already the exponential, so `render` and `base` held, and the old
+        // `"type": "exponential"` is dropped on load.
+        recipe: "53af9f2172093cac",
         behavior: PIPELINE_BEHAVIOR,
     },
 ];
@@ -427,10 +431,11 @@ pub const PIPELINE_FINGERPRINTS: &[PipelineFingerprint] = &[
 ///   behavior change. **And that is not a remote possibility:**
 ///   `algo/characteristic-curve-coverage` established that x86_64 and macOS return
 ///   different `f32` results from `log10f` on two samples of this very vector under
-///   the characteristic curve.
-///   `stages::golden::reachable_window` is the tool for settling it — it enumerates
-///   what a conforming libm can return — but note a fingerprint has no tolerance
-///   window to absorb the answer the way a golden does.
+///   the (since retired) characteristic curve.
+///   Settle it by enumerating what a conforming libm can return (the retired
+///   characteristic golden's `reachable_window`, in git history, is the worked
+///   example) — but note a fingerprint has no tolerance window to absorb the answer
+///   the way a golden does.
 /// - It stops at the reconstruction, i.e. **before** the lcms2 output color
 ///   transform. No post-lcms2 pixel and no embedded ICC byte — both of which differ
 ///   by target — enters any of the hashes.
@@ -642,8 +647,7 @@ mod drift_gate {
     use crate::pipeline::stages::golden;
     use crate::pipeline::white_balance::resolve_print_gains;
     use crate::types::{
-        DensityCurve, DensityParams, ExponentialParams, FilmBaseSource, PrintParams,
-        Reconstruction, WbSource,
+        DensityParams, ExponentialParams, FilmBaseSource, PrintParams, Reconstruction, WbSource,
     };
 
     /// Format an `f32` as its raw bit pattern in hex — no decimal formatting, so
@@ -865,10 +869,10 @@ mod drift_gate {
         // exists to pin.
         let perturbed_recon = Reconstruction {
             density: DensityParams::default(),
-            curve: DensityCurve::Exponential(ExponentialParams {
+            curve: ExponentialParams {
                 gamma: 1.05,
                 ..ExponentialParams::default()
-            }),
+            },
         };
         assert_ne!(
             stable_hash(&render_fingerprint_text(&perturbed_recon, default_wb)),

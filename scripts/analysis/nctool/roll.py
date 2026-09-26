@@ -160,6 +160,23 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return result
 
 
+def _drop_retired_curve_tag(defaults: dict, partial: dict) -> None:
+    """Drop a partial recipe's `reconstruction.curve.type = "exponential"` when the
+    build's own defaults carry no curve tag.
+
+    `hanten params` stopped writing the tag when the curve became the one exponential
+    (`nf-retire/characteristic`), so the old spelling would read as a variant switch in
+    `_deep_merge` and replace the whole default curve. The reference build still writes
+    it, and there a stated tag is a real selector, so it is kept."""
+    # A malformed section is left for `_freeze_recipe` to refuse with its own message.
+    default_rec, rec = defaults.get("reconstruction"), partial.get("reconstruction")
+    default_curve = default_rec.get("curve") if isinstance(default_rec, dict) else None
+    curve = rec.get("curve") if isinstance(rec, dict) else None
+    if (isinstance(default_curve, dict) and "type" not in default_curve
+            and isinstance(curve, dict) and curve.get("type") == "exponential"):
+        curve.pop("type")
+
+
 def _freeze_recipe(base: dict, dmin: list[float],
                    film_type: str | None, preset: str | None,
                    exposure: float | None) -> tuple[dict | None, str | None]:
@@ -182,10 +199,11 @@ def _freeze_recipe(base: dict, dmin: list[float],
     reconstruction = recipe.setdefault("reconstruction", {})
     if not isinstance(reconstruction, dict):
         return None, "recipe `reconstruction` must be an object"
-    curve = reconstruction.setdefault("curve", {"type": "exponential"})
-    if not isinstance(curve, dict):
+    # The curve is left as the merge resolved it: `hanten params` writes the build's own
+    # (with its tag on the reference build, without on this one).
+    curve = reconstruction.get("curve")
+    if curve is not None and not isinstance(curve, dict):
         return None, "recipe `reconstruction.curve` must be an object"
-    curve.setdefault("type", "exponential")
 
     if film_type:
         input_cfg = recipe.setdefault("input", {})
@@ -262,6 +280,7 @@ def cmd_convert(args) -> int:
     reconstruction = partial.get("reconstruction")
     if isinstance(reconstruction, dict) and reconstruction.get("type") == "density":
         reconstruction.pop("type")
+    _drop_retired_curve_tag(defaults, partial)
     base = _deep_merge(defaults, partial)
 
     unexposed = roles["unexposed"][0]

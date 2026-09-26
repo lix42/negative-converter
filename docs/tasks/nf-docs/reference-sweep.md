@@ -18,7 +18,7 @@ drop it.
 - **Scale.** A grep over the retired and superseded ids finds roughly eight `src/**`
   doc comments, three `docs/design-spec.md` pointers and one in `docs/using-nc.md`,
   across `types.rs`, `cli.rs`, `film_base.rs`, `stages.rs`, `shadow_metrics.rs`,
-  `density.rs` and `algo/characteristic.rs` / `film_stock/`. The grep finds candidates; the judgement is
+  `density.rs` and `film_stock/`. The grep finds candidates; the judgement is
   per site.
 - **Only one kind of rot is loud.** A changed *stem* stops resolving; a task that
   merely gained an `nf-*` prefix still substring-matches, so the old id keeps hitting

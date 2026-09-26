@@ -5,7 +5,7 @@
 //! ```
 //!
 //! This is the one deterministic mapping shared by every density curve
-//! (exponential / characteristic) and the fixed decode. It expresses NC's
+//! (the exponential curve) and the fixed decode. It expresses NC's
 //! **film-rendering intent** — it does *not* claim to recover physically neutral
 //! scene color, and it deliberately preserves the differences caused by film
 //! stock, lens, development, scanner, and the selected density curve. It adds no
@@ -186,10 +186,7 @@ pub fn map_nc_film_rgb_v1(film: FilmRgbImage) -> AcesCgImage {
 mod tests {
     use super::*;
     use crate::algo::reconstruct;
-    use crate::types::{
-        CharacteristicParams, DensityCurve, DensityParams, ExponentialParams, FilmBase,
-        Reconstruction,
-    };
+    use crate::types::{FilmBase, Reconstruction};
 
     // -- derivation helpers ----------------------------------------------------
     //
@@ -224,17 +221,25 @@ mod tests {
         FilmRgbImage::fixture(LinearImage::new(width, height, rgb, ir).unwrap())
     }
 
-    /// Every supported reconstruction config — all must use the same mapper.
-    fn all_configs() -> [Reconstruction; 2] {
+    /// A film-RGB producer under test, at its defaults.
+    type Producer = fn(&LinearImage, &FilmBase) -> FilmRgbImage;
+
+    /// Every film-RGB producer — both must reach the same mapper.
+    ///
+    /// The current chain's reconstruction and the new chain's fixed decode, each at
+    /// its defaults.
+    fn producers() -> [(&'static str, Producer); 2] {
         [
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Exponential(ExponentialParams::default()),
-            },
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Characteristic(CharacteristicParams::default()),
-            },
+            ("reconstruct", |img, base| {
+                reconstruct(img, base, &Reconstruction::default())
+                    .unwrap()
+                    .0
+            }),
+            ("fixed::decode", |img, base| {
+                crate::algo::fixed::decode(img, base, &Default::default())
+                    .unwrap()
+                    .0
+            }),
         ]
     }
 
@@ -365,19 +370,19 @@ mod tests {
 
     #[test]
     fn every_reconstruction_path_uses_the_same_mapper_and_preserves_shape_ir() {
-        // the exponential and the characteristic curve both reach the mapper and
+        // both producers reach the mapper and
         // yield an `AcesCgImage` (compiler-enforced by the return type) with the
         // dimensions and IR plane intact.
         let scan = vec![0.5, 0.3, 0.2, 0.05, 0.03, 0.02];
         let ir = Some(vec![0.25, 0.75]);
         let base = FilmBase::from([0.9, 0.55, 0.42]);
-        for config in all_configs() {
+        for (name, produce) in producers() {
             let img = LinearImage::new(2, 1, scan.clone(), ir.clone()).unwrap();
-            let (film, _) = reconstruct(&img, &base, &config).unwrap();
+            let film = produce(&img, &base);
             let aces = map_nc_film_rgb_v1(film);
-            assert_eq!((aces.width(), aces.height()), (2, 1), "{config:?}");
-            assert_eq!(aces.rgb().len(), 6, "{config:?}");
-            assert_eq!(aces.ir(), Some(&[0.25_f32, 0.75][..]), "{config:?}");
+            assert_eq!((aces.width(), aces.height()), (2, 1), "{name}");
+            assert_eq!(aces.rgb().len(), 6, "{name}");
+            assert_eq!(aces.ir(), Some(&[0.25_f32, 0.75][..]), "{name}");
             // Read direction round-trips dims + IR.
             let linear = aces.into_linear();
             assert_eq!((linear.width, linear.height), (2, 1));
@@ -393,17 +398,17 @@ mod tests {
         // post-lcms2 checksum), per CLAUDE.md's cross-platform caveat.
         let scan = vec![0.85, 0.5, 0.38, 0.3, 0.18, 0.12, 0.02, 0.012, 0.009];
         let base = FilmBase::from([0.9, 0.55, 0.42]);
-        for config in all_configs() {
+        for (name, produce) in producers() {
             let run = || {
                 let img = LinearImage::new(3, 1, scan.clone(), None).unwrap();
-                let (film, _) = reconstruct(&img, &base, &config).unwrap();
+                let film = produce(&img, &base);
                 map_nc_film_rgb_v1(film)
                     .rgb()
                     .iter()
                     .map(|v| v.to_bits())
                     .collect::<Vec<_>>()
             };
-            assert_eq!(run(), run(), "non-deterministic mapping for {config:?}");
+            assert_eq!(run(), run(), "non-deterministic mapping for {name}");
         }
     }
 

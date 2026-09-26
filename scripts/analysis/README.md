@@ -404,12 +404,12 @@ produces what it reads:
 
 ```sh
 PYTHONPATH=scripts/analysis .venv/bin/python -m nctool review generate \
-  scripts/preset-review/presets.matrix.json --out ../temp/preset-review
+  <matrix.json> --out ../temp/<set>
 ```
 
-The matrix is **data** (`scripts/preset-review/presets.matrix.json` is the worked
-example): it names the configurations, the flags each one passes, and the
-per-roll values those flags need. Every cell is one `hanten convert`; beside each
+The matrix is **data** (the `render-review-set` skill writes one per set): it names
+the configurations and the flags each one passes, with `{dmin}` standing for each
+frame's film base. Every cell is one `hanten convert`; beside each
 rendition the command writes that image's metric record, so the app can draw the
 tone and cast charts next to the picture. Frames and per-roll `Dmin` come from
 `scripts/analysis/fixtures.json` — the same declaration the metrics read,

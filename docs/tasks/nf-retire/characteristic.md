@@ -53,6 +53,26 @@ actually true.
 
 - Does the decode keep a `density.scale` default at all once it is not per-curve?
 
+## Outcome (2026-09-26, done)
+
+Scope grew by three decisions taken with the user before starting (progress log):
+`--preset` retires outright rather than losing only its names (`nf-look/look-presets`
+closed as "retired, not rebuilt"); `DensityCurve` collapses to `ExponentialParams`, the
+wire's `curve.type = "exponential"` dropped on load; and the one-valued surfaces go —
+`--density-curve` at every value, telemetry `conversion.curve` (schema 7), the report's
+curve `type`, `stock` and `out_of_table`.
+
+- **The open question:** `density.scale` keeps one plain default, `fixed::DENSITY_SCALE`.
+  All three per-curve resolution sites are gone, and with them roll's curve-switch reset
+  and its warnings.
+- **No pixel moved.** `render` and `base` reproduced; `recipe` refreshed in place on the
+  v7 row. `render`/`base` held because the default was already the exponential.
+- **Deleted beyond the file:** `algo/curve_probe.rs` whole, per the plan — including four
+  scalar-path probes (`channel_drift`, `sigmoid_scale`, `whole_roll_*`) that the open
+  `io/scanner-density-calibration` cites; it now points at them in git.
+  `scripts/preset-review/` and `nctool review`'s `{film_stock}` placeholder and `rolls`
+  block went too.
+
 ## How to Verify
 
 - `reconstruction.curve` accepts only the fixed decode; a recipe naming

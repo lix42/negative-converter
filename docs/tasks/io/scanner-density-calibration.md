@@ -40,12 +40,12 @@ renderer, with measurements to aim at.
     landing on *both* channels against red is not film chemistry — it is the signature of
     something in the scan/decode/base path, i.e. exactly this task's subject.
   - **The gain nulls the corpus mean, not any roll.** Per-roll residuals still span ±0.5
-    stop per density on the green–magenta axis (`curve_probe::sigmoid_scale`), and no single
+    stop per density on the green–magenta axis (`curve_probe::sigmoid_scale`, see below), and no single
     scale improves it — even the scan-derived corpus mean only moves \|green–magenta\| from
     0.60 to 0.56. A scale-shaped correction has no generic setting worth shipping, which is
     the negative result arguing for the 3×3 below.
-  - The `characteristic` curve deliberately keeps the **identity** gain so this residual
-    stays visible rather than half-absorbed: its own solved gain (`[1, 0.938, 0.985]`)
+  - The (since retired) `characteristic` curve kept the **identity** gain so this residual
+    stayed visible rather than half-absorbed: its own solved gain (`[1, 0.938, 0.985]`)
     measured *worse* than identity on real frames (0.047 against 0.039).
 - **The form to fit is a 3×3 + offset, not per-channel gains.** ACES applies exactly that
   (`CDD → CID`) *before* its per-channel curves, and nc is the same chain minus that stage.
@@ -68,9 +68,14 @@ renderer, with measurements to aim at.
   one fixture roll spans −1.88…+2.03. Resolving a 0.3 stops/density difference needs ~11
   frames of the same condition. Two per-roll/per-stock conclusions were retracted during
   that task for reading n=3–4 too confidently.
-- Diagnostic already in-tree: `algo::curve_probe::channel_drift` (asset-gated, `#[ignore]`d)
-  reports scan / predicted / residual drift per channel, per stock and per roll, with
-  scatter. Re-run it to score a candidate matrix.
+- Diagnostic, **no longer in-tree**: `algo::curve_probe::channel_drift` (asset-gated,
+  `#[ignore]`d) reported scan / predicted / residual drift per channel, per stock and per
+  roll, with scatter; `sigmoid_scale`, `whole_roll_scale` and `whole_roll_white_point`
+  measured the scalar path's per-channel slopes. The module read the published curves
+  through the `characteristic` inversion and was deleted with it
+  (`nf-retire/characteristic`); recover it with `git show 9b34848:src/algo/curve_probe.rs`
+  (and `src/algo/characteristic.rs` from the same commit) to score a candidate matrix.
+  Its roll names predate the asset folder's rename, so it needs re-pointing first.
 
 ### Shooting the calibration frames
 

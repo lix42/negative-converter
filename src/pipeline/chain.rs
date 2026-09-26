@@ -318,10 +318,7 @@ mod tests {
     use crate::pipeline::gain_ratio;
     use crate::pipeline::scene_correction::WhiteBalance;
     use crate::pipeline::working_space::map_nc_film_rgb_v1;
-    use crate::types::{
-        CharacteristicParams, DensityCurve, DensityParams, ExponentialParams, FilmBase,
-        LinearImage, Reconstruction,
-    };
+    use crate::types::{FilmBase, LinearImage, Reconstruction};
 
     /// Every stage at its identity — fit range at zero headroom — so a test sees the
     /// wiring and the destination matrix rather than the operator.
@@ -654,26 +651,28 @@ mod tests {
         // produced it — and deliberately *not* only the one a real `--new-flow` run
         // takes (`algo::fixed`): the boundary is the type, so what produces it stays
         // free to change.
-        let configs = [
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Exponential(ExponentialParams::default()),
-            },
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Characteristic(CharacteristicParams::default()),
-            },
+        type Producer = fn(&LinearImage, &FilmBase) -> crate::algo::FilmRgbImage;
+        let producers: [(&str, Producer); 2] = [
+            ("reconstruct", |img, base| {
+                reconstruct(img, base, &Reconstruction::default())
+                    .unwrap()
+                    .0
+            }),
+            ("fixed::decode", |img, base| {
+                crate::algo::fixed::decode(img, base, &Default::default())
+                    .unwrap()
+                    .0
+            }),
         ];
-        for config in configs {
+        for (name, produce) in producers {
             let base = FilmBase::from([0.5, 0.5, 0.5]);
             let img = LinearImage::new(2, 1, vec![0.1, 0.2, 0.3, 0.4, 0.2, 0.1], None).unwrap();
-            let (film, _) = reconstruct(&img, &base, &config).unwrap();
-            let aces = map_nc_film_rgb_v1(film);
+            let aces = map_nc_film_rgb_v1(produce(&img, &base));
             let expected = bits(&to_p3(aces.rgb()));
 
             let (out, _) = render(aces, &params()).unwrap().image.into_parts();
 
-            assert_eq!(bits(&out.rgb), expected, "{config:?}");
+            assert_eq!(bits(&out.rgb), expected, "{name}");
         }
     }
 

@@ -448,7 +448,7 @@ def build_generic(stocks: dict) -> dict:
 
 RUST_OUT = REPO / "src" / "film_stock" / "curves.rs"
 
-RUST_HEADER = '''//! Pinned characteristic-curve data — the literals the runtime inverts.
+RUST_HEADER = '''//! Pinned characteristic-curve data — the literals `super`'s evidence tests read.
 //!
 //! **Generated.** `python3 scripts/analysis/digitize_datasheets.py --emit-rust` rewrites
 //! this file from `curves.json`, which is itself digitized from the publications in
@@ -457,14 +457,14 @@ RUST_HEADER = '''//! Pinned characteristic-curve data — the literals the runti
 //!
 //! Each table is `(relative log exposure, density above D-min)` for one dye layer. The
 //! log-exposure axis is shifted so the stock's own **mid-grey aim density sits at
-//! `log10(0.18)`**, which is what makes the inversion self-anchoring: `10^(curve⁻¹(D′))`
-//! is relative scene exposure with mid-grey at 0.18, with no separate anchor to resolve.
+//! `log10(0.18)`**: relative scene exposure with mid-grey at 0.18, with no separate
+//! anchor to resolve.
 //!
-//! Two invariants the inversion depends on, both asserted in `super::tests`: **strictly
-//! increasing** in both coordinates, and a **first point at `D′ = 0`** (the film base).
+//! Two invariants, both asserted in `super::tests`: **strictly increasing** in both
+//! coordinates, and a **first point at `D′ = 0`** (the film base).
 //!
-//! Editing a literal changes rendered pixels for anyone naming that stock. Re-derive from
-//! the publication rather than hand-tuning.
+//! No render reads these tables; they are the evidence for the fixed decode's constants.
+//! Re-derive from the publication rather than hand-tuning.
 
 // These are digitized measurements, not mathematical constants. `clippy::approx_constant`
 // fires on `0.78539` (a log-exposure coordinate) because it is close to π/4, which is a
@@ -512,7 +512,7 @@ def emit_rust(stocks: dict) -> str:
                 out.append("    " + " ".join(f"({p[0]}, {p[1]})," for p in pts[i : i + 4]))
             out.append("];")
         out.append("")
-    out.append("/// Every stock the registry knows, in the order `--film-stock` lists them.")
+    out.append("/// Every stock the registry knows, in `FilmStock::ALL`'s order.")
     out.append("pub const STOCKS: &[StockCurves] = &[")
     for key in order:
         ident = key.replace("-", "_").upper()
