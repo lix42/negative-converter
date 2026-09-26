@@ -1,13 +1,12 @@
 //! Negative reconstruction and density curves (design-spec §7).
 //!
 //! The [`Reconstruction`] config drives the current chain's one path —
-//! Dmin-normalized corrected density `D′` mapped through a tagged exponential or
-//! characteristic curve — and the new chain's fixed decode ([`fixed`]) is a second
-//! producer. **Both return the typed [`FilmRgbImage`] boundary**:
+//! Dmin-normalized corrected density `D′` mapped through the exponential curve — and
+//! the new chain's fixed decode ([`fixed`]) is a second producer. **Both return the typed [`FilmRgbImage`] boundary**:
 //!
 //! ```text
 //! scan → Dmin normalization → corrected density D′   (density reconstruction)
-//!      → exponential | characteristic density curve   (the curve stage)
+//!      → exponential density curve                    (the curve stage)
 //!      → FilmRgbImage                                  (typed boundary)
 //! ```
 //!
@@ -19,15 +18,8 @@
 //! bit-identical to the pre-split monolithic converters' reconstruction half
 //! (pinned by the golden fixtures in `pipeline::stages`, `mod golden`).
 
-pub mod characteristic;
 pub mod density;
 pub mod fixed;
-
-/// The probe that measured whether inverting the published curves removes the per-channel
-/// cast a single scalar contrast leaves. Test-only, asset-gated, prints derived numbers
-/// only — see its header for the method and `docs/progress/algo.md` for the result.
-#[cfg(test)]
-mod curve_probe;
 
 use crate::types::{FilmBase, LinearImage, Reconstruction, Result};
 
@@ -139,16 +131,7 @@ impl std::fmt::Debug for FilmRgbImage {
 pub struct ReconstructionReport {
     /// The **derived** anchor the curve used — the corrected density that rendered to
     /// `1.0`, and therefore what sets the black floor at `10^(−contrast·anchor)`.
-    /// `None` for the characteristic curve, which places no anchor.
-    pub curve_anchor: Option<f32>,
-    /// How far the frame's densities fell outside the stock's published curve, per channel
-    /// — `Some` only for the characteristic curve, `None` for every other path.
-    ///
-    /// Reported rather than clamped. Out-of-table samples extrapolate along the end slope,
-    /// which keeps them ordered and finite, but they are **extrapolated**, not measured:
-    /// a frame with a large fraction of them is being rendered off the published data, and
-    /// the report has to say so instead of leaving it to be inferred from the picture.
-    pub out_of_table: Option<characteristic::OutOfTable>,
+    pub curve_anchor: f32,
 }
 
 /// Stage 3 — reconstruct the negative into the typed film positive
@@ -167,7 +150,6 @@ pub fn reconstruct(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CharacteristicParams, DensityCurve, DensityParams};
 
     fn image() -> LinearImage {
         LinearImage::new(
@@ -183,32 +165,18 @@ mod tests {
         FilmBase::from([0.9, 0.55, 0.42])
     }
 
-    /// Every supported curve, for exhaustive path checks.
-    fn all_configs() -> [Reconstruction; 2] {
-        [
-            Reconstruction::default(),
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Characteristic(CharacteristicParams::default()),
-            },
-        ]
-    }
-
     #[test]
-    fn every_path_returns_a_film_rgb_image_and_preserves_ir() {
-        // The type-level boundary: each supported config produces a
-        // `FilmRgbImage` (enforced by `reconstruct`'s signature — this test
-        // exercises all paths) with the dimensions and IR plane intact.
-        for config in all_configs() {
-            let (film, _) = reconstruct(&image(), &base(), &config).unwrap();
-            assert_eq!((film.width(), film.height()), (2, 1), "{config:?}");
-            assert_eq!(film.rgb().len(), 6, "{config:?}");
-            assert_eq!(film.ir(), Some(&[0.25_f32, 0.75][..]), "{config:?}");
-            // The read direction round-trips losslessly.
-            let linear = film.into_linear();
-            assert_eq!((linear.width, linear.height), (2, 1));
-            assert_eq!(linear.ir.as_deref(), Some(&[0.25_f32, 0.75][..]));
-        }
+    fn reconstruction_returns_a_film_rgb_image_and_preserves_ir() {
+        // The type-level boundary: the config produces a `FilmRgbImage` (enforced by
+        // `reconstruct`'s signature) with the dimensions and IR plane intact.
+        let (film, _) = reconstruct(&image(), &base(), &Reconstruction::default()).unwrap();
+        assert_eq!((film.width(), film.height()), (2, 1));
+        assert_eq!(film.rgb().len(), 6);
+        assert_eq!(film.ir(), Some(&[0.25_f32, 0.75][..]));
+        // The read direction round-trips losslessly.
+        let linear = film.into_linear();
+        assert_eq!((linear.width, linear.height), (2, 1));
+        assert_eq!(linear.ir.as_deref(), Some(&[0.25_f32, 0.75][..]));
     }
 
     // `FilmRgbImage`'s construction privacy is enforced by the compiler:
@@ -222,6 +190,6 @@ mod tests {
         let (_, report) = reconstruct(&image(), &base(), &Reconstruction::default()).unwrap();
         let expected =
             fixed::MID_ABOVE_BASE + crate::types::MID_GREY_OUTPUT_DECADES / fixed::BUNDLED_CONTRAST;
-        assert_eq!(report.curve_anchor, Some(expected));
+        assert_eq!(report.curve_anchor, expected);
     }
 }

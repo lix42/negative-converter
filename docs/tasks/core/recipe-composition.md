@@ -26,11 +26,10 @@ target subsection in design-spec §8, which this task implements.
 - `roll` is currently recipe-only — `--frames`, `--out-dir`, `--params`,
   `--strict`, `--max-memory` and reporting. There is no `--film-base` on it,
   which is precisely what forces file authoring for a one-off.
-- **`--preset` (with `--film-stock`) is part of the override surface `roll` gains**,
-  even though a preset is not a knob: it is the only way to apply a named bundle to a
-  roll without writing its expansion to a file first, and today that file can only
-  come from `convert --dump-params`, which `core/profile-authoring` deletes. It sits
-  above every `--params` layer and below individual flags, as on `convert`.
+- **There is no `--preset` to carry onto `roll`** — it retired with the
+  `characteristic` curve (`nf-retire/characteristic`). A named look is a `--params`
+  layer: exactly the file this task makes composable, authored by
+  `core/profile-authoring`.
 
 ## Open questions
 

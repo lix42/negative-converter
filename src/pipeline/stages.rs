@@ -67,20 +67,14 @@ pub struct DisplaySource {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ConvertReport {
     /// The **derived** anchor the curve used — the corrected density that rendered to
-    /// `1.0`, hence the black floor at `10^(−contrast·curve_anchor)`. `None` for the
-    /// characteristic curve.
-    pub curve_anchor: Option<f32>,
+    /// `1.0`, hence the black floor at `10^(−contrast·curve_anchor)`.
+    pub curve_anchor: f32,
     /// The resolved white-balance gains `[r, g, b]` the shared print controls
     /// applied — the explicit gains, or the auto-estimated ones
     /// (`print.white_balance = gray-world | percentile`). Reported so a roll can
     /// freeze one frame's estimate into a recipe / `--white-balance` (measure
     /// once, reuse). `None` for `film-master`, which runs no print controls.
     pub white_balance: Option<[f32; 3]>,
-    /// How far the frame fell outside the stock's published curve, per channel — `Some`
-    /// only for the characteristic curve. Carried out so the orchestrator can warn: an
-    /// out-of-table sample is extrapolated, not measured, and a frame with many of them is
-    /// being rendered off the published data.
-    pub out_of_table: Option<crate::algo::characteristic::OutOfTable>,
 }
 
 /// The `display-p3` / `compatibility` render: the shared display source, one SDR
@@ -130,7 +124,6 @@ pub fn render_display_source(
         convert: ConvertReport {
             curve_anchor: recon.curve_anchor,
             white_balance: Some(shared.controls.white_balance()),
-            out_of_table: recon.out_of_table,
         },
         shared,
         timings: StageTimings {
@@ -182,7 +175,6 @@ pub fn render_film_master(
         convert: ConvertReport {
             curve_anchor: recon.curve_anchor,
             white_balance: None,
-            out_of_table: recon.out_of_table,
         },
         timings: StageTimings {
             algorithm_ms,
@@ -208,7 +200,6 @@ fn ms_since(started: Instant) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DensityCurve, DensityParams};
 
     /// A small synthetic negative with the real scan layout — a near-black
     /// holder ring, then a bright, uniform orange rebate band (the film base),
@@ -239,15 +230,6 @@ mod tests {
         Reconstruction::default()
     }
 
-    /// The characteristic curve on the generic profile — the second producer that has to
-    /// reach the master through the same mapper.
-    fn characteristic_default() -> Reconstruction {
-        Reconstruction {
-            density: DensityParams::default(),
-            curve: DensityCurve::Characteristic(crate::types::CharacteristicParams::default()),
-        }
-    }
-
     #[test]
     fn film_master_render_bypasses_the_colour_transform_and_print_controls() {
         // The film-master branch must hand back the *mapped* ACEScg pixels: no
@@ -272,20 +254,7 @@ mod tests {
         // The master applied no white balance, so it claims none…
         assert_eq!(out.convert.white_balance, None);
         // …but the reconstruction's own resolved anchor IS part of the master.
-        assert!(out.convert.curve_anchor.is_some());
-    }
-
-    #[test]
-    fn film_master_render_works_for_every_reconstruction_path() {
-        // The split is producer-agnostic: the exponential and the characteristic curve
-        // both reach the master through the same mapper.
-        let img = synthetic_negative(8, 8);
-        let base = FilmBase::from([0.9, 0.55, 0.42]);
-        for reconstruction in [density_default(), characteristic_default()] {
-            let out = render_film_master(&img, &base, &reconstruction).unwrap();
-            assert_eq!(out.image.rgb.len(), 8 * 8 * 3, "{reconstruction:?}");
-            assert_eq!(out.convert.white_balance, None, "{reconstruction:?}");
-        }
+        assert!(out.convert.curve_anchor.is_finite());
     }
 
     #[test]
@@ -310,16 +279,16 @@ mod tests {
 /// picture cannot separate them.
 ///
 /// Synthetic and self-contained, so it runs in CI with no assets: a uniform frame is built
-/// at exactly the density the stock's datasheet calls mid-grey, pushed through the real
-/// reconstruction and display stages, and the delivered value read back.
+/// at a known mid-grey density — the curve's own pinned one, or a stock datasheet's —
+/// pushed through the real reconstruction and display stages, and the delivered value
+/// read back.
 #[cfg(test)]
 mod midtone_placement {
     use super::*;
     use crate::film_stock;
+    use crate::film_stock::FilmStock;
     use crate::pipeline::sdr::{self, SdrGamut};
-    use crate::types::{
-        CharacteristicParams, DensityParams, FilmBase, FilmStock, PrintParams, Reconstruction,
-    };
+    use crate::types::{DensityParams, FilmBase, PrintParams, Reconstruction};
 
     /// A uniform frame whose corrected density is exactly `d_prime` on every channel's own
     /// scale — i.e. the film's own record of a neutral tone at that density above base.
@@ -391,41 +360,7 @@ mod midtone_placement {
         let stock = FilmStock::Portra400;
         let print = PrintParams::default();
         let reinhard = Headroom::new(4.0).unwrap();
-        // Resolve the per-channel gain from the curve, exactly as the recipe and CLI paths
-        // do. Constructing `DensityParams::default()` beside a characteristic curve would
-        // apply the exponential's calibration on top of one that already carries each
-        // stock's per-channel response — the double-correction `default_scale_for`
-        // documents, and the reason a table built that way reads ~0.06 stop dark on those
-        // rows for no reason connected to what it is measuring.
-        let density = |curve: crate::types::DensityCurve| Reconstruction {
-            density: DensityParams {
-                scale: DensityParams::default_scale_for(curve.curve_type()),
-                ..DensityParams::default()
-            },
-            curve,
-        };
-        let cases: [(&str, Reconstruction); 3] = [
-            (
-                "characteristic (portra-400)",
-                density(crate::types::DensityCurve::Characteristic(
-                    CharacteristicParams { stock },
-                )),
-            ),
-            (
-                "characteristic (generic-c41)",
-                density(crate::types::DensityCurve::Characteristic(
-                    CharacteristicParams {
-                        stock: FilmStock::GenericC41,
-                    },
-                )),
-            ),
-            (
-                "exponential, defaults",
-                density(crate::types::DensityCurve::Exponential(
-                    crate::types::ExponentialParams::default(),
-                )),
-            ),
-        ];
+        let cases = [("exponential, defaults", Reconstruction::default())];
         println!(
             "\n{:30}{:>10}{:>12}{:>10}",
             "reconstruction", "no tone", "reinhard", "cost"
@@ -463,50 +398,25 @@ mod midtone_placement {
         );
     }
 
-    fn delivered(stock: FilmStock, tone: Headroom, print: &PrintParams) -> [f32; 3] {
-        let sc = film_stock::curves_for(stock);
-        let [grey, _] = sc.aims.expect("a stock with a published aim table");
-        let d_min = sc.d_min.expect("a measured stock");
-        // The datasheet's own mid-grey, per channel: the grey aim is red-only, so the other
-        // layers are read at the exposure that puts red there — which is what a neutral is.
-        let (image, base) = uniform_at(|c| {
-            let log_e = {
-                let t = sc.channels[0];
-                let target = grey - d_min[0];
-                let mut x = t[0].0;
-                for w in t.windows(2) {
-                    if (w[0].1 - target) * (w[1].1 - target) <= 0.0 && w[0].1 != w[1].1 {
-                        x = w[0].0 + (target - w[0].1) / (w[1].1 - w[0].1) * (w[1].0 - w[0].0);
-                        break;
-                    }
-                }
-                x
-            };
-            let t = sc.channels[c];
-            let i = t.partition_point(|p| p.0 <= log_e).clamp(1, t.len() - 1);
-            let ((x0, d0), (x1, d1)) = (t[i - 1], t[i]);
-            d0 + (log_e - x0) * (d1 - d0) / (x1 - x0)
-        });
+    fn delivered(tone: Headroom, print: &PrintParams) -> [f32; 3] {
         // **Identity per-channel gain, deliberately.** These are tests of the *display
         // operator*, and they need a reconstruction that puts mid-grey exactly at 0.18 —
         // extended Reinhard is free at 0.18 and only there, so measuring its cost anywhere
-        // else measures the offset instead. The default gain `[1, 0.84, 0.73]` moves this
-        // patch off 0.18 (it is calibrated for the exponential, which has no per-channel
-        // film model; the characteristic curve already has one). That effect is the subject of
-        // `the_default_gain_shifts_per_channel_level_on_both_curves`, not of these.
+        // else measures the offset instead. The curve pins mid-grey at its anchor's
+        // offset above the base, so a neutral patch at that density under the identity
+        // gain lands there exactly; the default gain `[1, 0.84, 0.73]` would move it off
+        // (the subject of `the_default_gain_shifts_per_channel_level`, not of these).
         let reconstruction = Reconstruction {
             density: DensityParams {
                 scale: [1.0, 1.0, 1.0],
                 ..DensityParams::default()
             },
-            curve: crate::types::DensityCurve::Characteristic(CharacteristicParams { stock }),
+            curve: crate::types::ExponentialParams::default(),
         };
+        let crate::types::AnchorPlacement::MidAtBaseOffset(mid) = reconstruction.curve.anchor;
+        let (image, base) = uniform_at(|_| mid);
         let shared = render_display_source(&image, &base, &reconstruction, print).unwrap();
         let out = sdr::render(&shared.shared, SdrGamut::DisplayP3, tone).unwrap();
-        // **Red, not green.** The patch is uniform, so any channel reads the same *tone* —
-        // but only red's `density.scale` gain is 1, so only red measures the tone question
-        // this module is about without the per-channel calibration folded in. The colour
-        // consequence of that calibration on this path is a separate assertion below.
         let rgb = &out.image().rgb;
         [rgb[0], rgb[1], rgb[2]]
     }
@@ -520,18 +430,17 @@ mod midtone_placement {
     /// delivered, at every headroom.
     #[test]
     fn mid_grey_lands_at_eighteen_percent_at_every_headroom() {
-        let stock = FilmStock::Portra400;
         let print = PrintParams::default();
-        // Red only: see `delivered`. Tone is the question here.
-        let tone_of = |t, p: &PrintParams| delivered(stock, t, p)[0];
+        // The patch is neutral, so any channel reads the tone; red is the one read.
+        let tone_of = |t, p: &PrintParams| delivered(t, p)[0];
 
         // Zero headroom, the identity: gamut mapping and the range check still run, but
         // nothing reshapes tone.
         let none = tone_of(Headroom::new(0.0).unwrap(), &print);
         assert!(
             (none - 0.18).abs() < 0.01,
-            "reconstruction placed the datasheet's mid-grey at {none:.4}, not 0.18 — the \
-             darkness would then be the curve's, not the operator's"
+            "reconstruction placed the curve's pinned mid-grey at {none:.4}, not 0.18 — \
+             the darkness would then be the curve's, not the operator's"
         );
 
         // Extended Reinhard: free at mid-grey, at every headroom. Swept rather than
@@ -557,123 +466,7 @@ mod midtone_placement {
         );
     }
 
-    /// **Each `--preset` carries the exposure that lands the calibration target on the
-    /// calibration stock.**
-    ///
-    /// What a preset promises is that *switching* it changes the look rather than the
-    /// brightness, so a comparison is about the reconstruction and the display tone
-    /// instead of "one is brighter". That is a **calibration convenience, not a rendering
-    /// goal.** nc does not promise that two presets render the same picture, and does not
-    /// promise a common mid-grey on every stock; making them agree is not what any of
-    /// them exists for, and a preset that suits a film better by sitting slightly off is
-    /// doing its job.
-    ///
-    /// So the assertion is scoped to the stock the constants were solved on
-    /// (`Portra400`), and every other stock is **printed, never asserted**. A residual
-    /// there measures how well that preset models that film: `characteristic-stock`
-    /// inverts the very curve the patch is built from and so lands the same value on all
-    /// of them, while the generic profile drifts with the stock. That drift is information
-    /// about the reconstruction, not a constant to tune away — per-stock exposures would
-    /// buy uniformity nobody asked for at the cost of more numbers to keep true.
-    ///
-    /// Synthetic and asset-free, on the same datasheet mid-grey patch as the rest of this
-    /// module. `generic-c41` is skipped throughout — it is derived rather than measured,
-    /// so it carries neither an aim table nor a `d_min` to build a patch from.
-    ///
-    /// The tolerance is 0.15 stop. The exposures are stated to two decimals, which is
-    /// ±0.005 stop of quantization on its own; the residuals run to 0.06 because a solved
-    /// exposure was rounded, not because a bundle drifted.
-    #[test]
-    fn presets_land_the_calibration_target_on_the_calibration_stock() {
-        use crate::cli::ConversionPreset;
-        // Scene mid-grey 0.18 rendered 1.33 stop up — the brightness approved
-        // 2026-09-15, and the same target the exposure table above solves against.
-        let target = 0.18 * 2f32.powf(1.33);
-        // The stock every preset constant was solved on.
-        let calibration = FilmStock::Portra400;
-
-        // `None` when the preset refuses the stock (`characteristic-aim` has no usable
-        // aim delta on three of them) or the renderer refuses the bundle.
-        let delivered_red = |preset: ConversionPreset, stock: FilmStock| -> Option<f32> {
-            let e = preset.expand(Some(stock)).ok()?;
-            let print = PrintParams {
-                print_exposure: e.print_exposure,
-                ..PrintParams::default()
-            };
-            let tone = Headroom::default();
-            let reconstruction = Reconstruction {
-                density: DensityParams {
-                    scale: e.density_scale,
-                    ..DensityParams::default()
-                },
-                curve: e.curve,
-            };
-            delivered_by(&reconstruction, stock, tone, &print).map(|rgb| rgb[0])
-        };
-
-        println!(
-            "\n  target {target:.4}\n\n  asserted — {}\n\n  {:24}{:>11}{:>12}",
-            calibration.as_str(),
-            "preset",
-            "delivered",
-            "stop"
-        );
-        let mut off = Vec::new();
-        for preset in ConversionPreset::ALL {
-            // A refusal on the calibration stock is a real failure, so it is never skipped.
-            let red = delivered_red(preset, calibration).unwrap_or_else(|| {
-                panic!("{} was refused on {}", preset.name(), calibration.as_str())
-            });
-            let stops = (red / target).log2();
-            println!("  {:24}{:>11.4}{:>+12.3}", preset.name(), red, stops);
-            if stops.abs() >= 0.15 {
-                off.push(format!(
-                    "{} delivered {red:.4} ({stops:+.3} stop)",
-                    preset.name()
-                ));
-            }
-        }
-        // Collected, not asserted per row: recalibrating the family means reading every
-        // preset's offset from one run, and a per-row assert hides the rest behind the
-        // first one that misses.
-        assert!(
-            off.is_empty(),
-            "{} of {} presets miss the calibration target {target:.4} on {}: {}",
-            off.len(),
-            ConversionPreset::ALL.len(),
-            calibration.as_str(),
-            off.join("; ")
-        );
-
-        // Printed and never asserted. One brightness across *stocks* is not a goal, so
-        // this table is a description of the family rather than a bound on it: the
-        // spread is what each preset's modelling of that film costs.
-        println!("\n  printed only — stop from target, every measured stock\n");
-        // Wide enough for the longest preset name, so the header sits over its column.
-        const COL: usize = 23;
-        print!("  {:16}", "stock");
-        for preset in ConversionPreset::ALL {
-            print!("{:>COL$}", preset.name());
-        }
-        println!();
-        for &stock in FilmStock::ALL {
-            // The derived generic states no aim table and no d_min, so there is no
-            // datasheet patch to build from it.
-            if film_stock::curves_for(stock).aims.is_none() {
-                continue;
-            }
-            print!("  {:16}", stock.as_str());
-            for preset in ConversionPreset::ALL {
-                match delivered_red(preset, stock) {
-                    Some(red) => print!("{:>+COL$.3}", (red / target).log2()),
-                    None => print!("{:>COL$}", "refused"),
-                }
-            }
-            println!();
-        }
-    }
-
-    /// How much per-channel *level* does the default gain move, on each curve?
+    /// How much per-channel *level* does the default gain move?
     ///
     /// Checked because an earlier write-up claimed "≤0.06 stop, the anchoring absorbs it",
     /// measured from whole-image means through `hanten convert`. That measurement was bad: two
@@ -682,20 +475,14 @@ mod midtone_placement {
     /// tilt the drift probes measure — so it is what actually decides whether the render
     /// reads magenta.
     #[test]
-    fn the_default_gain_shifts_per_channel_level_on_both_curves() {
+    fn the_default_gain_shifts_per_channel_level() {
         let stock = FilmStock::Portra400;
         let print = PrintParams::default();
         let identity = DensityParams {
             scale: [1.0, 1.0, 1.0],
             ..DensityParams::default()
         };
-        let cases: [(&str, crate::types::DensityCurve); 2] = [
-            (
-                "characteristic",
-                crate::types::DensityCurve::Characteristic(CharacteristicParams { stock }),
-            ),
-            ("exponential", crate::types::DensityCurve::default()),
-        ];
+        let cases = [("exponential", crate::types::ExponentialParams::default())];
         println!(
             "\n  {:16}{:>10}{:>10}{:>10}   per-channel stops vs identity",
             "curve", "R", "G", "B"
@@ -731,13 +518,7 @@ mod midtone_placement {
             "\n  {:16}{:>12}{:>12}   delivered spread (max |dev| from the mean)",
             "curve", "identity", "default"
         );
-        for (name, curve) in [
-            (
-                "characteristic",
-                crate::types::DensityCurve::Characteristic(CharacteristicParams { stock }),
-            ),
-            ("exponential", crate::types::DensityCurve::default()),
-        ] {
+        for (name, curve) in cases {
             let at = |density: DensityParams| {
                 delivered_by(
                     &Reconstruction { density, curve },
@@ -777,12 +558,11 @@ mod midtone_placement {
 /// acceptance gate: the split is a structural refactor, the default pixels are the
 /// contract.
 ///
-/// **Two of the seven are not reference captures**, and the claim has to be scoped or it
+/// **Two of the three are not reference captures**, and the claim has to be scoped or it
 /// stops being true. `golden_new_default_is_bit_identical` is captured fresh from the
 /// build each time the default moves (last on 2026-09-23, for `pipeline_version` 6), and
 /// `golden_density_exponential_customized_is_bit_identical` was recaptured on 2026-09-23
-/// without the retired print stage. (The characteristic golden is pinned by its own
-/// correctly-rounded derivation, not by a capture.) Both honestly pin "this has not drifted
+/// without the retired print stage. Both honestly pin "this has not drifted
 /// since it was set", which is strictly weaker than "matches the reference
 /// implementation" — no golden can claim the stronger thing about a value that was
 /// deliberately changed. Each says so at its own call site; read it before treating
@@ -804,12 +584,7 @@ mod midtone_placement {
 #[cfg(test)]
 pub(crate) mod golden {
     use super::*;
-    use crate::algo::characteristic::{OutOfTable, invert};
-    use crate::film_stock::curves_for;
-    use crate::types::{
-        AnchorPlacement, CharacteristicParams, DensityCurve, DensityCurveType, DensityParams,
-        ExponentialParams,
-    };
+    use crate::types::{AnchorPlacement, DensityParams, ExponentialParams};
 
     /// Five pixels spanning the tonal range plus out-of-range finite values,
     /// with an IR plane (`[0.1, 0.2, 0.3, 0.4, 0.5]`):
@@ -865,13 +640,13 @@ pub(crate) mod golden {
     fn assert_golden(
         reconstruction: Reconstruction,
         expected_rgb_bits: &[u32],
-        expected_anchor_bits: Option<u32>,
+        expected_anchor_bits: u32,
     ) {
         let (out, report) = reconstructed(&reconstruction);
         let got: Vec<u32> = out.rgb.iter().map(|v| v.to_bits()).collect();
         assert_eq!(got, expected_rgb_bits, "pixel bits drifted");
         assert_eq!(
-            report.curve_anchor.map(f32::to_bits),
+            report.curve_anchor.to_bits(),
             expected_anchor_bits,
             "anchor"
         );
@@ -926,17 +701,17 @@ pub(crate) mod golden {
     /// straight line at gamma **1.0** with the anchor at **2.0** (the nominal
     /// reference density of the day, pinned at white).
     ///
-    /// Pinned **explicitly** rather than through `DensityCurve::default()`, because
+    /// Pinned **explicitly** rather than through `ExponentialParams::default()`, because
     /// the default has moved twice since (`pipeline_version` 2 and 6). A golden vector
     /// that silently follows the default stops pinning anything the moment the default
     /// moves — it just re-describes whatever the build now does. Naming the
     /// configuration keeps every bit below exactly as captured from the reference
     /// code, and the *new* default gets its own golden (`golden_new_default_...`).
-    fn frozen_reference_curve() -> DensityCurve {
-        DensityCurve::Exponential(ExponentialParams {
+    fn frozen_reference_curve() -> ExponentialParams {
+        ExponentialParams {
             gamma: 1.0,
             anchor: AnchorPlacement::MidAtBaseOffset(offset_reaching(2.0, 1.0)),
-        })
+        }
     }
 
     /// `Reconstruction::default()`'s density knobs with [`frozen_reference_curve`].
@@ -966,7 +741,7 @@ pub(crate) mod golden {
                 0x40ccbdff, 0x403537ec, 0x3b745fb9, 0x4c2dff42, 0x49cd08c6, 0x3c29b443, 0x3c29b443,
                 0x3c29b443,
             ],
-            Some(0x3f7e0b8d), // 0.62 + 0.745/2
+            0x3f7e0b8d, // 0.62 + 0.745/2
         );
     }
 
@@ -983,7 +758,7 @@ pub(crate) mod golden {
                 0x3eeaaaab, 0x3eeeeef1, 0x3bc49ba7, 0x45abdfff, 0x45833ffb, 0x3c23d70a, 0x3c23d70a,
                 0x3c23d70a,
             ],
-            Some(0x40000000), // the anchor these bits were captured at
+            0x40000000, // the anchor these bits were captured at
         );
     }
 
@@ -1003,282 +778,17 @@ pub(crate) mod golden {
         assert_golden(
             Reconstruction {
                 density: custom_density(),
-                curve: DensityCurve::Exponential(ExponentialParams {
+                curve: ExponentialParams {
                     gamma: 1.4,
                     anchor: AnchorPlacement::MidAtBaseOffset(offset_reaching(1.8, 1.4)),
-                }),
+                },
             },
             &[
                 0x3b7ded3d, 0x3b622ad1, 0x3b3f180c, 0x3c9dd16d, 0x3c6c584b, 0x3c4c25f8, 0x3f9fa551,
                 0x3f23a448, 0x3ea6cf04, 0x3ad3c4f0, 0x48a063e0, 0x46f463df, 0x3b6887cd, 0x3b45ea62,
                 0x3b287418,
             ],
-            Some(0x3fe66666), // 1.8
-        );
-    }
-
-    // --- the characteristic curve -------------------------------------------
-    //
-    // `algo/characteristic-curve-coverage`. Its tables are covered in `film_stock::tests`,
-    // and the full chain's *properties* are pinned in `algo::characteristic::tests`.
-    // What follows is the bit-level half: captured numbers the code is measured against,
-    // plus the argument for why they are portable.
-
-    /// The reconstruction the two tests below measure: the default stock's published
-    /// curve, with the identity gain this curve resolves for itself.
-    ///
-    /// The gain comes from its single definition rather than being restated — pairing
-    /// `characteristic` with `DensityParams::default()`'s parametric calibration would
-    /// correct the stock's own per-channel structure a second time, which is the trap
-    /// `default_scale_for` exists to close.
-    fn characteristic_config() -> Reconstruction {
-        Reconstruction {
-            density: DensityParams {
-                scale: DensityParams::default_scale_for(DensityCurveType::Characteristic),
-                ..DensityParams::default()
-            },
-            curve: DensityCurve::Characteristic(CharacteristicParams::default()),
-        }
-    }
-
-    /// The captured reconstruction of [`characteristic_config`] over
-    /// [`pixels`] / [`base`], as raw `f32` bits. All positive, which is what lets the
-    /// golden below subtract bit patterns to measure a drift in ULPs.
-    const CHARACTERISTIC_EXPECTED: [u32; 15] = [
-        0x3c093270, 0x3c1d2b05, 0x3c120c73, // near-base shadow
-        0x3dcb7eb3, 0x3da81c63, 0x3d9e0a6f, // midtone
-        0x418c4e03, 0x4154240c, 0x409ddd62, // dense highlight (red is past the table)
-        0x2cb14e9f, 0x4fd667b8, 0x4b7e2778, // out-of-range finite, extrapolated hard
-        0x3b356c75, 0x3b356c75, 0x3b356c75, // exactly the base
-    ];
-
-    /// ULPs between two finite f32s of the same sign, as a bit-pattern distance.
-    fn ulps_between(a: f32, b: f32) -> i64 {
-        debug_assert!(
-            a.is_finite() && b.is_finite() && a.is_sign_positive() == b.is_sign_positive(),
-            "ULP distance is a bit-pattern distance, so it needs finite same-signed inputs"
-        );
-        (i64::from(a.to_bits()) - i64::from(b.to_bits())).abs()
-    }
-
-    /// The accuracy premise every measurement below rests on: a libm worth shipping is
-    /// within 1 ULP on these functions.
-    ///
-    /// Deliberately the **weak** bound. Both shipped targets are far better, and an
-    /// earlier version of this harness tried to exploit that — classifying a sample
-    /// "safe" when its true value sat further from an f32 rounding boundary than glibc's
-    /// documented `powf` excess (~0.02 ULP). Observation killed it. On x86_64 glibc's
-    /// `log10f` returns a different `f32` from Apple's for **sample 9**, whose margin is
-    /// 0.456 ULP — twenty times the threshold that had called it safe — and for sample 1
-    /// at 0.0153. A published bound for one function does not transfer to another, and
-    /// neither target documents `log10f` at all.
-    ///
-    /// So nothing here infers agreement from a margin. The window is derived by
-    /// enumerating what a conforming libm can actually return.
-    const LIBM_MAX_ERROR_ULPS: i64 = 1;
-
-    /// Sanity ceiling on a derived window. Not a tuning knob — it exists so that a future
-    /// vector landing on a near-vertical stretch of a published curve (`PORTRA_160_B` has
-    /// a segment with `1/γ = 767`) is reported rather than silently granted an enormous
-    /// tolerance.
-    const MAX_REASONABLE_WINDOW_ULPS: i64 = 200;
-
-    /// Every pixel value a conforming libm can produce for one sample, as a window in
-    /// ULPs around the captured value.
-    ///
-    /// **Sound by enumeration, not by argument.** `to_density`'s `log10` may return any
-    /// f32 within [`LIBM_MAX_ERROR_ULPS`] of the correctly-rounded density, so each is
-    /// rendered and the widest excursion taken; the curve's own `10^` may then be off by
-    /// the same again, which is the final term. Any target meeting the premise lands
-    /// inside this, whatever its individual error bounds are and whether or not anyone
-    /// publishes them.
-    ///
-    /// The window is wide where the curve is steep: a 1-ULP density difference is
-    /// amplified by `ln(10)·d·(1/γ_local)`, reaching 62 ULPs on the out-of-range pixel.
-    /// That costs nothing in detection — a real fault moves these pixels by ~10^5 ULPs
-    /// (measured: a `1e-6` nudge to one table literal moves them 115,523).
-    ///
-    /// **It measures the reachable set's own spread, and deliberately never looks at the
-    /// captured value.** A first version measured each render's distance *from the
-    /// capture*, which let a table edit inflate the window by exactly as much as it
-    /// inflated the drift — the golden then passed on a frame whose every pixel had
-    /// moved 115,523 ULPs. A window that depends on the value under test is not a window.
-    /// The falsifiability run is what caught it; nothing else would have.
-    fn reachable_window(table: &[(f32, f32)], rounded_d: f32) -> i64 {
-        let render = |d: f32| {
-            let (log_e, _) = invert(table, d);
-            10f32.powf(log_e)
-        };
-        let centre = render(rounded_d);
-        let widest = [rounded_d.next_down(), rounded_d.next_up()]
-            .into_iter()
-            .map(|d| ulps_between(render(d), centre))
-            .max()
-            .expect("two neighbouring densities");
-        widest + LIBM_MAX_ERROR_ULPS
-    }
-
-    /// The **correctly rounded** corrected density of each sample, computed in f64.
-    ///
-    /// The centre of each sample's window, and target-independent by construction —
-    /// which is the point: the host's own `to_density` output is one of the values a
-    /// conforming libm may return, not the reference.
-    ///
-    /// Stage 1 is written out as the code writes it, and two rounding details bite anyone
-    /// who shortens it. **The ratio is divided in f32 first**: `to_density` takes `log10`
-    /// of the *rounded* f32 quotient, and dividing in f64 instead puts the reference 5
-    /// ULPs out. **And the gain/offset cannot be dropped even at identity** — the
-    /// film-base pixel's ratio is exactly 1, so the negated log is `-0.0`, and it is the
-    /// `+ offset` that normalises the sign to the `+0.0` actually stored.
-    fn correctly_rounded_densities(density: &DensityParams) -> Vec<f32> {
-        let scan = pixels();
-        let film_base = <[f32; 3]>::from(base());
-        scan.rgb
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let c = i % 3;
-                let ratio = s.max(crate::algo::density::SCAN_EPSILON) / film_base[c];
-                let exact = f64::from(density.scale[c]) * -f64::from(ratio).log10()
-                    + f64::from(density.offset[c]);
-                exact as f32
-            })
-            .collect()
-    }
-
-    /// The characteristic curve's **wiring**, pinned within a derived per-sample window.
-    ///
-    /// Every other golden here is bit-for-bit. This one cannot be, and the reason is
-    /// measured rather than assumed: the chain evaluates two libm functions per sample —
-    /// `log10` in `to_density` and `10^` in the curve — and the two shipped targets
-    /// **observably disagree** on the first. x86_64's `log10f` returns a different `f32`
-    /// from Apple's on two of these fifteen samples. A bit-exact capture would be green
-    /// on the host that took it and red on the other, which is CLAUDE.md's cross-platform
-    /// rule.
-    ///
-    /// The window is not a chosen tolerance. [`reachable_window`] enumerates every pixel
-    /// a libm meeting [`LIBM_MAX_ERROR_ULPS`] can produce for each sample and takes the
-    /// widest, so this passes on any conforming target by construction rather than by the
-    /// luck of which way a rounding fell. (It was luck, once: the x86_64 disagreement on
-    /// sample 9 happens to fall in the direction the curve flattens, so an earlier
-    /// 1-ULP window passed CI while resting on nothing.)
-    ///
-    /// Nothing is lost as a regression pin. An edited table literal, a permuted channel
-    /// and one table applied across all three each move these values by percent — the
-    /// falsifiability matrix in `docs/progress/algo.md` (2026-09-10) records what each
-    /// perturbation moved, the smallest being ~10^5 ULPs against a worst-case window of
-    /// 63.
-    ///
-    /// One wiring fault it **cannot** see, because this config cannot: stages 1–2 are
-    /// `scale·d + offset`, and at the identity gain and zero offset that this curve
-    /// resolves for itself the transposed spelling is arithmetically the same. That one
-    /// belongs to `algo::characteristic::tests::the_chain_applies_the_density_gain_before_the_offset`,
-    /// which states it with an explicit non-neutral pair. The two halves of this task's
-    /// coverage are complementary by design, not redundant.
-    #[test]
-    fn golden_characteristic_is_correct_within_its_libm_window() {
-        let Reconstruction { density, curve } = characteristic_config();
-        let DensityCurve::Characteristic(params) = curve else {
-            unreachable!("the characteristic config selects the characteristic curve")
-        };
-        let stock = curves_for(params.stock);
-        let rounded = correctly_rounded_densities(&density);
-
-        let (out, report) = reconstructed(&characteristic_config());
-        // `zip` below truncates, so the length is asserted rather than assumed.
-        assert_eq!(out.rgb.len(), CHARACTERISTIC_EXPECTED.len());
-
-        for (i, (&want, &got)) in CHARACTERISTIC_EXPECTED
-            .iter()
-            .zip(out.rgb.iter())
-            .enumerate()
-        {
-            let captured = f32::from_bits(want);
-            let window = reachable_window(stock.channels[i % 3], rounded[i]);
-            let drift = ulps_between(got, captured);
-            assert!(
-                drift <= window,
-                "sample {i}: {:08x} is {drift} ULP from the captured {want:08x}, outside \
-                 the {window} ULP any conforming libm can reach",
-                got.to_bits()
-            );
-        }
-
-        // This curve reads its placement off the film, so no anchor is reported — the
-        // property that makes it self-anchoring, asserted where a curve that quietly
-        // acquired one would be caught.
-        assert_eq!(report.curve_anchor, None);
-        // The extrapolation statistic is part of this render's output, and no other
-        // golden carries one: the dense-highlight red and all three of the out-of-range
-        // pixel's channels fall outside the published table.
-        assert_eq!(
-            report.out_of_table,
-            Some(OutOfTable {
-                below: [0.2, 0.0, 0.0],
-                above: [0.2, 0.2, 0.2],
-            })
-        );
-        assert_eq!(out.ir.as_deref(), Some(&[0.1f32, 0.2, 0.3, 0.4, 0.5][..]));
-    }
-
-    /// The capture is intact and the host is conforming — the two things the golden's
-    /// derived window assumes but cannot check for itself.
-    ///
-    /// It fails if a table literal moves, if the vector changes, if a captured constant
-    /// is edited to something no correctly-rounded evaluation produces, or if a host's
-    /// libm is worse than [`LIBM_MAX_ERROR_ULPS`] — which would invalidate every window
-    /// the golden derives.
-    #[test]
-    fn the_characteristic_capture_is_correctly_rounded_and_the_host_conforms() {
-        let Reconstruction { density, curve } = characteristic_config();
-        let DensityCurve::Characteristic(params) = curve else {
-            unreachable!("the characteristic config selects the characteristic curve")
-        };
-        let stock = curves_for(params.stock);
-        let rounded = correctly_rounded_densities(&density);
-        let host = crate::algo::density::to_density(&pixels(), &base(), &density);
-        assert_eq!(host.density.len(), CHARACTERISTIC_EXPECTED.len());
-
-        let mut widest = 0;
-        for (i, (&want, &host_d)) in CHARACTERISTIC_EXPECTED
-            .iter()
-            .zip(host.density.iter())
-            .enumerate()
-        {
-            let captured = f32::from_bits(want);
-            assert!(
-                captured.is_finite() && captured > 0.0,
-                "sample {i}: {captured} is outside what `ulps_between` assumes"
-            );
-
-            // **Conformance, not equality.** Requiring the host's `log10` to equal the
-            // correctly-rounded value asserts the host rounds correctly, which is exactly
-            // what varies — it red x86_64 on sample 1.
-            let off = ulps_between(host_d, rounded[i]);
-            assert!(
-                off <= LIBM_MAX_ERROR_ULPS,
-                "sample {i}: this host's `log10` is {off} ULP from the correctly rounded \
-                 {:e}, beyond the accuracy every derived window assumes",
-                rounded[i]
-            );
-
-            // Capture integrity: the constant is what a correctly-rounded chain produces.
-            // `f64` resolves an f32 ULP to ~4e-9 of one, so this is not a close call.
-            let (log_e, _) = invert(stock.channels[i % 3], rounded[i]);
-            assert_eq!(
-                (10f64.powf(f64::from(log_e)) as f32).to_bits(),
-                want,
-                "sample {i}: the captured value is not the correctly-rounded 10^{log_e}"
-            );
-
-            widest = widest.max(reachable_window(stock.channels[i % 3], rounded[i]));
-        }
-
-        assert!(
-            widest <= MAX_REASONABLE_WINDOW_ULPS,
-            "the widest derived window is now {widest} ULP — a sample has landed somewhere \
-             the curve amplifies steeply, and the golden's tolerance should be understood \
-             before it is accepted"
+            0x3fe66666, // 1.8
         );
     }
 

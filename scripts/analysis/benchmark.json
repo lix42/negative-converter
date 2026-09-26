@@ -4,7 +4,7 @@
   "sets": {
     "fixtures": {
       "root": "repo",
-      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default curve, the exponential curve named explicitly, and f32 output. The `sigmoid` and `simple` cases went with those paths (nf-retire/sigmoid-and-simple); the reference build renders them. This is the set to use for a determinism / zero-diff check. Every case states `--output-preset display-p3` explicitly (`film-master` for the f32 one): they write TIFFs, and the product default is `gain-map-hdr` (a JPEG). They stated `legacy` until nf-retire/legacy-custom retired it (2026-09-23); records made before that are comparable only against the reference build (scripts/reference-snapshot/), not against these cases. This is a holding set -- nf-verification/benchmark-set rebuilds it on the new chain.",
+      "note": "The committed decoder fixtures -- tiny (502x462), no Drive assets needed, so `compare` is runnable and testable on any checkout. Covers both input formats (HDR 48-bit, HDRi 64-bit) and, across cases, the default curve and f32 output. The `sigmoid` and `simple` cases went with those paths (nf-retire/sigmoid-and-simple), and the case naming the exponential explicitly went with `--density-curve` (nf-retire/characteristic); the reference build renders them. This is the set to use for a determinism / zero-diff check. Every case states `--output-preset display-p3` explicitly (`film-master` for the f32 one): they write TIFFs, and the product default is `gain-map-hdr` (a JPEG). They stated `legacy` until nf-retire/legacy-custom retired it (2026-09-23); records made before that are comparable only against the reference build (scripts/reference-snapshot/), not against these cases. This is a holding set -- nf-verification/benchmark-set rebuilds it on the new chain.",
       "cases": [
         {
           "name": "hdri-default",
@@ -34,18 +34,6 @@
             "film-master",
             "--film-base",
             "0.9,0.55,0.42"
-          ]
-        },
-        {
-          "name": "hdri-exponential",
-          "input": "tests/fixtures/hdri-64bit.tif",
-          "args": [
-            "--output-preset",
-            "display-p3",
-            "--film-base",
-            "0.9,0.55,0.42",
-            "--density-curve",
-            "exponential"
           ]
         }
       ]

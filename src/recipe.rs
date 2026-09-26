@@ -382,10 +382,9 @@ pub fn check_body_without_flag(body: &serde_json::Value, context: &str) -> Resul
 
 /// Apply the command-line flags the new chain reads, flags winning over the recipe.
 ///
-/// Every other conversion flag is either refused by presence before this runs
-/// (`flow::reject_unavailable_flags`) or names what the decode already does
-/// (`--density-curve exponential`), so it has nothing to set. (`--reconstruction` is
-/// refused on both chains, before either runs.) `flow`'s `every_kept_flag_reaches_the_recipe` holds that each kept flag
+/// Every other conversion flag is refused by presence before this runs — by
+/// `flow::reject_unavailable_flags`, or on both chains by `cli`'s removed-flag check
+/// (`--reconstruction`, `--density-curve`, `--preset`, …) — so it has nothing to set. `flow`'s `every_kept_flag_reaches_the_recipe` holds that each kept flag
 /// has an arm here.
 pub fn merge(mut r: Recipe, args: &crate::cli::ConvertArgs) -> Recipe {
     crate::cli::merge_shared_sections(

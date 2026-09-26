@@ -901,9 +901,6 @@ mod tests {
         // `--d-max`, which the base-derived default never consults.
         assert!(message.contains("--print-exposure"), "{message}");
         assert!(!message.contains("--d-max"), "{message}");
-        // Nor an `--anchor-*` flag: the characteristic curve refuses the whole family,
-        // and this warning cannot see which curve ran.
-        assert!(!message.contains("--anchor"), "{message}");
 
         // Darker still, obviously.
         let dark = render_linear(&shared_from_film_rgb(&[0.05; 3]), identity())

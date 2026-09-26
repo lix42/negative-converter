@@ -16,7 +16,7 @@ Remove the old paths once the reference build exists: `legacy`/`custom`, the bou
 Created on 2026-09-19 as part of the new-flow migration plan (`docs/nf-migration.md`).
 Landed so far: **`legacy-custom`** (2026-09-23), **`sigmoid-and-simple`** (2026-09-23),
 **`display-tones`** (2026-09-24), **`dmax-machinery`** (2026-09-24),
-**`regional-balance`** (2026-09-25).
+**`regional-balance`** (2026-09-25), **`characteristic`** (2026-09-26).
 
 **What `legacy-custom` means for the rest of the epic.**
 
@@ -97,6 +97,21 @@ Landed so far: **`legacy-custom`** (2026-09-23), **`sigmoid-and-simple`** (2026-
   no report or telemetry field carries a per-frame reconstruction measurement.
 - **The drift gate's `render` text has two frozen lines now** (`dmax=`,
   `balance_range=`); both must stay byte-identical.
+
+**What `characteristic` means for the rest of the epic.**
+
+- **One curve, no selector.** `Reconstruction.curve` is an `ExponentialParams`; no recipe
+  section is internally tagged any more (`merge_json`'s tagged-switch rule went). The
+  old `"type": "exponential"` is dropped on load — a later retirement of a tag should do
+  the same, since every sidecar carries it.
+- **`--preset` is gone**, not just its names, and `nf-look/look-presets` closed without
+  rebuilding it: precedence is `defaults < params < flags`, and no flag is a CLI-only
+  expansion any more.
+- **`density.scale` has one default** (`fixed::DENSITY_SCALE`); roll no longer
+  re-resolves anything per curve by hand.
+- **Telemetry is schema 7** and the report's curve block is `anchor` / `anchor_value`.
+- **`film_stock` is `#[cfg(test)]`**; the scalar-path asset probes (`curve_probe`) are in
+  git only.
 
 ## legacy-custom
 
@@ -527,7 +542,83 @@ Landed so far: **`legacy-custom`** (2026-09-23), **`sigmoid-and-simple`** (2026-
 
 ## characteristic
 
-**Status:** not started
-**Updated:** 2026-09-19
+**Status:** done
+**Updated:** 2026-09-26
 
 - 2026-09-19: filed after the plan review. Goal: retire the `characteristic` curve path.
+- 2026-09-25: **plan.** Decisions taken with the user before starting: (1) **`--preset`
+  itself retires**, not only its three names: with them gone `ConversionPreset` is empty,
+  and a look-only bundle would hold one or two independent knobs (`look.contrast` is the
+  roll's and a preset may not set it; `look.channel_grade` corrects the roll's crossover),
+  which layered `--params` already names without code. The flag becomes a hidden
+  migration error at every value, the expansion layer and the report's
+  `conversion_preset` go, precedence becomes `defaults < params < flags`, and
+  `nf-look/look-presets` closes as retired, not rebuilt; (2) **`DensityCurve` collapses to
+  a struct** (the `Reconstruction` precedent): the wire's `"type": "exponential"` is
+  stripped on load, `"characteristic"` refused; (3) **one-value surfaces go**:
+  `--density-curve` is a hidden migration error at every value (the `display-tones`
+  precedent), telemetry drops `conversion.curve` (schema bump), the report drops the
+  curve type; (4) `density.scale` keeps one plain default, `fixed::DENSITY_SCALE`, and the
+  three per-curve resolution sites go; (5) no `pipeline_version` bump — `render` and
+  `base` must reproduce, `recipe` refreshes in place; (6) `scripts/preset-review/` is
+  deleted whole, its only matrix being the three presets.
+- 2026-09-25: **implemented; all gates green, not yet reviewed.**
+  - **Removed:** `algo/characteristic.rs` and `algo/curve_probe.rs` whole;
+    `DensityCurve`, `DensityCurveType`, `CharacteristicParams`,
+    `DensityParams::default_scale_for`, `ReconstructionReport::out_of_table` (and
+    `curve_anchor` is no longer an `Option`); in `cli`, `ConversionPreset`,
+    `PresetExpansion`, `ConversionPresetResult` and the report's `conversion_preset`,
+    `StockResult`, `OUT_OF_TABLE_WARN_FRACTION` and its warning, the curve-switch
+    warnings and `curve_type_spelling`, `sets_curve_stock` / `sets_density_scale`,
+    roll's per-frame gain reset, `merge_json`'s `internally_tagged_switch` (no recipe
+    section is internally tagged any more), `parse_density_curve`, the `validate` branch
+    and `merge` refusals that told the curves apart; `flow.rs`'s three rows (now
+    unreachable); `OutputPreset::applies_display_tone`, `REFERENCE_CONTRAST`,
+    `FilmStock`'s serde and `parse` (dead). `film_stock` is `#[cfg(test)]`.
+  - **Migration:** `RemovedCharacteristicFlags` (hidden, any value or none) in
+    `reject_removed_flags`, both chains; `ExponentialParams`' deserializer drops
+    `"type": "exponential"`, refuses `"characteristic"` / `stock` with
+    `REMOVED_CHARACTERISTIC_CURVE` (which names the `[1, 1, 1]` `density.scale` those
+    sidecars carry — dropping only the curve would replay the wrong gain), and refuses any
+    other tag.
+  - **Found on the way:** the unpinned-curve probe keyed on `type == "exponential"`, so a
+    curve without the tag (every recipe this build writes) would never have warned; it
+    now keys on `gamma`/`anchor` alone, and the warning no longer says the recipe "pins
+    `curve.type`". `fixed::DENSITY_SCALE`'s doc still claimed to be independent of the
+    legacy default, which had read it since `pipeline_version` 6.
+  - **Drift gate:** `render`/`base` reproduced; `recipe` refreshed in place
+    (`53af9f2172093cac`). Telemetry schema 7.
+  - **Tests:** 762 unit, 213 integration, 388 nctool. Gone: the preset, curve-switch and
+    characteristic tests and the characteristic golden with its libm-window harness
+    (`reachable_window`, cited in CLAUDE.md and `version.rs` as in git). Added:
+    `the_characteristic_flags_are_migration_errors` (unit) and
+    `the_characteristic_curve_is_a_migration_error` (binary: both chains before the
+    missing-base rule, tagged-sidecar byte-identical replay, the recipe refusal and its
+    remedy rendering, no retired field in report or sidecar). The "producer-agnostic"
+    tests now pair `reconstruct` with `fixed::decode`; the midtone probes pin mid-grey
+    through the curve's own anchor instead of an inverted datasheet patch.
+  - **Docs:** `using-nc.md` §5–§6, §11, §12–13 and header (examples re-run against the
+    binary), design-spec §2/§4/§5/§7/§8/§9 and the telemetry shape, design-update, CLAUDE.md,
+    the `render-review-set` and `perf-telemetry` skills, three READMEs, and the open tasks
+    that named the removed surface (`profile-authoring`, `recipe-composition`,
+    `subcommands`, `reference-sweep`, `scanner-density-calibration`).
+- 2026-09-26: **ship review** (`ship:diff-reviewer` + Codex). Taken: `benchmark.json`'s
+  `hdri-exponential` case still passed `--density-curve` and so exited 2 on every
+  `nctool compare run` — deleted (it was `hdri-default` once the flag went); stale
+  prose in `using-nc.md` §4 (a `curve.stock` roll warning, per-frame curve-switch
+  re-resolution) and design-spec's roll invariants; the whole-curve warning's remedy
+  still said to write a "tagged" curve (a user following it got the next warning);
+  stale `--density-curve` mentions in `recipe.rs`, `types.rs` and two tests; a merge test
+  still passing the removed flag; `nctool`'s `_drop_retired_curve_tag` crashed on a
+  non-object `reconstruction` (Codex; now left for `_freeze_recipe`'s message), and
+  `_freeze_recipe` no longer writes back the tag this build dropped. The generated
+  `curves.rs` and its emitter lost their last `--film-stock` mention.
+- 2026-09-26: **done.** Verified: all CI gates green (762 unit, 213 integration, 388
+  nctool), `render`/`base` reproduced with `recipe` refreshed, `docs/using-nc.md`
+  re-verified against the binary (minimal recipe, §3 recipe and sidecar replay
+  byte-identical; every quoted refusal re-run). The task's checks hold: a recipe naming
+  `characteristic` and each preset name refuse naming the replacement; nothing resolves a
+  per-curve `density.scale`; no message or help text recommends a removed flag. For
+  dependents: `print-prefix-rename` has one curve and no `type` tag to carry;
+  `nf-core/default-flip` inherits no curve selector; `io/scanner-density-calibration`'s
+  probes live in git (`9b34848:src/algo/curve_probe.rs`).

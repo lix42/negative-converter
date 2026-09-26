@@ -3,9 +3,10 @@
 ## Goal
 
 Rename `hanten params` to **`hanten profile`** and make it author a reusable look: accept
-the same override flags `convert` takes — including `--preset` and `--film-stock`,
-since a preset's expansion is exactly what a profile records — validate them, and
-write an annotated, hand-editable file — with no scan involved.
+the same override flags `convert` takes, validate them, and write an annotated,
+hand-editable file — with no scan involved. (`--preset` and `--film-stock` retired
+with the `characteristic` curve, `nf-retire/characteristic`: a named look is now a
+profile file, which is what this task authors.)
 
 Delete `--dump-params`, which this replaces.
 
@@ -55,9 +56,9 @@ composing a real recipe means splicing `calibrate`'s fragments in by hand.
 
 - `hanten profile <overrides> --out look.jsonc` writes a file with no scan present,
   and that file is accepted by `--params` unchanged.
-- `hanten profile --preset characteristic-stock --film-stock ektar-100 --out look.jsonc`
-  writes the same expansion `convert --dump-params` writes today, so a roll can still
-  take a named bundle after `--dump-params` is gone.
+- `hanten profile <look flags> --out look.jsonc` writes the same values
+  `convert --dump-params` writes today, so a roll can still take a named look after
+  `--dump-params` is gone.
 - The emitted comments survive a round trip *as comments in the file*, and the
   file still parses — the JSONC-is-a-superset claim, tested rather than assumed.
 - A contradictory override set (e.g. a sigmoid flag with an exponential curve) is

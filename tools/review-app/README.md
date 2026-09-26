@@ -56,7 +56,7 @@ that works (`nctool` is not installed, and measuring wants the venv):
 
 ```sh
 PYTHONPATH=scripts/analysis .venv/bin/python -m nctool review generate \
-  scripts/preset-review/presets.matrix.json
+  <matrix.json>
 ```
 
 ## Using it

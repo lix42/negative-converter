@@ -71,9 +71,8 @@ per-channel median of the five cells, so a gradient leaves it mid-spread and usa
 ## 3. The config set
 
 The matrix is **data**, so comparing something new is a JSON edit, not code. Write copies;
-never edit `scripts/preset-review/presets.matrix.json` or
-`scripts/analysis/fixtures.json` in place — they describe a curated study and their
-roll names predate the asset rename.
+never edit `scripts/analysis/fixtures.json` in place — it describes a curated study and
+its roll names predate the asset rename.
 
 Two files, built by a short script kept beside the set. The frame lists come from
 `manifest.json`; the `dmin` values do **not** — the manifest does not carry them, so the script
@@ -88,8 +87,8 @@ every cell whose `common_args` reference `{dmin}`.
   produces a doubled path and every frame is reported missing and skipped.
 - **matrix copy** — `schema_version` (must be `1`; the loader refuses the document
   otherwise), `output_dir`, `output_preset`, `common_args` (usually `["--film-base",
-  "{dmin}"]`), `metrics.inset`, a `rolls` block mapping roll → `film_stock` if any config uses
-  `{film_stock}`, and one entry per configuration under `configs`.
+  "{dmin}"]`), `metrics.inset`, and one entry per configuration under `configs`. `{dmin}`
+  is the one placeholder.
 - **a build axis, when comparing two binaries** — an optional top-level `builds`, one
   `{"id", "label", "nc"}` per binary (`note` optional). Every config is then rendered by
   every build, as cells with the composed id `<config>@<build>` and the label
@@ -300,11 +299,9 @@ weeks later.
 - **Nothing checks that a metric record describes the pixels beside it.** Re-render by hand
   and the charts go on describing the previous render; `nctool review generate` re-measures on
   checksum change, which is why it is the way to rebuild a set.
-- **A preset's calibration can move, and explicit flags do not freeze a render.** Stating
-  every flag pins those *values*, not the omitted defaults and not the algorithm inside the
-  `--nc` binary, so the same matrix re-run after a pipeline change can produce different
-  pixels. A matrix naming only `--preset` is looser still: it renders what that preset means
-  *today*. **A set records which binary made it only when it declares `builds`**: each config
+- **Explicit flags do not freeze a render.** Stating every flag pins those *values*, not
+  the omitted defaults and not the algorithm inside the `--nc` binary, so the same matrix
+  re-run after a pipeline change can produce different pixels. **A set records which binary made it only when it declares `builds`**: each config
   then carries a `producer` block, derived from what that binary reported rather than typed
   into the matrix, and the app shows it under the picture and in the button's tooltip. A
   matrix with no build axis still carries none — every cell writes its own `<image>.json`

@@ -12,16 +12,18 @@ A practical guide to converting film negative scans to positives with `hanten`.
 > `b36ca64` (under `--new-flow` the decode's slope is `reconstruction.linearization`,
 > print contrast is `look.contrast` / `--contrast`, and the look's grade is
 > `--channel-grade`, §11) plus `nf-retire/regional-balance` (the balance flags and keys
-> retired, §5–§6). The staleness
+> retired, §5–§6) and `nf-retire/characteristic` (the curve, `--density-curve`,
+> `--film-stock` and `--preset` retired, §5–§6). The staleness
 > signal is `pipeline_version`: if
 > `hanten --version` reports a different one, treat this document as suspect and
 > re-verify.
 >
 > **Retired flags and presets** — the regional balance (`--shadow-balance`,
 > `--highlight-balance`, `--balance-range`, `--auto-balance-range`),
-> `--display-tone` and `--highlight-compress`,
-> `--reconstruction`, `--density-curve sigmoid`, the `--sigmoid-*` flags, the
-> `sigmoid-knees` / `sigmoid-flat` presets, and before them `legacy` / `custom` — are
+> `--display-tone` and `--highlight-compress`, the `characteristic` curve with
+> `--density-curve`, `--film-stock` and `--preset`,
+> `--reconstruction`, the `sigmoid` curve and its `--sigmoid-*` flags and presets, and
+> before them `legacy` / `custom` — are
 > documented in the reference build's own guide
 > (`git show origin/reserve:docs/using-nc.md`; `scripts/reference-snapshot/README.md`
 > builds that binary). Here they are refused with a message naming the replacement.
@@ -248,7 +250,7 @@ parameter choices beside it:
 ```jsonc
 {
   "calibration": { "film_base": { "explicit": [0.163, 0.080, 0.0377] } },
-  "reconstruction": { "curve": { "type": "exponential", "gamma": 2.0,
+  "reconstruction": { "curve": { "gamma": 2.0,
                                  "anchor": { "mid-at-base-offset": 0.62 } },
                       "density": { "scale": [1.0, 0.84, 0.73] } }
 }
@@ -304,7 +306,7 @@ hanten params
       "scale": [1.0, 0.84, 0.73],
       "offset": [0.0, 0.0, 0.0]
     },
-    "curve": { "type": "exponential", "gamma": 2.0,
+    "curve": { "gamma": 2.0,
                "anchor": { "mid-at-base-offset": 0.62 } }
   },
   "input":       { "transfer": "auto", "meaning": "auto",
@@ -334,23 +336,15 @@ Omit any section and serde defaults fill the gap. This minimal recipe produces a
 }
 ```
 
-Naming a curve by `"type"` alone also resolves to the default, but warns that its
-`gamma` and `anchor` were left to this build — both defaults have moved before.
-
-> **Gotcha:** the tagged objects need their tag. If you include
-> `reconstruction.curve` at all, you **must** include its `"type"` — omitting it
-> fails with `reconstruction.curve is missing 'type'`. Omitting the whole `curve`
-> object is fine.
-
-The `curve` object above is the default **exponential** shape. The `characteristic`
-curve carries only its stock:
-
-```json
-{ "type": "characteristic", "stock": "portra-400" }
-```
+A `curve` object that states only one of `gamma` and `anchor` (or neither) also
+resolves, but warns that the rest was left to this build — both defaults have moved
+before.
 
 A recipe from an earlier build still carries `"type": "density"` inside
-`reconstruction`; that old value is accepted and dropped. `"type": "simple"` and a
+`reconstruction` and `"type": "exponential"` inside `curve`; both old values are
+accepted and dropped. A `"characteristic"` curve or a `curve.stock` is refused: that
+curve retired, and the message also names the `density.scale` of `[1, 1, 1]` its
+sidecars carry, which you should drop with it. `"type": "simple"` and a
 `"sigmoid"` curve are refused with a migration error — including every sidecar and
 `--dump-params` written while the sigmoid was the default, because replaying one on
 another curve would render a different picture. Render those with the reference build.
@@ -430,8 +424,7 @@ usage: recipe roll.json: top-level `film_base` is no longer supported — the ro
 
 **Flags always win over the recipe.** Precedence is by *source*, not value — an
 explicit `--white-balance 1,1,1` over a recipe's `auto` mode means neutral gains,
-not re-estimation. With a [`--preset`](#-preset--pick-a-look-by-name) the full chain is
-`defaults < --params recipe < --preset < flags`.
+not re-estimation: `defaults < --params recipe < flags`.
 
 ```sh
 hanten convert scan.tif -o out.jpg --params roll-recipe.json --print-exposure 0.5
@@ -488,215 +481,42 @@ default, `.tiff` under `display-p3`/`film-master`, `.avif` under
 `"output": "chosen"` writes `chosen.jpg` on a default roll.
 
 Some keys describe the *roll*, not the frame: the whole `calibration` section, the
-anchor placement, `curve.stock` and `output.preset`. Overriding one per frame is applied
+anchor placement and `output.preset`. Overriding one per frame is applied
 but warns loudly (and `--strict` turns the warning into a failing exit), because the
 frame then renders on a different rule from its siblings — a roll is one piece of film
 through one process.
 
-An override that changes `curve.type` **re-resolves the two knobs whose right value is
-per-curve**: the anchor placement and the per-channel `density.scale` both take the new
-curve's default. The roll's measured `calibration` is untouched by a curve switch, in
-either direction — it is a separate section, not a curve knob. Each reset warns if it
-discarded a value the recipe had stated; restate it inside the override to keep it.
+An override's retired `curve.type` is dropped at `"exponential"` and refused otherwise;
+there is one curve, so there is nothing to switch.
 
 ---
 
 ## 6. Reconstruction and curves
 
-### `--preset` — pick a look by name
+Reconstruction is density-domain inversion (Cineon / negadoctor lineage) through one
+curve, the **exponential**: a straight line in density whose slope is `--density-gamma`
+(default `2.0`) and whose placement is the anchor below
+(`{"mid-at-base-offset": 0.62}`). The default is the fixed decode's configuration: the
+same render `--new-flow` decodes with (§11).
 
-The three settings below (curve, per-channel gain, print exposure) only
-mean anything **together**: the exposure that lands one brightness runs from 1.59 to
-1.91 across the presets, because they place mid-grey differently.
-`--preset` names a bundle so you don't have to carry three coupled numbers. It leaves the
-display tone alone: a recipe's `fit_range.headroom_stops` survives it.
-
-Each bundle's exposure is solved so that **switching preset changes the look, not the
-brightness** — what you compare is then the reconstruction. That
-calibration is done on `portra-400`; on another stock the generic profile drifts with
-how closely it models that film. Presets are not meant to render
-alike, so a brightness difference between two of them on your film is part of what they
-offer, not something to correct.
-
-| `--preset` | Reconstruction | Display tone | Needs |
-|---|---|---|---|
-| `characteristic-generic` | `characteristic`, the averaged generic C-41 profile | `reinhard` | — |
-| `characteristic-stock` | `characteristic`, the roll's own published response | `reinhard` | `--film-stock` |
-| `characteristic-aim` | `characteristic-stock` + the aim-matched red density scale | `reinhard` | `--film-stock` |
-
-The `sigmoid-knees` and `sigmoid-flat` presets retired with the sigmoid curve and are
-refused by name; the reference build still renders them.
-
-```sh
-hanten convert scan.tif -o out.jpg --film-base 0.9,0.55,0.42 --preset characteristic-generic
-hanten convert scan.tif -o out.jpg --film-base 0.9,0.55,0.42 --preset characteristic-stock --film-stock portra-400
-```
-
-All three render scene mid-grey at the same brightness, so what you are comparing
-between them is the reconstruction and the tone, not "one is brighter".
-
-**A preset is a set of starting values, and individual flags still win over it.** The
-precedence chain is `defaults < --params recipe < --preset < flags` — the preset sits
-*above* the recipe, because `hanten params` writes every key explicitly and a preset
-underneath one would have nothing left to set. The report separates the two directions:
-
-```json
-"conversion_preset": {
-  "name": "characteristic-generic",
-  "replaced":   ["reconstruction.curve"],      // the preset won over the recipe
-  "overridden": ["print.print_exposure"]       // a flag won over the preset
-}
-```
-
-**A preset never touches the roll's measured `calibration`.** A preset names a *look*,
-and writes no `calibration` key at all, so a measured film base survives it
-untouched and never appear in `replaced`. Everything in `curve` — slope, anchor,
-stock — is the look, and the preset does replace it.
-
-**It is a command-line shorthand, not a recipe key.** `--dump-params` writes the
-*expanded* values, so a recipe replays identically on any build — including one whose
-preset definitions have since moved. A recipe that names a preset is rejected as an
-unknown field, and `hanten roll` takes the dumped recipe rather than a preset name:
-
-```sh
-hanten convert scan.tif -o out.jpg --film-base 0.9,0.55,0.42 \
-   --preset characteristic-stock --film-stock ektar-100 --dump-params roll.json
-hanten roll frames/ --out-dir out/ --params roll.json
-```
-
-Four combinations are refused rather than quietly doing something else:
-
-- **`--film-stock` beside `characteristic-generic`**, which has no stock — otherwise it
-  would silently render a different bundle at the wrong exposure. Use
-  `characteristic-stock`.
-- **`characteristic-stock` / `-aim` with `--film-stock generic-c41`** — that profile is
-  an average of nine sheets, not one film's response. Use `characteristic-generic`.
-- **`characteristic-aim` with `portra-800` or `ultramax-800`** — their datasheets
-  tabulate an aim delta their own curves contradict, so there is no correction to
-  derive. Use `characteristic-stock` for those.
-- **A preset with `--output-preset film-master`** — see below.
-
-A preset never *sets* `--output-preset`, but the two are not freely combinable: a
-conversion preset is a reconstruction **and display** bundle, so it needs an output preset
-that renders a display image. `display-p3`, `compatibility`, `gain-map-hdr`,
-`ultra-hdr-v1`, `hdr-pq`, `hdr-hlg`, `hdr-linear-tiff`, `hdr-pq-tiff` and `hdr-hlg-tiff`
-all work. `film-master`, which runs no display stage, refuses any `--preset` with a single
-message. For a film master, set the reconstruction knobs
-directly instead:
-
-```sh
-hanten convert scan.tif -o master.tif --film-base 0.9,0.55,0.42 \
-   --output-preset film-master --density-curve characteristic --film-stock ektar-100
-```
-
-Reconstruction is density-domain inversion (Cineon / negadoctor lineage), with two
-curves selected by `--density-curve`:
-
-| Curve | Knobs | Defaults |
-|---|---|---|
-| `exponential` *(default)* | `--density-gamma` — the straight line's slope, plus the anchor flags below | `gamma 2.0`, `anchor {"mid-at-base-offset": 0.62}` |
-| `characteristic` | `--film-stock` — and nothing else | `generic-c41` |
-
-The default is the fixed decode's configuration: the same render `--new-flow` decodes
-with (§11). Each curve takes **different recipe keys**, and mixing them is rejected —
-*"`gamma` is a parametric-curve key, but the curve type is "characteristic", which
-reads its slope and its mid-grey placement off the stock's published curve. Its only
-key is `stock`"*.
-
-`simple` reconstruction and the `sigmoid` curve retired. `--reconstruction`,
-`--density-curve sigmoid` and the `--sigmoid-*` flags are refused, each naming what
-replaces it:
+`simple` reconstruction, the `sigmoid` curve and the per-stock `characteristic` curve
+retired, and with them the flags that chose between curves. `--reconstruction`,
+`--density-curve` (at any value, `exponential` included), `--film-stock`, `--preset` and
+the `--sigmoid-*` flags are refused on both chains, each saying what to do instead:
 
 ```
-usage: --sigmoid-toe was removed with the sigmoid curve: the exponential has no knees,
-       and highlight roll-off belongs to the display tone (`--display-tone-headroom`).
+usage: --density-curve was removed: the exponential is the only density curve (recipe
+       `reconstruction.curve`), so there is nothing to select — drop the flag. …
+usage: --preset was removed: its bundles (`characteristic-generic`, `-stock`, `-aim`, and
+       earlier `sigmoid-knees` / `-flat`) set retired curves with an exposure calibrated
+       to them, and no bundle replaces them. Drop the flag, and set a knob you want
+       directly — `--print-exposure` on the current chain; `--contrast`,
+       `--channel-grade`, `--highlight-desaturation` under `--new-flow` — or collect them
+       in a `--params` recipe. …
 ```
 
-### `characteristic` — invert the film's own published curve
-
-The exponential *models* the film with a slope and an anchor. This one
-**reads** it: each dye layer's measured density-to-log-exposure relation, digitized from
-the manufacturer's characteristic curve, inverted per channel. Mid-grey lands at 0.18 by
-construction, so there is nothing to anchor and no contrast to pick.
-
-```sh
-hanten convert scan.tif -o out.tif --output-preset display-p3 \
-  --film-base 0.5,0.25,0.15 --density-curve characteristic --film-stock portra-400
-```
-
-Ten stocks ship, all digitized from Kodak publications kept in
-[`docs/datasheets/`](datasheets/): `generic-c41` *(the default)*, `ektar-100`,
-`portra-160`, `portra-160vc`, `portra-400`, `portra-400vc`, `portra-800`, `gold-200`,
-`ultramax-400`, `ultramax-800`. Naming a stock is a **refinement, never a requirement** —
-omit it and you get `generic-c41`, the average of the nine measured stocks, which renders
-correctly on any C-41 film. A stock that is named but unknown is a loud error listing the
-accepted spellings, because a silent fallback would hide a typo behind a plausible render.
-
-The report says which publication the numbers came from, so a datasheet value is
-checkable:
-
-```json
-"curve": {
-  "type": "characteristic",
-  "out_of_table": { "below": [0.00012215113, 8.5596905e-05, 1.6293963e-05],
-                    "above": [0.058473945, 0.051922057, 0.0] },
-  "stock": { "name": "portra-400", "publication": "E-4050", "revision": "2025-01",
-             "aims": [0.82, 1.18], "d_min": [0.2192, 0.646, 0.8665] },
-  "anchor": null, "anchor_value": null
-}
-```
-
-`anchor` is `null` on purpose: this curve follows no placement rule, and reporting one
-would name a knob the render never read.
-`aims` are the sheet's published *Judging Negative Exposures* densities, `[grey card,
-paper white]` (Status M, red channel) — the most directly checkable numbers on it if you
-own a densitometer. `out_of_table` is the fraction of the frame that fell past either end
-of the published curve, per channel; see the extrapolation note at the end of this
-section. The `d_min` is **diagnostic only** — your measured `--film-base` is what the
-render divides by. Its usefulness is as a check: the *differences* between those three
-numbers are the stock's orange-mask signature, so comparing them against your own base's
-differences tells you whether the stock you declared is the film you scanned.
-
-Why it exists: every C-41 stock measured has a blue layer 12–19 % steeper than its red
-one, so one contrast applied to all three channels leaves a colour cast that **grows with
-density** — measured at +1.26 stops per unit corrected density across 21 real frames,
-against +1.29 predicted by the datasheets. Inverting each channel's own curve removes it
-(residual +0.09). It also inverts the film's toe rather than adding a second one.
-
-**Known issue — a residual green cast.** The blue cast a single scalar contrast leaves is
-removed (measured residual +0.09 stops per unit density, against +1.26 before), but a green
-one remains, and its size depends on the stock: +0.08 for `gold-200`, +0.18 `portra-400`,
-+0.48 `portra-160`, +1.00 `ektar-100`. On the badly-affected stocks `--film-stock
-generic-c41` currently looks *better* than naming the stock, because averaging nine curves
-dilutes any one sheet's error. The cause is most likely a missing cross-channel term (ACES
-applies a 3×3 before its curves; Hanten does not yet) and it is tracked by
-`io/scanner-density-calibration`. Ektar's own sheet also disagrees with itself by 11 %
-between its aim table and its curve, which is a second, smaller factor for that stock.
-
-**It needs the display tone.** Like the exponential, this curve does not bound itself at
-the render's ceiling — it hands the display scene-referred exposure, and measured picture
-content reaches p99.99 **+3.64 stops** over diffuse white. So `--display-tone-headroom 0`
-(the identity) in practice *refuses* a render of ordinary picture content: the per-pixel
-range check rejects the frame (verified: "pixel 13 sits above reference white"), while any
-real headroom renders. It is not a rejected *combination* — nothing validates the pair —
-so content dark enough to stay inside the ceiling still renders (`--print-exposure=-3` on
-the test fixture exits 0). See §7.
-
-Two further limits. The published curves are for *typical* processing, not your
-roll, so a heavily pushed or badly stored film will not match. And densities outside the
-published range are **extrapolated** along its end slope, not read off it; `convert`'s
-report gives the per-channel fractions in `reconstruction_result.curve.out_of_table`. A
-`roll` frame entry carries no `reconstruction_result` block, so on a roll only the
-above-20 % warning surfaces — measure a representative frame with `convert` if you want
-the numbers.
-
-Expect a few per cent there on a full-frame scan and ignore it: the holder and rebate
-around the picture are denser than any exposed frame, so they sit past the end of every
-curve. Measured across twelve frames, that border is 5–7 % of the frame and **none of it is
-inside the picture area**. The figure is a poor check on the stock you declared, too —
-rendering one frame under every profile moved it only between 5.75 % and 6.55 %. Only a
-much larger fraction (the warning fires above 20 %) means the image itself is being
-extrapolated.
+**A named look is a recipe file.** Put the knobs you want in a partial recipe with no
+`calibration` and pass it with `--params` (§5); `roll` takes it the same way.
 
 ### Anchoring — where the curve pins a tone
 
@@ -723,18 +543,12 @@ recipe `"white-at-dmax"`, `"mid-at-dmax-fraction"`, `"black-at-base"`) retired i
 ```
 usage: --anchor-mid-fraction was removed: it pinned mid-grey at a fraction of the
        reference density. The roll reference density and the placements that read it
-       are gone. Drop the flag: on the exponential curve the anchor is placed from the
-       film base, mid-grey `--anchor-mid-offset D` density above it (default 0.62,
-       slope `--density-gamma`); the characteristic curve places mid-grey from the
-       stock's published response and takes neither.
+       are gone. Drop the flag: the anchor is placed from the film base, mid-grey
+       `--anchor-mid-offset D` density above it (default 0.62, slope
+       `--density-gamma`).
 ```
 
 The reference build keeps them, if you need to reproduce an old render.
-
-**Switching to the characteristic curve drops the placement**, since that curve reads
-its placement off the film. The roll's `calibration` is untouched — it is a separate
-section. If your recipe pinned a non-default placement, that is a loud,
-`--strict`-promotable warning naming what was dropped.
 
 > **Provisional values.** `D = 0.62` is the generic C-41 profile's mid-grey aim above
 > the base, rounded and frozen. The anchor stays referenced to the base: a roll's own
@@ -761,24 +575,13 @@ five roll medians (green `0.837`, blue `0.733`). Rolls are weighted equally on p
 — two thirds of the patches come from one scan date, and weighting by patch would let
 that date set the default on its own. It replaced `1,0.90,0.86` at `pipeline_version` 5.
 
-Two things to know before relying on it:
-
-- **The default is per-curve, and you do not have to manage it.** The `exponential`
-  applies one scalar contrast to every channel, so it has no per-channel film model of
-  its own and takes `1,0.84,0.73`. The `characteristic` curve carries each
-  stock's published per-channel structure already, so the same gain would correct it twice
-  — on ten reference frames that moves the channel means *away* from neutral
-  (`|G/R − 1| + |B/R − 1|` rises from 0.04 to 0.19) — and it therefore defaults to
-  `1,1,1`. Selecting a curve re-resolves the gain unless you state one: `--density-scale`
-  always wins, and switching away from a gain you had stated warns rather than dropping it
-  in silence.
-- **It balances five rolls; it does not fit yours.** Blue is the steady half — every
-  roll measured wants 0.68–0.78. Green is not: it splits by **scan date** (one group
-  0.86–0.90, another ~0.77, which tracks a change of developer rather than of film), so
-  the shipped `0.84` is a compromise that fits neither group exactly and can push a roll
-  from the higher group slightly green-yellow. The value is also calibrated on one
-  scanner. A roll that still shows a cast wants its own `--density-scale`;
-  `io/scanner-density-calibration` is the task that should remove the need to guess.
+**It balances five rolls; it does not fit yours.** Blue is the steady half — every
+roll measured wants 0.68–0.78. Green is not: it splits by **scan date** (one group
+0.86–0.90, another ~0.77, which tracks a change of developer rather than of film), so
+the shipped `0.84` is a compromise that fits neither group exactly and can push a roll
+from the higher group slightly green-yellow. The value is also calibrated on one
+scanner. A roll that still shows a cast wants its own `--density-scale`;
+`io/scanner-density-calibration` is the task that should remove the need to guess.
 
 ### The regional balance — retired
 
@@ -810,21 +613,8 @@ is dropped at its old default `"fixed"` and refused otherwise (§5).
 
 ### Nothing is silently ignored
 
-Cross-curve flags are **usage errors**:
-
-```sh
-hanten convert … --density-curve characteristic --density-gamma 1.8
-# usage: --density-gamma (1.8) sets a curve slope, but the resolved curve is
-#        characteristic — its slope is the film's own, read off the stock's published
-#        response. Pass --density-curve exponential to set a slope by hand
-
-hanten convert … --film-stock ektar-100
-# usage: --film-stock ektar-100 selects a published film response, but the resolved
-#        curve is exponential — a stock has nothing to configure there.
-#        Pass --density-curve characteristic
-```
-
-This is deliberate: a flag that quietly did nothing would be worse than a failure.
+A retired flag is a **usage error** naming what to do instead, never accepted and
+dropped: a flag that quietly did nothing would be worse than a failure.
 
 ---
 
@@ -1451,33 +1241,20 @@ $ hanten convert … --new-flow --output-preset display-p3
 usage: --output-preset has no meaning under `--new-flow`: the new flow has no
 counterpart for it yet — one arrives with the new flow's destination set: …
 
-$ hanten convert … --new-flow --density-curve characteristic
-usage: --density-curve has no meaning under `--new-flow`: the new flow has no
-counterpart for it, and will not gain one: … Use `--density-curve exponential`, …
+$ hanten convert … --new-flow --auto-wb gray-world
+usage: --auto-wb has no meaning under `--new-flow`: the new flow has no counterpart
+for it, and will not gain one: … Use `hanten measure-roll`, then its gains as
+`--white-balance` …
 ```
 
 A knob can be refused by the **flag** you typed, or — in a recipe — by the new
 chain's recipe schema, which has no key for it (below).
 
-**The reconstruction knobs are fully classified**, because the fixed decode that
-strands them has landed. It is one decode for every negative: a straight line in
-density against log exposure, with one reference-free anchor rule. So these are
-refused:
-
-| Refused | Why |
-|---|---|
-| `--density-curve characteristic` | the curve is no longer a choice the decode offers |
-| `--film-stock` | per-stock normalization becomes an optional **rendering** step — planned, not scheduled, and it will bring its own flag; `--film-stock` leaves with `--density-curve characteristic` |
-| `--preset` | a preset sets knobs on both sides of the decode/rendering boundary |
-
-And these still work, because they *are* the fixed decode's own calibration and
-anchor: `--density-scale`, `--density-offset`, `--density-gamma` (the decode's
-linearization — see below) and `--anchor-mid-offset`. So does `--density-curve exponential`, which
-names what the new flow already decodes with — an identity value asks for nothing this
-flow cannot do. (It is *not* spared in order to let one recipe be re-used on either
-chain: the new chain's recipe has no curve key, so there is no pinned value for a flag
-to clear.) The retired sigmoid, `simple` and regional-balance flags are refused before
-any of this, on either chain.
+**The fixed decode keeps every surviving reconstruction flag**, because they *are*
+its own calibration and anchor: `--density-scale`, `--density-offset`,
+`--density-gamma` (the decode's linearization — see below) and `--anchor-mid-offset`.
+The retired curve-selection, sigmoid, `simple`, reference-density and regional-balance
+flags are refused before any of this, on either chain.
 
 **A recipe for the new chain is its own document.** It states
 `"recipe_version": 2` and has one section per stage; `hanten params --new-flow`
@@ -1820,12 +1597,6 @@ shoulder of its own, so a low anchor is severe. Lower the exposure, raise the he
 move the anchor up, or use an f32 output (`hdr-linear-tiff`, `film-master`) for an
 unclamped result.
 
-**"reconstruction.curve is missing `type`"**
-A partial recipe that includes the `curve` object must include its tag. Add the
-type you actually intended — normally `"exponential"`, the default. Adding
-`"type": "characteristic"` also makes it parse, but it switches you to the other curve
-and changes your pixels.
-
 **`--strict` fails on every frame of an IR scan**
 Expected — see §9: an unconsumed IR plane warns, and `--strict` promotes it. The
 plane is consumed only when the base source is `auto` *and* the plane is
@@ -1849,7 +1620,6 @@ So you don't go looking:
 |---|---|
 | **Auto-cascade recipe generation** — a planner that produces a roll recipe for you, instead of you measuring and freezing it by hand | [`core/base-acquisition-planner`](tasks/core/base-acquisition-planner.md) |
 | **Content-based film-base fallback** (`--base-content`) for cropped scans with no visible rebate | [`film-base/content-fallback`](tasks/film-base/content-fallback.md) |
-| **Named conversion presets** (`--preset`) — selecting a whole reconstruction + display bundle by name instead of assembling the flags. Today each configuration is 3–5 coupled flags whose values only make sense together | [`algo/conversion-presets`](tasks/algo/conversion-presets.md) |
 | **IR dust removal** | roadmap follow-up, no task file yet |
 
 [`docs/TASKS.md`](TASKS.md) is the authoritative status for all of it.

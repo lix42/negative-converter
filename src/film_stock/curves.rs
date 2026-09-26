@@ -1,4 +1,4 @@
-//! Pinned characteristic-curve data — the literals the runtime inverts.
+//! Pinned characteristic-curve data — the literals `super`'s evidence tests read.
 //!
 //! **Generated.** `python3 scripts/analysis/digitize_datasheets.py --emit-rust` rewrites
 //! this file from `curves.json`, which is itself digitized from the publications in
@@ -7,14 +7,14 @@
 //!
 //! Each table is `(relative log exposure, density above D-min)` for one dye layer. The
 //! log-exposure axis is shifted so the stock's own **mid-grey aim density sits at
-//! `log10(0.18)`**, which is what makes the inversion self-anchoring: `10^(curve⁻¹(D′))`
-//! is relative scene exposure with mid-grey at 0.18, with no separate anchor to resolve.
+//! `log10(0.18)`**: relative scene exposure with mid-grey at 0.18, with no separate
+//! anchor to resolve.
 //!
-//! Two invariants the inversion depends on, both asserted in `super::tests`: **strictly
-//! increasing** in both coordinates, and a **first point at `D′ = 0`** (the film base).
+//! Two invariants, both asserted in `super::tests`: **strictly increasing** in both
+//! coordinates, and a **first point at `D′ = 0`** (the film base).
 //!
-//! Editing a literal changes rendered pixels for anyone naming that stock. Re-derive from
-//! the publication rather than hand-tuning.
+//! No render reads these tables; they are the evidence for the fixed decode's constants.
+//! Re-derive from the publication rather than hand-tuning.
 
 // These are digitized measurements, not mathematical constants. `clippy::approx_constant`
 // fires on `0.78539` (a log-exposure coordinate) because it is close to π/4, which is a
@@ -648,7 +648,7 @@ const ULTRAMAX_800_B: &[(f32, f32)] = &[
     (1.229986, 1.829476), (1.280505, 1.862082), (1.381332, 1.928733),
 ];
 
-/// Every stock the registry knows, in the order `--film-stock` lists them.
+/// Every stock the registry knows, in `FilmStock::ALL`'s order.
 pub const STOCKS: &[StockCurves] = &[
     StockCurves {
         name: "generic-c41",

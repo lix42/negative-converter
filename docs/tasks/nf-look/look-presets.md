@@ -1,4 +1,4 @@
-# Re-express the `--preset` bundles
+# Re-express the `--preset` bundles — retired, not rebuilt
 
 ## Goal
 
@@ -40,6 +40,31 @@ the old chain, so none of them survives unchanged; the likely answer is that
 - Whether a preset name is provenance in the report only, or a recipe key that
   re-expands — the old task chose CLI-only; re-check the reasoning, don't inherit
   it.
+
+## Outcome (2026-09-25): `--preset` retires
+
+Decided with the user and carried out by `nf-retire/characteristic`, whose deletion of
+the last three names left the flag with nothing to name. Both open questions resolve to
+"no preset":
+
+- **Nothing is coupled any more.** The bundles existed because their numbers were
+  meaningless apart (an exposure solved per reconstruction). With a fixed decode the look
+  has three knobs and none bundles: `look.contrast` is the roll's (a preset may not set
+  it), `look.channel_grade` corrects the roll's own crossover, and
+  `look.highlight_desaturation` is one number, on by default. A look preset would be one
+  or two independent flags under a name.
+- **Layered `--params` already names a look** (`core/recipe-composition`): a partial
+  recipe holding `look` is a user-owned, versioned bundle of ordinary recipe keys that
+  works on `roll`, with no calibration constants in code. That also removes the reason
+  `recipe-composition` had for carrying `--preset` onto `roll`.
+- Per-stock normalization brings its own flag (`stock-data-home`); the "direct"
+  rendering is a destination's (`nf-destinations/direct-preset`).
+
+`--preset` is a hidden migration error at every value, on both chains; the expansion
+layer, the report's `conversion_preset` block and the `defaults < params < preset <
+flags` layer are gone. Curated looks, if ever wanted, can ship as example `--params`
+files in `docs/using-nc.md` with no CLI surface. Do not reuse the name `--preset` for
+something else: an old command line should keep meeting its migration message.
 
 ## How to Verify
 

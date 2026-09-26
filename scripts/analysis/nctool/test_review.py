@@ -25,13 +25,11 @@ MATRIX = {
     "schema_version": 1,
     "title": "Two presets",
     "output_preset": "gain-map-hdr",
-    "common_args": ["--film-base", "{dmin}"],
-    "rolls": {"Ektar": {"film_stock": "ektar-100"}},
+    "common_args": ["--print-exposure", "0.5"],
     "metrics": {"inset": 0.1},
     "configs": [
-        {"id": "generic", "label": "generic", "args": ["--preset", "characteristic-generic"]},
-        {"id": "stock", "label": "stock",
-         "args": ["--preset", "characteristic-stock", "--film-stock", "{film_stock}"]},
+        {"id": "generic", "label": "generic", "args": ["--density-gamma", "2.2"]},
+        {"id": "stock", "label": "stock", "args": ["--film-base", "{dmin}"]},
     ],
 }
 
@@ -84,13 +82,23 @@ class TestMatrix(unittest.TestCase):
         with self.assertRaisesRegex(review.ReviewError, "metrics.inset"):
             load(metrics={"inset": 0.5})
 
-    # Which configs need a film stock is **stated by the args**, never guessed
-    # from the id: nc refuses `--film-stock` beside a preset with no stock to
-    # configure, and requires it for the ones that have one.
-    def test_only_the_configs_that_name_a_stock_need_one(self):
+    # Which configs need a per-frame value is **stated by the args**, never guessed
+    # from the id.
+    def test_only_the_configs_that_name_a_placeholder_need_its_value(self):
         configs = {c["id"]: c for c in load()["configs"]}
+        self.assertEqual(configs["generic"]["needs"], set())
+        self.assertEqual(configs["stock"]["needs"], {"dmin"})
+        # A placeholder in `common_args` is every config's need.
+        configs = {c["id"]: c for c in load(common_args=["--film-base", "{dmin}"])["configs"]}
         self.assertEqual(configs["generic"]["needs"], {"dmin"})
-        self.assertEqual(configs["stock"]["needs"], {"dmin", "film_stock"})
+
+    # `film_stock` left with `--film-stock` (`nf-retire/characteristic`), and with it
+    # the matrix's `rolls` block, which existed to state it.
+    def test_refuses_the_retired_film_stock_placeholder_and_rolls_block(self):
+        with self.assertRaisesRegex(review.ReviewError, "film_stock"):
+            load(configs=[{"id": "a", "args": ["--film-stock", "{film_stock}"]}])
+        with self.assertRaisesRegex(review.ReviewError, "unknown key rolls;"):
+            load(rolls={"Ektar": {}})
 
 
 class TestUnknownKeys(unittest.TestCase):
@@ -101,7 +109,7 @@ class TestUnknownKeys(unittest.TestCase):
     # labels, identical pixels, exit 0.
     def test_refuses_a_mistyped_config_key(self):
         with self.assertRaisesRegex(review.ReviewError, "unknown key arg;"):
-            load(configs=[{"id": "a", "arg": ["--preset", "characteristic-generic"]}])
+            load(configs=[{"id": "a", "arg": ["--density-gamma", "2.2"]}])
 
     # `insets` measures the whole frame — the film holder included, which is the
     # one thing the inset exists to keep out of the statistics.
@@ -112,10 +120,6 @@ class TestUnknownKeys(unittest.TestCase):
     def test_refuses_a_mistyped_top_level_key(self):
         with self.assertRaisesRegex(review.ReviewError, "unknown key output_presets;"):
             load(output_presets="gain-map-hdr")
-
-    def test_refuses_a_mistyped_roll_key(self):
-        with self.assertRaisesRegex(review.ReviewError, "unknown key stock;"):
-            load(rolls={"Ektar": {"stock": "ektar-100"}})
 
 
 class TestCopiedStrings(unittest.TestCase):
@@ -133,13 +137,12 @@ class TestCopiedStrings(unittest.TestCase):
 class TestExpansion(unittest.TestCase):
     def test_substitutes_the_per_frame_values(self):
         self.assertEqual(
-            review.expand_args(["--film-base", "{dmin}", "--film-stock", "{film_stock}"],
-                               {"dmin": "0.5,0.2,0.1", "film_stock": "ektar-100"}),
-            ["--film-base", "0.5,0.2,0.1", "--film-stock", "ektar-100"])
+            review.expand_args(["--film-base", "{dmin}"], {"dmin": "0.5,0.2,0.1"}),
+            ["--film-base", "0.5,0.2,0.1"])
 
     def test_leaves_an_argument_with_no_placeholder_alone(self):
-        self.assertEqual(review.expand_args(["--preset", "characteristic-generic"], {"dmin": "x"}),
-                         ["--preset", "characteristic-generic"])
+        self.assertEqual(review.expand_args(["--density-gamma", "2.2"], {"dmin": "x"}),
+                         ["--density-gamma", "2.2"])
 
 
 class TestMetricsSpace(unittest.TestCase):
@@ -397,34 +400,6 @@ class TestFrameSelection(unittest.TestCase):
             review._frames_to_render(load(), self.FIXTURES, "E1,Z9")
 
 
-class TestShippedMatrix(unittest.TestCase):
-    """The committed matrix is data the generator reads, so it is checked here."""
-
-    PATH = (Path(__file__).resolve().parents[2]
-            / "preset-review" / "presets.matrix.json")
-
-    def test_the_preset_matrix_loads(self):
-        matrix = review.load_matrix(self.PATH)
-        self.assertEqual(len(matrix["configs"]), 3)
-        self.assertEqual(matrix["output_preset"], "gain-map-hdr")
-
-    def test_every_roll_it_names_states_a_film_stock(self):
-        matrix = review.load_matrix(self.PATH)
-        for name, roll in matrix["rolls"].items():
-            self.assertTrue(roll["film_stock"], f"{name} states no film stock")
-
-    def test_its_frames_and_rolls_exist_in_the_fixtures(self):
-        # The fixture declaration is the frame source, so a roll named only in
-        # the matrix would silently lose every cell that needs its stock.
-        fixtures = json.loads(
-            (self.PATH.parents[1] / "analysis" / "fixtures.json")
-            .read_text(encoding="utf-8"))
-        matrix = review.load_matrix(self.PATH)
-        self.assertEqual(set(matrix["rolls"]) - set(fixtures["rolls"]), set())
-        for name in review._frames_to_render(matrix, fixtures, None):
-            self.assertIn(fixtures["frames"][name]["roll"], fixtures["rolls"])
-
-
 if __name__ == "__main__":
     unittest.main()
 
@@ -537,7 +512,7 @@ class TestBuildAxis(unittest.TestCase):
 
     def test_the_args_come_from_the_config_not_the_build(self):
         for cell in load(builds=BUILDS)["configs"][:2]:
-            self.assertEqual(cell["args"], ["--preset", "characteristic-generic"])
+            self.assertEqual(cell["args"], ["--density-gamma", "2.2"])
 
     # The join is injective because `@` is outside `SAFE_ID`: an author's id can
     # never contain one, so a composed id splits exactly one way. That is what
@@ -1050,7 +1025,6 @@ class TestBuildAxisEndToEnd(unittest.TestCase):
                      **matrix) -> tuple[int, str]:
         """One `cmd_generate` run. `builds=None` is the matrix with no build axis."""
         path = write({**MATRIX, "output_preset": "legacy", "common_args": [],
-                      "rolls": {"R": {}},
                       "configs": [{"id": "dflt", "args": []}],
                       "builds": builds, **matrix})
         args = argparse.Namespace(
@@ -1360,7 +1334,7 @@ class TestBuildAxisEndToEnd(unittest.TestCase):
 
     def test_an_override_repoints_a_build_without_editing_the_matrix(self):
         path = write({**MATRIX, "output_preset": "legacy", "common_args": [],
-                      "rolls": {"R": {}}, "configs": [{"id": "dflt", "args": []}],
+                      "configs": [{"id": "dflt", "args": []}],
                       "builds": [{"id": "after", "label": "a",
                                   "nc": "/nonexistent/x"}]})
         args = argparse.Namespace(

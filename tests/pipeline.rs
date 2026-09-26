@@ -640,8 +640,6 @@ fn hdr_linear_tiff_writes_a_bit_exact_display_linear_bt2020_master() {
             // the container — that samples above the 203-nit reference white
             // survive with no transfer or clamp applied — so the fixture has to
             // produce some, whatever the default curve is.
-            "--density-curve",
-            "exponential",
             "--strict",
         ]);
         assert_eq!(code, 0, "{err}");
@@ -752,8 +750,6 @@ fn coded_hdr_tiffs_store_exact_codes_and_signal_cicp_in_the_profile() {
             // peak below the 203-nit reference white would raise one
             // (`single_rendition_hdr_presets_warn_when_the_signal_stays_below_reference_white`)
             // that has nothing to do with PQ/HLG code storage.
-            "--density-curve",
-            "exponential",
             "--strict",
         ]);
         assert_eq!(code, 0, "{preset}: {err}");
@@ -1477,24 +1473,25 @@ fn convert_writes_tiff_sidecar_and_report() {
     assert_eq!(code, 0, "convert should succeed");
     assert!(is_tiff(&out), "output must be a valid TIFF");
     // Effective-recipe sidecar next to the output, valid JSON — recipe body under
-    // `params`, beside the `meta` identity envelope. The retired `type` selector is
-    // not written.
+    // `params`, beside the `meta` identity envelope. Neither retired `type` selector
+    // is written.
     let recipe = sidecar_params(&out);
     assert!(recipe["reconstruction"].get("type").is_none(), "{recipe}");
     assert_eq!(recipe["reconstruction"]["schema_version"], 1);
-    assert_eq!(recipe["reconstruction"]["curve"]["type"], "exponential");
+    assert!(
+        recipe["reconstruction"]["curve"].get("type").is_none(),
+        "{recipe}"
+    );
 
     let report = json(&stdout);
     assert_eq!(report["command"], "convert");
     assert!(report["reconstruction_result"].get("type").is_none());
-    assert_eq!(
-        report["reconstruction_result"]["curve"]["type"],
-        "exponential"
+    assert!(
+        report["reconstruction_result"]["curve"]
+            .get("type")
+            .is_none()
     );
-    assert_eq!(
-        report["recipe"]["reconstruction"]["curve"]["type"],
-        "exponential"
-    );
+    assert_eq!(report["recipe"]["reconstruction"]["curve"]["gamma"], 2.0);
     // The pinned working-space mapping is stamped on every convert report
     // (design-spec §8), independent of reconstruction path.
     assert_eq!(report["working_mapping"], "nc-film-rgb-v1");
@@ -1905,8 +1902,6 @@ fn bad_params_are_usage_errors() {
         out.to_str().unwrap(),
         "--output-preset",
         "display-p3",
-        "--density-curve",
-        "exponential",
         "--density-gamma",
         "0",
     ]);
@@ -1914,7 +1909,7 @@ fn bad_params_are_usage_errors() {
     assert!(!out.exists(), "no output on a usage error");
 
     // The removed simple clip controls are migration errors (exit 2), and the
-    // removed --algorithm selector points at --density-curve.
+    // removed --algorithm selector says to drop the flag.
     let (code, _stdout, err) = run(&[
         "convert",
         fixture("hdr-48bit.tif").to_str().unwrap(),
@@ -1938,8 +1933,8 @@ fn bad_params_are_usage_errors() {
     ]);
     assert_eq!(code, 2, "--algorithm must be a migration error: {err}");
     assert!(
-        err.contains("--density-curve"),
-        "the migration error names the replacement: {err}"
+        err.contains("reconstruction.curve") && err.contains("Drop the flag"),
+        "the migration error names what replaced it: {err}"
     );
     assert!(!out.exists(), "no output on a usage error");
 }
@@ -2159,10 +2154,10 @@ fn a_calibration_only_recipe_matches_the_same_values_given_as_flags() {
 /// spelling's stated gain reaches the report.
 ///
 /// Through the binary because that is where the defect was reproduced: `DensityParams` is
-/// a plain derive, so serde accepted the positional-array form, which deserialized
-/// successfully while `Reconstruction`'s raw-object `scale` probe read "not stated" — the
-/// stated `[1.2, 1.0, 0.8]` was overwritten by the per-curve default and the frame
-/// rendered a colour the recipe never asked for, at **exit 0** with no warning. The object
+/// a plain derive, so serde accepted the positional-array form, and while the gain's
+/// default was per-curve a raw-object probe read the array as "not stated" and replaced
+/// the stated `[1.2, 1.0, 0.8]` at **exit 0**. The per-curve default is gone
+/// (`nf-retire/characteristic`), but the recipe's sections are still objects. The object
 /// half is the control: it keeps the guard from over-correcting into "ignore a stated
 /// scale".
 #[test]
@@ -2173,7 +2168,7 @@ fn an_array_shaped_density_section_is_a_usage_error() {
             &tmp.path(name),
             &format!(
                 r#"{{"reconstruction":{{"type":"density","density":{density},
-                     "curve":{{"type":"characteristic"}}}},
+                     "curve":{{"type":"exponential"}}}},
                    "calibration":{{"film_base":{{"explicit":[0.9,0.55,0.42]}}}},
                    "output":{{"preset":"display-p3"}}}}"#
             ),
@@ -2358,8 +2353,6 @@ fn sidecar_recipe_round_trips_through_recipe_in() {
         "film-master",
         "--film-base",
         "0.9,0.55,0.42",
-        "--density-curve",
-        "exponential",
         "--density-gamma",
         "1.8",
         "--report",
@@ -3265,7 +3258,7 @@ fn telemetry_file_writes_full_record() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
 
-    assert_eq!(record["schema_version"], 6);
+    assert_eq!(record["schema_version"], 7);
     assert!(record["timestamp_ms"].as_u64().unwrap() > 0);
     assert!(record["nc_version"].is_string());
     assert!(record["target"].is_string());
@@ -3307,9 +3300,10 @@ fn telemetry_file_writes_full_record() {
 
     let conv = &record["conversion"];
     assert_eq!(conv["preset"], "display-p3");
-    // Schema 5 dropped the one-valued reconstruction type.
+    // Schema 5 dropped the one-valued reconstruction type, and schema 7 the one-valued
+    // curve.
     assert!(conv.get("reconstruction").is_none(), "{conv}");
-    assert_eq!(conv["curve"], "exponential");
+    assert!(conv.get("curve").is_none(), "{conv}");
     assert!(conv["params_hash"].as_str().unwrap().len() == 16);
     assert_eq!(
         conv["film_base_source"]["explicit"],
@@ -3434,7 +3428,7 @@ fn telemetry_log_appends_one_line_per_run() {
     // Each line is an independent, valid JSON object.
     for line in lines {
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert_eq!(v["schema_version"], 6);
+        assert_eq!(v["schema_version"], 7);
     }
 }
 
@@ -3674,7 +3668,7 @@ fn telemetry_file_dash_writes_json_to_stdout() {
     ]);
     assert_eq!(code, 0, "telemetry to stdout should succeed:\n{err}");
     let record = json(&stdout);
-    assert_eq!(record["schema_version"], 6);
+    assert_eq!(record["schema_version"], 7);
     assert_eq!(record["image"]["format"], "hdr");
 }
 
@@ -3710,10 +3704,7 @@ fn telemetry_params_hash_matches_identical_conversions() {
     let c = tmp.path("c.tiff");
     let ra = convert(&a, &[]);
     let rb = convert(&b, &[]);
-    let rc = convert(
-        &c,
-        &["--density-curve", "exponential", "--density-gamma", "1.8"],
-    );
+    let rc = convert(&c, &["--density-gamma", "1.8"]);
 
     let ha = ra["conversion"]["params_hash"].as_str().unwrap();
     let hb = rb["conversion"]["params_hash"].as_str().unwrap();
@@ -3867,10 +3858,9 @@ fn telemetry_key_in_recipe_is_rejected() {
 }
 
 #[test]
-fn telemetry_records_the_curve_and_params_hash() {
-    // The record's conversion summary names the resolved curve, and params_hash (over
-    // the effective recipe JSON) must cover the curve keys, so tweaking one changes the
-    // hash.
+fn telemetry_params_hash_covers_the_curve() {
+    // params_hash (over the effective recipe JSON) must cover the curve keys, so
+    // tweaking one changes the hash.
     let tmp = TempDir::new("tel-curve");
     let fix = fixture("hdr-48bit.tif");
     let convert = |out: &Path, extra: &[&str]| -> serde_json::Value {
@@ -3896,10 +3886,7 @@ fn telemetry_records_the_curve_and_params_hash() {
     };
     let ra = convert(&tmp.path("a.tiff"), &[]);
     let rb = convert(&tmp.path("b.tiff"), &["--density-gamma", "1.5"]);
-    let rc = convert(&tmp.path("c.tiff"), &["--density-curve", "characteristic"]);
 
-    assert_eq!(ra["conversion"]["curve"], "exponential", "{ra}");
-    assert_eq!(rc["conversion"]["curve"], "characteristic", "{rc}");
     assert_ne!(
         ra["conversion"]["params_hash"], rb["conversion"]["params_hash"],
         "a changed curve knob must change params_hash"
@@ -3908,8 +3895,8 @@ fn telemetry_records_the_curve_and_params_hash() {
 
 #[test]
 fn convert_reports_the_default_curve_and_its_base_derived_anchor() {
-    // The default render end to end: the report names the resolved curve and its
-    // placement, and the sidecar recipe carries the tagged curve.
+    // The default render end to end: the report names the curve's placement and the
+    // anchor it derived, and the sidecar recipe carries the curve.
     let tmp = TempDir::new("default-curve");
     let out = tmp.path("out.tiff");
     let (code, stdout, err) = run(&[
@@ -3925,7 +3912,7 @@ fn convert_reports_the_default_curve_and_its_base_derived_anchor() {
     assert_eq!(code, 0, "{err}");
     let report = json(&stdout);
     let curve = &report["reconstruction_result"]["curve"];
-    assert_eq!(curve["type"], "exponential");
+    assert!(curve.get("type").is_none(), "{curve}");
     assert!(
         curve["anchor"].get("mid-at-base-offset").is_some(),
         "{curve}"
@@ -3935,7 +3922,6 @@ fn convert_reports_the_default_curve_and_its_base_derived_anchor() {
     assert!((anchor - 0.992_363_75).abs() < 1e-6, "{anchor}");
     assert_eq!(report["working_mapping"], "nc-film-rgb-v1");
     let recipe = sidecar_params(&out);
-    assert_eq!(recipe["reconstruction"]["curve"]["type"], "exponential");
     assert_eq!(recipe["reconstruction"]["curve"]["gamma"], 2.0);
 }
 
@@ -4415,95 +4401,6 @@ fn roll_strict_promotes_a_warning_while_still_emitting_the_report() {
     assert!(err.contains("strict"), "stderr should explain: {err}");
 }
 
-/// A per-frame override that switches to the `characteristic` curve resolves that curve's
-/// **own** per-channel density gain, and the frame actually converts.
-///
-/// Two defects this pins, both of which passed every unit gate:
-///
-/// 1. The roll overlay is JSON-merged onto the *serialized* shared config, so
-///    `density.scale` is always present and `Reconstruction`'s deserialize-time resolution
-///    cannot fire. Without the explicit reset in the roll planner, a frame switched to
-///    `characteristic` kept the parametric curves' calibration `[1, 0.90, 0.86]` — applied
-///    on top of a curve that already carries each stock's per-channel response, which
-///    measured `|G/R − 1| + |B/R − 1|` rising from 0.039 to 0.185 on real frames.
-/// 2. The variant switch used to carry the roll's `dmax` into the new curve object, and
-///    `characteristic` had no `dmax` key — so the frame failed with "`dmax` is a
-///    parametric-curve key", naming a key the *merge* had inserted. There was no override
-///    text that worked, which made the curve unreachable from a roll manifest entirely.
-///    `core/calibration-recipe-section` removed the carry outright by moving the value to
-///    `calibration.dmax`; `merge_json_switches_internally_tagged_type_and_carries_nothing`
-///    pins that, and this test keeps the end-to-end half.
-///
-/// End-to-end rather than as a unit test because both bugs live in the seam between the
-/// JSON overlay and the typed config, which is exactly what a unit test on either side
-/// misses.
-#[test]
-fn roll_per_frame_curve_switch_resolves_that_curves_own_density_gain() {
-    let tmp = TempDir::new("roll-curve-scale");
-    let recipe = write_file(&tmp.path("roll.json"), ROLL_RECIPE);
-    let hdr = fixture("hdr-48bit.tif");
-    // Two frames: one on the roll's curve, one switched. Same input file, so any
-    // difference in the resolved recipe is the override's doing and nothing else.
-    let manifest_txt = format!(
-        r#"{{ "frames": [
-             {{ "input": {hdr:?}, "output": {shared:?} }},
-             {{ "input": {hdr:?}, "output": {switched:?},
-                "params": {{ "reconstruction": {{ "curve":
-                  {{ "type": "characteristic", "stock": "portra-400" }} }} }} }}
-           ] }}"#,
-        hdr = hdr.to_str().unwrap(),
-        shared = tmp.path("shared.tiff").to_str().unwrap(),
-        switched = tmp.path("switched.tiff").to_str().unwrap(),
-    );
-    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
-    let (code, stdout, err) = run(&[
-        "roll",
-        "--frames",
-        manifest.to_str().unwrap(),
-        "--out-dir",
-        tmp.path("out").to_str().unwrap(),
-        "--params",
-        recipe.to_str().unwrap(),
-    ]);
-    assert_eq!(
-        code, 0,
-        "both frames should convert:
-{stdout}
-{err}"
-    );
-    let report = json(&stdout);
-    assert_eq!(report["summary"]["succeeded"], 2, "{stdout}");
-
-    // The resolved recipe rides in each frame's sidecar.
-    let scale_of = |path: &std::path::Path| -> Vec<f64> {
-        let txt = std::fs::read_to_string(path.with_extension("tiff.json"))
-            .unwrap_or_else(|e| panic!("no sidecar beside {}: {e}", path.display()));
-        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-        let params = v.get("params").unwrap_or(&v);
-        params["reconstruction"]["density"]["scale"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|x| x.as_f64().unwrap())
-            .collect()
-    };
-    let round = |v: Vec<f64>| -> Vec<f64> {
-        v.into_iter()
-            .map(|x| (x * 1000.0).round() / 1000.0)
-            .collect()
-    };
-    assert_eq!(
-        round(scale_of(&tmp.path("shared.tiff"))),
-        vec![1.0, 0.84, 0.73],
-        "the unswitched frame keeps the parametric calibration"
-    );
-    assert_eq!(
-        round(scale_of(&tmp.path("switched.tiff"))),
-        vec![1.0, 1.0, 1.0],
-        "the switched frame must take the characteristic curve's own identity gain"
-    );
-}
-
 #[test]
 fn roll_warns_on_per_frame_film_base_override() {
     // film_base is meant to be roll-fixed, but a per-frame override that sets it is
@@ -4577,93 +4474,6 @@ fn roll_warns_on_per_frame_film_base_override() {
     );
     assert!(!report["warnings"].as_array().unwrap().is_empty());
     assert!(err.contains("strict"), "stderr should explain: {err}");
-}
-
-#[test]
-fn roll_warns_when_a_per_frame_curve_switch_drops_the_roll_anchor() {
-    // The break reachable **without naming the key**: an override that switches only
-    // `curve.type` to the characteristic curve takes no placement at all, so the roll's
-    // stated `anchor` is discarded — and `sets_curve_anchor`, a key probe, never sees it. Before
-    // this warning the frame rendered on a different tonal rule than the rest of the roll
-    // with nothing in the report to show it. `hdr-48bit.tif` is IR-free so the `--strict`
-    // half is about *this* warning and not the IR one.
-    let tmp = TempDir::new("roll-curve-switch-anchor");
-    let hdr = fixture("hdr-48bit.tif");
-    let manifest_txt = format!(
-        r#"{{ "frames": [
-             {{ "input": {hdr:?},
-                "params": {{ "reconstruction": {{ "curve": {{ "type": "characteristic" }} }} }} }}
-           ] }}"#,
-        hdr = hdr.to_str().unwrap(),
-    );
-    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
-    let roll_args = |recipe: &std::path::Path, out: &str, strict: bool| -> Vec<String> {
-        let mut a = vec![
-            "roll".to_string(),
-            "--frames".to_string(),
-            manifest.to_str().unwrap().to_string(),
-            "--out-dir".to_string(),
-            tmp.path(out).to_str().unwrap().to_string(),
-            "--params".to_string(),
-            recipe.to_str().unwrap().to_string(),
-        ];
-        if strict {
-            a.push("--strict".to_string());
-        }
-        a
-    };
-    let dropped = "dropped `reconstruction.curve.anchor`";
-
-    // A roll that pinned a non-default placement: the switch drops it, loudly.
-    let stated = write_file(
-        &tmp.path("stated.json"),
-        r#"{ "reconstruction": {
-               "curve": { "type": "exponential",
-                          "anchor": { "mid-at-base-offset": 0.5 } } },
-             "calibration": { "film_base": { "explicit": [0.9, 0.55, 0.42] } },
-             "output": { "preset": "display-p3" } }"#,
-    );
-    let args = roll_args(&stated, "out", false);
-    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(code, 0, "a dropped anchor warns, it does not fail:\n{err}");
-    let report = json(&stdout);
-    assert_eq!(
-        report["summary"]["succeeded"], 1,
-        "the frame still converts"
-    );
-    let w = report["warnings"]
-        .as_array()
-        .expect("roll-level warnings array");
-    assert!(
-        w.iter().any(|m| m.as_str().unwrap().contains(dropped)),
-        "the dropped roll anchor must reach the report: {report}"
-    );
-    assert!(err.contains(dropped), "warning echoed to stderr: {err}");
-
-    // Falsifiable control: the identical switch over a roll whose placement is the
-    // exponential's own default loses nothing chosen, so it must stay silent — otherwise
-    // every ordinary `type` override would warn and `--strict` would fail for all of
-    // them. Not run under `--strict`: this frame also clips, so a strict exit would
-    // prove nothing about *this* warning.
-    let defaulted = write_file(
-        &tmp.path("defaulted.json"),
-        r#"{ "reconstruction": {
-               "curve": { "type": "exponential",
-                          "anchor": { "mid-at-base-offset": 0.62 } } },
-             "calibration": { "film_base": { "explicit": [0.9, 0.55, 0.42] } },
-             "output": { "preset": "display-p3" } }"#,
-    );
-    let args = roll_args(&defaulted, "out-control", false);
-    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(code, 0, "the control must convert:\n{stdout}\n{err}");
-    let control = json(&stdout);
-    assert!(
-        !control["warnings"]
-            .as_array()
-            .is_some_and(|w| w.iter().any(|m| m.as_str().unwrap().contains(dropped))),
-        "the control must not report a dropped anchor: {control}"
-    );
-    assert!(!err.contains(dropped), "control stderr: {err}");
 }
 
 #[test]
@@ -5041,10 +4851,6 @@ fn film_master_writes_unclamped_float_acescg_and_reports_the_branch() {
     assert!(content.contains("not a physical scene-linear"), "{content}");
     // …and the versions the master depends on are all recorded.
     assert_eq!(report["working_mapping"], "nc-film-rgb-v1");
-    assert_eq!(
-        report["reconstruction_result"]["curve"]["type"],
-        "exponential"
-    );
     let anchor = report["reconstruction_result"]["curve"]["anchor_value"]
         .as_f64()
         .expect("the derived anchor is reported");
@@ -5271,7 +5077,7 @@ fn film_master_telemetry_names_the_preset_and_the_written_depth() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&rec).unwrap()).unwrap();
     let conv = &record["conversion"];
-    assert_eq!(record["schema_version"], 6);
+    assert_eq!(record["schema_version"], 7);
     assert_eq!(conv["preset"], "film-master");
     assert_eq!(
         conv["output_depth"], "f32",
@@ -5314,9 +5120,8 @@ fn film_master_telemetry_names_the_preset_and_the_written_depth() {
 
 #[test]
 fn film_master_content_names_the_placement_it_made() {
-    // The master's reported `content` names what placed mid-grey: the exponential's
-    // film-base-derived anchor, or the characteristic curve's own response — never
-    // the other one, and never a reference density that no longer exists.
+    // The master's reported `content` names what placed mid-grey: the curve's
+    // film-base-derived anchor — never a reference density that no longer exists.
     let tmp = TempDir::new("film-master-content");
     let input = fixture("hdri-64bit.tif");
     let convert = |name: &str, extra: &[&str]| -> serde_json::Value {
@@ -5343,15 +5148,6 @@ fn film_master_content_names_the_placement_it_made() {
     assert!(content.contains("film-base-derived anchor"), "{content}");
     assert!(content.contains("not a physical scene-linear"), "{content}");
     assert!(!content.contains("Dmax"), "{content}");
-
-    // Falsifiable: the characteristic curve claims its own placement instead.
-    let report = convert("stock.tiff", &["--density-curve", "characteristic"]);
-    let content = report["output_render"]["content"].as_str().unwrap();
-    assert!(
-        content.contains("published characteristic curve"),
-        "{content}"
-    );
-    assert!(!content.contains("film-base-derived"), "{content}");
 }
 
 #[test]
@@ -5754,8 +5550,6 @@ fn params_hash_is_the_hash_of_the_dump_params_bytes() {
         &[
             "--dump-params",
             dump.to_str().unwrap(),
-            "--density-curve",
-            "exponential",
             "--density-gamma",
             "1.7",
         ],
@@ -5790,7 +5584,7 @@ fn params_hash_is_the_hash_of_the_dump_params_bytes() {
     let (c2, s2, _) = convert_p3(
         &fixture("hdri-64bit.tif"),
         &out2,
-        &["--density-curve", "exponential", "--density-gamma", "1.8"],
+        &["--density-gamma", "1.8"],
     );
     assert_eq!(c2, 0);
     assert_ne!(
@@ -5829,8 +5623,6 @@ fn enveloped_sidecar_and_bare_legacy_recipe_both_reload_identically() {
         &[
             "--dump-params",
             dump.to_str().unwrap(),
-            "--density-curve",
-            "exponential",
             "--density-gamma",
             "1.6",
             "--report",
@@ -8930,587 +8722,6 @@ fn strict_still_fails_when_the_ir_marched_region_reaches_no_pixel() {
     );
 }
 
-/// The characteristic curve is reachable, self-anchoring, and reports its provenance.
-///
-/// `algo/film-stock-profiles`: naming a stock selects the *measured* film response instead
-/// of a parametric model, so the report must carry which publication the numbers came from
-/// — a datasheet value is only checkable if the reader can find the sheet.
-#[test]
-fn the_characteristic_curve_renders_and_reports_its_stock_provenance() {
-    let dir = TempDir::new("characteristic-curve");
-    let out = dir.path("out.tif");
-    let (code, stdout, err) = run(&[
-        "convert",
-        "tests/fixtures/hdr-48bit.tif",
-        "-o",
-        out.to_str().unwrap(),
-        "--output-preset",
-        "display-p3",
-        "--film-base",
-        "0.5,0.25,0.15",
-        "--density-curve",
-        "characteristic",
-        "--film-stock",
-        "portra-400",
-        "--report",
-        "json",
-    ]);
-    assert_eq!(code, 0, "{err}");
-    let report = json(&stdout);
-    let curve = &report["reconstruction_result"]["curve"];
-    assert_eq!(curve["type"], "characteristic");
-    assert_eq!(curve["stock"]["name"], "portra-400");
-    assert_eq!(curve["stock"]["publication"], "E-4050");
-    assert!(curve["stock"]["revision"].is_string());
-    // No placement rule — and the report says so rather than naming a number the
-    // render never consulted.
-    assert!(curve["anchor"].is_null(), "{curve}");
-    assert!(curve["anchor_value"].is_null(), "{curve}");
-    assert!(curve.get("dmax").is_none(), "{curve}");
-    // The recipe spelling must match the flag spelling, or the emitted recipe cannot be
-    // fed back — serde's kebab-case would have written `portra400`.
-    assert_eq!(
-        report["recipe"]["reconstruction"]["curve"]["stock"],
-        "portra-400"
-    );
-    assert!(out.exists());
-}
-
-/// A frame rendered mostly off the published table says so, and `--strict` refuses it.
-///
-/// The characteristic curve extrapolates along the end slope rather than clamping, which
-/// keeps out-of-range samples ordered and finite — but extrapolated is not measured, so a
-/// frame leaning on it has to announce that. `algo/characteristic-curve-coverage`: the
-/// fractions and this warning were the one part of the curve's output that nothing
-/// asserted, though they reach the report, the console and `--strict`.
-///
-/// The fixture is the IR-free one on purpose: `hdri-64bit.tif` emits "IR preserved but not
-/// used" on every frame, so a `--strict` run there exits non-zero whatever this warning
-/// does. The off-table base below also avoids clipping, so the strict failure counts
-/// exactly one warning — this one.
-#[test]
-fn an_off_table_characteristic_render_warns_and_is_strict_promotable() {
-    let dir = TempDir::new("characteristic-out-of-table");
-    let convert = |base: &str, out: &str, extra: &[&str]| {
-        let mut args = vec![
-            "convert",
-            "tests/fixtures/hdr-48bit.tif",
-            "-o",
-            out,
-            "--output-preset",
-            "display-p3",
-            "--film-base",
-            base,
-            "--density-curve",
-            "characteristic",
-            "--film-stock",
-            "portra-400",
-            "--report",
-            "json",
-        ];
-        args.extend_from_slice(extra);
-        run(&args)
-    };
-    // A film base far below the scan's own drives every red sample under the table.
-    const OFF_TABLE: &str = "0.05,0.05,0.05";
-
-    let warned = dir.path("warned.tif");
-    let (code, stdout, err) = convert(OFF_TABLE, warned.to_str().unwrap(), &[]);
-    assert_eq!(code, 0, "{err}");
-    let report = json(&stdout);
-    let warnings = report["warnings"].as_array().expect("a warnings array");
-    let warning = warnings
-        .iter()
-        .find(|w| {
-            w.as_str()
-                .unwrap()
-                .contains("published characteristic curve")
-        })
-        .unwrap_or_else(|| panic!("no out-of-table warning in {warnings:?}"));
-    let warning = warning.as_str().unwrap();
-    assert!(warning.contains("100.00%"), "{warning}");
-    assert!(warning.contains("extrapolated"), "{warning}");
-    // The per-channel figures the diagnosis needs, not just the worst one.
-    assert!(warning.contains("below: 100.00/63.30/10.97%"), "{warning}");
-    // The raw fraction rides through beside the rendered percentage (0.99998707 here —
-    // a handful of red samples do land on the table), so a reader can act on the number
-    // rather than re-parsing the sentence.
-    assert!(
-        report["reconstruction_result"]["curve"]["out_of_table"]["below"][0]
-            .as_f64()
-            .unwrap()
-            > 0.999
-    );
-
-    // Strict promotes it, and this frame raises nothing else — so the count proves it is
-    // *this* warning being promoted rather than a coincident one.
-    let strict = dir.path("strict.tif");
-    let (code, _, err) = convert(OFF_TABLE, strict.to_str().unwrap(), &["--strict"]);
-    assert_eq!(code, 1, "{err}");
-    assert!(err.contains("--strict: 1 warning(s) present"), "{err}");
-    assert!(err.contains("published characteristic curve"), "{err}");
-
-    // The control, so the assertions above are falsifiable: a sane base on the same frame
-    // reads entirely inside the table and raises no such warning.
-    let control = dir.path("control.tif");
-    let (code, stdout, err) = convert("0.5,0.25,0.15", control.to_str().unwrap(), &[]);
-    assert_eq!(code, 0, "{err}");
-    let report = json(&stdout);
-    assert_eq!(
-        report["reconstruction_result"]["curve"]["out_of_table"],
-        serde_json::json!({"below": [0.0, 0.0, 0.0], "above": [0.0, 0.0, 0.0]})
-    );
-    for w in report["warnings"].as_array().into_iter().flatten() {
-        assert!(
-            !w.as_str()
-                .unwrap()
-                .contains("published characteristic curve"),
-            "{w}"
-        );
-    }
-}
-
-/// The emitted recipe replays the render bit-for-bit — the determinism contract, and the
-/// only thing that proves the wire spelling of a new knob actually round-trips.
-#[test]
-fn a_characteristic_curve_recipe_round_trips_byte_identically() {
-    let dir = TempDir::new("characteristic-round-trip");
-    let (first, second) = (dir.path("a.tif"), dir.path("b.tif"));
-    let (code, stdout, err) = run(&[
-        "convert",
-        "tests/fixtures/hdr-48bit.tif",
-        "-o",
-        first.to_str().unwrap(),
-        "--output-preset",
-        "display-p3",
-        "--film-base",
-        "0.5,0.25,0.15",
-        "--density-curve",
-        "characteristic",
-        "--film-stock",
-        "gold-200",
-        "--report",
-        "json",
-    ]);
-    assert_eq!(code, 0, "{err}");
-    let recipe = dir.path("recipe.json");
-    std::fs::write(&recipe, json(&stdout)["recipe"].to_string()).unwrap();
-
-    let (code, _, err) = run(&[
-        "convert",
-        "tests/fixtures/hdr-48bit.tif",
-        "-o",
-        second.to_str().unwrap(),
-        "--params",
-        recipe.to_str().unwrap(),
-        "--report",
-        "none",
-    ]);
-    assert_eq!(code, 0, "{err}");
-    assert_eq!(
-        std::fs::read(&first).unwrap(),
-        std::fs::read(&second).unwrap(),
-        "the emitted recipe did not reproduce the render"
-    );
-}
-
-/// **Every** registry stock round-trips: a recipe emitted for it reloads and reproduces
-/// the render byte-for-byte. One stock is not enough — the wire spelling is per-variant
-/// (serde's kebab-case would have written `portra400`), so a single-stock test would have
-/// passed while nine others were unloadable.
-#[test]
-fn every_film_stock_round_trips_and_renders() {
-    let dir = TempDir::new("stock-matrix");
-    let stocks = [
-        "generic-c41",
-        "ektar-100",
-        "portra-160",
-        "portra-160vc",
-        "portra-400",
-        "portra-400vc",
-        "portra-800",
-        "gold-200",
-        "ultramax-400",
-        "ultramax-800",
-    ];
-    for stock in stocks {
-        let first = dir.path(&format!("{stock}-a.tif"));
-        let (code, stdout, err) = run(&[
-            "convert",
-            "tests/fixtures/hdr-48bit.tif",
-            "-o",
-            first.to_str().unwrap(),
-            "--output-preset",
-            "display-p3",
-            "--film-base",
-            "0.5,0.25,0.15",
-            "--density-curve",
-            "characteristic",
-            "--film-stock",
-            stock,
-            "--report",
-            "json",
-        ]);
-        assert_eq!(code, 0, "{stock}: {err}");
-        let report = json(&stdout);
-        assert_eq!(
-            report["recipe"]["reconstruction"]["curve"]["stock"], stock,
-            "{stock}: recipe spelling differs from the flag"
-        );
-        assert_eq!(
-            report["reconstruction_result"]["curve"]["stock"]["name"],
-            stock
-        );
-
-        let recipe = dir.path(&format!("{stock}.json"));
-        std::fs::write(&recipe, report["recipe"].to_string()).unwrap();
-        let second = dir.path(&format!("{stock}-b.tif"));
-        let (code, _, err) = run(&[
-            "convert",
-            "tests/fixtures/hdr-48bit.tif",
-            "-o",
-            second.to_str().unwrap(),
-            "--params",
-            recipe.to_str().unwrap(),
-            "--report",
-            "none",
-        ]);
-        assert_eq!(code, 0, "{stock} replay: {err}");
-        assert_eq!(
-            std::fs::read(&first).unwrap(),
-            std::fs::read(&second).unwrap(),
-            "{stock}: the emitted recipe did not reproduce the render"
-        );
-    }
-}
-
-/// Naming no stock is legal and resolves the generic C-41 profile — stock selection is a
-/// refinement, never a precondition, because most users will not know what they shot.
-#[test]
-fn the_characteristic_curve_defaults_to_the_generic_profile() {
-    let dir = TempDir::new("characteristic-generic");
-    let out = dir.path("out.tif");
-    let (code, stdout, err) = run(&[
-        "convert",
-        "tests/fixtures/hdr-48bit.tif",
-        "-o",
-        out.to_str().unwrap(),
-        "--output-preset",
-        "display-p3",
-        "--film-base",
-        "0.5,0.25,0.15",
-        "--density-curve",
-        "characteristic",
-        "--report",
-        "json",
-    ]);
-    assert_eq!(code, 0, "{err}");
-    let stock = &json(&stdout)["reconstruction_result"]["curve"]["stock"];
-    assert_eq!(stock["name"], "generic-c41");
-    assert_eq!(stock["publication"], "derived");
-    // The generic is an average, not a measurement, so it carries no published D-min.
-    assert!(stock["d_min"].is_null(), "{stock}");
-}
-
-/// Every way of asking this curve to be a parametric one is a loud usage error naming a
-/// remedy that actually works — not a silently ignored flag.
-#[test]
-fn the_characteristic_curve_refuses_parametric_knobs() {
-    let dir = TempDir::new("characteristic-refusals");
-    let out = dir.path("out.tif");
-    let base = ["--film-base", "0.5,0.25,0.15"];
-    for (extra, expect) in [
-        (
-            vec!["--anchor-mid-offset", "0.5"],
-            "it pins mid-grey where the stock's published response puts it",
-        ),
-        (
-            vec!["--density-gamma", "2.0"],
-            "its slope is the film's own",
-        ),
-    ] {
-        let mut args = vec![
-            "convert",
-            "tests/fixtures/hdr-48bit.tif",
-            "-o",
-            out.to_str().unwrap(),
-            "--output-preset",
-            "display-p3",
-            "--density-curve",
-            "characteristic",
-        ];
-        args.extend_from_slice(&base);
-        args.extend_from_slice(&extra);
-        let (code, _, err) = run(&args);
-        assert_eq!(code, 2, "{extra:?} should be a usage error: {err}");
-        assert!(err.contains(expect), "{extra:?} said: {err}");
-        // The remedy must be a route this curve does not itself refuse — the curve that
-        // *has* the knob. Advice a branch refuses is a defect this project has shipped
-        // three times.
-        assert!(
-            err.contains("--density-curve exponential"),
-            "{extra:?} gave no usable remedy: {err}"
-        );
-    }
-}
-
-/// A named-but-unknown stock fails loudly and lists what is accepted. Falling back to the
-/// generic would hide a typo behind a plausible render.
-#[test]
-fn an_unknown_film_stock_lists_the_accepted_names() {
-    let dir = TempDir::new("unknown-stock");
-    let out = dir.path("out.tif");
-    let (code, _, err) = run(&[
-        "convert",
-        "tests/fixtures/hdr-48bit.tif",
-        "-o",
-        out.to_str().unwrap(),
-        "--output-preset",
-        "display-p3",
-        "--film-base",
-        "0.5,0.25,0.15",
-        "--density-curve",
-        "characteristic",
-        "--film-stock",
-        "portra-1600",
-    ]);
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("unknown film stock `portra-1600`"), "{err}");
-    assert!(err.contains("generic-c41"), "{err}");
-    assert!(err.contains("ektar-100"), "{err}");
-}
-
-/// `--film-stock` against a parametric curve is a contradiction, not a no-op — the failure
-/// mode the tagged schema exists to prevent.
-#[test]
-fn a_film_stock_without_the_characteristic_curve_is_rejected() {
-    let dir = TempDir::new("stock-wrong-curve");
-    let out = dir.path("out.tif");
-    let (code, _, err) = run(&[
-        "convert",
-        "tests/fixtures/hdr-48bit.tif",
-        "-o",
-        out.to_str().unwrap(),
-        "--output-preset",
-        "display-p3",
-        "--film-base",
-        "0.5,0.25,0.15",
-        "--film-stock",
-        "ektar-100",
-    ]);
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("the resolved curve is exponential"), "{err}");
-    assert!(err.contains("--density-curve characteristic"), "{err}");
-}
-
-/// Two stocks must render differently, or the registry is decorative. Ektar and Gold 200
-/// differ by 0.09 density in where they place mid-grey above the base (0.61 vs 0.70),
-/// which is ~0.3 stop — plainly visible in the pixels.
-#[test]
-fn different_stocks_render_differently() {
-    let dir = TempDir::new("stock-differs");
-    let mut bytes = Vec::new();
-    for stock in ["ektar-100", "gold-200"] {
-        let out = dir.path(&format!("{stock}.tif"));
-        let (code, _, err) = run(&[
-            "convert",
-            "tests/fixtures/hdr-48bit.tif",
-            "-o",
-            out.to_str().unwrap(),
-            "--output-preset",
-            "display-p3",
-            "--film-base",
-            "0.5,0.25,0.15",
-            "--density-curve",
-            "characteristic",
-            "--film-stock",
-            stock,
-            "--report",
-            "none",
-        ]);
-        assert_eq!(code, 0, "{stock}: {err}");
-        bytes.push(std::fs::read(&out).unwrap());
-    }
-    assert_ne!(bytes[0], bytes[1], "the stock selection changed nothing");
-}
-
-#[test]
-fn roll_warns_on_a_per_frame_film_stock_override() {
-    // The stock is the most literally roll-fixed choice in the recipe: it names the film
-    // that was in the camera. A per-frame override is applied — the frame converts — but
-    // it swaps the whole measured response for that frame (per-channel contrast *and*
-    // mid-grey placement), so it warns loudly and `--strict` promotes it. Same contract as
-    // the film-base and anchor overrides. `hdr-48bit.tif` is IR-free, so the `--strict` half
-    // is about *this* warning and not the IR one.
-    let tmp = TempDir::new("roll-stock-override");
-    // `print_exposure: -4` is what makes the `--strict` half falsifiable, not a
-    // rendering choice. At the default exposure this frame clips ~27% of its samples
-    // through the legacy path, and that loss is a promotable warning of its own — so
-    // `--strict` exited 1 whether or not the stock override warned at all, and the
-    // control below would fail too. At -4 nothing clips and the *only* warning left is
-    // the one under test.
-    let recipe = write_file(
-        &tmp.path("roll.json"),
-        r#"{
-  "reconstruction": {
-    "type": "density",
-    "curve": { "type": "characteristic", "stock": "gold-200" }
-  },
-  "calibration": { "film_base": { "explicit": [0.9, 0.55, 0.42] } },
-  "print": { "print_exposure": -4 },
-  "output": { "preset": "display-p3" }
-}"#,
-    );
-    let hdr = fixture("hdr-48bit.tif");
-    let manifest_txt = format!(
-        r#"{{ "frames": [
-             {{ "input": {hdr:?},
-                "params": {{ "reconstruction": {{ "curve": {{ "stock": "ektar-100" }} }} }} }}
-           ] }}"#,
-        hdr = hdr.to_str().unwrap(),
-    );
-    let manifest = write_file(&tmp.path("frames.json"), &manifest_txt);
-    // The control: the same frame and the same shared recipe, with no per-frame
-    // `params` at all.
-    let control = write_file(
-        &tmp.path("frames-control.json"),
-        &format!(
-            r#"{{ "frames": [ {{ "input": {hdr:?} }} ] }}"#,
-            hdr = hdr.to_str().unwrap(),
-        ),
-    );
-    let roll_args = |frames: &Path, out: &str, strict: bool| -> Vec<String> {
-        let mut a = vec![
-            "roll".to_string(),
-            "--frames".to_string(),
-            frames.to_str().unwrap().to_string(),
-            "--out-dir".to_string(),
-            tmp.path(out).to_str().unwrap().to_string(),
-            "--params".to_string(),
-            recipe.to_str().unwrap().to_string(),
-        ];
-        if strict {
-            a.push("--strict".to_string());
-        }
-        a
-    };
-
-    let args = roll_args(&manifest, "out", false);
-    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(
-        code, 0,
-        "an override warns, it does not fail:\n{stdout}\n{err}"
-    );
-    let report = json(&stdout);
-    assert_eq!(
-        report["summary"]["succeeded"], 1,
-        "the frame still converts"
-    );
-    let w = report["warnings"].as_array().expect("roll-level warnings");
-    assert!(
-        w.iter().any(|m| m
-            .as_str()
-            .unwrap()
-            .contains("overriding the roll's film stock")),
-        "the per-frame stock override warns loudly: {report}"
-    );
-    assert!(
-        err.contains("overriding the roll's film stock"),
-        "warning echoed to stderr: {err}"
-    );
-
-    let args = roll_args(&manifest, "out-strict", true);
-    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(code, 1, "--strict promotes the override warning");
-    let report = json(&stdout);
-    assert_eq!(report["summary"]["failed"], 0, "the frame converted");
-    assert!(err.contains("strict"), "stderr should explain: {err}");
-    // The promoted warning must be *this* one. Without this the assertions above pass
-    // on any promotable warning the frame happens to emit.
-    assert!(
-        err.contains("overriding the roll's film stock"),
-        "the promoted warning must be the stock override: {err}"
-    );
-
-    // Control: identical run with no per-frame override must exit 0 under `--strict`.
-    // This is what makes the two assertions above falsifiable — with the stock warning
-    // deleted entirely, they both still passed while this fails.
-    let args = roll_args(&control, "out-control", true);
-    let (code, stdout, err) = run(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(
-        code, 0,
-        "no override must leave nothing for --strict to promote:\n{stdout}\n{err}"
-    );
-    assert!(
-        json(&stdout)["warnings"]
-            .as_array()
-            .is_none_or(|w| w.is_empty()),
-        "the control run must emit no roll-level warnings: {stdout}"
-    );
-}
-
-/// **A `--preset` over a recipe must not warn about a curve switch nobody asked for.**
-///
-/// The two curve-switch warnings exist to catch a *silent* reset, and they format their
-/// message from the target curve's **default** gain. Under a preset all three of their
-/// claims were wrong: they named `--density-curve` (never passed), stated `[1, 1, 1]`
-/// where `characteristic-aim` resolves `[1.1133202, 1, 1]`, and offered a remedy —
-/// "restate `--density-scale <the recipe's value>`" — that would have silently defeated
-/// the preset's aim correction. The preset's replacement is the user's own request, so it
-/// is reported by `conversion_preset` beside the resolved recipe instead.
-///
-/// Runs the real binary, because the defect was in `run_convert`'s warning composition
-/// rather than in either warning function — a unit test of the functions reproduces
-/// neither the suppression nor the misattribution.
-#[test]
-fn a_preset_does_not_warn_about_the_curve_switch_it_was_asked_to_make() {
-    let tmp = TempDir::new("preset-curve-switch");
-    let recipe = tmp.path("recipe.json");
-    std::fs::write(
-        &recipe,
-        r#"{"reconstruction":{"schema_version":1,
-            "density":{"scale":[1.0,0.8,0.7]},"curve":{"type":"exponential"}},
-            "calibration":{"film_base":{"explicit":[0.9,0.55,0.42]}}}"#,
-    )
-    .unwrap();
-    let out = tmp.path("out.jpg");
-    let (code, stdout, err) = run(&[
-        "convert",
-        fixture("hdr-48bit.tif").to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-        "--params",
-        recipe.to_str().unwrap(),
-        "--preset",
-        "characteristic-aim",
-        "--film-stock",
-        "ektar-100",
-        "--report",
-        "json",
-    ]);
-    assert_eq!(code, 0, "{err}");
-    assert!(
-        !err.contains("density.scale") && !err.contains("--density-curve"),
-        "the preset's own curve switch was reported as an unasked-for reset:\n{err}"
-    );
-
-    // Falsifiable: the switch really did replace the recipe's gain, so the suppression is
-    // load-bearing rather than a condition that never matches. The resolved gain is the
-    // preset's derived one — the very value the suppressed warning would have misstated.
-    let report = json(&stdout);
-    let scale = &report["recipe"]["reconstruction"]["density"]["scale"];
-    assert_eq!(scale[1].as_f64().unwrap(), 1.0, "recipe gain not replaced");
-    let red = scale[0].as_f64().unwrap();
-    assert!(
-        (red - 1.113_320_2).abs() < 1e-6,
-        "expected the derived aim scale, got {red}"
-    );
-    assert_eq!(
-        report["conversion_preset"]["name"], "characteristic-aim",
-        "the replacement must still be attributed somewhere"
-    );
-}
-
 /// An empty measurement region is a warning on `convert`, never a refusal
 /// (`film-base/holder-depth-mask` ship review, M1): nothing in a conversion measures
 /// over it since the auto reference density retired, so refusing would fail a run at
@@ -10412,8 +9623,8 @@ fn new_flow_refuses_a_knob_whose_counterpart_has_not_landed() {
         "display-p3",
         "--film-base",
         "0.9,0.55,0.42",
-        "--preset",
-        "characteristic-generic",
+        "--black-point",
+        "0.01",
         "--report",
         "none",
     ];
@@ -10421,7 +9632,7 @@ fn new_flow_refuses_a_knob_whose_counterpart_has_not_landed() {
     with_flow.push("--new-flow");
     let (code, _out, err) = run(&with_flow);
     assert_eq!(code, 2, "{err}");
-    assert!(err.contains("--preset"), "names the knob typed: {err}");
+    assert!(err.contains("--black-point"), "names the knob typed: {err}");
     assert!(err.contains("no counterpart for it yet"), "{err}");
     assert!(
         !err.contains("will not gain one"),
@@ -10438,27 +9649,6 @@ fn new_flow_refuses_a_knob_whose_counterpart_has_not_landed() {
 }
 
 #[test]
-fn new_flow_accepts_the_curve_it_already_is() {
-    // The tiebreaker's other half: `--density-curve exponential` names the curve the
-    // new flow already decodes with, so it asks for nothing and is accepted.
-    let tmp = TempDir::new("new-flow-curve-identity");
-    let (code, _out, err) = run(&[
-        "convert",
-        fixture("hdr-48bit.tif").to_str().unwrap(),
-        "-o",
-        tmp.path("out.tif").to_str().unwrap(),
-        "--film-base",
-        "0.9,0.55,0.42",
-        "--density-curve",
-        "exponential",
-        "--new-flow",
-        "--report",
-        "none",
-    ]);
-    assert_eq!(code, 0, "the identity curve must not be refused: {err}");
-}
-
-#[test]
 fn new_flow_refuses_a_knob_the_design_drops() {
     // The other verdict: a knob the new design drops for good names its replacement.
     let tmp = TempDir::new("new-flow-never");
@@ -10469,8 +9659,8 @@ fn new_flow_refuses_a_knob_the_design_drops() {
         tmp.path("out.tif").to_str().unwrap(),
         "--film-base",
         "0.9,0.55,0.42",
-        "--density-curve",
-        "characteristic",
+        "--auto-wb",
+        "gray-world",
         "--new-flow",
         "--report",
         "none",
@@ -10478,7 +9668,7 @@ fn new_flow_refuses_a_knob_the_design_drops() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("will not gain one"), "{err}");
     assert!(
-        err.contains("--density-curve exponential"),
+        err.contains("measure-roll"),
         "a `never` verdict names the replacement: {err}"
     );
     assert!(
@@ -10496,8 +9686,8 @@ fn new_flow_refuses_a_knob_the_design_drops() {
         "display-p3",
         "--film-base",
         "0.9,0.55,0.42",
-        "--density-curve",
-        "characteristic",
+        "--auto-wb",
+        "gray-world",
         "--report",
         "none",
     ]);
@@ -10513,10 +9703,7 @@ fn the_availability_gate_outranks_the_rules_it_would_confuse() {
     // selected" is the least-specific diagnosis in `validate`, and following it
     // would just earn the user this error on the next run.
     let tmp = TempDir::new("new-flow-order");
-    for knob in [
-        ["--density-curve", "characteristic"],
-        ["--film-stock", "ektar-100"],
-    ] {
+    for knob in [["--auto-wb", "gray-world"], ["--black-point", "0.01"]] {
         let (code, _out, err) = run(&[
             "convert",
             fixture("hdr-48bit.tif").to_str().unwrap(),
@@ -10536,133 +9723,6 @@ fn the_availability_gate_outranks_the_rules_it_would_confuse() {
         assert!(
             !err.contains("no film base selected"),
             "the less specific diagnosis must not win: {err}"
-        );
-    }
-}
-
-#[test]
-fn the_availability_gate_outranks_a_merge_refusal_too() {
-    // Ordering *across gates*, which is the half a value rule cannot reach on its own:
-    // `merge` refuses a stock beside the exponential, and a slope beside the
-    // characteristic curve, before any value rule runs, so the new flow's refusal would
-    // arrive second — behind advice about a chain the user did not select. The flag
-    // row pre-empts it. (Reported by the PR's Codex reviewer.)
-    let tmp = TempDir::new("new-flow-merge-order");
-    for extra in [
-        vec!["--film-stock", "ektar-100"],
-        vec!["--density-curve", "characteristic", "--density-gamma", "2"],
-    ] {
-        let fixture_path = fixture("hdr-48bit.tif").display().to_string();
-        let out = tmp.path("out.tif");
-        let mut argv = vec![
-            "convert",
-            &fixture_path,
-            "-o",
-            out.to_str().unwrap(),
-            "--film-base",
-            "0.9,0.55,0.42",
-            "--new-flow",
-            "--report",
-            "none",
-        ];
-        argv.extend_from_slice(&extra);
-        let (code, _out, err) = run(&argv);
-        assert_eq!(code, 2, "{err}");
-        assert!(
-            err.contains("has no meaning under `--new-flow`"),
-            "{extra:?}: the flow refusal must pre-empt merge: {err}"
-        );
-        assert!(
-            !err.contains("the resolved curve is"),
-            "merge's legacy diagnosis must not win under the new flow: {err}"
-        );
-
-        // Falsifiability: without the flag, merge's diagnosis is still the right one.
-        let mut argv = vec![
-            "convert",
-            &fixture_path,
-            "-o",
-            out.to_str().unwrap(),
-            "--output-preset",
-            "display-p3",
-            "--film-base",
-            "0.9,0.55,0.42",
-            "--report",
-            "none",
-        ];
-        argv.extend_from_slice(&extra);
-        let (code, _out, err) = run(&argv);
-        assert_eq!(code, 2, "{err}");
-        assert!(err.contains("the resolved curve is"), "{extra:?}: {err}");
-    }
-}
-
-#[test]
-fn new_flow_refuses_every_knob_the_fixed_decode_strands() {
-    // The reconstruction half of the availability inventory, driven through the
-    // binary. Each row is asserted to name the knob the user typed **and** to carry
-    // the verdict its design earns: the per-stock curve as a curve is gone for good,
-    // the per-stock curve as a look is waiting for a rendering stage. (The regional
-    // balance is removed on both chains — see
-    // `the_regional_balance_is_a_migration_error`.) Asserting the losing verdict's
-    // wording is absent is the only thing that tells two rules apart when both name
-    // the knob.
-    let tmp = TempDir::new("new-flow-stranded");
-    let refuse = |extra: &[&str]| -> String {
-        let out = tmp.path("out.tif");
-        let mut argv: Vec<&str> = vec![
-            "convert",
-            "FIXTURE",
-            "-o",
-            out.to_str().unwrap(),
-            "--film-base",
-            "0.9,0.55,0.42",
-            "--new-flow",
-            "--report",
-            "none",
-        ];
-        let fixture_path = fixture("hdr-48bit.tif").display().to_string();
-        argv[1] = &fixture_path;
-        argv.extend_from_slice(extra);
-        let (code, _out, err) = run(&argv);
-        assert_eq!(code, 2, "{extra:?} must be refused: {err}");
-        err
-    };
-
-    // Gone for good. (The reference density and the retired anchor placements are
-    // removed on both chains — see
-    // `the_reference_density_and_retired_placements_are_migration_errors`.)
-    {
-        let knob = ["--density-curve", "characteristic"];
-        let err = refuse(&knob);
-        assert!(err.contains(knob[0]), "names the knob typed: {err}");
-        assert!(err.contains("will not gain one"), "{knob:?}: {err}");
-        assert!(
-            !err.contains("no counterpart for it yet"),
-            "the losing verdict's wording must be absent: {err}"
-        );
-    }
-
-    // Waiting for a rendering stage, and each remedy must name the stage that carries
-    // it rather than a knob this flow also refuses.
-    for (knob, arriving) in [
-        // Planned but unscheduled, so it names the capability rather than a task.
-        (
-            vec!["--film-stock", "ektar-100"],
-            "per-stock normalization in the look stage",
-        ),
-        (
-            vec!["--preset", "characteristic-generic"],
-            "nf-look/look-presets",
-        ),
-    ] {
-        let err = refuse(&knob);
-        assert!(err.contains(knob[0]), "names the knob typed: {err}");
-        assert!(err.contains("no counterpart for it yet"), "{knob:?}: {err}");
-        assert!(err.contains(arriving), "{knob:?}: {err}");
-        assert!(
-            !err.contains("will not gain one"),
-            "the losing verdict's wording must be absent: {err}"
         );
     }
 }
@@ -10839,6 +9899,135 @@ fn the_reference_density_and_retired_placements_are_migration_errors() {
             "{anchor}: {err}"
         );
     }
+}
+
+/// `nf-retire/characteristic`: `--density-curve`, `--film-stock` and `--preset` are
+/// migration errors on both chains at every value, diagnosed before anything coarser; a
+/// sidecar's retired `"type": "exponential"` replays byte-identically; a recipe naming
+/// the `characteristic` curve is refused, and the remedy its message gives renders.
+#[test]
+fn the_characteristic_curve_is_a_migration_error() {
+    let tmp = TempDir::new("characteristic-retired");
+    let scan = fixture("hdr-48bit.tif");
+    let out = tmp.path("out.tif");
+
+    // (a) Each flag, on each chain, with no film base: the removed flag is the more
+    // specific diagnosis and must win over "no film base selected".
+    for flags in [
+        vec!["--density-curve", "characteristic"],
+        vec!["--density-curve", "exponential"],
+        vec!["--density-curve"],
+        vec!["--film-stock", "portra-400"],
+        vec!["--preset", "characteristic-generic"],
+        vec!["--preset", "sigmoid-knees"],
+    ] {
+        for new_flow in [false, true] {
+            let mut argv = vec![
+                "convert",
+                scan.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--report",
+                "none",
+            ];
+            if new_flow {
+                argv.push("--new-flow");
+            }
+            argv.extend_from_slice(&flags);
+            let (code, _, err) = run(&argv);
+            assert_eq!(code, 2, "{flags:?} (new flow {new_flow}): {err}");
+            assert!(
+                err.contains(&format!("{} was removed", flags[0])),
+                "{flags:?}: {err}"
+            );
+            assert!(!err.contains("no film base selected"), "{flags:?}: {err}");
+            assert!(!out.exists(), "no output on a usage error");
+        }
+    }
+
+    // (b) A recipe: every earlier sidecar carries the curve's `"type": "exponential"`,
+    // which replays byte-identically to the same curve without it.
+    let render_with = |name: &str, reconstruction: &str| {
+        let recipe = write_file(
+            &tmp.path(name),
+            &format!(
+                r#"{{"calibration":{{"film_base":{{"explicit":[0.9,0.55,0.42]}}}},
+                    "reconstruction":{reconstruction}}}"#
+            ),
+        );
+        let o = tmp.path(&format!("{name}.tif"));
+        let (code, _, err) = run(&[
+            "convert",
+            scan.to_str().unwrap(),
+            "-o",
+            o.to_str().unwrap(),
+            "--output-preset",
+            "display-p3",
+            "--params",
+            recipe.to_str().unwrap(),
+            "--report",
+            "none",
+        ]);
+        (code, err, o)
+    };
+    let (code, err, plain) = render_with(
+        "plain.json",
+        r#"{"curve":{"gamma":2.0,"anchor":{"mid-at-base-offset":0.62}}}"#,
+    );
+    assert_eq!(code, 0, "{err}");
+    let (code, err, tagged) = render_with(
+        "old-sidecar.json",
+        r#"{"curve":{"type":"exponential","gamma":2.0,"anchor":{"mid-at-base-offset":0.62}}}"#,
+    );
+    assert_eq!(code, 0, "an old sidecar's curve tag must replay: {err}");
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&tagged).unwrap(),
+        "the stripped tag renders exactly as its absence"
+    );
+
+    // (c) A characteristic sidecar is refused, naming its identity gain, and the remedy
+    // (drop the curve and that gain) renders the default.
+    let (code, err, _) = render_with(
+        "characteristic.json",
+        r#"{"density":{"scale":[1.0,1.0,1.0]},
+            "curve":{"type":"characteristic","stock":"portra-400"}}"#,
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(
+        err.contains("`characteristic` density curve")
+            && err.contains("reconstruction.density.scale"),
+        "{err}"
+    );
+    let (code, err, _) = render_with("remedy.json", "{}");
+    assert_eq!(code, 0, "the remedy must render: {err}");
+
+    // (d) Nothing the tool writes carries the retired surface.
+    let (code, stdout, err) = run(&[
+        "convert",
+        scan.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--output-preset",
+        "display-p3",
+        "--film-base",
+        "0.9,0.55,0.42",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    let report = json(&stdout);
+    assert!(report.get("conversion_preset").is_none(), "{report}");
+    let curve = &report["reconstruction_result"]["curve"];
+    for key in ["type", "stock", "out_of_table"] {
+        assert!(
+            curve.get(key).is_none(),
+            "report curve carries `{key}`: {curve}"
+        );
+    }
+    assert!(
+        sidecar_params(&out)["reconstruction"]["curve"]
+            .get("type")
+            .is_none()
+    );
 }
 
 /// `nf-retire/regional-balance`: the four flags and three recipe keys are migration
@@ -11094,61 +10283,11 @@ fn the_regional_balance_is_a_migration_error() {
 }
 
 #[test]
-fn the_new_flow_refusal_outranks_the_merge_rule_for_the_same_command_line() {
-    // The ordering discipline, and the one case in this table where it bites: `merge`
-    // refuses `--film-stock` without `--density-curve characteristic`, and its remedy
-    // is "pass `--density-curve characteristic`" — a curve `--new-flow` itself
-    // rejects. A rule must run before anything *coarser* can refuse, not merely early
-    // within its own gate, so the availability row runs pre-`merge` and this asserts
-    // the losing remedy never reaches the user.
-    let tmp = TempDir::new("new-flow-ordering");
-    let (code, _out, err) = run(&[
-        "convert",
-        fixture("hdr-48bit.tif").to_str().unwrap(),
-        "-o",
-        tmp.path("out.tif").to_str().unwrap(),
-        "--film-base",
-        "0.9,0.55,0.42",
-        "--film-stock",
-        "ektar-100",
-        "--new-flow",
-        "--report",
-        "none",
-    ]);
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("--film-stock"), "{err}");
-    assert!(
-        !err.contains("--density-curve characteristic"),
-        "merge's remedy names a curve this flow refuses; it must not win: {err}"
-    );
-
-    // Falsifiability: without the flag, merge's rule is exactly what fires.
-    let (code, _out, err) = run(&[
-        "convert",
-        fixture("hdr-48bit.tif").to_str().unwrap(),
-        "-o",
-        tmp.path("legacy.tif").to_str().unwrap(),
-        "--output-preset",
-        "display-p3",
-        "--film-base",
-        "0.9,0.55,0.42",
-        "--film-stock",
-        "ektar-100",
-        "--report",
-        "none",
-    ]);
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("--density-curve characteristic"), "{err}");
-}
-
-#[test]
 fn the_fixed_decodes_own_knobs_reach_the_decode_under_the_new_flow() {
     // The falsifiable control for the refusal table above: everything the fixed
     // decode reads must still be accepted **and must arrive** — an accepted flag the
     // decode never saw is the accepted-and-ignored defect, so the report's resolved
-    // `new_flow.decode` block is the witness, not the exit code. The identity values
-    // (naming the curve the flow already decodes with, a zero balance) are here too,
-    // because they must not be refused either.
+    // `new_flow.decode` block is the witness, not the exit code.
     let tmp = TempDir::new("new-flow-surviving");
     let decode_of = |extra: &[&str], name: &str| -> (i32, serde_json::Value, String) {
         let out = tmp.path(name);
@@ -11191,19 +10330,6 @@ fn the_fixed_decodes_own_knobs_reach_the_decode_under_the_new_flow() {
     let (code, d, err) = decode_of(&["--anchor-mid-offset", "0.7"], "anchor.tiff");
     assert_eq!(code, 0, "{err}");
     assert!(close(&d["anchor"], 0.7 + 0.744_727_5 / 1.8), "{d}");
-
-    let (code, d, err) = decode_of(
-        &["--density-curve", "exponential", "--density-gamma", "1.7"],
-        "gamma.tiff",
-    );
-    assert_eq!(code, 0, "{err}");
-    assert!(close(&d["linearization"], 1.7), "{d}");
-
-    let (code, _d, err) = decode_of(&["--density-curve", "exponential"], "identity.tiff");
-    assert_eq!(
-        code, 0,
-        "an identity curve selection must be accepted: {err}"
-    );
 
     // Bare `--density-gamma` too. Before `nf-core/recipe-schema` the new flow merged
     // its flags into the current chain's config, whose default curve was then the
@@ -11763,8 +10889,6 @@ fn the_anchor_guard_recommends_only_a_slope() {
         tmp.path("out").display().to_string(),
         "--film-base".into(),
         "0.9,0.55,0.42".into(),
-        "--density-curve".into(),
-        "exponential".into(),
         "--density-gamma".into(),
         "2e-39".into(),
         "--anchor-mid-offset".into(),

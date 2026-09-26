@@ -36,12 +36,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::io::decode::{DecodeInfo, SilverFastFormat};
-use crate::types::{DensityCurveType, EncodeReport, FilmBaseSource, OutputPreset};
+use crate::types::{EncodeReport, FilmBaseSource, OutputPreset};
 
 /// Telemetry record schema version. Bump on any change to [`TelemetryRecord`]'s
 /// shape so a server can ingest old and new records side by side. Note the record
-/// embeds domain enums (`OutputPreset`, `DensityCurveType`,
-/// `FilmBaseSource`, `SilverFastFormat`) whose serde representation lives
+/// embeds domain enums (`OutputPreset`, `FilmBaseSource`, `SilverFastFormat`) whose serde representation lives
 /// elsewhere — a change to *their* wire form is also a schema change and must
 /// bump this too.
 ///
@@ -78,7 +77,11 @@ use crate::types::{DensityCurveType, EncodeReport, FilmBaseSource, OutputPreset}
 ///
 /// v6: `conversion.dmax` is gone — the roll reference density retired with the
 /// placements that read it (`nf-retire/dmax-machinery`).
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// v7: `conversion.curve` is gone — with the `characteristic` curve retired
+/// (`nf-retire/characteristic`) the exponential is the only curve, so the field could
+/// hold one value.
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Default local JSONL log path, honoring `NC_TELEMETRY_LOG` then the platform
 /// data dir; `None` when no home/data dir can be located (the caller then warns
@@ -219,9 +222,6 @@ pub struct ConversionInfo {
     /// single biggest determinant of what the written pixels *are*: two f32 TIFFs
     /// (`film-master`, `hdr-linear-tiff`) are otherwise indistinguishable.
     pub preset: OutputPreset,
-    /// The resolved density curve — `DensityCurveType`'s serde form, so a curve added
-    /// there widens this field without a schema bump.
-    pub curve: DensityCurveType,
     /// Stable 64-bit hash (hex) of the effective recipe JSON — the same bytes
     /// written to the sidecar, so identical conversions share a hash.
     pub params_hash: String,
@@ -269,7 +269,6 @@ pub struct RecordInputs<'a> {
     pub loss: EncodeReport,
     pub input_bytes: Option<u64>,
     pub output_bytes: Option<u64>,
-    pub curve: DensityCurveType,
     pub params_hash: String,
     pub film_base_source: FilmBaseSource,
     pub output_depth: &'static str,
@@ -303,7 +302,6 @@ pub fn build_record(inputs: RecordInputs<'_>) -> TelemetryRecord {
         timing_ms: inputs.timings,
         conversion: ConversionInfo {
             preset: inputs.preset,
-            curve: inputs.curve,
             params_hash: inputs.params_hash,
             film_base_source: inputs.film_base_source,
             output_depth: inputs.output_depth,
@@ -457,7 +455,6 @@ mod tests {
             },
             input_bytes: Some(12_345),
             output_bytes: Some(67_890),
-            curve: DensityCurveType::Exponential,
             params_hash: "deadbeef".into(),
             film_base_source: FilmBaseSource::Auto,
             preset: OutputPreset::DisplayP3,
@@ -465,7 +462,7 @@ mod tests {
             warnings: 4,
         });
 
-        assert_eq!(rec.schema_version, 6);
+        assert_eq!(rec.schema_version, 7);
         assert_eq!(rec.image.width, 2000);
         assert_eq!(rec.image.height, 3000);
         // 2000 * 3000 = 6e6 pixels → 6.0 MP.
@@ -501,7 +498,6 @@ mod tests {
             loss: EncodeReport::default(),
             input_bytes: None,
             output_bytes: None,
-            curve: DensityCurveType::Exponential,
             params_hash: "0".into(),
             film_base_source: FilmBaseSource::Explicit([0.9, 0.5, 0.4]),
             preset: OutputPreset::FilmMaster,
@@ -626,8 +622,7 @@ mod tests {
         // Snapshot the exact serialized JSON for a fully-populated record and a
         // minimal one. This catches silent wire-shape drift — a renamed/added/
         // removed field, a reordered struct, or a changed foreign-enum
-        // representation (`DensityCurveType`/`FilmBaseSource`/
-        // `SilverFastFormat`) — any of
+        // representation (`FilmBaseSource`/`SilverFastFormat`) — any of
         // which is a `SCHEMA_VERSION` bump. If this test fails, update the snapshot
         // *and* bump `SCHEMA_VERSION` (and the design-spec / SKILL examples).
         // `nc_version`/`target` are set to fixed literals here so the snapshot is
@@ -660,7 +655,6 @@ mod tests {
             },
             conversion: ConversionInfo {
                 preset: OutputPreset::DisplayP3,
-                curve: DensityCurveType::Exponential,
                 params_hash: "0123456789abcdef".into(),
                 film_base_source: FilmBaseSource::Explicit([0.5, 0.25, 0.125]),
                 output_depth: "u16",
@@ -672,15 +666,14 @@ mod tests {
             },
         };
         let expected_full = concat!(
-            r#"{"schema_version":6,"timestamp_ms":1700000000000,"nc_version":"9.9.9","#,
+            r#"{"schema_version":7,"timestamp_ms":1700000000000,"nc_version":"9.9.9","#,
             r#""target":"test-triple","cpu_count":8,"#,
             r#""image":{"format":"hdri","width":100,"height":200,"megapixels":0.25,"#,
             r#""bit_depth":16,"channels":3,"ir_present":true,"input_bytes":1000,"#,
             r#""output_bytes":2000},"#,
             r#""timing_ms":{"total":30.0,"decode":5.0,"film_base":1.0,"algorithm":10.0,"#,
             r#""color":8.0,"encode":4.0,"ir_export":2.0},"#,
-            r#""conversion":{"preset":"display-p3","curve":"exponential","#,
-            r#""params_hash":"0123456789abcdef","#,
+            r#""conversion":{"preset":"display-p3","params_hash":"0123456789abcdef","#,
             r#""film_base_source":{"explicit":[0.5,0.25,0.125]},"output_depth":"u16"},"#,
             r#""outcome":{"warnings":1,"clipped":2,"non_finite":0}}"#,
         );
@@ -714,12 +707,10 @@ mod tests {
                 encode: 0.0,
                 ir_export: None,
             },
-            // A `film-master` run of the characteristic curve: no anchor, and
-            // `output_depth = f32` because the preset resolves it. Snapshotted here so
+            // A `film-master` run: `output_depth = f32` because the preset resolves it. Snapshotted here so
             // the `"film-master"` wire name and that depth pairing are both pinned.
             conversion: ConversionInfo {
                 preset: OutputPreset::FilmMaster,
-                curve: DensityCurveType::Characteristic,
                 params_hash: "0".into(),
                 film_base_source: FilmBaseSource::Auto,
                 output_depth: "f32",
@@ -731,14 +722,14 @@ mod tests {
             },
         };
         let expected_minimal = concat!(
-            r#"{"schema_version":6,"timestamp_ms":0,"nc_version":"9.9.9","#,
+            r#"{"schema_version":7,"timestamp_ms":0,"nc_version":"9.9.9","#,
             r#""target":"test-triple","cpu_count":null,"#,
             r#""image":{"format":"hdr","width":1,"height":1,"megapixels":0.0,"#,
             r#""bit_depth":16,"channels":3,"ir_present":false,"input_bytes":null,"#,
             r#""output_bytes":null},"#,
             r#""timing_ms":{"total":0.0,"decode":0.0,"film_base":0.0,"algorithm":0.0,"#,
             r#""color":0.0,"encode":0.0},"#,
-            r#""conversion":{"preset":"film-master","curve":"characteristic","params_hash":"0","#,
+            r#""conversion":{"preset":"film-master","params_hash":"0","#,
             r#""film_base_source":"auto","output_depth":"f32"},"#,
             r#""outcome":{"warnings":0,"clipped":0,"non_finite":0}}"#,
         );

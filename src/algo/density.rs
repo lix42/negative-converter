@@ -9,12 +9,11 @@
 //! 1. transmission → density:   D_c  = -log10(max(scan_c, EPS) / base_c)
 //! 2. density correction:       D'_c = scale_c · D_c + offset_c
 //! 3. density curve:            exponential lin_c = 10^(gamma · (D'_c − A))
-//!                              (or a stock's characteristic curve — `algo::characteristic`)
 //!                              → FilmRgbImage
 //! ```
 //!
 //! Stages 1–2 are [`to_density`] — **density
-//! reconstruction**, owned by [`reconstruct`], which then applies the tagged
+//! reconstruction**, owned by [`reconstruct`], which then applies the
 //! curve ([`apply_curve`], stage 3) to produce the typed
 //! [`FilmRgbImage`] boundary. The print controls run downstream of it, in
 //! `pipeline::render_split`, after the NC film RGB v1 → ACEScg mapping.
@@ -42,7 +41,7 @@ use rayon::prelude::*;
 use crate::algo::{FilmRgbImage, ReconstructionReport};
 #[cfg(doc)]
 use crate::types::AnchorPlacement;
-use crate::types::{DensityCurve, DensityParams, FilmBase, LinearImage, NcError, Result};
+use crate::types::{DensityParams, ExponentialParams, FilmBase, LinearImage, NcError, Result};
 
 /// Floor applied to the scan transmission before the `log10`, so a zero / negative
 /// / denormal sample can't produce `-inf`/`NaN` density (design "fail loudly, never
@@ -77,7 +76,7 @@ pub(crate) struct DensityImage {
 }
 
 /// Density reconstruction + the tagged curve (stages 1–3, design-spec §7.2):
-/// Dmin-normalize into corrected density `D′`, place the curve's anchor, then map `D′` through the selected
+/// Dmin-normalize into corrected density `D′`, place the curve's anchor, then map `D′` through the
 /// curve into the typed [`FilmRgbImage`]. Pure; the print controls are
 /// deliberately **not** here — they run past the ACEScg boundary
 /// (`pipeline::render_split`).
@@ -85,7 +84,7 @@ pub(super) fn reconstruct(
     image: &LinearImage,
     base: &FilmBase,
     params: &DensityParams,
-    curve: &DensityCurve,
+    curve: &ExponentialParams,
 ) -> Result<(FilmRgbImage, ReconstructionReport)> {
     // `to_density` divides by the per-channel base, so a zero / negative /
     // non-finite base would yield a silently-black or non-finite image.
@@ -94,49 +93,34 @@ pub(super) fn reconstruct(
     check_base(base)?;
     let density = to_density(image, base, params);
 
-    let mut characteristic_out_of_table = None;
-    let (film, curve_anchor) = match curve {
-        DensityCurve::Exponential(exp) => {
-            // The anchor is applied **in the exponent** — `10^(γ·(D' − A))` — not as a
-            // separate `10^(−γ·A)` gain: mathematically equivalent, but the factored
-            // form overflows `f32` when `γ·D'` alone exceeds the pow10 range even
-            // though the anchored exponent is small (e.g. `γ = 5`, EPS-clamped
-            // `D' ≈ 8`), turning white into `inf` instead of `1.0`.
-            let gamma = exp.gamma;
-            let anchor = exp.anchor.anchor(gamma);
-            // Defense in depth. Two ways the exponent goes non-finite, and **both**
-            // render `10^(−inf) = 0.0` for every sample — an all-black frame that trips
-            // neither the clip nor the non-finite counter: the placement's division by
-            // the slope can overflow the *anchor* (a positive-but-tiny gamma), and a
-            // large-but-finite anchor can overflow the *product* `gamma · anchor`.
-            // `validate` rejects both at the CLI boundary, naming the flag; a
-            // programmatic caller reaches here first.
-            if !anchor.is_finite() || !(gamma * anchor).is_finite() {
-                return Err(NcError::Other(format!(
-                    "the exponential anchor placement derived a non-usable anchor \
-                     ({anchor:e}) at gamma {gamma}: the curve's exponent \
-                     `gamma · (density − anchor)` is not finite, so every sample would \
-                     render as exactly 0.0. Use a photographic gamma and a smaller anchor \
-                     offset"
-                )));
-            }
-            let film = apply_curve(density, move |d| 10f32.powf(gamma * (d - anchor)));
-            (film, Some(anchor))
-        }
-        DensityCurve::Characteristic(ch) => {
-            // No anchor to place: the published curve carries it, so the report's
-            // `curve_anchor` is `None` rather than a derived number nothing consulted.
-            crate::algo::characteristic::check_tables(ch.stock)?;
-            let (film, out_of_table) = crate::algo::characteristic::apply_curve(density, ch.stock)?;
-            characteristic_out_of_table = Some(out_of_table);
-            (film, None)
-        }
-    };
+    // The anchor is applied **in the exponent** — `10^(γ·(D' − A))` — not as a
+    // separate `10^(−γ·A)` gain: mathematically equivalent, but the factored
+    // form overflows `f32` when `γ·D'` alone exceeds the pow10 range even
+    // though the anchored exponent is small (e.g. `γ = 5`, EPS-clamped
+    // `D' ≈ 8`), turning white into `inf` instead of `1.0`.
+    let gamma = curve.gamma;
+    let anchor = curve.anchor.anchor(gamma);
+    // Defense in depth. Two ways the exponent goes non-finite, and **both**
+    // render `10^(−inf) = 0.0` for every sample — an all-black frame that trips
+    // neither the clip nor the non-finite counter: the placement's division by
+    // the slope can overflow the *anchor* (a positive-but-tiny gamma), and a
+    // large-but-finite anchor can overflow the *product* `gamma · anchor`.
+    // `validate` rejects both at the CLI boundary, naming the flag; a
+    // programmatic caller reaches here first.
+    if !anchor.is_finite() || !(gamma * anchor).is_finite() {
+        return Err(NcError::Other(format!(
+            "the exponential anchor placement derived a non-usable anchor \
+             ({anchor:e}) at gamma {gamma}: the curve's exponent \
+             `gamma · (density − anchor)` is not finite, so every sample would \
+             render as exactly 0.0. Use a photographic gamma and a smaller anchor \
+             offset"
+        )));
+    }
+    let film = apply_curve(density, move |d| 10f32.powf(gamma * (d - anchor)));
     Ok((
         film,
         ReconstructionReport {
-            curve_anchor,
-            out_of_table: characteristic_out_of_table,
+            curve_anchor: anchor,
         },
     ))
 }
@@ -190,35 +174,8 @@ pub(crate) fn to_density(
     }
 }
 
-/// [`apply_curve`] with a **per-channel** tone function, for a curve whose response
-/// differs by dye layer.
-///
-/// The parametric curves share one function across all three channels; the characteristic
-/// curve does not, because the film does not — every C-41 stock measured has a blue layer
-/// 12-19% steeper than its red one. Same buffer discipline as [`apply_curve`]: in place,
-/// then through the validated constructor.
-pub(crate) fn apply_curve_per_channel(
-    density: DensityImage,
-    tone: impl Fn(usize, f32) -> f32 + Sync,
-) -> FilmRgbImage {
-    let mut rgb = density.density;
-    rgb.par_chunks_exact_mut(3).for_each(|px| {
-        for (c, v) in px.iter_mut().enumerate() {
-            *v = tone(c, *v);
-        }
-    });
-    FilmRgbImage::from_linear(
-        LinearImage::new(density.width, density.height, rgb, density.ir)
-            .expect("the curve preserves the validated buffer-length invariants"),
-    )
-}
-
 /// Stage 3 — apply a density curve `tone` (corrected density → positive
 /// linear) to every sample, minting the typed [`FilmRgbImage`] boundary.
-///
-/// The producer path for the exponential, which applies one function to every
-/// channel. It is not the only one: the characteristic curve mints its image through
-/// [`apply_curve_per_channel`].
 ///
 /// Pure and unclamped; a non-finite density (or a curve output that overflows) rides
 /// through so `io::encode`'s counters surface it.
@@ -278,18 +235,18 @@ mod tests {
     }
 
     /// The exponential curve carrying `gamma`, with mid-grey `offset` above the base.
-    fn exponential(gamma: f32, offset: f32) -> DensityCurve {
-        DensityCurve::Exponential(ExponentialParams {
+    fn exponential(gamma: f32, offset: f32) -> ExponentialParams {
+        ExponentialParams {
             gamma,
             anchor: AnchorPlacement::MidAtBaseOffset(offset),
-        })
+        }
     }
 
     /// The result of a full density-path reconstruction.
     #[derive(Debug)]
     struct Converted {
         out: LinearImage,
-        curve_anchor: Option<f32>,
+        curve_anchor: f32,
     }
 
     /// Run the full density path through the public entry point, `reconstruct`
@@ -298,7 +255,7 @@ mod tests {
         img: &LinearImage,
         base: &FilmBase,
         density: DensityParams,
-        curve: DensityCurve,
+        curve: ExponentialParams,
     ) -> Result<Converted> {
         let config = Reconstruction { density, curve };
         let (film, rep) = reconstruct_config(img, base, &config)?;
@@ -455,7 +412,7 @@ mod tests {
         let curve = exponential(gamma, 0.5);
         let via_config = run(&img, &base, density.clone(), curve).unwrap();
         let dimg = to_density(&img, &base, &density);
-        let anchor = curve.anchor().unwrap().anchor(gamma);
+        let anchor = curve.anchor.anchor(gamma);
         let via_parts = render(dimg, gamma, anchor);
         assert_eq!(via_config.out.rgb, via_parts.rgb);
         assert_eq!(via_config.out.ir, via_parts.ir);
@@ -473,7 +430,7 @@ mod tests {
             &img,
             &base,
             DensityParams::default(),
-            DensityCurve::default(),
+            ExponentialParams::default(),
         )
         .unwrap()
         .out;
@@ -497,7 +454,7 @@ mod tests {
         // because a regression in either is a colour bug that no other test sees.
         let base = FilmBase::from([0.5, 0.25, 0.15]);
         let neutral_out = |img, params| {
-            run(&img, &base, params, DensityCurve::default())
+            run(&img, &base, params, ExponentialParams::default())
                 .unwrap()
                 .out
         };
@@ -586,7 +543,7 @@ mod tests {
             &img,
             &base,
             DensityParams::default(),
-            DensityCurve::default(),
+            ExponentialParams::default(),
         )
         .unwrap()
         .out;
@@ -610,7 +567,7 @@ mod tests {
                 &img,
                 &FilmBase::from(bad),
                 DensityParams::default(),
-                DensityCurve::default(),
+                ExponentialParams::default(),
             )
             .unwrap_err();
             assert_eq!(err.exit_code(), 1, "base {bad:?} should fail loudly");
@@ -621,7 +578,7 @@ mod tests {
                 &img,
                 &FilmBase::from([0.5, 0.5, 0.5]),
                 DensityParams::default(),
-                DensityCurve::default(),
+                ExponentialParams::default(),
             )
             .is_ok()
         );
@@ -656,7 +613,7 @@ mod tests {
             &img,
             &base,
             DensityParams::default(),
-            DensityCurve::default(),
+            ExponentialParams::default(),
         )
         .unwrap()
         .out;
@@ -690,15 +647,9 @@ mod tests {
         let base = FilmBase::from([0.6, 0.6, 0.6]);
         let img = pixel([0.2, 0.2, 0.2], None);
 
-        // The exponential reports the anchor its placement derived…
+        // The curve reports the anchor its placement derived.
         let curve = exponential(1.0, 0.5);
         let rep = run(&img, &base, DensityParams::default(), curve).unwrap();
-        assert_eq!(rep.curve_anchor, Some(curve.anchor().unwrap().anchor(1.0)));
-
-        // …and the characteristic curve, which places none, reports none.
-        let characteristic =
-            DensityCurve::Characteristic(crate::types::CharacteristicParams::default());
-        let rep = run(&img, &base, DensityParams::default(), characteristic).unwrap();
-        assert_eq!(rep.curve_anchor, None);
+        assert_eq!(rep.curve_anchor, curve.anchor.anchor(1.0));
     }
 }

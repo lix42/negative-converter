@@ -103,6 +103,12 @@ percentile — never the base (it neutralises black) or the leader (1.5–3.5 st
 gains the wrong way). Under that white balance the operator's extra cleaning was not
 visible by eye; the band's value is keeping the pull off colour.
 
+**`look-presets` is done (2026-09-25): there are no look presets.** Nothing in the look
+is coupled the way the old bundles were, and a named look is a `--params` layer
+(`core/recipe-composition`), so `--preset` retired with the `characteristic` curve
+(`nf-retire/characteristic`) rather than being rebuilt. A new look control needs no
+preset row; do not reuse the name.
+
 ## stage
 
 **Status:** done
@@ -561,12 +567,18 @@ visible by eye; the band's value is keeping the pull off colour.
 
 ## look-presets
 
-**Status:** not started
-**Updated:** 2026-09-24
+**Status:** done
+**Updated:** 2026-09-25
 
 - 2026-09-19: created with the new-flow plan. Goal: re-express the `--preset` bundles.
 - 2026-09-24: recorded in the task file from `nf-look/contrast`: a preset does not set
   `look.contrast`.
+- 2026-09-25: **done — retired, not rebuilt** (user decision). A look-only preset would
+  bundle one or two independent knobs (`look.contrast` is the roll's and a preset may not
+  set it; `look.channel_grade` corrects the roll's crossover), and layered `--params`
+  already names a look without code. `nf-retire/characteristic` removes the flag with the
+  last three names: a hidden migration error at every value on both chains, no
+  `conversion_preset` report block, precedence `defaults < params < flags`.
 
 ## stock-data-home
 

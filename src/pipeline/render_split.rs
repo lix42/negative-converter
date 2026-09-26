@@ -392,10 +392,7 @@ mod tests {
     use super::*;
     use crate::algo::{FilmRgbImage, reconstruct};
     use crate::pipeline::working_space::map_nc_film_rgb_v1;
-    use crate::types::{
-        CharacteristicParams, DensityCurve, DensityParams, ExponentialParams, FilmBase,
-        Reconstruction, WbSource,
-    };
+    use crate::types::{FilmBase, Reconstruction, WbSource};
 
     /// An `AcesCgImage` whose *film RGB* input was exactly `rgb`, through the real
     /// working-space mapper.
@@ -405,18 +402,26 @@ mod tests {
         map_nc_film_rgb_v1(film)
     }
 
-    /// Every supported reconstruction config — the split must be indifferent to
-    /// which one produced the `AcesCgImage`.
-    fn all_configs() -> [Reconstruction; 2] {
+    /// A film-RGB producer under test, at its defaults.
+    type Producer = fn(&LinearImage, &FilmBase) -> FilmRgbImage;
+
+    /// Every film-RGB producer — the split must be indifferent to which one produced
+    /// the `AcesCgImage`.
+    ///
+    /// The current chain's reconstruction and the new chain's fixed decode, each at
+    /// its defaults.
+    fn producers() -> [(&'static str, Producer); 2] {
         [
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Exponential(ExponentialParams::default()),
-            },
-            Reconstruction {
-                density: DensityParams::default(),
-                curve: DensityCurve::Characteristic(CharacteristicParams::default()),
-            },
+            ("reconstruct", |img, base| {
+                reconstruct(img, base, &Reconstruction::default())
+                    .unwrap()
+                    .0
+            }),
+            ("fixed::decode", |img, base| {
+                crate::algo::fixed::decode(img, base, &Default::default())
+                    .unwrap()
+                    .0
+            }),
         ]
     }
 
@@ -481,25 +486,21 @@ mod tests {
     #[test]
     fn split_is_producer_agnostic_over_every_reconstruction_path() {
         // The split's input is `AcesCgImage` regardless of which reconstruction
-        // produced it (compiler-enforced by the signatures; this exercises all
-        // three paths so no path is accidentally excluded).
+        // produced it (compiler-enforced by the signatures; this exercises every
+        // producer so none is accidentally excluded).
         let scan = vec![0.5, 0.3, 0.2, 0.05, 0.03, 0.02];
         let base = FilmBase::from([0.9, 0.55, 0.42]);
-        for config in all_configs() {
+        for (name, produce) in producers() {
             let img = LinearImage::new(2, 1, scan.clone(), Some(vec![0.1, 0.9])).unwrap();
-            let (film, _) = reconstruct(&img, &base, &config).unwrap();
+            let film = produce(&img, &base);
             let master = film_master(map_nc_film_rgb_v1(film));
-            assert_eq!(master.rgb.len(), 6, "{config:?}");
-            assert_eq!(
-                master.ir.as_deref(),
-                Some(&[0.1_f32, 0.9][..]),
-                "{config:?}"
-            );
+            assert_eq!(master.rgb.len(), 6, "{name}");
+            assert_eq!(master.ir.as_deref(), Some(&[0.1_f32, 0.9][..]), "{name}");
 
             let img = LinearImage::new(2, 1, scan.clone(), None).unwrap();
-            let (film, _) = reconstruct(&img, &base, &config).unwrap();
+            let film = produce(&img, &base);
             let shared = display_source(map_nc_film_rgb_v1(film), &PrintParams::default()).unwrap();
-            assert_eq!(shared.source.rgb().len(), 6, "{config:?}");
+            assert_eq!(shared.source.rgb().len(), 6, "{name}");
         }
     }
 

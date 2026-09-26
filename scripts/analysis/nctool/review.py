@@ -123,11 +123,9 @@ OWNED_FLAGS = ("--output-preset", "-o", "--output", "--report", "--report-file")
 #: Placeholders a config's `args` may use, resolved per frame.
 #:
 #: `dmin` comes from the fixture declaration the metrics already use, so the two
-#: cannot drift; `film_stock` is stated per roll in the matrix, because the roll
-#: names in the fixtures ("2026-07-24-Gold200") are not the registry ids
-#: (`gold-200`) and deriving one from the other is the guess this toolkit refuses
-#: to make elsewhere.
-PLACEHOLDERS = ("dmin", "film_stock")
+#: cannot drift. (`film_stock` left with `--film-stock`, `nf-retire/characteristic`,
+#: and so did the matrix's `rolls` block that stated it.)
+PLACEHOLDERS = ("dmin",)
 
 
 class ReviewError(Exception):
@@ -373,7 +371,7 @@ def placeholders_in(args: list[str], at: str) -> set[str]:
 
     Checked when the matrix is read rather than when a frame is rendered, so a
     typo is one error at the top instead of the same error once per frame — or,
-    worse, a literal `{film_stok}` handed to `nc` as a flag value.
+    worse, a literal `{dmn}` handed to `nc` as a flag value.
     """
     used: set[str] = set()
     for arg in args:
@@ -423,7 +421,7 @@ def load_matrix(path: Path) -> dict:
     """
     raw = _load_object(path, "matrix")
     _known_keys(raw, {"schema_version", "title", "description", "output_dir",
-                      "output_preset", "common_args", "rolls", "frames", "metrics",
+                      "output_preset", "common_args", "frames", "metrics",
                       "builds", "configs"}, str(path))
     version = raw.get("schema_version")
     if version != SCHEMA:
@@ -466,18 +464,6 @@ def load_matrix(path: Path) -> dict:
             "builds": config_builds(entry.get("builds"), builds, f"{at}.builds"),
         })
 
-    rolls_raw = raw.get("rolls", {})
-    if not isinstance(rolls_raw, dict):
-        raise ReviewError("rolls must be an object keyed by roll name")
-    rolls = {}
-    for name, entry in rolls_raw.items():
-        if not isinstance(entry, dict):
-            raise ReviewError(f"rolls.{name} must be an object")
-        _known_keys(entry, {"film_stock"}, f"rolls.{name}")
-        stock = entry.get("film_stock")
-        rolls[name] = {"film_stock": _string(stock, f"rolls.{name}.film_stock")
-                       if stock is not None else None}
-
     frames = raw.get("frames")
     if frames is not None:
         frames = _string_list(frames, "frames")
@@ -502,7 +488,6 @@ def load_matrix(path: Path) -> dict:
         # having exactly one place turn the declaration into that list is what
         # keeps the three from disagreeing about how many cells there are.
         "configs": expand_configs(builds, configs),
-        "rolls": rolls,
         "frames": frames,
         "inset": float(inset),
         "output_dir": _optional_string(raw.get("output_dir"), "output_dir"),
@@ -1140,7 +1125,6 @@ def cmd_generate(args) -> int:
         roll_fixture = fixtures.get("rolls", {}).get(roll, {})
         values = {
             "dmin": ",".join(str(c) for c in roll_fixture.get("dmin", [])),
-            "film_stock": (matrix["rolls"].get(roll) or {}).get("film_stock") or "",
         }
 
         renditions: dict[str, object] = {}

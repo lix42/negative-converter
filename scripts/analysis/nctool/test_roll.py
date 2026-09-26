@@ -36,6 +36,29 @@ class TestRecipe(unittest.TestCase):
             {"curve": {"type": "characteristic", "stock": "ektar-100"}})
         self.assertEqual(merged["curve"], {"type": "characteristic", "stock": "ektar-100"})
 
+    def test_a_retired_curve_tag_is_dropped_only_where_the_build_writes_none(self):
+        # This build's defaults carry no curve tag, so an old recipe's
+        # `"type": "exponential"` must not read as a variant switch that drops the
+        # default curve's keys.
+        partial = {"reconstruction": {"curve": {"type": "exponential", "gamma": 1.5}}}
+        defaults = {"reconstruction": {"curve": {"gamma": 2.0,
+                                                 "anchor": {"mid-at-base-offset": .62}}}}
+        roll._drop_retired_curve_tag(defaults, partial)
+        merged = roll._deep_merge(defaults, partial)
+        self.assertEqual(merged["reconstruction"]["curve"],
+                         {"gamma": 1.5, "anchor": {"mid-at-base-offset": .62}})
+        # The reference build writes the tag, and there it is a selector: kept.
+        partial = {"reconstruction": {"curve": {"type": "exponential", "gamma": 1.5}}}
+        roll._drop_retired_curve_tag(
+            {"reconstruction": {"curve": {"type": "sigmoid"}}}, partial)
+        self.assertEqual(partial["reconstruction"]["curve"]["type"], "exponential")
+        # A malformed section is left untouched for `_freeze_recipe` to refuse.
+        for partial in ({"reconstruction": "invalid"}, {"reconstruction": {"curve": 1}}):
+            roll._drop_retired_curve_tag(defaults, partial)
+        _, error = roll._freeze_recipe({"reconstruction": "invalid"}, [.1, .2, .3],
+                                       None, None, None)
+        self.assertIn("must be an object", error)
+
     def test_measured_values_override_recipe_calibration(self):
         base = {
             "calibration": {"film_base": {"explicit": [9, 9, 9]}},
@@ -63,10 +86,15 @@ class TestRecipe(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(recipe["calibration"]["dmax"], {"explicit": 1.4})
 
-    def test_an_unstated_curve_freezes_to_the_default_exponential(self):
+    def test_an_unstated_curve_is_left_to_the_build(self):
+        # `hanten params` writes the build's own curve into the merged base; freezing
+        # adds no tag this build no longer writes.
         recipe, error = roll._freeze_recipe({}, [.1, .2, .3], None, None, None)
         self.assertIsNone(error)
-        self.assertEqual(recipe["reconstruction"]["curve"], {"type": "exponential"})
+        self.assertNotIn("curve", recipe["reconstruction"])
+        _, error = roll._freeze_recipe({"reconstruction": {"curve": 1}}, [.1, .2, .3],
+                                       None, None, None)
+        self.assertIn("must be an object", error)
 
     def test_default_region_is_center_eighty_percent(self):
         value, error = roll._region(None, {"width": 100, "height": 80}, "Dmin")

@@ -12,7 +12,6 @@ otherwise.
 | [`iso-decoder-oracle/`](iso-decoder-oracle/) | A macOS ImageIO interoperability oracle for ISO and legacy gain-map JPEGs. |
 | [`render-defaults-v2/`](render-defaults-v2/) | Reproduce the historical v1-to-v2 default-render measurements. |
 | [`render-defaults-v3/`](render-defaults-v3/) | Render and measure the legacy-TIFF-to-gain-map-JPEG default transition. |
-| [`preset-review/`](preset-review/) | The review **matrix** for the conversion presets; rendered by `nctool review generate`. |
 | `check-vendored-native.py` | Verify the checked-in libultrahdr and libjpeg-turbo source snapshots. |
 
 ## Vendored native-source check
@@ -64,9 +63,6 @@ touch that tool:
 - [`analysis/fixtures.json`](analysis/fixtures.json) — every
   frame's `file`/`dmin_frame`/`dmax_frame`, plus the `Ektar`/`Portra160-2026-07-22`
   roll keys (moved from the retired `sigmoid-baseline/`)
-- [`preset-review/presets.matrix.json`](preset-review/presets.matrix.json) — the
-  `rolls` block's `"2026-07-24-Gold200"`/`"Ektar"`/`"Portra160-2026-07-22"` keys
-  (Gold200's key is still valid; Ektar/Portra160 are not)
 - [`analysis/benchmark.json`](analysis/benchmark.json) and
   [`analysis/README.md`](analysis/README.md) — usages of the roll name `Ektar`
   as a live `nctool roll ...` argument

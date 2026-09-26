@@ -42,7 +42,7 @@ development, and scanner rendering in unclamped linear ACEScg. Its contract is
 **whatever the configured reconstruction produces**, unclamped, with fixed/roll
 Dmax placement, bypassing every later print/display control and rejecting
 frame-local fitting — it is *not* tied to a particular curve shape, and already
-varies with `--density-curve` and every curve knob. Under today's default that
+varies with every curve knob. Under today's default that
 happens to include the reference-anchored sigmoid's toe/midtone/shoulder
 rendering; `algo/reconstruction-render-curve-split` is moving the shoulder to the
 display stage, which changes the default master's rendering but not this
@@ -1015,8 +1015,8 @@ the design in `docs/design-update.md`:
 - `nf-look/contrast` (new flow): `nf-look/stage`, `nf-reconstruction/gamma-split`
   — the look half of `gamma`; supersedes `algo/contrast-latitude-spike`
 - `nf-look/look-presets` (new flow): `nf-look/contrast`, `nf-look/per-channel-grade`
-  — every current `--preset` names a retiring curve and an exposure calibrated
-  to the old chain
+  — every `--preset` named a retiring curve and an exposure calibrated to the old
+  chain; retired rather than rebuilt
 - `nf-look/stock-data-home` (new flow): `nf-look/stage`
   — the registry and datasheets lose their consumer when `characteristic`
   leaves the decode
@@ -1096,7 +1096,7 @@ the design in `docs/design-update.md`:
   whether any scale reaches the knee'd render's whites is what decides
   `nf-look/path-to-white`
 - `nf-retire/characteristic` (new flow): `nf-retire/sigmoid-and-simple`, `nf-look/stock-data-home`
-  — the curve, `--film-stock`, three preset names and `default_scale_for`'s
+  — the curve, `--film-stock`, `--preset` and `default_scale_for`'s
   per-curve case; the stock *data* stays (`nf-look/stock-data-home`) and becomes
   `#[cfg(test)]`
 - `nf-core/report-contract` (new flow): `nf-core/stage-skeleton`
@@ -1703,9 +1703,11 @@ the design in `docs/design-update.md`:
   `gamma-split`. **Done 2026-09-24**: one knob (a per-roll contrast under
   `anchor-comparison`'s C/D *is* its value), default `2.0 / 1.8` provisional, presets do
   not set it; shadow separation is the contrast's, not fit range's
-- [ ] [Re-express the `--preset` bundles](tasks/nf-look/look-presets.md) —
-  every current `--preset` names a retiring curve and an exposure calibrated
-  to the old chain
+- [x] [Re-express the `--preset` bundles](tasks/nf-look/look-presets.md) —
+  **done 2026-09-25: retired, not rebuilt.** With a fixed decode nothing is coupled
+  (contrast is the roll's, the grade corrects the roll), and a named look is a
+  `--params` layer; `--preset` is a migration error, removed by
+  `nf-retire/characteristic`
 - [x] [A home for the film-stock data](tasks/nf-look/stock-data-home.md) — the
   data stays as `film_stock/`, the evidence for the fixed decode's constants; the
   inversion is split into `algo/characteristic.rs` for its retirement, and
@@ -1870,10 +1872,15 @@ the design in `docs/design-update.md`:
   balance left 2.16
 - [ ] [Rename the `print.*` prefix](tasks/nf-retire/print-prefix-rename.md) —
   after the second implementation is gone, so nothing is renamed twice
-- [ ] [Retire the `characteristic` curve
-  path](tasks/nf-retire/characteristic.md) — the curve (`algo/characteristic.rs`,
-  deleted whole), `--film-stock`, three preset names and `default_scale_for`'s
-  per-curve case; the stock *data* stays, and becomes `#[cfg(test)]`
+- [x] [Retire the `characteristic` curve
+  path](tasks/nf-retire/characteristic.md) — **done 2026-09-26.** The curve
+  (`algo/characteristic.rs` and `algo/curve_probe.rs` deleted whole), `--density-curve`,
+  `--film-stock` and `--preset` itself are migration errors on both chains; the curve is
+  a plain `ExponentialParams` (the old `"type": "exponential"` dropped on load);
+  `density.scale` has one default; the report's `conversion_preset` and curve
+  `type`/`stock`/`out_of_table` and telemetry `conversion.curve` (schema 7) are gone.
+  The stock *data* stays, `#[cfg(test)]`. No pixel moved (`render`/`base` reproduced,
+  `recipe` refreshed)
 
 ### nf-docs — [progress](progress/nf-docs.md)
 > Fold the new design into the spec, the user guide and CLAUDE.md.
