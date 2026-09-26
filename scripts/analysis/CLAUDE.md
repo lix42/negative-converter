@@ -8,9 +8,6 @@ only the traps it does not.
   `NCTOOL_REQUIRE_DEPS=1 PYTHONPATH=scripts/analysis .venv/bin/python -m unittest discover -s scripts/analysis -p "test_*.py"`.
   No `.venv` in a fresh worktree: `uv venv --python 3.12 && uv pip install -r scripts/analysis/requirements.txt`.
   The harness test needs `target/debug/hanten` (`cargo build`; release alone is not enough).
-- **`test_falls_back_to_the_default_binary` fails whenever `target/release/hanten`
-  exists** — it asserts the default binary is missing. Move the binary aside; it
-  is not a regression.
 - **A stale `__pycache__` can shadow an edit.** CPython validates a `.pyc` by mtime
   and size, so a same-length edit within the same second runs the old bytecode
   while tracebacks quote the new source. If a fix seems not to take, clear

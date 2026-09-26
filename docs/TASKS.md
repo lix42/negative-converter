@@ -1564,7 +1564,7 @@ the design in `docs/design-update.md`:
   run aborts it.
 - [x] [Re-key the asset probes to today's roll names](tasks/analysis/probe-fixture-roll-names.md) — the `#[ignore]`d probes' `FIXTURES` use pre-rename roll names and panic before measuring
 - [ ] [Seed roles for the date-named rolls](tasks/analysis/manifest-seed-roles.md) — a from-scratch `nctool manifest generate` would mark every roll's `base.tif`/`leader.tif` as `real`
-- [ ] [`nctool`'s default-binary test depends on the
+- [x] [`nctool`'s default-binary test depends on the
   checkout](tasks/analysis/review-test-local-binary.md) — fails whenever
   `target/release/hanten` exists; CI never builds one, so only local gates see it
 

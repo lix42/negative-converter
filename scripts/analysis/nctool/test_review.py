@@ -595,9 +595,23 @@ class TestResolveBinaries(unittest.TestCase):
         self.assertIsNone(resolved[0]["id"])
         self.assertEqual(resolved[0]["nc"], str(Path(binary).resolve()))
 
+    # `DEFAULT_NC` is relative to the working directory, so the test supplies its
+    # own: the checkout's may hold a real release build, or none.
     def test_falls_back_to_the_default_binary(self):
-        with self.assertRaisesRegex(review.ReviewError, review.DEFAULT_NC):
-            review.resolve_binaries([], {}, None)
+        cwd = Path(tempfile.mkdtemp(prefix="nc-review-cwd-"))
+        default = cwd / review.DEFAULT_NC
+        default.parent.mkdir(parents=True)
+        default.write_text("#!/bin/sh\necho 'hanten 0.1.0'\n", encoding="utf-8")
+        default.chmod(0o755)
+        with contextlib.chdir(cwd):
+            resolved = review.resolve_binaries([], {}, None)
+        self.assertEqual(resolved[0]["nc"], str(default.resolve()))
+
+    def test_refuses_a_missing_binary_before_rendering(self):
+        missing = Path(tempfile.mkdtemp(prefix="nc-review-bin-")) / "hanten"
+        with self.assertRaisesRegex(review.ReviewError,
+                                    "no hanten binary at .*cargo build --release"):
+            review.resolve_binaries([], {}, str(missing))
 
     # The reference build this axis exists to compare against predates the rename
     # and prints `nc`. A pre-flight

@@ -1065,8 +1065,16 @@ What other epics need to know about `analysis`:
 
 ## review-test-local-binary
 
-**Status:** not started
+**Status:** done (2026-09-25)
 **Updated:** 2026-09-25
 
 - 2026-09-25: filed while shipping `nf-calibration/anchor-comparison`. Goal: the `nctool`
   default-binary test stops depending on whether a release binary is built.
+- 2026-09-25: done. The test now runs from a temporary working directory holding a fake
+  `hanten` at `DEFAULT_NC`, and asserts `resolve_binaries` resolves to it — a positive
+  check that the fallback is *used*, where the old one only matched the path in a
+  missing-binary error. `review.py` is unchanged: `DEFAULT_NC` stays relative to the
+  working directory, which is the behaviour under test. The missing-binary refusal the
+  old test covered incidentally has its own test now, through an `--nc` path that does
+  not exist. Removed the "move the binary aside" advice from `scripts/analysis/CLAUDE.md`
+  and `nc-fixer.md`.

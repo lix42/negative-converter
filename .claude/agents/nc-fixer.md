@@ -77,9 +77,7 @@ NCTOOL_REQUIRE_DEPS=1 PYTHONPATH=scripts/analysis .venv/bin/python -m unittest d
 cargo test --all-features
 ```
 
-The `nctool` suite needs the venv (`scripts/analysis/CLAUDE.md`) and fails
-whenever `target/release/hanten` exists — move it aside rather than report a
-regression.
+The `nctool` suite needs the venv (`scripts/analysis/CLAUDE.md`).
 
 Then report back:
 
